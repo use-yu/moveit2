@@ -1,0 +1,27 @@
+# Default initial positions for wheel_robot's ros2_control fake system
+
+initial_positions:
+  base_joint1: 0
+  base_joint2: 0
+  base_joint3: 0
+  body_joint1: 0
+  body_joint2: 0
+  body_joint3: 0
+  body_joint4: 0
+  head_joint3: 0
+  head_joint2: 0
+  head_joint1: 0
+  l_arm_Joint1: 0
+  l_arm_Joint2: 0
+  l_arm_Joint3: 0
+  l_arm_Joint4: 0
+  l_arm_Joint5: 0
+  l_arm_Joint6: 0
+  l_arm_Joint7: 0
+  r_arm_Joint1: 0
+  r_arm_Joint2: 0
+  r_arm_Joint3: 0
+  r_arm_Joint4: 0
+  r_arm_Joint5: 0
+  r_arm_Joint6: 0
+  r_arm_Joint7: 0

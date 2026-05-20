@@ -1,0 +1,25 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: moveit_resources_qj2m_description
+    relative_path: urdf/arms_2w.urdf
+  srdf:
+    relative_path: config/wheel_robot.srdf
+  package_settings:
+    author_name: gaoyu
+    author_email: 2675751737@qq.com
+    generated_timestamp: 1779179511
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
