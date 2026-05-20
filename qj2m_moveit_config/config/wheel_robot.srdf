@@ -273,4 +273,49 @@
     <disable_collisions link1="neck_1" link2="neck_2" reason="Adjacent"/>
     <disable_collisions link1="neck_1" link2="neck_3" reason="Never"/>
     <disable_collisions link1="neck_2" link2="neck_3" reason="Adjacent"/>
+    <!-- neck / body-1-link: disable collision with remaining links -->
+    <disable_collisions link1="neck_1" link2="AL5" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="AL6" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="AR5" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="AR6" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="arml_7" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="armr_7" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="base_footprint" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="base_x_link" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="base_y_link" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="l_arm_Link7_tool" reason="Never"/>
+    <disable_collisions link1="neck_1" link2="r_arm_Link7_tool" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="AL5" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="AL6" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="AR5" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="AR6" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="arml_7" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="armr_7" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="base_footprint" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="base_x_link" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="base_y_link" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="l_arm_Link7_tool" reason="Never"/>
+    <disable_collisions link1="neck_2" link2="r_arm_Link7_tool" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="AL4" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="AL5" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="AL6" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="AR4" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="AR5" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="AR6" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="arml_7" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="armr_7" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="base_footprint" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="base_x_link" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="base_y_link" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="l_arm_Link7_tool" reason="Never"/>
+    <disable_collisions link1="neck_3" link2="r_arm_Link7_tool" reason="Never"/>
+    <disable_collisions link1="body-1-link" link2="AL6" reason="Never"/>
+    <disable_collisions link1="body-1-link" link2="AR6" reason="Never"/>
+    <disable_collisions link1="body-1-link" link2="arml_7" reason="Never"/>
+    <disable_collisions link1="body-1-link" link2="armr_7" reason="Never"/>
+    <disable_collisions link1="body-1-link" link2="base_footprint" reason="Never"/>
+    <disable_collisions link1="body-1-link" link2="base_x_link" reason="Never"/>
+    <disable_collisions link1="body-1-link" link2="base_y_link" reason="Never"/>
+    <disable_collisions link1="body-1-link" link2="l_arm_Link7_tool" reason="Never"/>
+    <disable_collisions link1="body-1-link" link2="r_arm_Link7_tool" reason="Never"/>
 </robot>

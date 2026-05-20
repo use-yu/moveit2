@@ -20,7 +20,7 @@ namespace
 {
 constexpr char kPlanningGroup[] = "left_arm";
 // 从零开始多次独立规划，再取最短路径
-constexpr unsigned int kParallelPlanningAttempts = 100;
+constexpr unsigned int kParallelPlanningAttempts = 20;
 // 给 joint limit 的最大速度乘一个比例系数
 constexpr double kVelocityScale = 0.5;
 constexpr double kAccelerationScale = 0.5;
