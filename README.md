@@ -1,7 +1,8 @@
 # moveit2
 
 实际测试同一起点和终点
-不加hybridize和simplifySolution实际70个点  73.910 ms
+不加hybridize和simplifySolution实际70个点  73.910 ms-
+
 加上simplifySolution实际26或27个点 383.810 ms
 加上hybridize实际26的频率增多  100次20核 910.490 ms
 
