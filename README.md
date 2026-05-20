@@ -1,4 +1,8 @@
 # moveit2
+model_based_planning_context.cpp
+hybridize: true 时尝试A前半 + B中段 + C结尾组合成更短 / 更平滑 / 更自然
+
+
 planning_context_manager.cpp 
 max_planning_threads_()可以设置同时跑几个 planner，默认是 4。
 

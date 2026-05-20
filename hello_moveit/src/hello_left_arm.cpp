@@ -1,6 +1,7 @@
 // colcon build --packages-select hello_moveit
 // pkill -f ros2 || true
 // pkill -f move_group || true
+// htop -p $(pgrep -f move_group)
 
 #include <chrono>
 #include <condition_variable>
@@ -19,7 +20,7 @@ namespace
 {
 constexpr char kPlanningGroup[] = "left_arm";
 // 从零开始多次独立规划，再取最短路径
-constexpr unsigned int kParallelPlanningAttempts = 20;
+constexpr unsigned int kParallelPlanningAttempts = 100;
 // 给 joint limit 的最大速度乘一个比例系数
 constexpr double kVelocityScale = 0.5;
 constexpr double kAccelerationScale = 0.5;
@@ -203,10 +204,6 @@ int main(int argc, char * argv[])
   RCLCPP_INFO(
     logger, "Planning group: %s (%u joints), planner: RRTConnect, attempts: %u",
     kPlanningGroup, jmg->getVariableCount(), kParallelPlanningAttempts);
-  RCLCPP_INFO(
-    logger,
-    "Compare: [hello_left_arm] plan() wall time vs [move_group] "
-    "'RRTConnect: Solution found in ...' vs plan.planning_time_ below");
 
   MoveGroupInterface::Plan plan;
   const auto plan_start = std::chrono::steady_clock::now();
@@ -224,11 +221,6 @@ int main(int argc, char * argv[])
     logger,
     "move_group planning_time_ (server-reported solver): %.3f ms",
     plan_server_ms);
-  RCLCPP_INFO(
-    logger,
-    "overhead (wall - server): %.3f ms  |  "
-    "OMPL 'Solution found in ...' -> see demo.launch / move_group terminal",
-    plan_wall_ms - plan_server_ms);
 
   if (!plan_ok)
   {
@@ -244,8 +236,8 @@ int main(int argc, char * argv[])
   const double exec_ms =
     std::chrono::duration<double, std::milli>(exec_end - exec_start).count();
 
-  RCLCPP_INFO(logger, "Execution time: %.3f ms (%s)", exec_ms, exec_ok ? "success" : "failed");
-  RCLCPP_INFO(logger, "Total time: %.3f ms", plan_wall_ms + exec_ms);
+  // RCLCPP_INFO(logger, "Execution time: %.3f ms (%s)", exec_ms, exec_ok ? "success" : "failed");
+  // RCLCPP_INFO(logger, "Total time: %.3f ms", plan_wall_ms + exec_ms);
 
   rclcpp::shutdown();
   spinner.join();
