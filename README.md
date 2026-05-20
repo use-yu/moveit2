@@ -1,4 +1,14 @@
 # moveit2
+对位姿目标，MoveIt在关节空间里现算一个（或少量）同时满足：位姿约束 +无碰撞 的关节状态，作为这次规划里可用的构型
+容差
+move_group_interface.cpp
+    goal_joint_tolerance_ = 1e-4;
+    goal_position_tolerance_ = 1e-4;     // 0.1 mm
+    goal_orientation_tolerance_ = 1e-3;  // ~0.1 deg
+
+
+
+chomp规划时间太长，超10s
 
 实际测试同一起点和终点
 不加hybridize和simplifySolution实际70个点  73.910 ms-

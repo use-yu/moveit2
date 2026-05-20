@@ -12,6 +12,9 @@
 #include <string>
 #include <thread>
 
+#include <Eigen/Geometry>
+
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
@@ -19,6 +22,8 @@
 namespace
 {
 constexpr char kPlanningGroup[] = "left_arm";
+// 与 SRDF 中 left_arm 的 tip_link / left_tool 的 parent_link 一致
+constexpr char kEndEffectorLink[] = "l_arm_Link7_tool";
 // 从零开始多次独立规划，再取最短路径
 constexpr unsigned int kParallelPlanningAttempts = 20;
 // 给 joint limit 的最大速度乘一个比例系数
@@ -27,16 +32,14 @@ constexpr double kAccelerationScale = 0.5;
 
 using JointMap = std::map<std::string, double>;
 
-// 仅左臂 7 关节目标 [rad]
-const JointMap kGoalJoints{
-  {"l_arm_Joint1", 0.5},
-  {"l_arm_Joint2", -1},
-  {"l_arm_Joint3", 1.5},
-  {"l_arm_Joint4", 0.4},
-  {"l_arm_Joint5", 1.3},
-  {"l_arm_Joint6", 0.8},
-  {"l_arm_Joint7", 0.9},
-};
+// 规划坐标系（通常为 virtual_joint 父坐标系，见 SRDF）下的末端目标位姿
+// 位置 [m]；欧拉角 [rad]，按固定坐标系 XYZ（roll→pitch→yaw）构造姿态，可按现场修改
+constexpr double kGoalX = 0.35;
+constexpr double kGoalY = 0.25;
+constexpr double kGoalZ = 0.55;
+constexpr double kGoalRoll = 0.0;
+constexpr double kGoalPitch = 0.0;
+constexpr double kGoalYaw = 0.0;
 
 JointMap filterToGroup(const moveit::core::JointModelGroup * jmg, const JointMap & joints)
 {
@@ -50,35 +53,6 @@ JointMap filterToGroup(const moveit::core::JointModelGroup * jmg, const JointMap
     }
   }
   return filtered;
-}
-
-void warnGoalOutOfJointLimits(
-  const rclcpp::Logger & logger,
-  const moveit::core::RobotModelConstPtr & model,
-  const JointMap & goal)
-{
-  for (const auto & [name, value] : goal)
-  {
-    const moveit::core::VariableBounds & bounds = model->getVariableBounds(name);
-    if (!bounds.position_bounded_)
-    {
-      continue;
-    }
-    if (value < bounds.min_position_)
-    {
-      RCLCPP_WARN(
-        logger,
-        "Goal joint '%s': requested %.4f < min bound %.4f; move_group will clamp to min.",
-        name.c_str(), value, bounds.min_position_);
-    }
-    else if (value > bounds.max_position_)
-    {
-      RCLCPP_WARN(
-        logger,
-        "Goal joint '%s': requested %.4f > max bound %.4f; move_group will clamp to max.",
-        name.c_str(), value, bounds.max_position_);
-    }
-  }
 }
 
 std::optional<JointMap> readStartFromJointStates(
@@ -149,6 +123,30 @@ std::optional<JointMap> readStartFromJointStates(
   return start;
 }
 
+geometry_msgs::msg::PoseStamped makeGoalPoseStamped(
+  const rclcpp::Node::SharedPtr & node,
+  const std::string & planning_frame)
+{
+  geometry_msgs::msg::PoseStamped stamped;
+  stamped.header.frame_id = planning_frame;
+  stamped.header.stamp = node->now();
+
+  stamped.pose.position.x = kGoalX;
+  stamped.pose.position.y = kGoalY;
+  stamped.pose.position.z = kGoalZ;
+
+  const Eigen::Quaterniond q =
+    Eigen::AngleAxisd(kGoalYaw, Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(kGoalPitch, Eigen::Vector3d::UnitY()) *
+    Eigen::AngleAxisd(kGoalRoll, Eigen::Vector3d::UnitX());
+  stamped.pose.orientation.x = q.x();
+  stamped.pose.orientation.y = q.y();
+  stamped.pose.orientation.z = q.z();
+  stamped.pose.orientation.w = q.w();
+
+  return stamped;
+}
+
 }  // namespace
 
 int main(int argc, char * argv[])
@@ -190,20 +188,30 @@ int main(int argc, char * argv[])
     return 1;
   }
   const JointMap & start = *start_opt;
-  const JointMap goal = filterToGroup(jmg, kGoalJoints);
 
   moveit::core::RobotState start_state(*move_group.getCurrentState());
   start_state.setVariablePositions(start);
   move_group.setStartState(start_state);
-  warnGoalOutOfJointLimits(logger, move_group.getRobotModel(), goal);
-  if (!move_group.setJointValueTarget(goal))
-  {
-    RCLCPP_WARN(logger, "setJointValueTarget() returned false (goal out of bounds).");
-  }
+
+  move_group.setEndEffectorLink(kEndEffectorLink);
+
+  const std::string planning_frame = move_group.getPlanningFrame();
+  const geometry_msgs::msg::PoseStamped goal_pose =
+    makeGoalPoseStamped(node, planning_frame);
+
+  move_group.clearPoseTargets();
+  move_group.setPoseTarget(goal_pose);
 
   RCLCPP_INFO(
-    logger, "Planning group: %s (%u joints), planner: RRTConnect, attempts: %u",
-    kPlanningGroup, jmg->getVariableCount(), kParallelPlanningAttempts);
+    logger,
+    "Planning group: %s (%u joints), EE: %s, frame: %s, planner: RRTConnect, attempts: %u",
+    kPlanningGroup, jmg->getVariableCount(), kEndEffectorLink, planning_frame.c_str(),
+    kParallelPlanningAttempts);
+  RCLCPP_INFO(
+    logger,
+    "Pose goal: position (%.3f, %.3f, %.3f) m, RPY (%.3f, %.3f, %.3f) rad",
+    goal_pose.pose.position.x, goal_pose.pose.position.y, goal_pose.pose.position.z,
+    kGoalRoll, kGoalPitch, kGoalYaw);
 
   MoveGroupInterface::Plan plan;
   const auto plan_start = std::chrono::steady_clock::now();
