@@ -18,7 +18,9 @@
 namespace
 {
 constexpr char kPlanningGroup[] = "left_arm";
-constexpr unsigned int kParallelPlanningAttempts = 100;
+// 从零开始多次独立规划，再取最短路径
+constexpr unsigned int kParallelPlanningAttempts = 20;
+// 给 joint limit 的最大速度乘一个比例系数
 constexpr double kVelocityScale = 0.5;
 constexpr double kAccelerationScale = 0.5;
 
@@ -27,7 +29,7 @@ using JointMap = std::map<std::string, double>;
 // 仅左臂 7 关节目标 [rad]
 const JointMap kGoalJoints{
   {"l_arm_Joint1", 0.5},
-  {"l_arm_Joint2", 0.0},
+  {"l_arm_Joint2", 1},
   {"l_arm_Joint3", 0.0},
   {"l_arm_Joint4", 0.0},
   {"l_arm_Joint5", 0.0},
@@ -47,6 +49,35 @@ JointMap filterToGroup(const moveit::core::JointModelGroup * jmg, const JointMap
     }
   }
   return filtered;
+}
+
+void warnGoalOutOfJointLimits(
+  const rclcpp::Logger & logger,
+  const moveit::core::RobotModelConstPtr & model,
+  const JointMap & goal)
+{
+  for (const auto & [name, value] : goal)
+  {
+    const moveit::core::VariableBounds & bounds = model->getVariableBounds(name);
+    if (!bounds.position_bounded_)
+    {
+      continue;
+    }
+    if (value < bounds.min_position_)
+    {
+      RCLCPP_WARN(
+        logger,
+        "Goal joint '%s': requested %.4f < min bound %.4f; move_group will clamp to min.",
+        name.c_str(), value, bounds.min_position_);
+    }
+    else if (value > bounds.max_position_)
+    {
+      RCLCPP_WARN(
+        logger,
+        "Goal joint '%s': requested %.4f > max bound %.4f; move_group will clamp to max.",
+        name.c_str(), value, bounds.max_position_);
+    }
+  }
 }
 
 std::optional<JointMap> readStartFromJointStates(
@@ -163,7 +194,11 @@ int main(int argc, char * argv[])
   moveit::core::RobotState start_state(*move_group.getCurrentState());
   start_state.setVariablePositions(start);
   move_group.setStartState(start_state);
-  move_group.setJointValueTarget(goal);
+  warnGoalOutOfJointLimits(logger, move_group.getRobotModel(), goal);
+  if (!move_group.setJointValueTarget(goal))
+  {
+    RCLCPP_WARN(logger, "setJointValueTarget() returned false (goal out of bounds).");
+  }
 
   RCLCPP_INFO(
     logger, "Planning group: %s (%u joints), planner: RRTConnect, attempts: %u",

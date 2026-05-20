@@ -17,6 +17,7 @@ namespace
 {
 constexpr char kPlanningGroup[] = "dual_manipulator";
 // OMPL 并行规划：多路 RRTConnect 同时采样，碰撞检测在多线程中执行（MoveIt 默认最多 4 线程）
+// hybridize: true 时尝试A前半 + B中段 + C结尾组合成更短 / 更平滑 / 更自然
 constexpr unsigned int kParallelPlanningAttempts = 4;
 
 using JointMap = std::map<std::string, double>;

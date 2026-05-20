@@ -12,8 +12,6 @@ planner_configs:
   RRTConnect:
     type: geometric::RRTConnect
     range: 0.0
-    hybridize: true
-
 torso:
   default_planner_config: RRTConnect
   planner_configs:
