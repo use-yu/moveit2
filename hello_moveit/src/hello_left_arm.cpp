@@ -30,12 +30,12 @@ using JointMap = std::map<std::string, double>;
 // 仅左臂 7 关节目标 [rad]
 const JointMap kGoalJoints{
   {"l_arm_Joint1", 0.5},
-  {"l_arm_Joint2", 1},
-  {"l_arm_Joint3", 0.0},
-  {"l_arm_Joint4", 0.0},
-  {"l_arm_Joint5", 0.0},
-  {"l_arm_Joint6", 0.0},
-  {"l_arm_Joint7", 0.0},
+  {"l_arm_Joint2", -1},
+  {"l_arm_Joint3", 1.5},
+  {"l_arm_Joint4", 0.4},
+  {"l_arm_Joint5", 1.3},
+  {"l_arm_Joint6", 0.8},
+  {"l_arm_Joint7", 0.9},
 };
 
 JointMap filterToGroup(const moveit::core::JointModelGroup * jmg, const JointMap & joints)
@@ -219,8 +219,13 @@ int main(int argc, char * argv[])
     plan_wall_ms, plan_ok ? "success" : "failed");
   RCLCPP_INFO(
     logger,
-    "move_group planning_time_ (server-reported solver): %.3f ms",
+    "move_group planning_time: %.3f ms",
     plan_server_ms);
+  if (plan_ok)
+  {
+    const size_t num_waypoints = plan.trajectory_.joint_trajectory.points.size();
+    RCLCPP_INFO(logger, "planned trajectory: %zu waypoints", num_waypoints);
+  }
 
   if (!plan_ok)
   {
@@ -233,8 +238,8 @@ int main(int argc, char * argv[])
   const auto exec_start = std::chrono::steady_clock::now();
   const bool exec_ok = static_cast<bool>(move_group.execute(plan));
   const auto exec_end = std::chrono::steady_clock::now();
-  const double exec_ms =
-    std::chrono::duration<double, std::milli>(exec_end - exec_start).count();
+  // const double exec_ms =
+  //   std::chrono::duration<double, std::milli>(exec_end - exec_start).count();
 
   // RCLCPP_INFO(logger, "Execution time: %.3f ms (%s)", exec_ms, exec_ok ? "success" : "failed");
   // RCLCPP_INFO(logger, "Total time: %.3f ms", plan_wall_ms + exec_ms);

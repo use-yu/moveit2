@@ -1,4 +1,9 @@
 # moveit2
+实际测试一段不加hybridize和simplifySolution实际70个点  73.910 ms
+加上simplifySolution实际26或27个点 383.810 ms
+加上hybridize实际26的频率增多  100次20核 910.490 ms
+
+
 model_based_planning_context.cpp
 hybridize: true 时尝试A前半 + B中段 + C结尾组合成更短 / 更平滑 / 更自然
 
