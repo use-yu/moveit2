@@ -14,6 +14,7 @@ find_package(moveit_visual_tools REQUIRED)
 add_executable(hello_moveit src/hello_moveit.cpp)
 add_executable(hello_qj2m src/hello_qj2m.cpp)
 add_executable(hello_left_arm src/hello_left_arm.cpp)
+add_executable(hello_left_arm_ompl_chomp src/hello_left_arm_ompl_chomp.cpp)
 
 target_include_directories(hello_moveit PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -48,7 +49,18 @@ ament_target_dependencies(
   "sensor_msgs"
 )
 
-install(TARGETS hello_moveit hello_qj2m hello_left_arm
+target_include_directories(hello_left_arm_ompl_chomp PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(hello_left_arm_ompl_chomp PUBLIC c_std_99 cxx_std_17)
+ament_target_dependencies(
+  hello_left_arm_ompl_chomp
+  "moveit_ros_planning_interface"
+  "rclcpp"
+  "sensor_msgs"
+)
+
+install(TARGETS hello_moveit hello_qj2m hello_left_arm hello_left_arm_ompl_chomp
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch

@@ -1,0 +1,21 @@
+# CHOMP 作为 OMPL 的 planning_request_adapter（chomp/OptimizerAdapter）的参数
+# 节点命名空间下的 chomp.*，由 move_group.launch.py 与 to_moveit_configs() 一并加载
+#
+# trajectory_initialization_method: fillTrajectory 表示用 OMPL 返回的轨迹作 CHOMP 初值（勿用 quintic-spline）
+
+chomp:
+  planning_time_limit: 10.0
+  max_iterations: 100
+  max_iterations_after_collision_free: 5
+  trajectory_initialization_method: "fillTrajectory"
+  smoothness_cost_weight: 0.1
+  obstacle_cost_weight: 1.0
+  learning_rate: 0.01
+  smoothness_cost_velocity: 0.0
+  smoothness_cost_acceleration: 1.0
+  smoothness_cost_jerk: 0.0
+  ridge_factor: 0.0
+  joint_update_limit: 0.1
+  collision_clearance: 0.02
+  collision_threshold: 0.07
+  use_stochastic_descent: true
