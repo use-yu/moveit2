@@ -18,32 +18,32 @@ namespace
 constexpr char kPlanningGroup[] = "dual_manipulator";
 // OMPL 并行规划：多路 RRTConnect 同时采样，碰撞检测在多线程中执行（MoveIt 默认最多 4 线程）
 // hybridize: true 时尝试A前半 + B中段 + C结尾组合成更短 / 更平滑 / 更自然
-constexpr unsigned int kParallelPlanningAttempts = 4;
+constexpr unsigned int kParallelPlanningAttempts = 20;
 
 using JointMap = std::map<std::string, double>;
 
 const JointMap kGoalJoints{
   {"base_joint1", 0.5},
-  {"base_joint2", 0.0},
-  {"base_joint3", 0.0},
-  {"body_joint1", 0.0},
-  {"body_joint2", 0.0},
-  {"body_joint3", 0.0},
-  {"body_joint4", 0.0},
+  {"base_joint2", 0.2},
+  {"base_joint3", 0.2},
+  {"body_joint1", 0.2},
+  {"body_joint2", 0.2},
+  {"body_joint3", 0.2},
+  {"body_joint4", 0.2},
   {"l_arm_Joint1", 0.9},
   {"l_arm_Joint2", 0.0},
-  {"l_arm_Joint3", 0.0},
+  {"l_arm_Joint3", 0.4},
   {"l_arm_Joint4", 0.5},
-  {"l_arm_Joint5", 0.0},
-  {"l_arm_Joint6", 0.0},
-  {"l_arm_Joint7", 0.0},
+  {"l_arm_Joint5", 0.5},
+  {"l_arm_Joint6", 0.5},
+  {"l_arm_Joint7", 0.5},
   {"r_arm_Joint1", 0.9},
   {"r_arm_Joint2", 0.0},
-  {"r_arm_Joint3", 0.0},
+  {"r_arm_Joint3", 0.5},
   {"r_arm_Joint4", 0.5},
-  {"r_arm_Joint5", 0.0},
-  {"r_arm_Joint6", 0.0},
-  {"r_arm_Joint7", 0.0},
+  {"r_arm_Joint5", 0.5},
+  {"r_arm_Joint6", 0.5},
+  {"r_arm_Joint7", 0.5},
 };
 
 JointMap filterToGroup(const moveit::core::JointModelGroup * jmg, const JointMap & joints)

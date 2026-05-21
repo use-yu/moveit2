@@ -1,2 +1,5 @@
-# moveit_resources/
-# moveit2/
+# Linux core dumps (repo root only; do not use bare "core" — source trees have core/ dirs)
+/core
+
+# ROS 2 launch logs (e.g. ROS_LOG_DIR under workspace)
+.ros_log/

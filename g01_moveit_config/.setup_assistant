@@ -1,0 +1,25 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: moveit_resources_g01_description
+    relative_path: urdf/G01-URDF888.urdf
+  srdf:
+    relative_path: config/G01.srdf
+  package_settings:
+    author_name: gaoyu
+    author_email: 2675751737@qq.com
+    generated_timestamp: 1779359809
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity

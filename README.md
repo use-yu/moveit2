@@ -1,4 +1,28 @@
 # moveit2
+运行代码：
+官方例子
+ros2 launch moveit2_tutorials demo.launch.py
+
+qj2m：
+ros2 launch qj2m_moveit_config demo.launch.py
+ros2 run hello_moveit hello_qj2m
+
+MoveIt 设置助手：
+ros2 launch moveit_setup_assistant setup_assistant.launch.py
+1. moveit_resources文件夹下复制一个包
+2. 修改 package.xml 和 CMakeLists.txt 的包名字，修改urdf的meshes路径
+3. colcon build --packages-select moveit_resources && source install/setup.bash
+
+
+
+
+实际测试：
+rviz太卡是meshes文件太大，可以用open3D库缩小
+
+
+对于双臂无法给双臂的位姿规划，需要先求逆解再规划
+适用于单臂关节空间或笛卡尔空间规划，双臂只能自己先求逆解关节空间规划
+
 对位姿目标，MoveIt在关节空间里现算一个（或少量）同时满足：位姿约束 +无碰撞 的关节状态，作为这次规划里可用的构型
 容差
 move_group_interface.cpp
