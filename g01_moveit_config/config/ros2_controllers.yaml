@@ -53,6 +53,8 @@ body_controller:
       - base_joint2
       - body_joint1
       - body_joint2
+    # left_body/right_body 执行时轨迹只含 body_joint1/2，不含底盘关节；必须为 true
+    allow_partial_joints_goal: true
     command_interfaces:
       - position
     state_interfaces:

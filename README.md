@@ -13,11 +13,10 @@ ros2 launch moveit_setup_assistant setup_assistant.launch.py
 2. 修改 package.xml 和 CMakeLists.txt 的包名字，修改urdf的meshes路径
 3. colcon build --packages-select moveit_resources && source install/setup.bash
 
-
-
-
-实际测试：
-rviz太卡是meshes文件太大，可以用open3D库缩小
+注意生成的joint_limits.yaml文件整数要改成小数
+注意生成控制器时要拆细一点：底盘+腰+双臂
+注意要添加虚拟关节，不然会报错
+注意meshes文件太大会卡，可以用open3D库缩小
 
 
 对于双臂无法给双臂的位姿规划，需要先求逆解再规划

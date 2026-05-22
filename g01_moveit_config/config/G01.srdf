@@ -9,9 +9,8 @@
     <!--JOINTS: When a joint is specified, the child link of that joint (which will always exist) is automatically included-->
     <!--CHAINS: When a chain is specified, all the links along the chain (including endpoints) are included in the group. Additionally, all the joints that are parents to included links are also included. This means that joints along the chain and the parent joint of the base link are included in the group-->
     <!--SUBGROUPS: Groups can also be formed by referencing to already defined group names-->
-    <group name="left">
-        <joint name="virtual_joint"/>
-        <joint name="world_to_base_footprint"/>
+    <!-- 底盘+躯干：对应 body_controller -->
+    <group name="body">
         <joint name="base_joint1"/>
         <joint name="base_joint2"/>
         <joint name="body_joint1"/>
@@ -72,6 +71,14 @@
         <joint name="r_arm_joint4"/>
         <joint name="r_arm_joint5"/>
         <joint name="r_arm_joint6"/>
+    </group>
+    <group name="body">
+        <joint name="virtual_joint"/>
+        <joint name="world_to_base_footprint"/>
+        <joint name="base_joint1"/>
+        <joint name="base_joint2"/>
+        <joint name="body_joint1"/>
+        <joint name="body_joint2"/>
     </group>
     <group name="body">
         <joint name="virtual_joint"/>
