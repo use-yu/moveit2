@@ -64,6 +64,7 @@ install(TARGETS hello_moveit hello_qj2m hello_left_arm hello_left_arm_ompl_chomp
 
 install(PROGRAMS
   scripts/hello_deep_frame.py
+  scripts/hello_deep_frame_body.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

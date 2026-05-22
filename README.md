@@ -1,5 +1,8 @@
 # moveit2
 运行代码：
+
+ros2 launch g01_moveit_config demo.launch.py
+
 官方例子
 ros2 launch moveit2_tutorials demo.launch.py
 
