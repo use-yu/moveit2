@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 超限警告
 """
 向 MoveIt 规划场景添加半透明「深框」碰撞体，并规划/执行指定 group 的关节目标。
 
@@ -20,6 +21,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import time
 
@@ -54,8 +56,7 @@ FRAME_HEIGHT = 0.7
 WALL_THICKNESS = 0.02
 
 # 深框底面中心在规划坐标系下的位置 [m]
-# 注：body 组下 base_joint1 正向对应世界 +X 前进；BASE_X 太小会让目标姿态直接戳进深框
-BASE_X = 2.5
+BASE_X = 2.0
 BASE_Y = 0.0
 BASE_Z = 0.0
 
@@ -67,7 +68,7 @@ MOVE_GROUP_ACTION = "move_action"
 
 # --------------------------- 规划参数（可快速切换） ---------------------------
 # 想规划哪个 group，只改这里即可（例如: "body" / "dual" / "left_arm"）
-ACTIVE_GROUP = "body"
+ACTIVE_GROUP = "dual_arm"
 
 # 快速切换配置：key 是你要填写的 ACTIVE_GROUP，group_name 是 SRDF 真实组名
 GROUP_CONFIGS = {
@@ -76,72 +77,35 @@ GROUP_CONFIGS = {
         "joint_target": {
             "base_joint1": 1.0,
             "base_joint2": 0.0,
-            # body_joint1 上限 0.0，给一点余量避免目标贴限位导致采样失败
-            "body_joint1": -0.01,
-            # body_joint2 过大会让 YB 前倾撞进深框前壁
+            "body_joint1": 0.0,
             "body_joint2": 0.0,
         },
     },
-    "dual": {
+    "dual_arm": {
         "group_name": "dual_arm",
         "joint_target": {
-            "base_joint1": 0.2,
+            "base_joint1": 1.25,
             "base_joint2": 0.0,
-            "body_joint1": 0.0,
+            "body_joint1": -0.26,
             "body_joint2": 1.1,
-            "l_arm_joint1": 0.0,
-            "l_arm_joint2": 0.0,
-            "l_arm_joint3": 0.0,
-            "l_arm_joint4": 0.0,
-            "l_arm_joint5": 0.0,
-            "l_arm_joint6": 0.0,
-            "r_arm_joint1": 0.0,
-            "r_arm_joint2": 0.0,
-            "r_arm_joint3": 0.0,
-            "r_arm_joint4": 0.0,
-            "r_arm_joint5": 0.0,
-            "r_arm_joint6": 0.0,
+            "l_arm_joint1": -20 * math.pi / 180,
+            "l_arm_joint2": -102 * math.pi / 180,
+            "l_arm_joint3": -92 * math.pi / 180,
+            "l_arm_joint4": 137 * math.pi / 180,
+            "l_arm_joint5": -0 * math.pi,
+            "l_arm_joint6": -0 * math.pi / 180,
+            "r_arm_joint1": -20 * math.pi / 180,
+            "r_arm_joint2": -102 * math.pi / 180,
+            "r_arm_joint3": -92 * math.pi / 180,
+            "r_arm_joint4": 137 * math.pi / 180,
+            "r_arm_joint5": -0 * math.pi,
+            "r_arm_joint6": -0 * math.pi / 180,
         },
     },
 }
 PLANNER_ID = "RRTConnect"
 NUM_PLANNING_ATTEMPTS = 20
-ALLOWED_PLANNING_TIME = 10.0  # [s]
-
-# MoveIt 错误码 -> 名称，便于排查（FAILURE=99999 表示规划器未给出明确原因）
-MOVEIT_ERROR_NAMES = {
-    MoveItErrorCodes.SUCCESS: "SUCCESS",
-    MoveItErrorCodes.FAILURE: "FAILURE",
-    MoveItErrorCodes.PLANNING_FAILED: "PLANNING_FAILED",
-    MoveItErrorCodes.INVALID_MOTION_PLAN: "INVALID_MOTION_PLAN",
-    MoveItErrorCodes.MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE:
-        "MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE",
-    MoveItErrorCodes.CONTROL_FAILED: "CONTROL_FAILED",
-    MoveItErrorCodes.UNABLE_TO_AQUIRE_SENSOR_DATA: "UNABLE_TO_AQUIRE_SENSOR_DATA",
-    MoveItErrorCodes.TIMED_OUT: "TIMED_OUT",
-    MoveItErrorCodes.PREEMPTED: "PREEMPTED",
-    MoveItErrorCodes.START_STATE_IN_COLLISION: "START_STATE_IN_COLLISION",
-    MoveItErrorCodes.START_STATE_VIOLATES_PATH_CONSTRAINTS:
-        "START_STATE_VIOLATES_PATH_CONSTRAINTS",
-    MoveItErrorCodes.GOAL_IN_COLLISION: "GOAL_IN_COLLISION",
-    MoveItErrorCodes.GOAL_VIOLATES_PATH_CONSTRAINTS: "GOAL_VIOLATES_PATH_CONSTRAINTS",
-    MoveItErrorCodes.GOAL_CONSTRAINTS_VIOLATED: "GOAL_CONSTRAINTS_VIOLATED",
-    MoveItErrorCodes.INVALID_GROUP_NAME: "INVALID_GROUP_NAME",
-    MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS: "INVALID_GOAL_CONSTRAINTS",
-    MoveItErrorCodes.INVALID_ROBOT_STATE: "INVALID_ROBOT_STATE",
-    MoveItErrorCodes.INVALID_LINK_NAME: "INVALID_LINK_NAME",
-    MoveItErrorCodes.INVALID_OBJECT_NAME: "INVALID_OBJECT_NAME",
-    MoveItErrorCodes.FRAME_TRANSFORM_FAILURE: "FRAME_TRANSFORM_FAILURE",
-    MoveItErrorCodes.COLLISION_CHECKING_UNAVAILABLE: "COLLISION_CHECKING_UNAVAILABLE",
-    MoveItErrorCodes.ROBOT_STATE_STALE: "ROBOT_STATE_STALE",
-    MoveItErrorCodes.SENSOR_INFO_STALE: "SENSOR_INFO_STALE",
-    MoveItErrorCodes.COMMUNICATION_FAILURE: "COMMUNICATION_FAILURE",
-    MoveItErrorCodes.NO_IK_SOLUTION: "NO_IK_SOLUTION",
-}
-
-
-def moveit_error_name(code: int) -> str:
-    return MOVEIT_ERROR_NAMES.get(code, f"UNKNOWN({code})")
+ALLOWED_PLANNING_TIME = 5.0  # [s]
 
 
 def _make_pose(x: float, y: float, z: float) -> Pose:
@@ -216,6 +180,8 @@ def make_joint_goal_constraints(
     """将关节目标字典转换为 MoveIt 关节约束集合。"""
     constraints = Constraints()
     constraints.name = f"{group_name}_joint_goal"
+
+    # 关节约束阈值越小越严格。这里给较小容差，便于精确到位又避免数值抖动导致失败。
     tolerance_above = 1e-3
     tolerance_below = 1e-3
 
@@ -305,10 +271,8 @@ class HelloDeepFrameBody(Node):
         return self._apply_planning_scene([make_remove_collision_object()])
 
     def _run_move_group(
-        self,
-        group_name: str,
-        joint_target: dict[str, float],
-        plan_only: bool,
+        self, group_name: str, joint_target: dict[str, float]
+        , plan_only: bool
     ) -> tuple[bool, float]:
         """发送一次 move_action 请求，返回(是否成功, wall_time_ms)。"""
         if not self._move_group_action_client.wait_for_server(timeout_sec=10.0):
@@ -365,24 +329,17 @@ class HelloDeepFrameBody(Node):
         move_result = action_result.result
 
         wall_ms = (time.monotonic() - t0) * 1000.0
-        err_val = move_result.error_code.val if move_result else None
-        err_name = moveit_error_name(err_val) if err_val is not None else "None"
-
         if status != GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().error(
                 f"move_action 未成功完成，status={status}, "
-                f"moveit_error_code={err_val} ({err_name})。"
+                f"moveit_error_code={move_result.error_code.val if move_result else 'None'}。"
             )
-            if err_val == MoveItErrorCodes.FAILURE:
-                self.get_logger().error(
-                    "提示：FAILURE 通常意味着目标状态本身无效（与障碍物碰撞 / 贴近关节限位 / "
-                    "起点本身已碰撞），请检查关节目标与场景障碍物位置。"
-                )
             return False, wall_ms
 
-        if move_result is None or err_val != MoveItErrorCodes.SUCCESS:
+        if move_result is None or move_result.error_code.val != MoveItErrorCodes.SUCCESS:
             self.get_logger().error(
-                f"MoveIt 规划/执行失败，error_code={err_val} ({err_name})。"
+                f"MoveIt 规划/执行失败，error_code="
+                f"{move_result.error_code.val if move_result else 'None'}。"
             )
             return False, wall_ms
 
@@ -397,14 +354,6 @@ class HelloDeepFrameBody(Node):
             f"(planner={PLANNER_ID}, attempts={NUM_PLANNING_ATTEMPTS}, "
             f"time={ALLOWED_PLANNING_TIME:.1f}s)"
         )
-
-        current = self._read_current_joint_positions(list(joint_target.keys()))
-        if current is not None:
-            for name, target in joint_target.items():
-                self.get_logger().info(
-                    f"  关节 {name}: 当前 {current[name]:+.4f} -> 目标 {target:+.4f} "
-                    f"(Δ={target - current[name]:+.4f})"
-                )
 
         plan_ok, plan_ms = self._run_move_group(group_name, joint_target, plan_only=True)
         self.get_logger().info(
