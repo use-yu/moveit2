@@ -107,22 +107,9 @@ GROUP_CONFIGS = {
             "r_arm_joint6": -0 * math.pi / 180,
         },
     },
-    "left_body": {
-        "group_name": "left_body",
-        "joint_target": {
-            "body_joint1": -0.26,
-            "body_joint2": 1.1,
-            "l_arm_joint1": -20 * math.pi / 180,
-            "l_arm_joint2": -102 * math.pi / 180,
-            "l_arm_joint3": -92 * math.pi / 180,
-            "l_arm_joint4": 137 * math.pi / 180,
-            "l_arm_joint5": -0 * math.pi,
-            "l_arm_joint6": -0 * math.pi / 180,
-        },
-    },
 }
 PLANNER_ID = "RRTConnect"
-NUM_PLANNING_ATTEMPTS = 20
+NUM_PLANNING_ATTEMPTS = 40
 ALLOWED_PLANNING_TIME = 5.0  # [s]
 
 # 末端位姿规划组（SRDF left_body：躯干 + 左臂，不含底盘关节）
@@ -140,8 +127,8 @@ POSE_GROUP_JOINTS = [
 
 # 末端位姿目标（相对 base_link，连杆 L6）
 EE_LINK = "L6"
-EE_GOAL_X = -0.8
-EE_GOAL_Y = -0.0
+EE_GOAL_X = -0.7
+EE_GOAL_Y = -0.3
 EE_GOAL_Z = 0.0
 EE_GOAL_ROLL = -math.pi / 2
 EE_GOAL_PITCH = -math.pi / 2
@@ -592,7 +579,7 @@ def main(args: list[str] | None = None) -> int:
         if not node.plan_and_execute_group_joint_goal(planning_group, joint_target):
             logger.error(f"{ACTIVE_GROUP}（实际组: {planning_group}）规划/执行失败。")
             return 1
-
+        # 规划并执行末端位姿目标
         ee_pose = _make_pose(
             EE_GOAL_X, EE_GOAL_Y, EE_GOAL_Z, EE_GOAL_ROLL, EE_GOAL_PITCH, EE_GOAL_YAW
         )
