@@ -30,12 +30,15 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Pose
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
+    BoundingVolume,
     CollisionObject,
     Constraints,
     JointConstraint,
     MoveItErrorCodes,
     ObjectColor,
+    OrientationConstraint,
     PlanningScene,
+    PositionConstraint,
 )
 from moveit_msgs.srv import ApplyPlanningScene
 from rclpy.action import ActionClient
@@ -45,8 +48,10 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import ColorRGBA
 
 # --------------------------- 场景与障碍物参数 ---------------------------
-# 规划坐标系（与 SRDF virtual_joint 的 parent_frame 一致）
-PLANNING_FRAME = "world"
+# 末端位姿规划坐标系（L6 目标相对 base_link）
+PLANNING_FRAME = "base_link"
+# 深框等环境障碍物固定在 world
+SCENE_FRAME = "world"
 
 # 深框外形尺寸 [m]：长 L × 宽 W × 高 H（开口朝上，无顶盖）
 FRAME_LENGTH = 0.8
@@ -86,7 +91,7 @@ GROUP_CONFIGS = {
         "joint_target": {
             "base_joint1": 1.25,
             "base_joint2": 0.0,
-            "body_joint1": -0.26,
+            "body_joint1": -0.25,
             "body_joint2": 1.1,
             "l_arm_joint1": -20 * math.pi / 180,
             "l_arm_joint2": -102 * math.pi / 180,
@@ -102,16 +107,68 @@ GROUP_CONFIGS = {
             "r_arm_joint6": -0 * math.pi / 180,
         },
     },
+    "left_body": {
+        "group_name": "left_body",
+        "joint_target": {
+            "body_joint1": -0.26,
+            "body_joint2": 1.1,
+            "l_arm_joint1": -20 * math.pi / 180,
+            "l_arm_joint2": -102 * math.pi / 180,
+            "l_arm_joint3": -92 * math.pi / 180,
+            "l_arm_joint4": 137 * math.pi / 180,
+            "l_arm_joint5": -0 * math.pi,
+            "l_arm_joint6": -0 * math.pi / 180,
+        },
+    },
 }
 PLANNER_ID = "RRTConnect"
 NUM_PLANNING_ATTEMPTS = 20
 ALLOWED_PLANNING_TIME = 5.0  # [s]
 
+# 末端位姿规划组（SRDF left_body：躯干 + 左臂，不含底盘关节）
+POSE_PLANNING_GROUP = "left_body"
+POSE_GROUP_JOINTS = [
+    "body_joint1",
+    "body_joint2",
+    "l_arm_joint1",
+    "l_arm_joint2",
+    "l_arm_joint3",
+    "l_arm_joint4",
+    "l_arm_joint5",
+    "l_arm_joint6",
+]
 
-def _make_pose(x: float, y: float, z: float) -> Pose:
-    """构造单位姿态（无旋转）的位置 Pose。"""
+# 末端位姿目标（相对 base_link，连杆 L6）
+EE_LINK = "L6"
+EE_GOAL_X = -0.8
+EE_GOAL_Y = -0.0
+EE_GOAL_Z = 0.0
+EE_GOAL_ROLL = -math.pi / 2
+EE_GOAL_PITCH = -math.pi / 2
+EE_GOAL_YAW = -math.pi
+
+
+def _quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
+    """固定坐标系 XYZ：RPY → 四元数 (x, y, z, w)。"""
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return x, y, z, w
+
+
+def _make_pose(
+    x: float, y: float, z: float, roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0
+) -> Pose:
     pose = Pose()
-    pose.orientation.w = 1.0
+    qx, qy, qz, qw = _quat_from_rpy(roll, pitch, yaw)
+    pose.orientation.x = qx
+    pose.orientation.y = qy
+    pose.orientation.z = qz
+    pose.orientation.w = qw
     pose.position.x = x
     pose.position.y = y
     pose.position.z = z
@@ -197,6 +254,41 @@ def make_joint_goal_constraints(
     return constraints
 
 
+# MoveGroupInterface 默认目标容差（move_group_interface.cpp）
+_DEFAULT_GOAL_POS_TOL = 1e-4   # [m]
+_DEFAULT_GOAL_ORI_TOL = 1e-3   # [rad]
+
+
+def make_pose_goal_constraints(link_name: str, pose: Pose) -> Constraints:
+    constraints = Constraints()
+    constraints.name = "pose_goal"
+    sphere = SolidPrimitive()
+    sphere.type = SolidPrimitive.SPHERE
+    sphere.dimensions = [_DEFAULT_GOAL_POS_TOL]
+    region = BoundingVolume()
+    region.primitives.append(sphere)
+    goal_pose = Pose()
+    goal_pose.position = pose.position
+    goal_pose.orientation.w = 1.0
+    region.primitive_poses.append(goal_pose)
+    pc = PositionConstraint()
+    pc.header.frame_id = PLANNING_FRAME
+    pc.link_name = link_name
+    pc.constraint_region = region
+    pc.weight = 1.0
+    constraints.position_constraints.append(pc)
+    oc = OrientationConstraint()
+    oc.header.frame_id = PLANNING_FRAME
+    oc.link_name = link_name
+    oc.orientation = pose.orientation
+    oc.absolute_x_axis_tolerance = _DEFAULT_GOAL_ORI_TOL
+    oc.absolute_y_axis_tolerance = _DEFAULT_GOAL_ORI_TOL
+    oc.absolute_z_axis_tolerance = _DEFAULT_GOAL_ORI_TOL
+    oc.weight = 1.0
+    constraints.orientation_constraints.append(oc)
+    return constraints
+
+
 class HelloDeepFrameBody(Node):
     """添加/移除深框，并请求 move_group 执行指定 group 的关节目标规划。"""
 
@@ -207,14 +299,39 @@ class HelloDeepFrameBody(Node):
         )
         self._move_group_action_client = ActionClient(self, MoveGroup, MOVE_GROUP_ACTION)
         self._latest_joint_positions: dict[str, float] = {}
+        self._joint_state_seq = 0
         self._joint_state_sub = self.create_subscription(
             JointState, "joint_states", self._on_joint_state, 10
         )
 
     def _on_joint_state(self, msg: JointState) -> None:
+        self._joint_state_seq += 1
         for idx, name in enumerate(msg.name):
             if idx < len(msg.position):
                 self._latest_joint_positions[name] = msg.position[idx]
+
+    def _read_fresh_joint_positions(
+        self, joint_names: list[str], timeout_sec: float = 10.0
+    ) -> dict[str, float] | None:
+        """关节运动完成后调用：等待新一帧 joint_states，再读取实际位置。"""
+        self.get_logger().info("位姿规划前：等待并读取最新 joint_states …")
+        seq0 = self._joint_state_seq
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline and self._joint_state_seq <= seq0:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self._joint_state_seq <= seq0:
+            self.get_logger().warning(
+                f"位姿规划前 {timeout_sec:.1f}s 内未收到新 joint_states，使用最近缓存"
+            )
+        rclpy.spin_once(self, timeout_sec=0.5)
+        missing = [name for name in joint_names if name not in self._latest_joint_positions]
+        if missing:
+            self.get_logger().error(f"读取关节位置失败，缺失: {missing}")
+            return None
+        positions = {name: self._latest_joint_positions[name] for name in joint_names}
+        for name in joint_names:
+            self.get_logger().info(f"  {name} = {positions[name]:+.4f}")
+        return positions
 
     def _read_current_joint_positions(
         self, joint_names: list[str], timeout_sec: float = 5.0
@@ -345,6 +462,78 @@ class HelloDeepFrameBody(Node):
 
         return True, wall_ms
 
+    def _run_move_group_pose(
+        self,
+        group_name: str,
+        link_name: str,
+        pose: Pose,
+        plan_only: bool,
+        start_positions: dict[str, float] | None = None,
+    ) -> tuple[bool, float]:
+        if not self._move_group_action_client.wait_for_server(timeout_sec=10.0):
+            return False, 0.0
+        goal = MoveGroup.Goal()
+        goal.request.group_name = group_name
+        goal.request.planner_id = PLANNER_ID
+        goal.request.num_planning_attempts = NUM_PLANNING_ATTEMPTS
+        goal.request.allowed_planning_time = ALLOWED_PLANNING_TIME
+        goal.request.start_state.is_diff = True
+        if start_positions:
+            names = list(start_positions.keys())
+            goal.request.start_state.joint_state.name = names
+            goal.request.start_state.joint_state.position = [
+                start_positions[name] for name in names
+            ]
+        goal.request.goal_constraints.append(make_pose_goal_constraints(link_name, pose))
+        goal.planning_options.plan_only = plan_only
+        goal.planning_options.look_around = False
+        goal.planning_options.replan = False
+        t0 = time.monotonic()
+        send_goal_future = self._move_group_action_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_goal_future, timeout_sec=15.0)
+        if not send_goal_future.done() or send_goal_future.result() is None:
+            return False, 0.0
+        goal_handle = send_goal_future.result()
+        if not goal_handle.accepted:
+            return False, 0.0
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(
+            self, result_future, timeout_sec=ALLOWED_PLANNING_TIME + 30.0
+        )
+        if not result_future.done() or result_future.result() is None:
+            return False, 0.0
+        action_result = result_future.result()
+        wall_ms = (time.monotonic() - t0) * 1000.0
+        move_result = action_result.result
+        if action_result.status != GoalStatus.STATUS_SUCCEEDED:
+            return False, wall_ms
+        if move_result is None or move_result.error_code.val != MoveItErrorCodes.SUCCESS:
+            return False, wall_ms
+        return True, wall_ms
+
+    def plan_and_execute_pose_goal(
+        self, group_name: str, link_name: str, pose: Pose
+    ) -> bool:
+        joint_names = POSE_GROUP_JOINTS if group_name == POSE_PLANNING_GROUP else []
+        start_positions = (
+            self._read_fresh_joint_positions(joint_names) if joint_names else None
+        )
+        if joint_names and start_positions is None:
+            return False
+
+        self.get_logger().info(
+            f"末端位姿目标 {link_name} @ {PLANNING_FRAME}: "
+            f"({pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f}), "
+            f"RPY=({EE_GOAL_ROLL:.3f}, {EE_GOAL_PITCH:.3f}, {EE_GOAL_YAW:.3f})"
+        )
+        ok, wall_ms = self._run_move_group_pose(
+            group_name, link_name, pose, plan_only=False, start_positions=start_positions
+        )
+        self.get_logger().info(
+            f"Pose plan+execute: {wall_ms:.3f} ms ({'success' if ok else 'failed'})"
+        )
+        return ok
+
     def plan_and_execute_group_joint_goal(
         self, group_name: str, joint_target: dict[str, float]
     ) -> bool:
@@ -388,8 +577,8 @@ def main(args: list[str] | None = None) -> int:
         planning_group = group_cfg["group_name"]
         joint_target = group_cfg["joint_target"]
 
-        logger.info(f"规划坐标系: {PLANNING_FRAME}")
-        deep_frame = make_deep_frame_collision_object(PLANNING_FRAME)
+        logger.info(f"末端位姿坐标系: {PLANNING_FRAME}，场景障碍物: {SCENE_FRAME}")
+        deep_frame = make_deep_frame_collision_object(SCENE_FRAME)
         logger.info(
             f"正在添加半透明碰撞体「{COLLISION_OBJECT_ID}」"
             f"（{len(deep_frame.primitives)} 块 BOX，alpha={DISPLAY_COLOR.a}）…"
@@ -403,6 +592,15 @@ def main(args: list[str] | None = None) -> int:
         if not node.plan_and_execute_group_joint_goal(planning_group, joint_target):
             logger.error(f"{ACTIVE_GROUP}（实际组: {planning_group}）规划/执行失败。")
             return 1
+
+        ee_pose = _make_pose(
+            EE_GOAL_X, EE_GOAL_Y, EE_GOAL_Z, EE_GOAL_ROLL, EE_GOAL_PITCH, EE_GOAL_YAW
+        )
+        logger.info(f"末端位姿规划组: {POSE_PLANNING_GROUP}")
+        if not node.plan_and_execute_pose_goal(POSE_PLANNING_GROUP, EE_LINK, ee_pose):
+            logger.error(f"末端位姿 ({EE_LINK}, 组 {POSE_PLANNING_GROUP}) 规划/执行失败。")
+            return 1
+
 
         logger.info(
             f"{ACTIVE_GROUP}（实际组: {planning_group}）规划与执行完成。按回车键退出并清理深框…"
