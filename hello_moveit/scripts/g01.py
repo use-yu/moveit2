@@ -94,6 +94,16 @@ JOINT_TARGETS = {
         "r_arm_joint5": -0 * math.pi,
         "r_arm_joint6": -0 * math.pi / 180,
     },
+    "left_body": {
+        "body_joint1": 0.0,
+        "body_joint2": 1.313,
+        "l_arm_joint1": 1.8697,
+        "l_arm_joint2": 0.2,
+        "l_arm_joint3": 0.135997,
+        "l_arm_joint4": 1.23459,
+        "l_arm_joint5": 2.1201,
+        "l_arm_joint6": -1.5702,
+    },
 }
 
 # 位姿规划时作为起始状态的关节（不含底盘，与 left_body 组一致）
@@ -110,8 +120,8 @@ POSE_START_JOINTS = [
 
 # 规划器
 PLANNER_ID = "RRTConnect"
-NUM_ATTEMPTS = 100
-PLAN_TIME_SEC = 20.0
+NUM_ATTEMPTS = 1000
+PLAN_TIME_SEC = 50.0
 
 # 深框障碍物（固定在 world，与机器人 base_link 无关）
 SCENE_FRAME = "world"
@@ -445,13 +455,20 @@ def main(argv: list[str] | None = None) -> int:
             log.error("关节规划/执行失败")
             return 1
 
-        # --- 3. 末端位姿运动 ---
-        # ep = EE_POSE
-        # pose = make_pose(ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"])
-        # log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
-        # if not node.plan_execute_pose(POSE_GROUP, EE_LINK, pose):
-        #     log.error("末端位姿规划/执行失败")
+        # # --- 2. 关节空间运动 ---
+        # targets = JOINT_TARGETS[POSE_GROUP]
+        # log.info(f"关节规划组: {POSE_GROUP}")
+        # if not node.plan_execute_joints(POSE_GROUP, targets):
+        #     log.error("关节规划/执行失败")
         #     return 1
+
+        # --- 3. 末端位姿运动 ---
+        ep = EE_POSE
+        pose = make_pose(ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"])
+        log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
+        if not node.plan_execute_pose(POSE_GROUP, EE_LINK, pose):
+            log.error("末端位姿规划/执行失败")
+            return 1
 
         log.info("全部完成。按回车退出并移除深框 …")
         try:
