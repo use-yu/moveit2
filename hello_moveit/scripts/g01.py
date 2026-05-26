@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import sys
 import time
+from typing import Iterable, Sequence
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -120,8 +121,11 @@ POSE_START_JOINTS = [
 
 # 规划器
 PLANNER_ID = "RRTConnect"
-NUM_ATTEMPTS = 1000
-PLAN_TIME_SEC = 50.0
+NUM_ATTEMPTS = 20
+PLAN_TIME_SEC = 10.0
+
+# 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
+DEFAULT_SPEED_SCALE = 0.5
 
 # 深框障碍物（固定在 world，与机器人 base_link 无关）
 SCENE_FRAME = "world"
@@ -198,8 +202,12 @@ def make_deep_frame() -> CollisionObject:
     return obj
 
 
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
 def make_joint_constraints(group: str, joints: dict[str, float]) -> Constraints:
-    """关节目标 → MoveIt goal_constraints（每个关节一个 JointConstraint）。"""
+    """关节目标（dict）→ MoveIt goal_constraints（每个关节一个 JointConstraint）。"""
     c = Constraints()
     c.name = f"{group}_joint_goal"
     for name, pos in joints.items():
@@ -210,6 +218,15 @@ def make_joint_constraints(group: str, joints: dict[str, float]) -> Constraints:
         jc.weight = 1.0
         c.joint_constraints.append(jc)
     return c
+
+
+def make_joint_constraints_from_vector(
+    group: str, joint_names: Sequence[str], joint_values: Sequence[float]
+) -> Constraints:
+    """关节目标（vector）→ MoveIt goal_constraints。"""
+    if len(joint_names) != len(joint_values):
+        raise ValueError(f"joint_names 与 joint_values 长度不一致: {len(joint_names)} vs {len(joint_values)}")
+    return make_joint_constraints(group, dict(zip(joint_names, joint_values)))
 
 
 def make_pose_constraints(link: str, pose: Pose) -> Constraints:
@@ -330,6 +347,7 @@ class G01Demo(Node):
         joint_names: list[str] | None = None,
         start: dict[str, float] | None = None,
         plan_only: bool = False,
+        speed_scale: float | None = None,
     ) -> tuple[bool, float]:
         """
         调用 move_action 一次：规划（plan_only=True）或规划并执行（False）。
@@ -356,6 +374,10 @@ class G01Demo(Node):
         g.request.num_planning_attempts = NUM_ATTEMPTS
         g.request.allowed_planning_time = PLAN_TIME_SEC
         g.request.goal_constraints = goal_constraints
+        if speed_scale is not None:
+            s = _clamp01(speed_scale)
+            g.request.max_velocity_scaling_factor = s
+            g.request.max_acceleration_scaling_factor = s
         g.request.start_state.is_diff = True
         if start:
             g.request.start_state.joint_state.name = list(start.keys())
@@ -381,47 +403,97 @@ class G01Demo(Node):
             return False, elapsed_ms()
         return True, elapsed_ms()
 
-    def plan_execute_joints(self, group: str, targets: dict[str, float]) -> bool:
-        """关节目标：先仅规划验证，再规划并执行，并打印各阶段耗时。"""
-        names = list(targets.keys())
-        goal = [make_joint_constraints(group, targets)]
+    def plan_execute_joint_waypoints(
+        self,
+        group: str,
+        speed_scale: float,
+        joint_names: Sequence[str],
+        waypoints: Sequence[Sequence[float]],
+    ) -> bool:
+        """
+        关节空间多点规划（vector<vector>）：
+        - joint_names: 关节名顺序
+        - waypoints: 每个路径点是一组关节角（与 joint_names 等长）
+        逐段：先 plan_only 验证，再 plan+execute；每段执行后用 joint_states 作为下一段起点。
+        """
         log = self.get_logger()
-        log.info(
-            f"[{group}] 关节目标 (planner={PLANNER_ID}, "
-            f"attempts={NUM_ATTEMPTS}, time={PLAN_TIME_SEC:.1f}s): {targets}"
-        )
-
-        plan_ok, plan_ms = self.move(group, goal, joint_names=names, plan_only=True)
-        log.info(f"Planning time: {plan_ms:.3f} ms ({'success' if plan_ok else 'failed'})")
-        if not plan_ok:
+        if not waypoints:
+            log.error(f"[{group}] waypoints 为空")
             return False
 
-        exec_ok, exec_ms = self.move(group, goal, joint_names=names, plan_only=False)
-        log.info(f"Execution time: {exec_ms:.3f} ms ({'success' if exec_ok else 'failed'})")
-        log.info(f"Total time: {plan_ms + exec_ms:.3f} ms")
-        return exec_ok
+        start = self._get_joints(list(joint_names))
+        if start is None:
+            return False
 
-    def plan_execute_pose(self, group: str, link: str, pose: Pose) -> bool:
-        """末端位姿：先仅规划再执行，与关节目标相同分步计时。"""
+        log.info(
+            f"[{group}] 关节多点路径: {len(waypoints)} waypoints, speed_scale={_clamp01(speed_scale):.2f}, "
+            f"planner={PLANNER_ID}, attempts={NUM_ATTEMPTS}, time={PLAN_TIME_SEC:.1f}s"
+        )
+
+        for idx, q in enumerate(waypoints):
+            goal = [make_joint_constraints_from_vector(group, joint_names, q)]
+
+            plan_ok, plan_ms = self.move(
+                group, goal, start=start, plan_only=True, speed_scale=speed_scale
+            )
+            log.info(
+                f"[{group}] segment {idx + 1}/{len(waypoints)} planning: {plan_ms:.3f} ms "
+                f"({'success' if plan_ok else 'failed'})"
+            )
+            if not plan_ok:
+                return False
+
+            exec_ok, exec_ms = self.move(
+                group, goal, start=start, plan_only=False, speed_scale=speed_scale
+            )
+            log.info(
+                f"[{group}] segment {idx + 1}/{len(waypoints)} execution: {exec_ms:.3f} ms "
+                f"({'success' if exec_ok else 'failed'})"
+            )
+            if not exec_ok:
+                return False
+
+            start = self._get_joints(list(joint_names), wait_new=True)
+            if start is None:
+                return False
+
+        return True
+
+    def plan_execute_pose_xyz_rpy(
+        self,
+        group: str,
+        speed_scale: float,
+        link: str,
+        x: float,
+        y: float,
+        z: float,
+        roll: float,
+        pitch: float,
+        yaw: float,
+    ) -> bool:
+        """位姿目标：输入 xyz + rpy + group + 速度缩放。"""
         start = self._get_joints(POSE_START_JOINTS, wait_new=True)
         if start is None:
             return False
+
+        pose = make_pose(x, y, z, roll, pitch, yaw)
         p = pose.position
         log = self.get_logger()
         log.info(
             f"[{group}] 位姿目标 {link} @ {PLAN_FRAME}: "
-            f"({p.x:.3f}, {p.y:.3f}, {p.z:.3f})"
+            f"pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), rpy({roll:.3f}, {pitch:.3f}, {yaw:.3f}), "
+            f"speed_scale={_clamp01(speed_scale):.2f}"
         )
+
         goal = [make_pose_constraints(link, pose)]
 
-        plan_ok, plan_ms = self.move(group, goal, start=start, plan_only=True)
-        log.info(f"Pose planning time: {plan_ms:.3f} ms ({'success' if plan_ok else 'failed'})")
+        plan_ok, plan_ms = self.move(group, goal, start=start, plan_only=True, speed_scale=speed_scale)
+        log.info(f"[{group}] pose planning: {plan_ms:.3f} ms ({'success' if plan_ok else 'failed'})")
         if not plan_ok:
             return False
 
-        exec_ok, exec_ms = self.move(group, goal, start=start, plan_only=False)
-        log.info(f"Pose execution time: {exec_ms:.3f} ms ({'success' if exec_ok else 'failed'})")
-        log.info(f"Pose total time: {plan_ms + exec_ms:.3f} ms")
+        exec_ok, exec_ms = self.move(group, goal, start=start, plan_only=False, speed_scale=speed_scale)
+        log.info(f"[{group}] pose execution: {exec_ms:.3f} ms ({'success' if exec_ok else 'failed'})")
         return exec_ok
 
 
@@ -450,8 +522,18 @@ def main(argv: list[str] | None = None) -> int:
 
         # --- 2. 关节空间运动 ---
         targets = JOINT_TARGETS[ACTIVE_GROUP]
+        joint_names = list(targets.keys())
+        q1 = [1.25, 0.0, -0.25, 1.1, 
+        -20 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
+        80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+        q2 = [1.25, 0.0, -0.25, 1.1, 
+        -20 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
+        120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+
+        waypoints = [q1, q2]  # 需要多点时：继续 waypoints.append(q3) ...
+
         log.info(f"关节规划组: {ACTIVE_GROUP}")
-        if not node.plan_execute_joints(ACTIVE_GROUP, targets):
+        if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
             log.error("关节规划/执行失败")
             return 1
 
@@ -463,12 +545,21 @@ def main(argv: list[str] | None = None) -> int:
         #     return 1
 
         # --- 3. 末端位姿运动 ---
-        ep = EE_POSE
-        pose = make_pose(ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"])
-        log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
-        if not node.plan_execute_pose(POSE_GROUP, EE_LINK, pose):
-            log.error("末端位姿规划/执行失败")
-            return 1
+        # ep = EE_POSE
+        # log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
+        # if not node.plan_execute_pose_xyz_rpy(
+        #     POSE_GROUP,
+        #     DEFAULT_SPEED_SCALE,
+        #     EE_LINK,
+        #     ep["x"],
+        #     ep["y"],
+        #     ep["z"],
+        #     ep["roll"],
+        #     ep["pitch"],
+        #     ep["yaw"],
+        # ):
+        #     log.error("末端位姿规划/执行失败")
+        #     return 1
 
         log.info("全部完成。按回车退出并移除深框 …")
         try:
