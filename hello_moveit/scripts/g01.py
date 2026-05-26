@@ -556,54 +556,54 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         frame_added = True
 
-        # --- 2. 关节空间运动 ---
-        targets = JOINT_TARGETS[ACTIVE_GROUP]
-        joint_names = list(targets.keys())
-        q1 = [1.25, 0.0, -0.25, 1.1, 
-        2.352639, -1.521807, 2.147846, 0.945048, 2.702450, -2.565092, 
-        80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
-        # q2 = [1.25, 0.0, -0.25, 1.1, 
-        # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
-        # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
-
-        waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
-
-        log.info(f"关节规划组: {ACTIVE_GROUP}")
-        current = node._get_joints(joint_names)
-        if current is None:
-            log.error("读取当前关节位置失败，无法规划")
-            return 1
-        log.info("规划前当前关节位置 [rad]:")
-        for name in joint_names:
-            log.info(f"  {name}: {current[name]:.6f}")
-
-        if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
-            log.error("关节规划/执行失败")
-            return 1
-
         # # --- 2. 关节空间运动 ---
-        # targets = JOINT_TARGETS[POSE_GROUP]
-        # log.info(f"关节规划组: {POSE_GROUP}")
-        # if not node.plan_execute_joints(POSE_GROUP, targets):
+        # targets = JOINT_TARGETS[ACTIVE_GROUP]
+        # joint_names = list(targets.keys())
+        # q1 = [1.25, 0.0, -0.25, 1.1, 
+        # 2.352639, -1.521807, 2.147846, 0.945048, 2.702450, -2.565092, 
+        # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+        # # q2 = [1.25, 0.0, -0.25, 1.1, 
+        # # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
+        # # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+
+        # waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
+
+        # log.info(f"关节规划组: {ACTIVE_GROUP}")
+        # current = node._get_joints(joint_names)
+        # if current is None:
+        #     log.error("读取当前关节位置失败，无法规划")
+        #     return 1
+        # log.info("规划前当前关节位置 [rad]:")
+        # for name in joint_names:
+        #     log.info(f"  {name}: {current[name]:.6f}")
+
+        # if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
         #     log.error("关节规划/执行失败")
         #     return 1
 
-        # --- 3. 末端位姿运动 ---
-        ep = EE_POSE
-        log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
-        if not node.plan_execute_pose_xyz_rpy(
-            POSE_GROUP,
-            0.1,
-            EE_LINK,
-            ep["x"],
-            ep["y"],
-            ep["z"],
-            ep["roll"],
-            ep["pitch"],
-            ep["yaw"],
-        ):
-            log.error("末端位姿规划/执行失败")
-            return 1
+        # # # --- 2. 关节空间运动 ---
+        # # targets = JOINT_TARGETS[POSE_GROUP]
+        # # log.info(f"关节规划组: {POSE_GROUP}")
+        # # if not node.plan_execute_joints(POSE_GROUP, targets):
+        # #     log.error("关节规划/执行失败")
+        # #     return 1
+
+        # # --- 3. 末端位姿运动 ---
+        # ep = EE_POSE
+        # log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
+        # if not node.plan_execute_pose_xyz_rpy(
+        #     POSE_GROUP,
+        #     0.1,
+        #     EE_LINK,
+        #     ep["x"],
+        #     ep["y"],
+        #     ep["z"],
+        #     ep["roll"],
+        #     ep["pitch"],
+        #     ep["yaw"],
+        # ):
+        #     log.error("末端位姿规划/执行失败")
+        #     return 1
 
         log.info("全部完成。按回车退出并移除深框 …")
         try:

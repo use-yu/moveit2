@@ -8,17 +8,15 @@ default_acceleration_scaling_factor: 0.1
 # -----------------------------------------------------------------------------
 # 碰撞检测「安全距离」（单位：米）
 # 本文件会被 MoveItConfigsBuilder 加载到 robot_description_planning 命名空间，
-# PlanningSceneMonitor::configureDefaultPadding() 会读这几个键。默认全 0 / 1.0。
-#   default_robot_padding   : 整机所有 link 碰撞包络向外膨胀的厚度
-#   default_object_padding  : 场景中 CollisionObject（如「深框」）向外膨胀的厚度
-#   default_attached_padding: 机器人 attach 物体的膨胀厚度
-#   default_robot_scale     : link 碰撞几何整体缩放，1.0 表示不缩放
-# 两侧 padding 是「相加」的：robot_padding + object_padding = 实际最小间隙。
-# 副作用：可达性会略微缩小；若必须钻 1 cm 狭缝，请按需调小。
+# 由 PlanningSceneMonitor::configureDefaultPadding() 读取。
+#
+# MoveIt 2 主线实际只消费这两个键：
+#   default_robot_padding : 整机所有 link 碰撞包络外扩的厚度（米）
+#   default_robot_scale   : link 碰撞几何整体缩放，1.0 表示不缩放
+# 在节点启动时通过 scene_->getCollisionEnvNonConst()->setPadding(...) 一次性
+# Robot ↔ World 自碰撞不受影响
 # -----------------------------------------------------------------------------
-default_robot_padding: 0.005
-default_object_padding: 0.01
-default_attached_padding: 0.01
+default_robot_padding: 0.01
 default_robot_scale: 1.0
 
 # Specific joint properties can be changed with the keys [max_position, min_position, max_velocity, max_acceleration]
