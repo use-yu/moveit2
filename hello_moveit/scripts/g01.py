@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 关节空间规划不到1s，给末端位姿4s左右
 """
 G01 MoveIt 演示脚本
 
@@ -17,7 +18,6 @@ G01 MoveIt 演示脚本
   colcon build --packages-select hello_moveit && source install/setup.bash
   ros2 run hello_moveit g01.py
 
-C++ 等价实现（推荐）：src/hello_g01.cpp → ros2 run hello_moveit hello_g01
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from typing import Iterable, Sequence
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Pose
-from moveit_msgs.action import MoveGroup
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     BoundingVolume,
     CollisionObject,
@@ -43,7 +43,7 @@ from moveit_msgs.msg import (
     PlanningScene,
     PositionConstraint,
 )
-from moveit_msgs.srv import ApplyPlanningScene
+from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -62,13 +62,20 @@ POSE_GROUP = "left_body"
 EE_LINK = "L6"
 EE_POSE = dict(
     x=-0.75,
+    y=-0.25,
+    z=0.0,
+    roll=-math.pi / 2,
+    pitch=-math.pi / 2,
+    yaw=-math.pi,
+)
+EE_POSE2 = dict(
+    x=-0.75,
     y=-0.35,
     z=0.0,
     roll=-math.pi / 2,
     pitch=-math.pi / 2,
     yaw=-math.pi,
 )
-
 # 各组的关节目标 [rad]（键名须与 URDF/SRDF 一致）
 JOINT_TARGETS = {
     "body": {
@@ -132,18 +139,24 @@ DEFAULT_SPEED_SCALE = 0.5
 SCENE_FRAME = "world"
 PLAN_FRAME = "base_link"  # 末端位姿约束坐标系
 FRAME_ID = "深框"
-FRAME_SIZE = (0.8, 0.8, 0.7)  # 长×宽×高 [m]
+FRAME_SIZE = (0.9, 0.9, 0.6)  # 长×宽×高 [m]
 WALL_T = 0.02
 FRAME_CENTER = (2.0, 0.0, 0.0)  # 底面中心 [m]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 
 # ROS 接口名（move_group 默认）
 SVC_APPLY_SCENE = "apply_planning_scene"
+SVC_CARTESIAN_PATH = "compute_cartesian_path"
 ACT_MOVE_GROUP = "move_action"
+ACT_EXEC_TRAJ = "execute_trajectory"
 
 # 末端目标容差（与 MoveGroupInterface 默认一致）
 _POS_TOL = 1e-4
 _ORI_TOL = 1e-3
+
+# 笛卡尔直线运动参数
+CART_EEF_STEP = 0.005     # 服务端 IK 离散步长（m）
+CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截断）
 
 
 # =============================================================================
@@ -309,7 +322,9 @@ class G01Demo(Node):
     def __init__(self):
         super().__init__("g01_demo")
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
+        self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
+        self._exec_cli = ActionClient(self, ExecuteTrajectory, ACT_EXEC_TRAJ)
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
@@ -450,7 +465,7 @@ class G01Demo(Node):
         关节空间多点规划（vector<vector>）：
         - joint_names: 关节名顺序
         - waypoints: 每个路径点是一组关节角（与 joint_names 等长）
-        逐段：先 plan_only 验证，再 plan+execute；每段执行后用 joint_states 作为下一段起点。
+        逐段：一次 move_action（plan + execute 同时），完成后用 joint_states 作为下一段起点。
         """
         log = self.get_logger()
         if not waypoints:
@@ -469,24 +484,14 @@ class G01Demo(Node):
         for idx, q in enumerate(waypoints):
             goal = [make_joint_constraints_from_vector(group, joint_names, q)]
 
-            plan_ok, plan_ms = self.move(
-                group, goal, start=start, plan_only=True, speed_scale=speed_scale
-            )
-            log.info(
-                f"[{group}] segment {idx + 1}/{len(waypoints)} planning: {plan_ms:.3f} ms "
-                f"({'success' if plan_ok else 'failed'})"
-            )
-            if not plan_ok:
-                return False
-
-            exec_ok, exec_ms = self.move(
+            ok, used_ms = self.move(
                 group, goal, start=start, plan_only=False, speed_scale=speed_scale
             )
             log.info(
-                f"[{group}] segment {idx + 1}/{len(waypoints)} execution: {exec_ms:.3f} ms "
-                f"({'success' if exec_ok else 'failed'})"
+                f"[{group}] segment {idx + 1}/{len(waypoints)} plan+exec: {used_ms:.3f} ms "
+                f"({'success' if ok else 'failed'})"
             )
-            if not exec_ok:
+            if not ok:
                 return False
 
             start = self._get_joints(list(joint_names), wait_new=True)
@@ -506,31 +511,143 @@ class G01Demo(Node):
         roll: float,
         pitch: float,
         yaw: float,
+        use_cartesian: bool = False,
     ) -> bool:
-        """位姿目标：输入 xyz + rpy + group + 速度缩放。"""
-        start = self._get_joints(POSE_START_JOINTS, wait_new=True)
-        if start is None:
-            return False
+        """位姿目标：输入 xyz + rpy + group + 速度缩放。
 
+        use_cartesian=False（默认）：走 move_action（OMPL 关节空间规划，可绕障）。
+        use_cartesian=True         ：走 compute_cartesian_path 服务（笛卡尔直线，
+            等价于 RViz MotionPlanning 插件中 "Use Cartesian Path" 复选框）。
+        """
         pose = make_pose(x, y, z, roll, pitch, yaw)
         p = pose.position
         log = self.get_logger()
         log.info(
             f"[{group}] 位姿目标 {link} @ {PLAN_FRAME}: "
             f"pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), rpy({roll:.3f}, {pitch:.3f}, {yaw:.3f}), "
-            f"speed_scale={_clamp01(speed_scale):.2f}"
+            f"speed_scale={_clamp01(speed_scale):.2f}, use_cartesian={use_cartesian}"
         )
+
+        if use_cartesian:
+            return self.plan_execute_cartesian_line(
+                group, link, pose, speed_scale=speed_scale
+            )
+
+        start = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        if start is None:
+            return False
 
         goal = [make_pose_constraints(link, pose)]
 
-        plan_ok, plan_ms = self.move(group, goal, start=start, plan_only=True, speed_scale=speed_scale)
-        log.info(f"[{group}] pose planning: {plan_ms:.3f} ms ({'success' if plan_ok else 'failed'})")
-        if not plan_ok:
+        ok, used_ms = self.move(group, goal, start=start, plan_only=False, speed_scale=speed_scale)
+        log.info(f"[{group}] pose plan+exec: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        return ok
+
+    def plan_execute_cartesian_line(
+        self,
+        group: str,
+        link: str,
+        end_pose: Pose,
+        speed_scale: float = 0.2,
+        avoid_collisions: bool = True,
+        eef_step: float = CART_EEF_STEP,
+        min_fraction: float = CART_MIN_FRACTION,
+    ) -> bool:
+        """从当前末端位姿直线移动到 end_pose（笛卡尔路径，绝对位姿）。
+
+        - 走 compute_cartesian_path 服务：服务从 start_state 做 FK 得到当前 EE 位姿，
+          再沿 waypoints[0]=end_pose 做直线段（关节空间逐段 IK 拼接而成）。
+        - 拿到 RobotTrajectory 后用 execute_trajectory action 执行。
+        - Humble 的 GetCartesianPath 没有 max_velocity_scaling_factor 字段，速度缩放
+          在客户端通过缩放 time_from_start / velocities / accelerations 实现。
+        - fraction < min_fraction 视为失败（默认 0.99，要求基本走完整条直线）。
+        """
+        log = self.get_logger()
+        t0 = time.monotonic()
+        elapsed_ms = lambda: (time.monotonic() - t0) * 1000.0
+
+        if not self._cart_cli.wait_for_service(timeout_sec=10.0):
+            log.error(f"服务 {SVC_CARTESIAN_PATH} 不可用")
+            return False
+        if not self._exec_cli.wait_for_server(timeout_sec=10.0):
+            log.error(f"动作 {ACT_EXEC_TRAJ} 不可用")
             return False
 
-        exec_ok, exec_ms = self.move(group, goal, start=start, plan_only=False, speed_scale=speed_scale)
-        log.info(f"[{group}] pose execution: {exec_ms:.3f} ms ({'success' if exec_ok else 'failed'})")
-        return exec_ok
+        start = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        if start is None:
+            return False
+
+        req = GetCartesianPath.Request()
+        req.header.frame_id = PLAN_FRAME
+        req.start_state.is_diff = True
+        req.start_state.joint_state.name = list(start.keys())
+        req.start_state.joint_state.position = list(start.values())
+        req.group_name = group
+        req.link_name = link
+        req.waypoints = [end_pose]
+        req.max_step = eef_step
+        req.jump_threshold = 0.0
+        req.avoid_collisions = avoid_collisions
+
+        p = end_pose.position
+        log.info(
+            f"[{group}] 笛卡尔直线 {link} @ {PLAN_FRAME}: "
+            f"end pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
+            f"max_step={eef_step:.4f}, avoid_collisions={avoid_collisions}, "
+            f"speed_scale={_clamp01(speed_scale):.2f}"
+        )
+
+        fut = self._cart_cli.call_async(req)
+        if not self._spin_until(fut, 15.0):
+            log.error("compute_cartesian_path 超时")
+            return False
+
+        res = fut.result()
+        code_val = res.error_code.val
+        plan_ms = elapsed_ms()
+        log.info(
+            f"[{group}] cartesian planning: {plan_ms:.3f} ms, fraction={res.fraction:.3f}, "
+            f"error_code={code_val}({_moveit_error_name(code_val)})"
+        )
+        if res.fraction < min_fraction or code_val != MoveItErrorCodes.SUCCESS:
+            log.error(
+                f"笛卡尔直线规划未达标：fraction={res.fraction:.3f} < {min_fraction}, "
+                f"error_code={code_val}({_moveit_error_name(code_val)})"
+            )
+            return False
+
+        traj = res.solution
+        s = _clamp01(speed_scale)
+        if s > 0.0 and abs(s - 1.0) > 1e-6:
+            for pt in traj.joint_trajectory.points:
+                total = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
+                scaled = total / s
+                pt.time_from_start.sec = int(scaled)
+                pt.time_from_start.nanosec = int(round((scaled - int(scaled)) * 1e9))
+                pt.velocities = [v * s for v in pt.velocities]
+                pt.accelerations = [a * s * s for a in pt.accelerations]
+
+        goal = ExecuteTrajectory.Goal(trajectory=traj)
+        send_fut = self._exec_cli.send_goal_async(goal)
+        if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
+            log.error("execute_trajectory 目标被拒绝或超时")
+            return False
+        res_fut = send_fut.result().get_result_async()
+        if not self._spin_until(res_fut, 60.0):
+            log.error("execute_trajectory 结果超时")
+            return False
+
+        ar = res_fut.result()
+        exec_code = ar.result.error_code.val if ar.result else None
+        if ar.status != GoalStatus.STATUS_SUCCEEDED or exec_code != MoveItErrorCodes.SUCCESS:
+            log.error(
+                f"execute_trajectory 失败：status={ar.status}, "
+                f"error_code={exec_code}({_moveit_error_name(exec_code) if exec_code is not None else 'None'})"
+            )
+            return False
+
+        log.info(f"[{group}] cartesian plan+exec: {elapsed_ms():.3f} ms (success)")
+        return True
 
 
 # =============================================================================
@@ -556,54 +673,66 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         frame_added = True
 
-        # # --- 2. 关节空间运动 ---
-        # targets = JOINT_TARGETS[ACTIVE_GROUP]
-        # joint_names = list(targets.keys())
-        # q1 = [1.25, 0.0, -0.25, 1.1, 
-        # 2.352639, -1.521807, 2.147846, 0.945048, 2.702450, -2.565092, 
-        # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
-        # # q2 = [1.25, 0.0, -0.25, 1.1, 
-        # # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
-        # # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+        # --- 2. 关节空间运动 ---
+        targets = JOINT_TARGETS[ACTIVE_GROUP]
+        joint_names = list(targets.keys())
+        q1 = [1.25, 0.0, -0.25, 1.1, 
+        2.352639, -1.521807, 2.147846, 0.945048, 2.702450, -2.565092, 
+        80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+        # q2 = [1.25, 0.0, -0.25, 1.1, 
+        # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
+        # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
 
-        # waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
+        waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
 
-        # log.info(f"关节规划组: {ACTIVE_GROUP}")
-        # current = node._get_joints(joint_names)
-        # if current is None:
-        #     log.error("读取当前关节位置失败，无法规划")
-        #     return 1
-        # log.info("规划前当前关节位置 [rad]:")
-        # for name in joint_names:
-        #     log.info(f"  {name}: {current[name]:.6f}")
+        log.info(f"关节规划组: {ACTIVE_GROUP}")
+        current = node._get_joints(joint_names)
+        if current is None:
+            log.error("读取当前关节位置失败，无法规划")
+            return 1
+        log.info("规划前当前关节位置 [rad]:")
+        for name in joint_names:
+            log.info(f"  {name}: {current[name]:.6f}")
 
-        # if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
-        #     log.error("关节规划/执行失败")
-        #     return 1
+        if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
+            log.error("关节规划/执行失败")
+            return 1
 
-        # # # --- 2. 关节空间运动 ---
-        # # targets = JOINT_TARGETS[POSE_GROUP]
-        # # log.info(f"关节规划组: {POSE_GROUP}")
-        # # if not node.plan_execute_joints(POSE_GROUP, targets):
-        # #     log.error("关节规划/执行失败")
-        # #     return 1
+        # --- 3. 末端位姿运动
+        ep = EE_POSE
+        log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
+        if not node.plan_execute_pose_xyz_rpy(
+            POSE_GROUP,
+            0.2,  # 速度快容易失败
+            EE_LINK,
+            ep["x"],
+            ep["y"],
+            ep["z"],
+            ep["roll"],
+            ep["pitch"],
+            ep["yaw"],
+            use_cartesian=False,
+        ):
+            log.error("末端位姿规划/执行失败")
+            return 1
 
-        # # --- 3. 末端位姿运动 ---
-        # ep = EE_POSE
-        # log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
-        # if not node.plan_execute_pose_xyz_rpy(
-        #     POSE_GROUP,
-        #     0.1,
-        #     EE_LINK,
-        #     ep["x"],
-        #     ep["y"],
-        #     ep["z"],
-        #     ep["roll"],
-        #     ep["pitch"],
-        #     ep["yaw"],
-        # ):
-        #     log.error("末端位姿规划/执行失败")
-        #     return 1
+        # --- 4. 末端位姿运动（笛卡尔直线，等价 RViz "Use Cartesian Path"） ---
+        ep = EE_POSE2
+        log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
+        if not node.plan_execute_pose_xyz_rpy(
+            POSE_GROUP,
+            0.2,  # 速度快容易失败
+            EE_LINK,
+            ep["x"],
+            ep["y"],
+            ep["z"],
+            ep["roll"],
+            ep["pitch"],
+            ep["yaw"],
+            use_cartesian=True,
+        ):
+            log.error("末端位姿规划/执行失败")
+            return 1
 
         log.info("全部完成。按回车退出并移除深框 …")
         try:
