@@ -23,6 +23,7 @@ C++ 等价实现（推荐）：src/hello_g01.cpp → ros2 run hello_moveit hello
 from __future__ import annotations
 
 import math
+import multiprocessing
 import sys
 import time
 from typing import Iterable, Sequence
@@ -204,6 +205,37 @@ def make_deep_frame() -> CollisionObject:
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
+
+def _moveit_error_name(val: int) -> str:
+    # 只覆盖常见错误，其他按数值输出
+    mapping = {
+        MoveItErrorCodes.SUCCESS: "SUCCESS",
+        MoveItErrorCodes.FAILURE: "FAILURE",
+        MoveItErrorCodes.PLANNING_FAILED: "PLANNING_FAILED",
+        MoveItErrorCodes.INVALID_MOTION_PLAN: "INVALID_MOTION_PLAN",
+        MoveItErrorCodes.MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE: "MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE",
+        MoveItErrorCodes.CONTROL_FAILED: "CONTROL_FAILED",
+        MoveItErrorCodes.UNABLE_TO_AQUIRE_SENSOR_DATA: "UNABLE_TO_AQUIRE_SENSOR_DATA",
+        MoveItErrorCodes.TIMED_OUT: "TIMED_OUT",
+        MoveItErrorCodes.PREEMPTED: "PREEMPTED",
+        MoveItErrorCodes.START_STATE_IN_COLLISION: "START_STATE_IN_COLLISION",
+        MoveItErrorCodes.START_STATE_VIOLATES_PATH_CONSTRAINTS: "START_STATE_VIOLATES_PATH_CONSTRAINTS",
+        MoveItErrorCodes.GOAL_IN_COLLISION: "GOAL_IN_COLLISION",
+        MoveItErrorCodes.GOAL_VIOLATES_PATH_CONSTRAINTS: "GOAL_VIOLATES_PATH_CONSTRAINTS",
+        MoveItErrorCodes.GOAL_CONSTRAINTS_VIOLATED: "GOAL_CONSTRAINTS_VIOLATED",
+        MoveItErrorCodes.INVALID_GROUP_NAME: "INVALID_GROUP_NAME",
+        MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS: "INVALID_GOAL_CONSTRAINTS",
+        MoveItErrorCodes.INVALID_ROBOT_STATE: "INVALID_ROBOT_STATE",
+        MoveItErrorCodes.INVALID_LINK_NAME: "INVALID_LINK_NAME",
+        MoveItErrorCodes.INVALID_OBJECT_NAME: "INVALID_OBJECT_NAME",
+        MoveItErrorCodes.FRAME_TRANSFORM_FAILURE: "FRAME_TRANSFORM_FAILURE",
+        MoveItErrorCodes.COLLISION_CHECKING_UNAVAILABLE: "COLLISION_CHECKING_UNAVAILABLE",
+        MoveItErrorCodes.ROBOT_STATE_STALE: "ROBOT_STATE_STALE",
+        MoveItErrorCodes.SENSOR_INFO_STALE: "SENSOR_INFO_STALE",
+        MoveItErrorCodes.NO_IK_SOLUTION: "NO_IK_SOLUTION",
+    }
+    return mapping.get(int(val), f"UNKNOWN({int(val)})")
 
 
 def make_joint_constraints(group: str, joints: dict[str, float]) -> Constraints:
@@ -395,11 +427,15 @@ class G01Demo(Node):
             return False, elapsed_ms()
 
         ar = res_fut.result()
+        code_val = ar.result.error_code.val if ar.result else None
         if ar.status != GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().error(f"move_action 状态失败: {ar.status}")
+            self.get_logger().error(
+                f"move_action 状态失败: {ar.status} (GoalStatus)，"
+                f" MoveItErrorCodes={code_val}({_moveit_error_name(code_val) if code_val is not None else 'None'})"
+            )
             return False, elapsed_ms()
-        if ar.result.error_code.val != MoveItErrorCodes.SUCCESS:
-            self.get_logger().error(f"MoveIt 错误码: {ar.result.error_code.val}")
+        if code_val != MoveItErrorCodes.SUCCESS:
+            self.get_logger().error(f"MoveIt 错误码: {code_val} ({_moveit_error_name(code_val)})")
             return False, elapsed_ms()
         return True, elapsed_ms()
 
@@ -524,15 +560,23 @@ def main(argv: list[str] | None = None) -> int:
         targets = JOINT_TARGETS[ACTIVE_GROUP]
         joint_names = list(targets.keys())
         q1 = [1.25, 0.0, -0.25, 1.1, 
-        -20 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
+        2.352639, -1.521807, 2.147846, 0.945048, 2.702450, -2.565092, 
         80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
-        q2 = [1.25, 0.0, -0.25, 1.1, 
-        -20 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
-        120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+        # q2 = [1.25, 0.0, -0.25, 1.1, 
+        # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
+        # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
 
-        waypoints = [q1, q2]  # 需要多点时：继续 waypoints.append(q3) ...
+        waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
 
         log.info(f"关节规划组: {ACTIVE_GROUP}")
+        current = node._get_joints(joint_names)
+        if current is None:
+            log.error("读取当前关节位置失败，无法规划")
+            return 1
+        log.info("规划前当前关节位置 [rad]:")
+        for name in joint_names:
+            log.info(f"  {name}: {current[name]:.6f}")
+
         if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
             log.error("关节规划/执行失败")
             return 1
@@ -545,21 +589,21 @@ def main(argv: list[str] | None = None) -> int:
         #     return 1
 
         # --- 3. 末端位姿运动 ---
-        # ep = EE_POSE
-        # log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
-        # if not node.plan_execute_pose_xyz_rpy(
-        #     POSE_GROUP,
-        #     DEFAULT_SPEED_SCALE,
-        #     EE_LINK,
-        #     ep["x"],
-        #     ep["y"],
-        #     ep["z"],
-        #     ep["roll"],
-        #     ep["pitch"],
-        #     ep["yaw"],
-        # ):
-        #     log.error("末端位姿规划/执行失败")
-        #     return 1
+        ep = EE_POSE
+        log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
+        if not node.plan_execute_pose_xyz_rpy(
+            POSE_GROUP,
+            0.3,
+            EE_LINK,
+            ep["x"],
+            ep["y"],
+            ep["z"],
+            ep["roll"],
+            ep["pitch"],
+            ep["yaw"],
+        ):
+            log.error("末端位姿规划/执行失败")
+            return 1
 
         log.info("全部完成。按回车退出并移除深框 …")
         try:
