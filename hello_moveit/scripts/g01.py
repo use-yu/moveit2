@@ -22,6 +22,7 @@ G01 MoveIt 演示脚本
 
 from __future__ import annotations
 
+import copy
 import math
 import multiprocessing
 import sys
@@ -64,16 +65,16 @@ EE_POSE = dict(
     x=-0.75,
     y=-0.25,
     z=0.0,
-    roll=-math.pi / 2,
-    pitch=-math.pi / 2,
+    roll=-math.pi / 4,
+    pitch=-math.pi / 4,
     yaw=-math.pi,
 )
 EE_POSE2 = dict(
     x=-0.75,
     y=-0.35,
     z=0.0,
-    roll=-math.pi / 2,
-    pitch=-math.pi / 2,
+    roll=-math.pi / 4,
+    pitch=-math.pi / 4,
     yaw=-math.pi,
 )
 # 各组的关节目标 [rad]（键名须与 URDF/SRDF 一致）
@@ -158,6 +159,9 @@ _ORI_TOL = 1e-3
 CART_EEF_STEP = 0.005     # 服务端 IK 离散步长（m）
 CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截断）
 
+# 抓取流程默认参数
+PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
+
 
 # =============================================================================
 # 几何与消息构造（纯函数，无 ROS 通信）
@@ -184,6 +188,33 @@ def make_pose(x: float, y: float, z: float, roll=0.0, pitch=0.0, yaw=0.0) -> Pos
     qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
     p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = qx, qy, qz, qw
     return p
+
+
+def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
+    """沿 pose 自身坐标系 z 轴方向平移 dz 米，得到新位姿（姿态不变）。
+
+    用旋转矩阵第三列（= 局部 +z 在 base 系下的方向）做平移：
+        new_p = p + dz * R[:, 2]
+    其中 R 由 (qx, qy, qz, qw) 构造。
+    """
+    qx, qy, qz, qw = (
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w,
+    )
+    zx = 2.0 * (qx * qz + qw * qy)
+    zy = 2.0 * (qy * qz - qw * qx)
+    zz = 1.0 - 2.0 * (qx * qx + qy * qy)
+    out = Pose()
+    out.position.x = pose.position.x + dz * zx
+    out.position.y = pose.position.y + dz * zy
+    out.position.z = pose.position.z + dz * zz
+    out.orientation.x = qx
+    out.orientation.y = qy
+    out.orientation.z = qz
+    out.orientation.w = qw
+    return out
 
 
 def make_deep_frame() -> CollisionObject:
@@ -500,31 +531,27 @@ class G01Demo(Node):
 
         return True
 
-    def plan_execute_pose_xyz_rpy(
+    def plan_execute_pose(
         self,
         group: str,
         speed_scale: float,
         link: str,
-        x: float,
-        y: float,
-        z: float,
-        roll: float,
-        pitch: float,
-        yaw: float,
+        pose: Pose,
         use_cartesian: bool = False,
     ) -> bool:
-        """位姿目标：输入 xyz + rpy + group + 速度缩放。
+        """位姿目标：直接输入 geometry_msgs/Pose。
 
         use_cartesian=False（默认）：走 move_action（OMPL 关节空间规划，可绕障）。
         use_cartesian=True         ：走 compute_cartesian_path 服务（笛卡尔直线，
             等价于 RViz MotionPlanning 插件中 "Use Cartesian Path" 复选框）。
         """
-        pose = make_pose(x, y, z, roll, pitch, yaw)
         p = pose.position
         log = self.get_logger()
         log.info(
             f"[{group}] 位姿目标 {link} @ {PLAN_FRAME}: "
-            f"pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), rpy({roll:.3f}, {pitch:.3f}, {yaw:.3f}), "
+            f"pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
+            f"quat({pose.orientation.x:.3f}, {pose.orientation.y:.3f}, "
+            f"{pose.orientation.z:.3f}, {pose.orientation.w:.3f}), "
             f"speed_scale={_clamp01(speed_scale):.2f}, use_cartesian={use_cartesian}"
         )
 
@@ -543,7 +570,24 @@ class G01Demo(Node):
         log.info(f"[{group}] pose plan+exec: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         return ok
 
-    def plan_execute_cartesian_line(
+    def plan_execute_pose_xyz_rpy(
+        self,
+        group: str,
+        speed_scale: float,
+        link: str,
+        x: float,
+        y: float,
+        z: float,
+        roll: float,
+        pitch: float,
+        yaw: float,
+        use_cartesian: bool = False,
+    ) -> bool:
+        """位姿目标：输入 xyz + rpy；内部转 Pose 后调 plan_execute_pose。"""
+        pose = make_pose(x, y, z, roll, pitch, yaw)
+        return self.plan_execute_pose(group, speed_scale, link, pose, use_cartesian)
+
+    def _cartesian_plan(
         self,
         group: str,
         link: str,
@@ -552,30 +596,21 @@ class G01Demo(Node):
         avoid_collisions: bool = True,
         eef_step: float = CART_EEF_STEP,
         min_fraction: float = CART_MIN_FRACTION,
-    ) -> bool:
-        """从当前末端位姿直线移动到 end_pose（笛卡尔路径，绝对位姿）。
+    ):
+        """调 compute_cartesian_path 服务，规划成功返回（已缩放速度的）RobotTrajectory。
 
-        - 走 compute_cartesian_path 服务：服务从 start_state 做 FK 得到当前 EE 位姿，
-          再沿 waypoints[0]=end_pose 做直线段（关节空间逐段 IK 拼接而成）。
-        - 拿到 RobotTrajectory 后用 execute_trajectory action 执行。
-        - Humble 的 GetCartesianPath 没有 max_velocity_scaling_factor 字段，速度缩放
-          在客户端通过缩放 time_from_start / velocities / accelerations 实现。
-        - fraction < min_fraction 视为失败（默认 0.99，要求基本走完整条直线）。
+        失败返回 None。返回的 trajectory 可直接缓存以备后续反向播放/重发。
         """
         log = self.get_logger()
         t0 = time.monotonic()
-        elapsed_ms = lambda: (time.monotonic() - t0) * 1000.0
 
         if not self._cart_cli.wait_for_service(timeout_sec=10.0):
             log.error(f"服务 {SVC_CARTESIAN_PATH} 不可用")
-            return False
-        if not self._exec_cli.wait_for_server(timeout_sec=10.0):
-            log.error(f"动作 {ACT_EXEC_TRAJ} 不可用")
-            return False
+            return None
 
         start = self._get_joints(POSE_START_JOINTS, wait_new=True)
         if start is None:
-            return False
+            return None
 
         req = GetCartesianPath.Request()
         req.header.frame_id = PLAN_FRAME
@@ -600,11 +635,11 @@ class G01Demo(Node):
         fut = self._cart_cli.call_async(req)
         if not self._spin_until(fut, 15.0):
             log.error("compute_cartesian_path 超时")
-            return False
+            return None
 
         res = fut.result()
         code_val = res.error_code.val
-        plan_ms = elapsed_ms()
+        plan_ms = (time.monotonic() - t0) * 1000.0
         log.info(
             f"[{group}] cartesian planning: {plan_ms:.3f} ms, fraction={res.fraction:.3f}, "
             f"error_code={code_val}({_moveit_error_name(code_val)})"
@@ -614,7 +649,7 @@ class G01Demo(Node):
                 f"笛卡尔直线规划未达标：fraction={res.fraction:.3f} < {min_fraction}, "
                 f"error_code={code_val}({_moveit_error_name(code_val)})"
             )
-            return False
+            return None
 
         traj = res.solution
         s = _clamp01(speed_scale)
@@ -627,13 +662,26 @@ class G01Demo(Node):
                 pt.velocities = [v * s for v in pt.velocities]
                 pt.accelerations = [a * s * s for a in pt.accelerations]
 
+        return traj
+
+    def _execute_traj(self, traj, timeout: float = 60.0) -> bool:
+        """直接把一条 RobotTrajectory 发给 execute_trajectory action。
+
+        traj 必须已是「速度缩放后」的最终轨迹（_cartesian_plan 或 _reverse_trajectory
+        的返回值均已满足）。
+        """
+        log = self.get_logger()
+        if not self._exec_cli.wait_for_server(timeout_sec=10.0):
+            log.error(f"动作 {ACT_EXEC_TRAJ} 不可用")
+            return False
+
         goal = ExecuteTrajectory.Goal(trajectory=traj)
         send_fut = self._exec_cli.send_goal_async(goal)
         if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
             log.error("execute_trajectory 目标被拒绝或超时")
             return False
         res_fut = send_fut.result().get_result_async()
-        if not self._spin_until(res_fut, 60.0):
+        if not self._spin_until(res_fut, timeout):
             log.error("execute_trajectory 结果超时")
             return False
 
@@ -645,8 +693,152 @@ class G01Demo(Node):
                 f"error_code={exec_code}({_moveit_error_name(exec_code) if exec_code is not None else 'None'})"
             )
             return False
+        return True
 
-        log.info(f"[{group}] cartesian plan+exec: {elapsed_ms():.3f} ms (success)")
+    @staticmethod
+    def _reverse_trajectory(traj):
+        """反向播放：positions/time 反序、velocity 取负、acceleration 仅反序（不变号）。
+
+        数学：设原 q(t) on [0,T]，反向播放定义 r(τ) = q(T − τ)，则
+            r'(τ)  = -q'(T − τ)    → velocity 每分量取负
+            r''(τ) = +q''(T − τ)   → acceleration 不变号（只是按时间反序）
+        时间戳：t_new[i] = T − t_old[N-1-i]（即反序后的第 0 点时间为 0）。
+        """
+        out = copy.deepcopy(traj)
+        pts = out.joint_trajectory.points
+        if len(pts) < 2:
+            return out
+
+        total_ns = pts[-1].time_from_start.sec * 1_000_000_000 + pts[-1].time_from_start.nanosec
+        rev_pts = []
+        for src in reversed(pts):
+            new = copy.deepcopy(src)
+            if new.velocities:
+                new.velocities = [-v for v in new.velocities]
+            old_ns = src.time_from_start.sec * 1_000_000_000 + src.time_from_start.nanosec
+            delta = total_ns - old_ns
+            new.time_from_start.sec = int(delta // 1_000_000_000)
+            new.time_from_start.nanosec = int(delta % 1_000_000_000)
+            rev_pts.append(new)
+        out.joint_trajectory.points = rev_pts
+        return out
+
+    def plan_execute_cartesian_line(
+        self,
+        group: str,
+        link: str,
+        end_pose: Pose,
+        speed_scale: float = 0.2,
+        avoid_collisions: bool = True,
+        eef_step: float = CART_EEF_STEP,
+        min_fraction: float = CART_MIN_FRACTION,
+    ) -> bool:
+        """从当前末端位姿直线移动到 end_pose：先 _cartesian_plan 再 _execute_traj。
+
+        - 走 compute_cartesian_path 服务：服务从 start_state 做 FK 得到当前 EE 位姿，
+          再沿 waypoints[0]=end_pose 做直线段（关节空间逐段 IK 拼接而成）。
+        - 拿到 RobotTrajectory 后用 execute_trajectory action 执行。
+        - Humble 的 GetCartesianPath 没有 max_velocity_scaling_factor 字段，速度缩放
+          在客户端通过缩放 time_from_start / velocities / accelerations 实现。
+        - fraction < min_fraction 视为失败（默认 0.99，要求基本走完整条直线）。
+        """
+        log = self.get_logger()
+        t0 = time.monotonic()
+        traj = self._cartesian_plan(
+            group, link, end_pose, speed_scale, avoid_collisions, eef_step, min_fraction
+        )
+        if traj is None:
+            return False
+        if not self._execute_traj(traj):
+            return False
+        log.info(f"[{group}] cartesian plan+exec: {(time.monotonic() - t0) * 1000.0:.3f} ms (success)")
+        return True
+
+    def pick_and_return(
+        self,
+        target_pose: Pose,
+        speed_scale: float,
+        group: str,
+        link: str = EE_LINK,
+        pre_grasp_offset: float = PRE_GRASP_OFFSET,
+    ) -> bool:
+        """抓取流程（5 步）：
+
+        1. OMPL 关节空间 → 预备抓取点（target 沿其自身末端 z 轴外移 `pre_grasp_offset` m）。
+        2. 笛卡尔直线 → 抓取目标 `target_pose`。
+        3. 等待用户按回车（模拟实际抓取/夹爪动作）。
+        4. 笛卡尔直线 → 退回预备抓取点（原路退）。
+        5. OMPL 关节空间 → 回到调用前的关节起点。
+
+        参数：
+            target_pose      : 末端抓取位姿（geometry_msgs/Pose，在 PLAN_FRAME 下）
+            speed_scale      : 各段共用的速度缩放（0~1）
+            group            : SRDF 规划组（如 left_body）
+            link             : 末端连杆名（默认 EE_LINK）
+            pre_grasp_offset : 预备点沿末端 z 轴的退距（m）
+        """
+        log = self.get_logger()
+
+        home_joints = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        if home_joints is None:
+            log.error("[pick] 读取起点关节失败")
+            return False
+        log.info(
+            f"[pick] 起点关节已记录: "
+            + ", ".join(f"{k}={v:.3f}" for k, v in home_joints.items())
+        )
+
+        pre_pose = pose_offset_local_z(target_pose, pre_grasp_offset)
+        pp = pre_pose.position
+        tp = target_pose.position
+        log.info(
+            f"[pick] 抓取目标 pos({tp.x:.3f}, {tp.y:.3f}, {tp.z:.3f}); "
+            f"预备点（沿末端 z 退 {pre_grasp_offset:.3f} m）pos({pp.x:.3f}, {pp.y:.3f}, {pp.z:.3f})"
+        )
+
+        log.info("[pick] 1/5  OMPL  → 预备抓取点")
+        if not self.plan_execute_pose(group, speed_scale, link, pre_pose, use_cartesian=False):
+            log.error("[pick] 到预备抓取点失败")
+            return False
+
+        log.info("[pick] 2/5  Cart  → 抓取目标（缓存轨迹用于反向退回）")
+        approach_traj = self._cartesian_plan(group, link, target_pose, speed_scale=speed_scale)
+        if approach_traj is None:
+            log.error("[pick] 直线接近规划失败")
+            return False
+        if not self._execute_traj(approach_traj):
+            log.error("[pick] 直线接近执行失败")
+            return False
+        n_pts = len(approach_traj.joint_trajectory.points)
+        log.info(f"[pick] 抓取轨迹已缓存（{n_pts} 点），退回时直接反向播放，免重规划")
+
+        log.info("[pick] 3/5  到达抓取位置，按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
+
+        log.info("[pick] 4/5  反向播放抓取轨迹 → 退回预备抓取点（不再求解）")
+        retreat_traj = self._reverse_trajectory(approach_traj)
+        if not self._execute_traj(retreat_traj):
+            log.error("[pick] 反向播放退回失败")
+            return False
+
+        log.info("[pick] 5/5  OMPL  → 回到起点关节")
+        current = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        if current is None:
+            log.error("[pick] 读取当前关节失败")
+            return False
+        f_joints = [-0.01292, 1.015203, -0.51133, -0.17993, 0.502329, 1.796362, 0.075785, -1.160019]
+
+        goal = [make_joint_constraints_from_vector(group, POSE_START_JOINTS, f_joints)]
+        ok, used_ms = self.move(group, goal, start=current, plan_only=False, speed_scale=0.5)
+        log.info(f"[pick] return-to-home: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        if not ok:
+            log.error("[pick] 回到起点失败")
+            return False
+
+        log.info("[pick] 抓取流程完成。")
         return True
 
 
@@ -698,40 +890,20 @@ def main(argv: list[str] | None = None) -> int:
             log.error("关节规划/执行失败")
             return 1
 
-        # --- 3. 末端位姿运动
-        ep = EE_POSE
-        log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
-        if not node.plan_execute_pose_xyz_rpy(
-            POSE_GROUP,
-            0.2,  # 速度快容易失败
-            EE_LINK,
-            ep["x"],
-            ep["y"],
-            ep["z"],
-            ep["roll"],
-            ep["pitch"],
-            ep["yaw"],
-            use_cartesian=False,
+        # --- 3. 抓取流程：OMPL → 预备点 → Cart 接近 → 回车 → Cart 退回 → OMPL 复位 ---
+        ep = EE_POSE2  # 实际抓取目标位姿
+        target_pose = make_pose(
+            ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
+        )
+        log.info(f"抓取规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
+        if not node.pick_and_return(
+            target_pose=target_pose,
+            speed_scale=0.2,
+            group=POSE_GROUP,
+            link=EE_LINK,
+            pre_grasp_offset=PRE_GRASP_OFFSET,
         ):
-            log.error("末端位姿规划/执行失败")
-            return 1
-
-        # --- 4. 末端位姿运动（笛卡尔直线，等价 RViz "Use Cartesian Path"） ---
-        ep = EE_POSE2
-        log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
-        if not node.plan_execute_pose_xyz_rpy(
-            POSE_GROUP,
-            0.2,  # 速度快容易失败
-            EE_LINK,
-            ep["x"],
-            ep["y"],
-            ep["z"],
-            ep["roll"],
-            ep["pitch"],
-            ep["yaw"],
-            use_cartesian=True,
-        ):
-            log.error("末端位姿规划/执行失败")
+            log.error("抓取流程失败")
             return 1
 
         log.info("全部完成。按回车退出并移除深框 …")
