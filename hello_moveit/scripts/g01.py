@@ -593,7 +593,7 @@ def main(argv: list[str] | None = None) -> int:
         log.info(f"位姿规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
         if not node.plan_execute_pose_xyz_rpy(
             POSE_GROUP,
-            0.3,
+            0.1,
             EE_LINK,
             ep["x"],
             ep["y"],

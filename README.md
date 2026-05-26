@@ -21,7 +21,7 @@ ros2 launch moveit_setup_assistant setup_assistant.launch.py
 注意要添加虚拟关节，不然会报错
 注意meshes文件太大会卡，可以用open3D库缩小
 
-
+#
 对于双臂无法给双臂的位姿规划，需要先求逆解再规划
 适用于单臂关节空间或笛卡尔空间规划，双臂只能自己先求逆解关节空间规划
 
@@ -32,8 +32,10 @@ move_group_interface.cpp
     goal_position_tolerance_ = 1e-4;     // 0.1 mm
     goal_orientation_tolerance_ = 1e-3;  // ~0.1 deg
 
+#
+TOTG 时间参数化：给路径加上时间
 
-
+#
 chomp规划时间太长，超10s
 
 实际测试同一起点和终点
