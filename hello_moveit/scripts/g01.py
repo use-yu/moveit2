@@ -130,6 +130,7 @@ if not POSE_START_JOINTS:
 PLANNER_ID = "RRTConnect"
 NUM_ATTEMPTS = 20
 PLAN_TIME_SEC = 10.0
+MOVE_MAX_RETRIES = 3  # move_action 失败后再试几次（应对 INVALID_MOTION_PLAN 等 OMPL 随机性失败）
 
 # 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
 DEFAULT_SPEED_SCALE = 0.5
@@ -463,35 +464,18 @@ class G01Demo(Node):
         rm = CollisionObject(id=FRAME_ID, operation=CollisionObject.REMOVE)
         return self._apply_scene([rm])
 
-    def move(
+    def _move_once(
         self,
         group: str,
         goal_constraints: list[Constraints],
-        joint_names: list[str] | None = None,
-        start: dict[str, float] | None = None,
-        plan_only: bool = False,
-        speed_scale: float | None = None,
-    ) -> tuple[bool, float, RobotTrajectory | None]:
-        """
-        调用 move_action 一次：规划（plan_only=True）或规划并执行（False）。
-
-        返回 (是否成功, 墙钟耗时 [ms], planned_trajectory)；
-        失败或无轨迹时第三项为 None。
-        joint_names + 未传 start：从 joint_states 读当前位置作为起点。
-        start：显式指定起点（位姿规划在关节运动后用）。
-        """
+        start: dict[str, float] | None,
+        plan_only: bool,
+        speed_scale: float | None,
+    ) -> tuple[bool, float, RobotTrajectory | None, int | None]:
+        """单次 move_action 调用。返回 (ok, 耗时 ms, trajectory, error_code)。"""
+        log = self.get_logger()
         t0 = time.monotonic()
         elapsed_ms = lambda: (time.monotonic() - t0) * 1000.0
-        no_traj = lambda ok: (ok, elapsed_ms(), None)
-
-        if not self._move_cli.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error(f"动作 {ACT_MOVE_GROUP} 不可用")
-            return no_traj(False)
-
-        if start is None and joint_names:
-            start = self._get_joints(joint_names)
-            if start is None:
-                return no_traj(False)
 
         g = MoveGroup.Goal()
         g.request.group_name = group
@@ -511,30 +495,111 @@ class G01Demo(Node):
 
         send_fut = self._move_cli.send_goal_async(g)
         if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
-            self.get_logger().error("move_action 目标被拒绝或超时")
-            return no_traj(False)
+            log.error("move_action 目标被拒绝或超时")
+            return False, elapsed_ms(), None, None
 
         res_fut = send_fut.result().get_result_async()
         if not self._spin_until(res_fut, PLAN_TIME_SEC + 30.0):
-            self.get_logger().error("move_action 结果超时")
-            return no_traj(False)
+            log.error("move_action 结果超时")
+            return False, elapsed_ms(), None, MoveItErrorCodes.TIMED_OUT
 
         ar = res_fut.result()
         code_val = ar.result.error_code.val if ar.result else None
         if ar.status != GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().error(
+            log.error(
                 f"move_action 状态失败: {ar.status} (GoalStatus)，"
                 f" MoveItErrorCodes={code_val}({_moveit_error_name(code_val) if code_val is not None else 'None'})"
             )
-            return no_traj(False)
+            return False, elapsed_ms(), None, code_val
         if code_val != MoveItErrorCodes.SUCCESS:
-            self.get_logger().error(f"MoveIt 错误码: {code_val} ({_moveit_error_name(code_val)})")
-            return no_traj(False)
+            log.error(f"MoveIt 错误码: {code_val} ({_moveit_error_name(code_val)})")
+            return False, elapsed_ms(), None, code_val
 
         traj = None
         if ar.result and ar.result.planned_trajectory.joint_trajectory.points:
             traj = ar.result.planned_trajectory
-        return True, elapsed_ms(), traj
+        return True, elapsed_ms(), traj, MoveItErrorCodes.SUCCESS
+
+    @staticmethod
+    def _move_error_retryable(code: int | None) -> bool:
+        """是否值得因 OMPL 随机性再试（起点/终点本身非法的不重试）。"""
+        if code is None:
+            return True
+        non_retryable = {
+            MoveItErrorCodes.START_STATE_IN_COLLISION,
+            MoveItErrorCodes.GOAL_IN_COLLISION,
+            MoveItErrorCodes.START_STATE_VIOLATES_PATH_CONSTRAINTS,
+            MoveItErrorCodes.GOAL_VIOLATES_PATH_CONSTRAINTS,
+            MoveItErrorCodes.INVALID_GROUP_NAME,
+            MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS,
+            MoveItErrorCodes.NO_IK_SOLUTION,
+        }
+        return code not in non_retryable
+
+    def move(
+        self,
+        group: str,
+        goal_constraints: list[Constraints],
+        joint_names: list[str] | None = None,
+        start: dict[str, float] | None = None,
+        plan_only: bool = False,
+        speed_scale: float | None = None,
+        max_retries: int | None = None,
+    ) -> tuple[bool, float, RobotTrajectory | None]:
+        """
+        调用 move_action：规划（plan_only=True）或规划并执行（False）。
+
+        失败时自动重试最多 MOVE_MAX_RETRIES 次（应对 INVALID_MOTION_PLAN 等
+        postprocessing 漏检/重采样碰撞；OMPL 每次随机采样可能换一条路）。
+
+        返回 (是否成功, 墙钟耗时 [ms]（含所有尝试）, planned_trajectory)；
+        失败或无轨迹时第三项为 None。
+        joint_names + 未传 start：从 joint_states 读当前位置作为起点。
+        start：显式指定起点（位姿规划在关节运动后用）。
+        """
+        log = self.get_logger()
+        retries = MOVE_MAX_RETRIES if max_retries is None else max(1, max_retries)
+        t0 = time.monotonic()
+        no_traj = lambda ok: (ok, (time.monotonic() - t0) * 1000.0, None)
+
+        if not self._move_cli.wait_for_server(timeout_sec=10.0):
+            log.error(f"动作 {ACT_MOVE_GROUP} 不可用")
+            return no_traj(False)
+
+        if start is None and joint_names:
+            start = self._get_joints(joint_names)
+            if start is None:
+                return no_traj(False)
+
+        last_code: int | None = None
+        for attempt in range(1, retries + 1):
+            ok, _, traj, code = self._move_once(
+                group, goal_constraints, start, plan_only, speed_scale
+            )
+            last_code = code
+            if ok:
+                if attempt > 1:
+                    log.info(f"[{group}] move_action 第 {attempt}/{retries} 次成功")
+                return True, (time.monotonic() - t0) * 1000.0, traj
+            if attempt < retries and self._move_error_retryable(code):
+                log.warning(
+                    f"[{group}] move_action 第 {attempt}/{retries} 次失败 "
+                    f"({_moveit_error_name(code) if code is not None else 'unknown'})，重试 …"
+                )
+                # 若上次已执行部分轨迹，用最新 joint_states 作下次起点
+                if start and not plan_only:
+                    refreshed = self._get_joints(list(start.keys()), wait_new=True)
+                    if refreshed is not None:
+                        start = refreshed
+                continue
+            break
+
+        if retries > 1:
+            log.error(
+                f"[{group}] move_action {retries} 次均失败，"
+                f"末次错误: {_moveit_error_name(last_code) if last_code is not None else 'unknown'}"
+            )
+        return no_traj(False)
 
     def plan_execute_joint_waypoints(
         self,
