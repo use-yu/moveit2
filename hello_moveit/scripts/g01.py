@@ -18,6 +18,16 @@ G01 MoveIt 演示脚本
   colcon build --packages-select hello_moveit && source install/setup.bash
   ros2 run hello_moveit g01.py
 
+实际测试遇到的问题：
+1. moveit关节空间规划时由于时间参数化（TOTG）有时候规划成功，执行失败
+可以通过修改 ompl_planning.yaml 中的 longest_valid_segment_fraction 参数来解决，值越小，规划时间越长，但是规划成功率越高
+本代码采用失败重新规划方法来解决这个问题，相比改参数这样求解速度更快
+
+2. 做末端直线运动时由于机械臂构型不同，实际有解但有时候会规划失败，
+本代码采用求解多个逆解，再从多个逆解中选择一个直线规划可以求解成功的逆解，保证构型合理
+
+3. moveit先plan再execute时，耗时较长
+本代码采用先plan+execute的方法
 """
 
 from __future__ import annotations
@@ -63,8 +73,9 @@ from std_msgs.msg import ColorRGBA
 ACTIVE_GROUP = "dual_arm"
 
 # 第二步：末端位姿规划组与目标（连杆 L6，坐标系 base_link）
-POSE_GROUP = "left_body"
-EE_LINK = "L6"
+POSE_GROUP = "right_body"
+
+EE_LINK = "R6"
 EE_POSE = dict(
     x=-0.75,
     y=-0.25,
@@ -73,13 +84,21 @@ EE_POSE = dict(
     pitch=-math.pi / 4,
     yaw=-math.pi,
 )
+# EE_POSE2 = dict(
+#     x=-0.75,
+#     y=-0.35,
+#     z=0.0,
+#     roll=-math.pi / 4,
+#     pitch=-math.pi / 4,
+#     yaw=-math.pi,
+# )
 EE_POSE2 = dict(
-    x=-0.75,
-    y=-0.35,
-    z=0.0,
-    roll=-math.pi / 4,
-    pitch=-math.pi / 4,
-    yaw=-math.pi,
+    x=-0.788,
+    y=-0.101,
+    z=0.054,
+    roll=-1.603,
+    pitch=-1.340,
+    yaw=3.071,
 )
 # 各组的关节目标 [rad]（键名须与 URDF/SRDF 一致）
 JOINT_TARGETS = {
@@ -117,6 +136,28 @@ JOINT_TARGETS = {
         "l_arm_joint4": 1.23459,
         "l_arm_joint5": 2.1201,
         "l_arm_joint6": -1.5702,
+    },
+    "left": {
+        "base_joint1": 1.25,
+        "base_joint2": 0.0,
+        "body_joint1": 0.0,
+        "body_joint2": 1.313,
+        "l_arm_joint1": 1.8697,
+        "l_arm_joint2": 0.2,
+        "l_arm_joint3": 0.135997,
+        "l_arm_joint4": 1.23459,
+        "l_arm_joint5": 2.1201,
+        "l_arm_joint6": -1.5702,
+    },
+    "right_body": {
+        "body_joint1": 0.0,
+        "body_joint2": -1.313,
+        "r_arm_joint1": -1.8697,
+        "r_arm_joint2": 0.2,
+        "r_arm_joint3": 0.135997,
+        "r_arm_joint4": 1.23459,
+        "r_arm_joint5": 2.1201,
+        "r_arm_joint6": -1.5702,
     },
 }
 
@@ -164,6 +205,19 @@ CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截�
 PLACE_JOINTS = {
     "left_body": [
         -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    ],
+    "left": [
+        1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    ],
+    "right_body": [
+        -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    ],
+    "right": [
+        1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    ],
+    "dual_arm": [
+        1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+        ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
     ],
 }
 
