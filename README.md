@@ -38,6 +38,10 @@ TOTG 时间参数化：给路径加上时间
 #
 chomp规划时间太长，超10s
 
+#
+MTC 先在 ComputeIK 那里枚举 N 个 IK 解作为分支；对每个分支尝试 MoveRelative approach。approach 失败的 IK 解被剪掉，剩下的可行 IK 解再回填给上游 Connect（OMPL）作为目标关节配置。所以"approach 不可行的 IK 直接淘汰"这一句话就是 MTC 内置的行为
+
+#
 实际测试同一起点和终点
 不加hybridize和simplifySolution实际70个点  73.910 ms-
 
