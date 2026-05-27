@@ -46,8 +46,9 @@ from moveit_msgs.msg import (
     PlanningScene,
     PositionConstraint,
     RobotState,
+    RobotTrajectory,
 )
-from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetPositionIK
+from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetPositionFK, GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -146,6 +147,7 @@ FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 SVC_APPLY_SCENE = "apply_planning_scene"
 SVC_CARTESIAN_PATH = "compute_cartesian_path"
 SVC_COMPUTE_IK = "compute_ik"
+SVC_COMPUTE_FK = "compute_fk"
 ACT_MOVE_GROUP = "move_action"
 ACT_EXEC_TRAJ = "execute_trajectory"
 
@@ -159,9 +161,10 @@ CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截�
 
 # 抓取流程默认参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
+POST_RETURN_Z_OFFSET = 0.1  # 复位后沿末端坐标系 +z 轴直线移动距离 [m]
 
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
-IK_N_CANDIDATES = 12          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
+IK_N_CANDIDATES = 200          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
 IK_SEED_PERTURB = math.pi/2     # 随机种子各关节的最大扰动幅度 [rad]，越大解越分散
 IK_TIMEOUT_SEC = 0.2          # 每次 /compute_ik 超时（KDL 对边界姿态需更长收敛时间）
 IK_RANDOM_SEED = 42           # 让 IK 多解枚举可复现；改成 None 则每次随机
@@ -359,6 +362,7 @@ class G01Demo(Node):
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
         self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
         self._ik_cli = self.create_client(GetPositionIK, SVC_COMPUTE_IK)
+        self._fk_cli = self.create_client(GetPositionFK, SVC_COMPUTE_FK)
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
         self._exec_cli = ActionClient(self, ExecuteTrajectory, ACT_EXEC_TRAJ)
         # 缓存最新 joint_states，供规划起点使用
@@ -396,6 +400,42 @@ class G01Demo(Node):
         self.get_logger().error(f"读取关节超时，缺失: {[n for n in names if n not in self._joints]}")
         return None
 
+    def _get_link_pose_fk(
+        self, link: str, joints: dict[str, float] | None = None
+    ) -> Pose | None:
+        """用 /compute_fk 根据关节角求 link 在 PLAN_FRAME 下的位姿。"""
+        log = self.get_logger()
+        if not self._fk_cli.wait_for_service(timeout_sec=5.0):
+            log.error(f"服务 {SVC_COMPUTE_FK} 不可用")
+            return None
+
+        if joints is None:
+            joints = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        if joints is None:
+            return None
+
+        req = GetPositionFK.Request()
+        req.header.frame_id = PLAN_FRAME
+        req.fk_link_names = [link]
+        req.robot_state = RobotState()
+        req.robot_state.joint_state.name = list(joints.keys())
+        req.robot_state.joint_state.position = list(joints.values())
+        req.robot_state.is_diff = True
+
+        fut = self._fk_cli.call_async(req)
+        if not self._spin_until(fut, 5.0):
+            log.error("compute_fk 超时")
+            return None
+
+        res = fut.result()
+        if res.error_code.val != MoveItErrorCodes.SUCCESS or not res.pose_stamped:
+            log.error(
+                f"compute_fk 失败: error_code={res.error_code.val}"
+                f"({_moveit_error_name(res.error_code.val)})"
+            )
+            return None
+        return res.pose_stamped[0].pose
+
     def _apply_scene(self, objects: list[CollisionObject], colors: list[ObjectColor] | None = None) -> bool:
         """向 move_group 提交规划场景 diff（添加/删除障碍物）。"""
         if not self._scene_cli.wait_for_service(timeout_sec=10.0):
@@ -431,25 +471,27 @@ class G01Demo(Node):
         start: dict[str, float] | None = None,
         plan_only: bool = False,
         speed_scale: float | None = None,
-    ) -> tuple[bool, float]:
+    ) -> tuple[bool, float, RobotTrajectory | None]:
         """
         调用 move_action 一次：规划（plan_only=True）或规划并执行（False）。
 
-        返回 (是否成功, 墙钟耗时 [ms])，从发送目标到收到结果。
+        返回 (是否成功, 墙钟耗时 [ms], planned_trajectory)；
+        失败或无轨迹时第三项为 None。
         joint_names + 未传 start：从 joint_states 读当前位置作为起点。
         start：显式指定起点（位姿规划在关节运动后用）。
         """
         t0 = time.monotonic()
         elapsed_ms = lambda: (time.monotonic() - t0) * 1000.0
+        no_traj = lambda ok: (ok, elapsed_ms(), None)
 
         if not self._move_cli.wait_for_server(timeout_sec=10.0):
             self.get_logger().error(f"动作 {ACT_MOVE_GROUP} 不可用")
-            return False, elapsed_ms()
+            return no_traj(False)
 
         if start is None and joint_names:
             start = self._get_joints(joint_names)
             if start is None:
-                return False, elapsed_ms()
+                return no_traj(False)
 
         g = MoveGroup.Goal()
         g.request.group_name = group
@@ -470,12 +512,12 @@ class G01Demo(Node):
         send_fut = self._move_cli.send_goal_async(g)
         if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
             self.get_logger().error("move_action 目标被拒绝或超时")
-            return False, elapsed_ms()
+            return no_traj(False)
 
         res_fut = send_fut.result().get_result_async()
         if not self._spin_until(res_fut, PLAN_TIME_SEC + 30.0):
             self.get_logger().error("move_action 结果超时")
-            return False, elapsed_ms()
+            return no_traj(False)
 
         ar = res_fut.result()
         code_val = ar.result.error_code.val if ar.result else None
@@ -484,11 +526,15 @@ class G01Demo(Node):
                 f"move_action 状态失败: {ar.status} (GoalStatus)，"
                 f" MoveItErrorCodes={code_val}({_moveit_error_name(code_val) if code_val is not None else 'None'})"
             )
-            return False, elapsed_ms()
+            return no_traj(False)
         if code_val != MoveItErrorCodes.SUCCESS:
             self.get_logger().error(f"MoveIt 错误码: {code_val} ({_moveit_error_name(code_val)})")
-            return False, elapsed_ms()
-        return True, elapsed_ms()
+            return no_traj(False)
+
+        traj = None
+        if ar.result and ar.result.planned_trajectory.joint_trajectory.points:
+            traj = ar.result.planned_trajectory
+        return True, elapsed_ms(), traj
 
     def plan_execute_joint_waypoints(
         self,
@@ -520,7 +566,7 @@ class G01Demo(Node):
         for idx, q in enumerate(waypoints):
             goal = [make_joint_constraints_from_vector(group, joint_names, q)]
 
-            ok, used_ms = self.move(
+            ok, used_ms, _ = self.move(
                 group, goal, start=start, plan_only=False, speed_scale=speed_scale
             )
             log.info(
@@ -571,7 +617,7 @@ class G01Demo(Node):
 
         goal = [make_pose_constraints(link, pose)]
 
-        ok, used_ms = self.move(group, goal, start=start, plan_only=False, speed_scale=speed_scale)
+        ok, used_ms, _ = self.move(group, goal, start=start, plan_only=False, speed_scale=speed_scale)
         log.info(f"[{group}] pose plan+exec: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         return ok
 
@@ -974,6 +1020,7 @@ class G01Demo(Node):
         group: str,
         link: str = EE_LINK,
         pre_grasp_offset: float = PRE_GRASP_OFFSET,
+        post_return_z_offset: float = POST_RETURN_Z_OFFSET,
     ) -> bool:
         """抓取流程（5 步，IK 多解 + approach 预检版）：
 
@@ -987,7 +1034,9 @@ class G01Demo(Node):
         2. OMPL 关节空间 → q_pre（确定的关节配置，可绕障）。
         3. 直接执行缓存的 approach_traj（笛卡尔直线进入 target，免重规划）。
         4. 等待用户按回车（模拟抓取动作）。
-        5. 反向播放 approach_traj → 退回 q_pre；OMPL → 回到 f_joints 复位。
+        5. 反向播放 approach_traj + 1/6 的 OMPL 轨迹 → 回到 1/6 初始关节配置。
+        6. OMPL → 回到 f_joints 复位。
+        7. 沿末端坐标系 +z 轴直线移动 POST_RETURN_Z_OFFSET（笛卡尔，不做 IK 多解枚举）。
 
         参数：
             target_pose      : 末端抓取位姿（geometry_msgs/Pose，在 PLAN_FRAME 下）
@@ -995,6 +1044,7 @@ class G01Demo(Node):
             group            : SRDF 规划组（如 left_body）
             link             : 末端连杆名（默认 EE_LINK）
             pre_grasp_offset : 预备点沿末端 z 轴的退距（m，负值=沿 -z）
+            post_return_z_offset : 复位后沿末端 +z 轴直线移动距离（m）
         """
         log = self.get_logger()
 
@@ -1006,7 +1056,7 @@ class G01Demo(Node):
             f"预备点（沿末端 z 退 {pre_grasp_offset:.3f} m）pos({pp.x:.3f}, {pp.y:.3f}, {pp.z:.3f})"
         )
 
-        log.info("[pick] 0/5  IK 多解枚举 + approach 预检 …")
+        log.info("[pick] 0/7  IK 多解枚举 + approach 预检 …")
         picked = self._select_feasible_grasp_pair(
             group, link, target_pose, pre_pose,
             joint_names=POSE_START_JOINTS,
@@ -1021,49 +1071,84 @@ class G01Demo(Node):
             + ", ".join(f"{n}={q_pre[n]:.3f}" for n in POSE_START_JOINTS)
         )
 
-        log.info("[pick] 1/5  OMPL  → q_pre（关节目标，IK 解已确定）")
+        log.info("[pick] 1/7  OMPL  → q_pre（关节目标，IK 解已确定）")
         current = self._get_joints(POSE_START_JOINTS, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
+        pick_start_joints = current
         goal = [make_joint_constraints(group, q_pre)]
-        ok, used_ms = self.move(group, goal, start=current, plan_only=False, speed_scale=speed_scale)
+        ok, used_ms, to_pre_traj = self.move(
+            group, goal, start=current, plan_only=False, speed_scale=speed_scale
+        )
         log.info(f"[pick] OMPL → q_pre: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not ok:
             log.error("[pick] OMPL 到 q_pre 失败")
             return False
+        if to_pre_traj is None or not to_pre_traj.joint_trajectory.points:
+            log.error("[pick] 1/7 未返回 OMPL 轨迹，无法原路退回初始位置")
+            return False
 
         log.info(
-            f"[pick] 2/5  执行已缓存的 approach 轨迹 → q_target "
+            f"[pick] 2/7  执行已缓存的 approach 轨迹 → q_target "
             f"（{len(approach_traj.joint_trajectory.points)} 点，免重规划）"
         )
         if not self._execute_traj(approach_traj):
             log.error("[pick] 直线接近执行失败")
             return False
 
-        log.info("[pick] 3/5  到达抓取位置，按回车继续 …")
+        log.info("[pick] 3/7  到达抓取位置，按回车继续 …")
         try:
             input()
         except EOFError:
             pass
 
-        log.info("[pick] 4/5  反向播放 approach → 退回 q_pre（不再求解）")
-        retreat_traj = self._reverse_trajectory(approach_traj)
-        if not self._execute_traj(retreat_traj):
-            log.error("[pick] 反向播放退回失败")
+        log.info(
+            "[pick] 4/7  反向播放 approach + 1/7 OMPL → 回到 1/7 初始位置（不再求解）"
+        )
+        retreat_approach = self._reverse_trajectory(approach_traj)
+        if not self._execute_traj(retreat_approach):
+            log.error("[pick] 反向播放 approach 失败")
             return False
+        retreat_to_start = self._reverse_trajectory(to_pre_traj)
+        if not self._execute_traj(retreat_to_start):
+            log.error("[pick] 反向播放 1/7 OMPL 回到初始位置失败")
+            return False
+        log.info(
+            "[pick] 已回到 1/7 初始位置: "
+            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in POSE_START_JOINTS)
+        )
 
-        log.info("[pick] 5/5  OMPL  → 复位关节配置")
+        log.info("[pick] 5/7  OMPL  → 复位关节配置")
         current = self._get_joints(POSE_START_JOINTS, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
-        f_joints = [-0.01292, 1.015203, -0.51133, -0.17993, 0.502329, 1.796362, 0.075785, -1.160019]
+        f_joints = [-0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787]
         goal = [make_joint_constraints_from_vector(group, POSE_START_JOINTS, f_joints)]
-        ok, used_ms = self.move(group, goal, start=current, plan_only=False, speed_scale=0.25)
+        ok, used_ms, _ = self.move(group, goal, start=current, plan_only=False, speed_scale=0.5)
         log.info(f"[pick] return-to-home: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not ok:
             log.error("[pick] 回到起点失败")
+            return False
+
+        log.info(
+            f"[pick] 6/7  沿末端 +z 轴直线移动 {post_return_z_offset:.3f} m "
+            f"（笛卡尔，从当前位姿 FK 偏移）"
+        )
+        current = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        if current is None:
+            log.error("[pick] 读取当前关节失败")
+            return False
+        ee_pose = self._get_link_pose_fk(link, current)
+        if ee_pose is None:
+            log.error("[pick] FK 读取当前末端位姿失败")
+            return False
+        offset_pose = pose_offset_local_z(ee_pose, post_return_z_offset)
+        if not self.plan_execute_cartesian_line(
+            group, link, offset_pose, speed_scale=speed_scale
+        ):
+            log.error("[pick] 复位后沿末端 z 轴直线移动失败")
             return False
 
         log.info("[pick] 抓取流程完成。")
@@ -1114,6 +1199,14 @@ def main(argv: list[str] | None = None) -> int:
         log.info("  " + ", ".join(joint_names))
         log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
+        log.info("按回车继续，输入 q 回车退出并移除深框 …")
+        try:
+            if input().strip().lower() == "q":
+                return 0
+        except EOFError:
+            pass
+
+
         if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
             log.error("关节规划/执行失败")
             return 1
@@ -1134,9 +1227,10 @@ def main(argv: list[str] | None = None) -> int:
             log.error("抓取流程失败")
             return 1
 
-        log.info("全部完成。按回车退出并移除深框 …")
+        log.info("按回车继续，输入 q 回车退出并移除深框 …")
         try:
-            input()
+            if input().strip().lower() == "q":
+                return 0
         except EOFError:
             pass
         code = 0
