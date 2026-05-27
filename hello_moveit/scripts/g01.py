@@ -117,16 +117,10 @@ JOINT_TARGETS = {
 }
 
 # 位姿规划时作为起始状态的关节（不含底盘，与 left_body 组一致）
-POSE_START_JOINTS = [
-    "body_joint1",
-    "body_joint2",
-    "l_arm_joint1",
-    "l_arm_joint2",
-    "l_arm_joint3",
-    "l_arm_joint4",
-    "l_arm_joint5",
-    "l_arm_joint6",
-]
+POSE_START_JOINTS = list(JOINT_TARGETS.get(POSE_GROUP, {}).keys())
+if not POSE_START_JOINTS:
+    raise KeyError(f"JOINT_TARGETS 中未找到 POSE_GROUP={POSE_GROUP} 的关节列表")
+
 
 # 规划器
 PLANNER_ID = "RRTConnect"
@@ -865,12 +859,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         frame_added = True
 
-        # --- 2. 关节空间运动 ---
+        # --- 2. 关节空间运动 ---   
         targets = JOINT_TARGETS[ACTIVE_GROUP]
         joint_names = list(targets.keys())
         q1 = [1.25, 0.0, -0.25, 1.1, 
-        2.352639, -1.521807, 2.147846, 0.945048, 2.702450, -2.565092, 
-        80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+        3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477, 
+        3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477,]
         # q2 = [1.25, 0.0, -0.25, 1.1, 
         # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
         # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
@@ -883,8 +877,8 @@ def main(argv: list[str] | None = None) -> int:
             log.error("读取当前关节位置失败，无法规划")
             return 1
         log.info("规划前当前关节位置 [rad]:")
-        for name in joint_names:
-            log.info(f"  {name}: {current[name]:.6f}")
+        log.info("  " + ", ".join(joint_names))
+        log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
         if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
             log.error("关节规划/执行失败")
