@@ -160,9 +160,17 @@ _ORI_TOL = 1e-3
 CART_EEF_STEP = 0.005     # 服务端 IK 离散步长（m）
 CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截断）
 
+# left_body 放置位关节目标 [rad]（键顺序与 JOINT_TARGETS[group] 一致）
+PLACE_JOINTS = {
+    "left_body": [
+        -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    ],
+}
+
 # 抓取流程默认参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
-POST_RETURN_Z_OFFSET = 0.1  # 复位后沿末端坐标系 +z 轴直线移动距离 [m]
+POST_RETURN_Z_OFFSET = 0.1  # 复位后沿末端 +z 轴直线移动距离 [m]
+PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
 IK_N_CANDIDATES = 200          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
@@ -187,6 +195,13 @@ def quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, 
         cr * cp * sy - sr * sp * cy,
         cr * cp * cy + sr * sp * sy,
     )
+
+
+def joint_names_for_group(group: str) -> list[str]:
+    """从 JOINT_TARGETS 读取 group 的关节名列表（顺序与 place_joints 向量一致）。"""
+    if group not in JOINT_TARGETS:
+        raise KeyError(f"未知 group={group}，JOINT_TARGETS 可选: {list(JOINT_TARGETS)}")
+    return list(JOINT_TARGETS[group].keys())
 
 
 def make_pose(x: float, y: float, z: float, roll=0.0, pitch=0.0, yaw=0.0) -> Pose:
@@ -313,10 +328,10 @@ def make_joint_constraints_from_vector(
     return make_joint_constraints(group, dict(zip(joint_names, joint_values)))
 
 
-def make_pose_constraints(link: str, pose: Pose) -> Constraints:
+def make_pose_constraints(link: str, pose: Pose, frame_id: str = PLAN_FRAME) -> Constraints:
     """
     末端位姿目标 → PositionConstraint（位置球）+ OrientationConstraint。
-    约束在 PLAN_FRAME 下表达，link_name 为末端连杆名。
+    约束在 frame_id 下表达，link_name 为末端连杆名。
     """
     c = Constraints()
     c.name = "pose_goal"
@@ -332,14 +347,14 @@ def make_pose_constraints(link: str, pose: Pose) -> Constraints:
     region.primitive_poses.append(pos_only)
 
     pc = PositionConstraint()
-    pc.header.frame_id = PLAN_FRAME
+    pc.header.frame_id = frame_id
     pc.link_name = link
     pc.constraint_region = region
     pc.weight = 1.0
     c.position_constraints.append(pc)
 
     oc = OrientationConstraint()
-    oc.header.frame_id = PLAN_FRAME
+    oc.header.frame_id = frame_id
     oc.link_name = link
     oc.orientation = pose.orientation
     oc.absolute_x_axis_tolerance = _ORI_TOL
@@ -402,21 +417,26 @@ class G01Demo(Node):
         return None
 
     def _get_link_pose_fk(
-        self, link: str, joints: dict[str, float] | None = None
+        self,
+        link: str,
+        joints: dict[str, float] | None = None,
+        joint_names: Sequence[str] | None = None,
+        plan_frame: str = PLAN_FRAME,
     ) -> Pose | None:
-        """用 /compute_fk 根据关节角求 link 在 PLAN_FRAME 下的位姿。"""
+        """用 /compute_fk 根据关节角求 link 在 plan_frame 下的位姿。"""
         log = self.get_logger()
         if not self._fk_cli.wait_for_service(timeout_sec=5.0):
             log.error(f"服务 {SVC_COMPUTE_FK} 不可用")
             return None
 
         if joints is None:
-            joints = self._get_joints(POSE_START_JOINTS, wait_new=True)
+            names = list(joint_names) if joint_names is not None else POSE_START_JOINTS
+            joints = self._get_joints(names, wait_new=True)
         if joints is None:
             return None
 
         req = GetPositionFK.Request()
-        req.header.frame_id = PLAN_FRAME
+        req.header.frame_id = plan_frame
         req.fk_link_names = [link]
         req.robot_state = RobotState()
         req.robot_state.joint_state.name = list(joints.keys())
@@ -713,6 +733,8 @@ class G01Demo(Node):
         eef_step: float = CART_EEF_STEP,
         min_fraction: float = CART_MIN_FRACTION,
         start_joints: dict | None = None,
+        joint_names: Sequence[str] | None = None,
+        plan_frame: str = PLAN_FRAME,
         verbose: bool = True,
     ):
         """调 compute_cartesian_path 服务，规划成功返回（已缩放速度的）RobotTrajectory。
@@ -733,12 +755,14 @@ class G01Demo(Node):
             log.error(f"服务 {SVC_CARTESIAN_PATH} 不可用")
             return None
 
-        start = start_joints if start_joints is not None else self._get_joints(POSE_START_JOINTS, wait_new=True)
+        start = start_joints if start_joints is not None else self._get_joints(
+            list(joint_names) if joint_names is not None else POSE_START_JOINTS, wait_new=True
+        )
         if start is None:
             return None
 
         req = GetCartesianPath.Request()
-        req.header.frame_id = PLAN_FRAME
+        req.header.frame_id = plan_frame
         req.start_state.is_diff = True
         req.start_state.joint_state.name = list(start.keys())
         req.start_state.joint_state.position = list(start.values())
@@ -752,7 +776,7 @@ class G01Demo(Node):
         p = end_pose.position
         if verbose:
             log.info(
-                f"[{group}] 笛卡尔直线 {link} @ {PLAN_FRAME}: "
+                f"[{group}] 笛卡尔直线 {link} @ {plan_frame}: "
                 f"end pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
                 f"max_step={eef_step:.4f}, avoid_collisions={avoid_collisions}, "
                 f"speed_scale={_clamp01(speed_scale):.2f}"
@@ -860,6 +884,7 @@ class G01Demo(Node):
         avoid_collisions: bool = True,
         timeout: float = IK_TIMEOUT_SEC,
         return_code: bool = False,
+        plan_frame: str = PLAN_FRAME,
     ):
         """调 /compute_ik 服务，求单个 IK 解。
 
@@ -878,7 +903,7 @@ class G01Demo(Node):
         req.ik_request.ik_link_name = link
         req.ik_request.avoid_collisions = avoid_collisions
         req.ik_request.pose_stamped = PoseStamped()
-        req.ik_request.pose_stamped.header.frame_id = PLAN_FRAME
+        req.ik_request.pose_stamped.header.frame_id = plan_frame
         req.ik_request.pose_stamped.pose = pose
         req.ik_request.robot_state = RobotState()
         req.ik_request.robot_state.joint_state.name = list(seed.keys())
@@ -911,6 +936,7 @@ class G01Demo(Node):
         perturb: float = IK_SEED_PERTURB,
         dedup_tol: float = 1e-2,
         avoid_collisions: bool = True,
+        plan_frame: str = PLAN_FRAME,
     ) -> list[dict]:
         """通过随机种子枚举 pose 在 group 上的多个不同 IK 解。
 
@@ -944,7 +970,8 @@ class G01Demo(Node):
             else:
                 seed = {n: current[n] + rng.uniform(-perturb, perturb) for n in joint_names}
             sol, code = self._solve_ik(
-                group, link, pose, seed, avoid_collisions=avoid_collisions, return_code=True
+                group, link, pose, seed,
+                avoid_collisions=avoid_collisions, return_code=True, plan_frame=plan_frame,
             )
             if sol is None:
                 if code is not None:
@@ -971,7 +998,7 @@ class G01Demo(Node):
             p = pose.position
             o = pose.orientation
             log.error(
-                f"[ik-multi] target pose 详情: frame={PLAN_FRAME}, link={link}, group={group}\n"
+                f"[ik-multi] target pose 详情: frame={plan_frame}, link={link}, group={group}\n"
                 f"           position=({p.x:.4f}, {p.y:.4f}, {p.z:.4f})\n"
                 f"           quat=({o.x:.4f}, {o.y:.4f}, {o.z:.4f}, {o.w:.4f})"
             )
@@ -982,7 +1009,7 @@ class G01Demo(Node):
                 no_col_sols = self._solve_ik_multi(
                     group, link, pose, joint_names,
                     n_candidates=n_candidates, perturb=perturb, dedup_tol=dedup_tol,
-                    avoid_collisions=False,
+                    avoid_collisions=False, plan_frame=plan_frame,
                 )
                 if no_col_sols:
                     log.warning(
@@ -1006,6 +1033,7 @@ class G01Demo(Node):
         joint_names: Sequence[str],
         speed_scale: float,
         n_candidates: int = IK_N_CANDIDATES,
+        plan_frame: str = PLAN_FRAME,
     ):
         """从 target_pose 的多个 IK 解里挑「能直线退回 pre_pose」的一组。
 
@@ -1014,7 +1042,9 @@ class G01Demo(Node):
             即真正用来「从 pre_pose 直线接近 target_pose」的轨迹。
         """
         log = self.get_logger()
-        candidates = self._solve_ik_multi(group, link, target_pose, joint_names, n_candidates)
+        candidates = self._solve_ik_multi(
+            group, link, target_pose, joint_names, n_candidates, plan_frame=plan_frame
+        )
         if not candidates:
             log.error("[grasp-select] target_pose 在该 group 上没有任何 IK 解")
             return None
@@ -1024,6 +1054,8 @@ class G01Demo(Node):
                 group, link, pre_pose,
                 speed_scale=speed_scale,
                 start_joints=q_target,
+                joint_names=joint_names,
+                plan_frame=plan_frame,
                 verbose=False,
             )
             if retreat_traj is None:
@@ -1083,50 +1115,51 @@ class G01Demo(Node):
         target_pose: Pose,
         speed_scale: float,
         group: str,
-        link: str = EE_LINK,
-        pre_grasp_offset: float = PRE_GRASP_OFFSET,
-        post_return_z_offset: float = POST_RETURN_Z_OFFSET,
+        link: str,
+        plan_frame: str,
+        joint_names: Sequence[str],
+        place_joints: Sequence[float],
+        place_speed_scale: float = PLACE_SPEED_SCALE,
     ) -> bool:
-        """抓取流程（5 步，IK 多解 + approach 预检版）：
-
-        关键改造：提前枚举 target_pose 的多个 IK 解，对每个解预演「直线退回 pre_pose」，
-        挑出能走通的那一组 (q_pre, q_target, approach_traj)；然后用 OMPL 关节空间目标
-        奔向 q_pre（而不是奔向 pre_pose 的位姿），从根本上消除「OMPL 押错 IK 分支
-        导致 cartesian approach 偶发不可达」的问题。
-
-        步骤：
-        1. 选解 + 预检：_select_feasible_grasp_pair → (q_pre, q_target, approach_traj)。
-        2. OMPL 关节空间 → q_pre（确定的关节配置，可绕障）。
-        3. 直接执行缓存的 approach_traj（笛卡尔直线进入 target，免重规划）。
-        4. 等待用户按回车（模拟抓取动作）。
-        5. 反向播放 approach + 1/7 OMPL → 1/7 初始位置（第一段复位）。
-        6. OMPL → f_joints 放置位置（缓存轨迹）。
-        7. 沿末端 +z 笛卡尔直线移动（缓存轨迹）。
-        8. 原路返回：反向 7 → 放置位置；反向 6 → 1/7 初始位置。
+        """抓取流程（IK 多解 + approach 预检 + 放置 + 原路返回）。
 
         参数：
-            target_pose      : 末端抓取位姿（geometry_msgs/Pose，在 PLAN_FRAME 下）
-            speed_scale      : 各段共用的速度缩放（0~1）
-            group            : SRDF 规划组（如 left_body）
-            link             : 末端连杆名（默认 EE_LINK）
-            pre_grasp_offset : 预备点沿末端 z 轴的退距（m，负值=沿 -z）
-            post_return_z_offset : 复位后沿末端 +z 轴直线移动距离（m）
+            target_pose       : 末端抓取位姿（geometry_msgs/Pose，在 plan_frame 下表达）
+            speed_scale       : 抓取段速度缩放（0~1）
+            group             : SRDF 规划组（如 left_body）
+            link              : 末端连杆名（如 L6）
+            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 base_link、world）
+            joint_names       : group 内关节名顺序（与 place_joints 一一对应）
+            place_joints      : 放置位关节目标 [rad]（向量，顺序同 joint_names）
+            place_speed_scale : 5/8 OMPL 到放置位的速度缩放（0~1）
         """
         log = self.get_logger()
+        joint_names = list(joint_names)
+        if len(place_joints) != len(joint_names):
+            log.error(
+                f"[pick] place_joints 长度 {len(place_joints)} 与 joint_names 长度 "
+                f"{len(joint_names)} 不一致"
+            )
+            return False
 
-        pre_pose = pose_offset_local_z(target_pose, pre_grasp_offset)
+        log.info(
+            f"[pick] group={group}, link={link}, plan_frame={plan_frame}"
+        )
+
+        pre_pose = pose_offset_local_z(target_pose, PRE_GRASP_OFFSET)
         pp = pre_pose.position
         tp = target_pose.position
         log.info(
-            f"[pick] 抓取目标 pos({tp.x:.3f}, {tp.y:.3f}, {tp.z:.3f}); "
-            f"预备点（沿末端 z 退 {pre_grasp_offset:.3f} m）pos({pp.x:.3f}, {pp.y:.3f}, {pp.z:.3f})"
+            f"[pick] 抓取目标 @ {plan_frame} pos({tp.x:.3f}, {tp.y:.3f}, {tp.z:.3f}); "
+            f"预备点（沿末端 z 退 {PRE_GRASP_OFFSET:.3f} m）pos({pp.x:.3f}, {pp.y:.3f}, {pp.z:.3f})"
         )
 
         log.info("[pick] 0/8  IK 多解枚举 + approach 预检 …")
         picked = self._select_feasible_grasp_pair(
             group, link, target_pose, pre_pose,
-            joint_names=POSE_START_JOINTS,
+            joint_names=joint_names,
             speed_scale=speed_scale,
+            plan_frame=plan_frame,
         )
         if picked is None:
             log.error("[pick] 未找到「IK 可解 + cartesian approach 可行」的 IK 解")
@@ -1134,11 +1167,11 @@ class G01Demo(Node):
         q_pre, q_target, approach_traj = picked
         log.info(
             "[pick] 选定 q_pre: "
-            + ", ".join(f"{n}={q_pre[n]:.3f}" for n in POSE_START_JOINTS)
+            + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
         )
 
         log.info("[pick] 1/8  OMPL  → q_pre（关节目标，IK 解已确定）")
-        current = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        current = self._get_joints(joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
@@ -1182,18 +1215,17 @@ class G01Demo(Node):
             return False
         log.info(
             "[pick] 第一段复位完成，已回到 1/8 初始位置: "
-            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in POSE_START_JOINTS)
+            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
         )
 
         log.info("[pick] 5/8  OMPL  → 运动到放置位置")
-        current = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        current = self._get_joints(joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
-        f_joints = [-0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787]
-        goal = [make_joint_constraints_from_vector(group, POSE_START_JOINTS, f_joints)]
+        goal = [make_joint_constraints_from_vector(group, joint_names, place_joints)]
         ok, used_ms, to_place_traj = self.move(
-            group, goal, start=current, plan_only=False, speed_scale=0.5
+            group, goal, start=current, plan_only=False, speed_scale=place_speed_scale
         )
         log.info(f"[pick] OMPL → 放置位置: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not ok:
@@ -1202,22 +1234,31 @@ class G01Demo(Node):
         if to_place_traj is None or not to_place_traj.joint_trajectory.points:
             log.error("[pick] 5/8 未返回 OMPL 轨迹，无法原路返回")
             return False
+        log.info(
+            "[pick] 放置位关节: "
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(joint_names, place_joints))
+        )
 
         log.info(
-            f"[pick] 6/8  沿末端 +z 轴直线移动 {post_return_z_offset:.3f} m "
+            f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
             f"（笛卡尔，从当前位姿 FK 偏移）"
         )
-        current = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        current = self._get_joints(joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
-        ee_pose = self._get_link_pose_fk(link, current)
+        ee_pose = self._get_link_pose_fk(
+            link, current, joint_names=joint_names, plan_frame=plan_frame
+        )
         if ee_pose is None:
             log.error("[pick] FK 读取当前末端位姿失败")
             return False
-        offset_pose = pose_offset_local_z(ee_pose, post_return_z_offset)
+        offset_pose = pose_offset_local_z(ee_pose, POST_RETURN_Z_OFFSET)
         z_offset_traj = self._cartesian_plan(
-            group, link, offset_pose, speed_scale=speed_scale
+            group, link, offset_pose,
+            speed_scale=speed_scale,
+            joint_names=joint_names,
+            plan_frame=plan_frame,
         )
         if z_offset_traj is None:
             log.error("[pick] 6/8 笛卡尔直线规划失败")
@@ -1243,7 +1284,7 @@ class G01Demo(Node):
             return False
         log.info(
             "[pick] 原路返回完成，当前应在 1/8 初始位置: "
-            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in POSE_START_JOINTS)
+            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
         )
 
         log.info("[pick] 抓取流程完成。")
@@ -1306,18 +1347,28 @@ def main(argv: list[str] | None = None) -> int:
             log.error("关节规划/执行失败")
             return 1
 
-        # --- 3. 抓取流程：OMPL → 预备点 → Cart 接近 → 回车 → Cart 退回 → OMPL 复位 ---
-        ep = EE_POSE2  # 实际抓取目标位姿
+        # --- 3. 抓取流程 ---
+        pick_group = POSE_GROUP
+        pick_joint_names = joint_names_for_group(pick_group)
+        if pick_group not in PLACE_JOINTS:
+            log.error(f"PLACE_JOINTS 中未配置 group={pick_group}")
+            return 1
+        ep = EE_POSE2
         target_pose = make_pose(
             ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
         )
-        log.info(f"抓取规划组: {POSE_GROUP}，末端连杆: {EE_LINK}")
+        log.info(
+            f"抓取: group={pick_group}, link={EE_LINK}, frame={PLAN_FRAME}"
+        )
         if not node.pick_and_return(
             target_pose=target_pose,
             speed_scale=0.2,
-            group=POSE_GROUP,
+            group=pick_group,
             link=EE_LINK,
-            pre_grasp_offset=PRE_GRASP_OFFSET,
+            plan_frame=PLAN_FRAME,
+            joint_names=pick_joint_names,
+            place_joints=PLACE_JOINTS[pick_group],
+            place_speed_scale=0.5,
         ):
             log.error("抓取流程失败")
             return 1
