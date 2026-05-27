@@ -1099,9 +1099,10 @@ class G01Demo(Node):
         2. OMPL 关节空间 → q_pre（确定的关节配置，可绕障）。
         3. 直接执行缓存的 approach_traj（笛卡尔直线进入 target，免重规划）。
         4. 等待用户按回车（模拟抓取动作）。
-        5. 反向播放 approach_traj + 1/6 的 OMPL 轨迹 → 回到 1/6 初始关节配置。
-        6. OMPL → 回到 f_joints 复位。
-        7. 沿末端坐标系 +z 轴直线移动 POST_RETURN_Z_OFFSET（笛卡尔，不做 IK 多解枚举）。
+        5. 反向播放 approach + 1/7 OMPL → 1/7 初始位置（第一段复位）。
+        6. OMPL → f_joints 放置位置（缓存轨迹）。
+        7. 沿末端 +z 笛卡尔直线移动（缓存轨迹）。
+        8. 原路返回：反向 7 → 放置位置；反向 6 → 1/7 初始位置。
 
         参数：
             target_pose      : 末端抓取位姿（geometry_msgs/Pose，在 PLAN_FRAME 下）
@@ -1121,7 +1122,7 @@ class G01Demo(Node):
             f"预备点（沿末端 z 退 {pre_grasp_offset:.3f} m）pos({pp.x:.3f}, {pp.y:.3f}, {pp.z:.3f})"
         )
 
-        log.info("[pick] 0/7  IK 多解枚举 + approach 预检 …")
+        log.info("[pick] 0/8  IK 多解枚举 + approach 预检 …")
         picked = self._select_feasible_grasp_pair(
             group, link, target_pose, pre_pose,
             joint_names=POSE_START_JOINTS,
@@ -1136,7 +1137,7 @@ class G01Demo(Node):
             + ", ".join(f"{n}={q_pre[n]:.3f}" for n in POSE_START_JOINTS)
         )
 
-        log.info("[pick] 1/7  OMPL  → q_pre（关节目标，IK 解已确定）")
+        log.info("[pick] 1/8  OMPL  → q_pre（关节目标，IK 解已确定）")
         current = self._get_joints(POSE_START_JOINTS, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
@@ -1151,25 +1152,25 @@ class G01Demo(Node):
             log.error("[pick] OMPL 到 q_pre 失败")
             return False
         if to_pre_traj is None or not to_pre_traj.joint_trajectory.points:
-            log.error("[pick] 1/7 未返回 OMPL 轨迹，无法原路退回初始位置")
+            log.error("[pick] 1/8 未返回 OMPL 轨迹，无法原路退回初始位置")
             return False
 
         log.info(
-            f"[pick] 2/7  执行已缓存的 approach 轨迹 → q_target "
+            f"[pick] 2/8  执行已缓存的 approach 轨迹 → q_target "
             f"（{len(approach_traj.joint_trajectory.points)} 点，免重规划）"
         )
         if not self._execute_traj(approach_traj):
             log.error("[pick] 直线接近执行失败")
             return False
 
-        log.info("[pick] 3/7  到达抓取位置，按回车继续 …")
+        log.info("[pick] 3/8  到达抓取位置，按回车继续 …")
         try:
             input()
         except EOFError:
             pass
 
         log.info(
-            "[pick] 4/7  反向播放 approach + 1/7 OMPL → 回到 1/7 初始位置（不再求解）"
+            "[pick] 4/8  第一段复位：反向 approach + 1/8 OMPL → 1/8 初始位置"
         )
         retreat_approach = self._reverse_trajectory(approach_traj)
         if not self._execute_traj(retreat_approach):
@@ -1177,28 +1178,33 @@ class G01Demo(Node):
             return False
         retreat_to_start = self._reverse_trajectory(to_pre_traj)
         if not self._execute_traj(retreat_to_start):
-            log.error("[pick] 反向播放 1/7 OMPL 回到初始位置失败")
+            log.error("[pick] 反向播放 1/8 OMPL 回到初始位置失败")
             return False
         log.info(
-            "[pick] 已回到 1/7 初始位置: "
+            "[pick] 第一段复位完成，已回到 1/8 初始位置: "
             + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in POSE_START_JOINTS)
         )
 
-        log.info("[pick] 5/7  OMPL  → 复位关节配置")
+        log.info("[pick] 5/8  OMPL  → 运动到放置位置")
         current = self._get_joints(POSE_START_JOINTS, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
         f_joints = [-0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787]
         goal = [make_joint_constraints_from_vector(group, POSE_START_JOINTS, f_joints)]
-        ok, used_ms, _ = self.move(group, goal, start=current, plan_only=False, speed_scale=0.5)
-        log.info(f"[pick] return-to-home: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        ok, used_ms, to_place_traj = self.move(
+            group, goal, start=current, plan_only=False, speed_scale=0.5
+        )
+        log.info(f"[pick] OMPL → 放置位置: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not ok:
-            log.error("[pick] 回到起点失败")
+            log.error("[pick] 运动到放置位置失败")
+            return False
+        if to_place_traj is None or not to_place_traj.joint_trajectory.points:
+            log.error("[pick] 5/8 未返回 OMPL 轨迹，无法原路返回")
             return False
 
         log.info(
-            f"[pick] 6/7  沿末端 +z 轴直线移动 {post_return_z_offset:.3f} m "
+            f"[pick] 6/8  沿末端 +z 轴直线移动 {post_return_z_offset:.3f} m "
             f"（笛卡尔，从当前位姿 FK 偏移）"
         )
         current = self._get_joints(POSE_START_JOINTS, wait_new=True)
@@ -1210,11 +1216,35 @@ class G01Demo(Node):
             log.error("[pick] FK 读取当前末端位姿失败")
             return False
         offset_pose = pose_offset_local_z(ee_pose, post_return_z_offset)
-        if not self.plan_execute_cartesian_line(
+        z_offset_traj = self._cartesian_plan(
             group, link, offset_pose, speed_scale=speed_scale
-        ):
-            log.error("[pick] 复位后沿末端 z 轴直线移动失败")
+        )
+        if z_offset_traj is None:
+            log.error("[pick] 6/8 笛卡尔直线规划失败")
             return False
+        if not self._execute_traj(z_offset_traj):
+            log.error("[pick] 6/8 沿末端 z 轴直线移动执行失败")
+            return False
+
+        log.info(
+            f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
+            f"（{len(z_offset_traj.joint_trajectory.points)} 点）"
+        )
+        if not self._execute_traj(self._reverse_trajectory(z_offset_traj)):
+            log.error("[pick] 7/8 反向播放 6/8 失败")
+            return False
+
+        log.info(
+            f"[pick] 8/8  原路返回 ②：反向播放 5/8 → 1/8 初始位置 "
+            f"（{len(to_place_traj.joint_trajectory.points)} 点）"
+        )
+        if not self._execute_traj(self._reverse_trajectory(to_place_traj)):
+            log.error("[pick] 8/8 反向播放 5/8 失败")
+            return False
+        log.info(
+            "[pick] 原路返回完成，当前应在 1/8 初始位置: "
+            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in POSE_START_JOINTS)
+        )
 
         log.info("[pick] 抓取流程完成。")
         return True
