@@ -33,7 +33,7 @@ from reach import (  # type: ignore
 
 def _default_in_path() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, "ee_pose2_ok.txt")
+    return os.path.join(here, "ee_pose2_bad.txt")
 
 
 def _parse_kv_line(line: str) -> dict[str, str]:

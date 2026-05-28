@@ -200,7 +200,7 @@ CYLINDER_MARKER_NS = "g01_pose_cylinder"
 CYLINDER_MARKER_TOPIC = "g01_pose_cylinder"
 CYLINDER_DIAMETER = 0.15   # 直径 [m]
 CYLINDER_HEIGHT = 0.06     # 高度 [m]（沿位姿局部 z 轴）
-CYLINDER_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.45)
+CYLINDER_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.9)
 
 # 随机采样时的“物体尺寸”（用于保证物体整体在深框内）
 # 默认用 RViz 圆柱体尺寸；如果你的抓取物体更大，请在这里改。
