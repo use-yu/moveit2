@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>g01_topic_hardware</name>
+  <version>0.0.1</version>
+  <description>ros2_control hardware plugin bridging G01 command/state topics.</description>
+  <maintainer email="todo@example.com">todo</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>sensor_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <hardware_interface plugin="${prefix}/g01_topic_hardware_plugins.xml"/>
+  </export>
+</package>

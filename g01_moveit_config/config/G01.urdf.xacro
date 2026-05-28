@@ -1,6 +1,9 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="G01">
     <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
+    <xacro:arg name="ros2_control_hardware_plugin" default="mock_components/GenericSystem" />
+    <xacro:arg name="ros2_control_state_topic" default="" />
+    <xacro:arg name="ros2_control_command_topic" default="" />
 
     <!-- Import G01 urdf file -->
     <xacro:include filename="$(find moveit_resources_g01_description)/urdf/G01-URDF888.urdf" />
@@ -9,6 +12,11 @@
     <xacro:include filename="G01.ros2_control.xacro" />
 
 
-    <xacro:G01_ros2_control name="FakeSystem" initial_positions_file="$(arg initial_positions_file)"/>
+    <xacro:G01_ros2_control
+        name="G01System"
+        initial_positions_file="$(arg initial_positions_file)"
+        hardware_plugin="$(arg ros2_control_hardware_plugin)"
+        state_topic="$(arg ros2_control_state_topic)"
+        command_topic="$(arg ros2_control_command_topic)"/>
 
 </robot>

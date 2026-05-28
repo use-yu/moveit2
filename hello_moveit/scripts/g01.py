@@ -13,6 +13,7 @@ G01 MoveIt 演示脚本
 前提：
   - 已启动 move_group：ros2 launch g01_moveit_config demo.launch.py
   - 本节点与 move_group 在同一 ROS 域
+  ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true
 
 运行（Python）：
   colcon build --packages-select hello_moveit && source install/setup.bash

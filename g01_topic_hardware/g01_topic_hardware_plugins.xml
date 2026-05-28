@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<library path="g01_topic_hardware">
+  <class
+    name="g01_topic_hardware/G01TopicSystem"
+    type="g01_topic_hardware::G01TopicSystem"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>Bridge joint command/state topics to ros2_control.</description>
+  </class>
+</library>
+

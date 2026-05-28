@@ -1,0 +1,6 @@
+# Real G01 robot topics used by `g01_topic_hardware/G01TopicSystem`.
+# Both topics use message type: sensor_msgs/msg/JointState
+# - state_topic: published by the real robot (name[], position[], velocity[] ...)
+# - command_topic: consumed by the real robot (name[], position[] required; velocity/effort usually ignored)
+state_topic: /g01/joint_states
+command_topic: /g01/joint_commands

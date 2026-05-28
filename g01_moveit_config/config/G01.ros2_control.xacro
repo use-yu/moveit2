@@ -1,12 +1,16 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-    <xacro:macro name="G01_ros2_control" params="name initial_positions_file">
+    <xacro:macro name="G01_ros2_control" params="name initial_positions_file hardware_plugin state_topic command_topic">
         <xacro:property name="initial_positions" value="${load_yaml(initial_positions_file)['initial_positions']}"/>
 
         <ros2_control name="${name}" type="system">
             <hardware>
-                <!-- By default, set up controllers for simulation. This won't work on real hardware -->
-                <plugin>mock_components/GenericSystem</plugin>
+                <!-- Default: simulation / mock. For real robot, pass a different plugin via xacro args. -->
+                <plugin>${hardware_plugin}</plugin>
+                <xacro:if value="${hardware_plugin == 'g01_topic_hardware/G01TopicSystem'}">
+                    <param name="state_topic">${state_topic}</param>
+                    <param name="command_topic">${command_topic}</param>
+                </xacro:if>
             </hardware>
             <joint name="base_joint1">
                 <command_interface name="position"/>
