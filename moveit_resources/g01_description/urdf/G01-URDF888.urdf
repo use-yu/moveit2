@@ -1037,4 +1037,17 @@
       effort="100"
       velocity="2" />
   </joint>
+  <link name="l_tool" />
+  <joint name="l_tool_to_L6" type="fixed">
+        <parent link="L6" />
+        <child link="l_tool"/>
+        <origin xyz="0 0 0.15" rpy="0 0 0"/>
+  </joint>
+
+  <link name="r_tool" />
+  <joint name="r_tool_to_R6" type="fixed">
+        <parent link="R6" />
+        <child link="r_tool"/>
+        <origin xyz="0 0 0.15" rpy="0 0 0"/>
+  </joint>
 </robot>

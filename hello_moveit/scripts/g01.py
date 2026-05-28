@@ -21,7 +21,7 @@ G01 MoveIt 演示脚本
 实际测试遇到的问题：
 1. moveit关节空间规划时由于时间参数化（TOTG）有时候规划成功，执行失败
 可以通过修改 ompl_planning.yaml 中的 longest_valid_segment_fraction 参数来解决，值越小，规划时间越长，但是规划成功率越高
-本代码采用失败重新规划方法来解决这个问题，相比改参数这样求解速度更快
+本代码采用设置一个较好的初始构型，再加上失败重新规划方法来解决这个问题，相比改参数这样求解速度更快
 
 2. 做末端直线运动时由于机械臂构型不同，实际有解但有时候会规划失败，
 本代码采用求解多个逆解，再从多个逆解中选择一个直线规划可以求解成功的逆解，保证构型合理
@@ -73,17 +73,20 @@ from std_msgs.msg import ColorRGBA
 ACTIVE_GROUP = "dual_arm"
 
 # 第二步：末端位姿规划组与目标（连杆 L6，坐标系 base_link）
-POSE_GROUP = "right_body"
+POSE_GROUP = "left_body"
 
-EE_LINK = "R6"
-EE_POSE = dict(
-    x=-0.75,
-    y=-0.25,
-    z=0.0,
-    roll=-math.pi / 4,
-    pitch=-math.pi / 4,
-    yaw=-math.pi,
+# EE_LINK 必须在 末端linkL6 下游、用 fixed joint 连上去的子 link（例如 l_tool）
+EE_LINK = "l_tool"
+EE_POSE2 = dict(
+    x=-0.724,
+    y=-0.184,
+    z=0.058,
+    roll=1.731,
+    pitch=-0.149,
+    yaw=-0.232,
 )
+
+# L6
 # EE_POSE2 = dict(
 #     x=-0.75,
 #     y=-0.35,
@@ -92,14 +95,15 @@ EE_POSE = dict(
 #     pitch=-math.pi / 4,
 #     yaw=-math.pi,
 # )
-EE_POSE2 = dict(
-    x=-0.788,
-    y=-0.101,
-    z=0.054,
-    roll=-1.603,
-    pitch=-1.340,
-    yaw=3.071,
-)
+# R6
+# EE_POSE2 = dict(
+#     x=-0.788,
+#     y=-0.101,
+#     z=0.054,
+#     roll=-1.603,
+#     pitch=-1.340,
+#     yaw=3.071,
+# )
 # 各组的关节目标 [rad]（键名须与 URDF/SRDF 一致）
 JOINT_TARGETS = {
     "body": {
