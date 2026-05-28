@@ -1581,7 +1581,7 @@ def main(argv: list[str] | None = None) -> int:
         # - 深框以 SCENE_FRAME=world 发布；EE_POSE2 需要以 PLAN_FRAME=base_link 表达。
         # - 因此：先在 world 下深框“内腔”采样点，再用 TF(world->base_link 的逆，即 lookup_transform(base_link <- world))
         #   把点变换到 base_link，得到 EE_POSE2 的 xyz。
-        trials = 200
+        trials = 100000
         ok_path = "ee_pose2_ok.txt"
         bad_path = "ee_pose2_bad.txt"
 
