@@ -64,6 +64,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker
 
 # =============================================================================
 # 用户可调参数（改这里即可，无需动下面逻辑）
@@ -175,7 +176,7 @@ if not POSE_START_JOINTS:
 PLANNER_ID = "RRTConnect"
 NUM_ATTEMPTS = 20
 PLAN_TIME_SEC = 10.0
-MOVE_MAX_RETRIES = 3  # move_action 失败后再试几次（应对 INVALID_MOTION_PLAN 等 OMPL 随机性失败）
+MOVE_MAX_RETRIES = 5  # move_action 失败后再试几次（应对 INVALID_MOTION_PLAN 等 OMPL 随机性失败）
 
 # 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
 DEFAULT_SPEED_SCALE = 0.5
@@ -188,6 +189,14 @@ FRAME_SIZE = (0.9, 0.9, 0.6)  # 长×宽×高 [m]
 WALL_T = 0.02
 FRAME_CENTER = (2.0, 0.0, 0.0)  # 底面中心 [m]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
+
+# 位姿标记圆柱（仅 RViz Marker 显示，不进入规划场景碰撞）
+CYLINDER_MARKER_ID = "ee_pose_cylinder"
+CYLINDER_MARKER_NS = "g01_pose_cylinder"
+CYLINDER_MARKER_TOPIC = "g01_pose_cylinder"
+CYLINDER_DIAMETER = 0.15   # 直径 [m]
+CYLINDER_HEIGHT = 0.06     # 高度 [m]（沿位姿局部 z 轴）
+CYLINDER_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.45)
 
 # ROS 接口名（move_group 默认）
 SVC_APPLY_SCENE = "apply_planning_scene"
@@ -328,6 +337,42 @@ def make_deep_frame() -> CollisionObject:
     return obj
 
 
+def pose_from_dict(ep: dict) -> Pose:
+    """EE_POSE2 风格字典 → geometry_msgs/Pose（位置 + roll/pitch/yaw）。"""
+    return make_pose(
+        ep["x"], ep["y"], ep["z"],
+        ep.get("roll", 0.0), ep.get("pitch", 0.0), ep.get("yaw", 0.0),
+    )
+
+
+def make_cylinder_marker(
+    pose: Pose,
+    marker_id: int,
+    frame_id: str = PLAN_FRAME,
+    diameter: float = CYLINDER_DIAMETER,
+    height: float = CYLINDER_HEIGHT,
+    color: ColorRGBA | None = None,
+    ns: str = CYLINDER_MARKER_NS,
+    action: int = Marker.ADD,
+) -> Marker:
+    """构造 RViz 圆柱 Marker（仅可视化，不参与碰撞检测）。
+
+    圆柱中心在 pose 原点，轴线沿 pose 局部 z；scale.x/y=直径，scale.z=高度。
+    """
+    m = Marker()
+    m.header.frame_id = frame_id
+    m.ns = ns
+    m.id = marker_id
+    m.type = Marker.CYLINDER
+    m.action = action
+    m.pose = pose
+    m.scale.x = diameter
+    m.scale.y = diameter
+    m.scale.z = height
+    m.color = color or CYLINDER_COLOR
+    return m
+
+
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
@@ -443,6 +488,9 @@ class G01Demo(Node):
         self._joints: dict[str, float] = {}
         self._js_count = 0
         self.create_subscription(JointState, "joint_states", self._on_js, 10)
+        self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 10)
+        self._cylinder_marker_ids: dict[str, int] = {}
+        self._next_cylinder_marker_id = 0
 
     def _on_js(self, msg: JointState):
         """每次收到 joint_states 更新缓存并递增计数（用于检测「新帧」）。"""
@@ -541,6 +589,58 @@ class G01Demo(Node):
         """从场景中删除深框。"""
         rm = CollisionObject(id=FRAME_ID, operation=CollisionObject.REMOVE)
         return self._apply_scene([rm])
+
+    def _cylinder_marker_numeric_id(self, object_id: str) -> int:
+        if object_id not in self._cylinder_marker_ids:
+            self._cylinder_marker_ids[object_id] = self._next_cylinder_marker_id
+            self._next_cylinder_marker_id += 1
+        return self._cylinder_marker_ids[object_id]
+
+    def show_cylinder_at_pose(
+        self,
+        pose: Pose | dict,
+        object_id: str = CYLINDER_MARKER_ID,
+        frame_id: str = PLAN_FRAME,
+        diameter: float = CYLINDER_DIAMETER,
+        height: float = CYLINDER_HEIGHT,
+        color: ColorRGBA | None = None,
+    ) -> bool:
+        """在 RViz 中半透明显示圆柱（仅 Marker，不参与碰撞检测）。
+
+        pose 可为 geometry_msgs/Pose，或 EE_POSE2 风格 dict。
+        需在 RViz 添加 Marker 显示，话题订阅 /<node_name>/g01_pose_cylinder。
+        """
+        p = pose if isinstance(pose, Pose) else pose_from_dict(pose)
+        mid = self._cylinder_marker_numeric_id(object_id)
+        m = make_cylinder_marker(
+            p, mid, frame_id=frame_id, diameter=diameter, height=height, color=color
+        )
+        m.header.stamp = self.get_clock().now().to_msg()
+        self._cylinder_marker_pub.publish(m)
+        self.get_logger().info(
+            f"已发布圆柱 Marker（仅显示）id={object_id} topic={CYLINDER_MARKER_TOPIC} "
+            f"@ {frame_id} pos=({p.position.x:.3f}, {p.position.y:.3f}, {p.position.z:.3f}), "
+            f"Ø{diameter * 100:.0f}cm × H{height * 100:.0f}cm"
+        )
+        return True
+
+    def remove_cylinder_at_pose(
+        self,
+        object_id: str = CYLINDER_MARKER_ID,
+        frame_id: str = PLAN_FRAME,
+    ) -> bool:
+        """删除 show_cylinder_at_pose 发布的 RViz 圆柱 Marker。"""
+        if object_id not in self._cylinder_marker_ids:
+            return True
+        m = Marker()
+        m.header.frame_id = frame_id
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = CYLINDER_MARKER_NS
+        m.id = self._cylinder_marker_ids[object_id]
+        m.action = Marker.DELETE
+        self._cylinder_marker_pub.publish(m)
+        del self._cylinder_marker_ids[object_id]
+        return True
 
     def _move_once(
         self,
@@ -1393,6 +1493,8 @@ def main(argv: list[str] | None = None) -> int:
         log.info("  " + ", ".join(joint_names))
         log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
+        node.show_cylinder_at_pose(EE_POSE2)
+
         log.info("按回车继续，输入 q 回车退出并移除深框 …")
         try:
             if input().strip().lower() == "q":
@@ -1400,11 +1502,9 @@ def main(argv: list[str] | None = None) -> int:
         except EOFError:
             pass
 
-
         if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
             log.error("关节规划/执行失败")
             return 1
-
         # --- 3. 抓取流程 ---
         pick_group = POSE_GROUP
         pick_joint_names = joint_names_for_group(pick_group)
@@ -1440,6 +1540,7 @@ def main(argv: list[str] | None = None) -> int:
         code = 0
 
     finally:
+        node.remove_cylinder_at_pose()
         if frame_added:
             log.info(f"移除「{FRAME_ID}」…")
             if not node.remove_frame():
