@@ -11,6 +11,7 @@ find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(action_msgs REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
   src/g01_topic_system.cpp
@@ -26,6 +27,7 @@ ament_target_dependencies(${PROJECT_NAME}
   rclcpp
   rclcpp_lifecycle
   sensor_msgs
+  action_msgs
 )
 
 pluginlib_export_plugin_description_file(hardware_interface g01_topic_hardware_plugins.xml)

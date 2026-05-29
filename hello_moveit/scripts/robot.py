@@ -4,11 +4,11 @@
 G01 机器人话题模拟器（配合 g01_topic_hardware / use_real_hardware:=true）
 
 - 100 Hz 发布 /g01/joint_states（sensor_msgs/JointState）
-- 订阅 /g01/joint_commands，收到后用命令位置更新状态并继续发布
+- 订阅 /g01/joint_commands（仅 RViz 点 Execute、控制器 action 进入 EXECUTING 后才发布）
 
 话题与 g01_moveit_config/config/real_hardware_topics.yaml 一致。
 
-运行：
+运行（真机模式请先启本脚本，再 launch demo）：
   python3 hello_moveit/scripts/robot.py
   # 或
   ros2 run hello_moveit robot.py   # 需先在 CMakeLists 中 install
@@ -57,6 +57,7 @@ class G01RobotSimulator(Node):
 
         self._state_pub = self.create_publisher(JointState, STATE_TOPIC, 10)
         self.create_subscription(JointState, COMMAND_TOPIC, self._on_command, 10)
+        self._publish_state()  # 立即发布，避免 MoveIt 先用旧的 /joint_states
         self.create_timer(1.0 / PUBLISH_HZ, self._publish_state)
 
         self.get_logger().info(

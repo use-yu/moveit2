@@ -1,20 +1,15 @@
 import os
 
 from ament_index_python.packages import get_package_share_directory
-from launch.actions import DeclareLaunchArgument
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
-from launch.substitutions import PythonExpression
 
 from moveit_configs_utils import MoveItConfigsBuilder
 from moveit_configs_utils.launches import generate_move_group_launch
 
 
-def generate_launch_description():
-    use_real_arg = DeclareLaunchArgument(
-        "use_real_hardware",
-        default_value="false",
-    )
-
+def _load_topics():
     cfg_path = os.path.join(
         get_package_share_directory("g01_moveit_config"),
         "config",
@@ -28,15 +23,26 @@ def generate_launch_description():
         raise RuntimeError(
             f"Missing keys in {cfg_path}. Required: state_topic, command_topic"
         )
-    state_topic = str(data["state_topic"])
-    command_topic = str(data["command_topic"])
+    return str(data["state_topic"]), str(data["command_topic"])
 
-    hardware_plugin = PythonExpression(
+
+def generate_launch_description():
+    return LaunchDescription(
         [
-            "'g01_topic_hardware/G01TopicSystem' if '",
-            LaunchConfiguration("use_real_hardware", default="false"),
-            "' == 'true' else 'mock_components/GenericSystem'",
+            DeclareLaunchArgument("use_real_hardware", default_value="false"),
+            OpaqueFunction(function=_launch_setup),
         ]
+    )
+
+
+def _launch_setup(context):
+    state_topic, command_topic = _load_topics()
+    use_real = LaunchConfiguration("use_real_hardware").perform(context) == "true"
+
+    hardware_plugin = (
+        "g01_topic_hardware/G01TopicSystem"
+        if use_real
+        else "mock_components/GenericSystem"
     )
 
     moveit_config = (
@@ -52,6 +58,9 @@ def generate_launch_description():
         .to_moveit_configs()
     )
 
-    ld = generate_move_group_launch(moveit_config)
-    ld.add_action(use_real_arg)
-    return ld
+    if use_real:
+        moveit_config.moveit_cpp["planning_scene_monitor_options"] = {
+            "joint_state_topic": state_topic,
+        }
+
+    return generate_move_group_launch(moveit_config).entities
