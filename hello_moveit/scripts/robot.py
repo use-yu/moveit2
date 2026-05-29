@@ -25,7 +25,7 @@ from sensor_msgs.msg import JointState
 
 STATE_TOPIC = "/g01/joint_states"
 COMMAND_TOPIC = "/g01/joint_commands"
-PUBLISH_HZ = 100.0
+PUBLISH_HZ = 50.0
 
 # 与 g01.py JOINT_TARGETS["dual_arm"] 键序一致
 INITIAL_JOINTS: list[tuple[str, float]] = [
