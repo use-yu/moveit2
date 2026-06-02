@@ -1,0 +1,18 @@
+{
+    "robot_number": 2,
+    "current_robot": 1,
+    "node_info": [
+        {
+            "ip_address": "192.168.5.1",
+            "robot_type": "cr7",
+            "trajectory_duration": 0.3,
+            "robot_node_name": "dobot_left"
+        },
+        {
+            "ip_address": "192.168.5.2",
+            "robot_type": "cr7",
+            "trajectory_duration": 0.3,
+            "robot_node_name": "dobot_right"
+        }
+    ]
+}

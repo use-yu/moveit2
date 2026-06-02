@@ -1,3 +1,7 @@
 {
-    "cmake.sourceDirectory": "/home/ws_moveit/src/qj2m_moveit_config"
+  "git.enabled": true,
+  "git.decorations.enabled": true,
+  "scm.diffDecorations": "all",
+  "diffEditor.renderSideBySide": true,
+  "diffEditor.ignoreTrimWhitespace": false
 }

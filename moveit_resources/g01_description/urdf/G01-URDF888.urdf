@@ -36,7 +36,7 @@
     <origin xyz="0 0 0" rpy="0 0 0" />
 
     <axis xyz="-1 0 0" />
-    <limit lower="-50.0" upper="50.0" effort="100.0" velocity="1.0" />
+    <limit lower="-1.0" upper="1.0" effort="100.0" velocity="1.0" />
   </joint>
 
   <link
@@ -249,7 +249,7 @@
       xyz="0 -1 0" />
     <limit
       lower="-0.25"
-      upper="0.0"
+      upper="0"
       effort="100"
       velocity="1" />
   </joint>
@@ -339,7 +339,7 @@
       lower="0"
       upper="1.5708"
       effort="100"
-      velocity="2" />
+      velocity="0.26" />
   </joint>
   <link
     name="R1">
@@ -386,7 +386,7 @@
     type="revolute">
     <origin
       xyz="0 0.377999999999968 -0.3085"
-      rpy="3.14159265358979 0 3.14159265358979" />
+      rpy="3.14159265358979 0 1.57079631189374" />
     <parent
       link="YB" />
     <child
@@ -444,7 +444,8 @@
     type="revolute">
     <origin
       xyz="0.0639942896829944 0.000854919860884817 0.0829999999999999"
-      rpy="0.962598114856819 1.57079631189374 0.975956634984278" />
+      rpy="-1.57079631189374 0 -1.57079631189374" />
+      <!-- rpy="0.962598114856819 1.57079631189374 0.975956634984278" /> -->
     <parent
       link="R1" />
     <child
@@ -453,7 +454,7 @@
       xyz="0 0 1" />
     <limit
       lower="-3.1416"
-      upper="0.2"
+      upper="3.1416"
       effort="100"
       velocity="2" />
   </joint>
@@ -510,8 +511,8 @@
     <axis
       xyz="0 0 -1" />
     <limit
-      lower="-3.1416"
-      upper="3.1416"
+      lower="-2.79"
+      upper="2.79"
       effort="100"
       velocity="2" />
   </joint>
@@ -734,13 +735,13 @@
     type="revolute">
     <origin
       xyz="0 0.377999999999968 0.1205"
-      rpy="0 0 0" />
+      rpy="0 0 -1.57079631189374" />
     <parent
       link="YB" />
     <child
       link="L1" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -792,16 +793,16 @@
     type="revolute">
     <origin
       xyz="-0.0639751221249114 0.00178430633972448 0.08299999999993"
-      rpy="3.11370925402287 -1.57079631189374 3.14159265358979" />
+      rpy="-1.57079631189374 0 1.57079631189374" />
     <parent
       link="L1" />
     <child
       link="L2" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
-      upper="0.2"
+      upper="3.1416"
       effort="100"
       velocity="2" />
   </joint>
@@ -856,10 +857,10 @@
     <child
       link="L3" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
-      lower="-3.1416"
-      upper="3.1416"
+      lower="-2.79"
+      upper="2.79"
       effort="100"
       velocity="2" />
   </joint>
@@ -914,7 +915,7 @@
     <child
       link="L4" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -972,7 +973,7 @@
     <child
       link="L5" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -1030,13 +1031,14 @@
     <child
       link="L6" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
       effort="100"
       velocity="2" />
   </joint>
+
   <link name="l_tool" />
   <joint name="l_tool_to_L6" type="fixed">
         <parent link="L6" />
@@ -1050,4 +1052,5 @@
         <child link="r_tool"/>
         <origin xyz="0 0 0.15" rpy="0 0 0"/>
   </joint>
+
 </robot>

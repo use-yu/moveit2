@@ -39,66 +39,66 @@ joint_limits:
     max_acceleration: 0.0
   body_joint2:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 0.26
     has_acceleration_limits: false
     max_acceleration: 0.0
   l_arm_joint1:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.14
     has_acceleration_limits: false
     max_acceleration: 0.0
   l_arm_joint2:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.14
     has_acceleration_limits: false
     max_acceleration: 0.0
   l_arm_joint3:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.14
     has_acceleration_limits: false
     max_acceleration: 0.0
   l_arm_joint4:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.89
     has_acceleration_limits: false
     max_acceleration: 0.0
   l_arm_joint5:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.89
     has_acceleration_limits: false
     max_acceleration: 0.0
   l_arm_joint6:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.89
     has_acceleration_limits: false
     max_acceleration: 0.0
   r_arm_joint1:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.14
     has_acceleration_limits: false
     max_acceleration: 0.0
   r_arm_joint2:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.14
     has_acceleration_limits: false
     max_acceleration: 0.0
   r_arm_joint3:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.14
     has_acceleration_limits: false
     max_acceleration: 0.0
   r_arm_joint4:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.89
     has_acceleration_limits: false
     max_acceleration: 0.0
   r_arm_joint5:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.89
     has_acceleration_limits: false
     max_acceleration: 0.0
   r_arm_joint6:
     has_velocity_limits: true
-    max_velocity: 2.0
+    max_velocity: 3.89
     has_acceleration_limits: false
     max_acceleration: 0.0
