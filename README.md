@@ -1,7 +1,24 @@
 # moveit2
 运行代码：
 
+g01实际部署：
+
+启动moveit：
+    ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true
+启动tcp-ros通信：
+    python3 servoj_30ms.py
+启动真机话题桥接：
+    python3 comm.py
+启动腰部控制通信：
+    python3 waist.py
+
+官方 ros2 SDK：
+    ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py
+
+仿真：
 ros2 launch g01_moveit_config demo.launch.py
+抓取轨迹：
+    python3 g01.py
 
 官方例子
 ros2 launch moveit2_tutorials demo.launch.py

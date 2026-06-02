@@ -1,4 +1,5 @@
 ## ROS2 Service 列表（含说明）
+ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py
 
 以下服务由 Dobot bringup 节点提供。
 

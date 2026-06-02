@@ -4,6 +4,7 @@
 # sleep(3)
 # rclpy.spin(state_node) 等待 /g01/joint_commands
 # 控制和臂位置是角度
+# tcp读取状态100hz,发布指令33hz
 
 import socket
 from time import sleep
