@@ -114,7 +114,6 @@ JOINT_TARGETS = {
         "body_joint1": 0.0,
         "body_joint2": 0.0,
     },
-    # 预备位：底盘略前伸、躯干抬起、双臂零位（与 hello_go1.cpp dual_arm 一致）
     "dual_arm": {
         "base_joint1": 1.25,
         "base_joint2": 0.0,
@@ -166,6 +165,10 @@ JOINT_TARGETS = {
         "r_arm_joint6": -1.5702,
     },
 }
+
+# 全机关节顺序（与 comm.py / /g01/joint_states 一致），规划起点须包含全部关节
+ALL_JOINT_NAMES = list(JOINT_TARGETS["dual_arm"].keys())
+JOINT_STATE_TOPIC = "/g01/joint_states"
 
 # 位姿规划时作为起始状态的关节（不含底盘，与 left_body 组一致）
 POSE_START_JOINTS = list(JOINT_TARGETS.get(POSE_GROUP, {}).keys())
@@ -488,7 +491,7 @@ class G01Demo(Node):
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
-        self.create_subscription(JointState, "joint_states", self._on_js, 10)
+        self.create_subscription(JointState, JOINT_STATE_TOPIC, self._on_js, 10)
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 10)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
@@ -522,6 +525,34 @@ class G01Demo(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
         self.get_logger().error(f"读取关节超时，缺失: {[n for n in names if n not in self._joints]}")
         return None
+
+    def _planning_start(
+        self,
+        overrides: dict[str, float] | None = None,
+        wait_new: bool = False,
+        timeout: float = 10.0,
+    ) -> dict[str, float] | None:
+        """从 /g01/joint_states 读取全机关节作为规划起点，可用 overrides 覆盖部分关节。"""
+        base = self._get_joints(ALL_JOINT_NAMES, wait_new=wait_new, timeout=timeout)
+        if base is None:
+            return dict(overrides) if overrides else None
+        if overrides:
+            base.update(overrides)
+        return base
+
+    def _set_robot_start_state(
+        self,
+        robot_state: RobotState,
+        overrides: dict[str, float] | None = None,
+        wait_new: bool = False,
+    ) -> bool:
+        start = self._planning_start(overrides, wait_new=wait_new)
+        robot_state.is_diff = True
+        if start is None:
+            return overrides is None
+        robot_state.joint_state.name = list(start.keys())
+        robot_state.joint_state.position = list(start.values())
+        return True
 
     def _get_link_pose_fk(
         self,
@@ -667,9 +698,13 @@ class G01Demo(Node):
             g.request.max_velocity_scaling_factor = s
             g.request.max_acceleration_scaling_factor = s
         g.request.start_state.is_diff = True
-        if start:
-            g.request.start_state.joint_state.name = list(start.keys())
-            g.request.start_state.joint_state.position = list(start.values())
+        start_full = self._planning_start(start)
+        if start_full is None and start is not None:
+            log.error("无法从 /g01/joint_states 读取全机关节起点")
+            return False, elapsed_ms(), None, None
+        if start_full:
+            g.request.start_state.joint_state.name = list(start_full.keys())
+            g.request.start_state.joint_state.position = list(start_full.values())
         g.planning_options.plan_only = plan_only
 
         send_fut = self._move_cli.send_goal_async(g)
@@ -914,9 +949,10 @@ class G01Demo(Node):
             log.error(f"服务 {SVC_CARTESIAN_PATH} 不可用")
             return None
 
-        start = start_joints if start_joints is not None else self._get_joints(
-            list(joint_names) if joint_names is not None else POSE_START_JOINTS, wait_new=True
-        )
+        if start_joints is not None:
+            start = self._planning_start(start_joints, wait_new=True)
+        else:
+            start = self._planning_start(wait_new=True)
         if start is None:
             return None
 

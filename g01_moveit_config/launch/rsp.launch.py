@@ -3,7 +3,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from moveit_configs_utils import MoveItConfigsBuilder
@@ -59,15 +59,13 @@ def _launch_setup(context):
         .to_moveit_configs()
     )
 
-    remappings = [("joint_states", state_topic)] if use_real else []
-
     return [
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
             respawn=True,
             output="screen",
-            remappings=remappings,
+            remappings=[("joint_states", state_topic)],
             parameters=[
                 moveit_config.robot_description,
                 {

@@ -109,7 +109,7 @@ JOINT_ORDER = [
 ]
 LEFT_JOINTS = JOINT_ORDER[4:10]
 RIGHT_JOINTS = JOINT_ORDER[10:16]
-COMMAND_TOPIC = "/g01/joint_commands2"
+COMMAND_TOPIC = "/g01/joint_commands"
 
 
 class fankuis():

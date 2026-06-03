@@ -12,7 +12,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "use_real_hardware",
                 default_value="false",
-                description="If true, skip joint_state_broadcaster (state comes from /g01/joint_states).",
+                description="If true, skip joint_state_broadcaster (state comes from state_topic).",
             ),
             OpaqueFunction(function=_launch_setup),
         ]

@@ -1,10 +1,10 @@
 # Real G01 robot topics used by `g01_topic_hardware/G01TopicSystem`.
 # Message type: sensor_msgs/msg/JointState (full joint name[] + position[])
 #
-# state_topic: 真机/robot.py 发布；use_real_hardware:=true 时：
-#   - ros2_control 订阅（read）
-#   - robot_state_publisher / move_group 直接订阅（不再经 joint_state_broadcaster 写 /joint_states）
+# state_topic: 真机/comm.py/robot.py 发布；MoveIt / RViz / robot_state_publisher 均订阅此话题
+#   - use_real_hardware:=true 时 ros2_control 订阅（read），不启动 joint_state_broadcaster
+#   - 仿真时 joint_state_broadcaster 经 remap 发布到此话题（不再使用 /joint_states）
 # command_topic: MoveIt -> 真机（仅 RViz 点 Execute 且轨迹 action 为 EXECUTING 时发布）
-# 启动顺序：先 robot.py / 真机驱动，再 demo.launch.py use_real_hardware:=true
+# 启动顺序：先 robot.py / comm.py / 真机驱动，再 demo.launch.py use_real_hardware:=true
 state_topic: /g01/joint_states
 command_topic: /g01/joint_commands

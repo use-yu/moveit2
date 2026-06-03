@@ -55,12 +55,8 @@ def _launch_setup(context):
                 "ros2_control_command_topic": command_topic,
             },
         )
+        .moveit_cpp("config/moveit_cpp.yaml")
         .to_moveit_configs()
     )
-
-    if use_real:
-        moveit_config.moveit_cpp["planning_scene_monitor_options"] = {
-            "joint_state_topic": state_topic,
-        }
 
     return generate_move_group_launch(moveit_config).entities
