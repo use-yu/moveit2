@@ -71,6 +71,15 @@
     </visual>
     
     <!-- 桌子 -->
+    <visual>
+      <origin xyz="0.0 -0.023 0.0" rpy="0 0 0" />
+      <geometry>
+          <box size="0.425 0.1 0.9" />
+      </geometry>
+      <material name="base_link_box_transparent">
+        <color rgba="1 0 0 0.5" />
+      </material>
+    </visual>
     <collision>
       <origin xyz="0.0 -0.023 0.0" rpy="0 0 0" />
       <geometry>
@@ -290,13 +299,13 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <collision>
+    <!-- <collision>
       <origin xyz="-0.02 0.19752 -0.094" rpy="0 0 0" />
       <geometry>
         <box size="0.23 0.51 0.32" />
       </geometry>
-    </collision>
-    <!-- <collision>
+    </collision> -->
+    <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -304,7 +313,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/YB.STL" />
       </geometry>
-    </collision> -->
+    </collision>
   </link>
 
   <!-- <link name="base_link_yb">
