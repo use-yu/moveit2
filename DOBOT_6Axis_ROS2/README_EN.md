@@ -21,6 +21,10 @@ MovJ
 ServoJ 角度
 ros2 service call /dobot_right/dobot_bringup_ros2/srv/ServoJ dobot_msgs_v4/srv/ServoJ "{a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0, param_value: ['t=0.03']}"
 
+工具电控制：
+ros2 service call /dobot_right/dobot_bringup_ros2/srv/SetToolPower dobot_msgs_v4/srv/SetToolPower "{status: 0}"
+
+
 ### 命名说明
 
 - `/dobot_left/...`：单台机器人实例的命名空间（对应 `param.json` 中的 `robot_node_name`）。
