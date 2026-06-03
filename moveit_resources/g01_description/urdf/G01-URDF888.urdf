@@ -69,14 +69,21 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-
-    <!-- 底盘 -->
+    
+    <!-- 桌子 -->
     <collision>
+      <origin xyz="0.0 -0.023 0.0" rpy="0 0 0" />
+      <geometry>
+          <box size="0.425 0.1 0.9" />
+      </geometry>
+    </collision>
+    <!-- 底盘 -->
+    <!-- <collision>
       <origin xyz="0.13 -0.52 0.0" rpy="0 0 0" />
       <geometry>
           <box size="0.78 0.19 0.65" />
       </geometry>
-    </collision>
+    </collision> -->
     <!-- 后舱/电池仓 -->
     <collision>
       <origin xyz="0.26 -0.255 0.0" rpy="0 0 0" />
