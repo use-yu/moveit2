@@ -116,6 +116,7 @@ JOINT_TARGETS = {
         "body_joint1": 0.0,
         "body_joint2": 0.0,
     },
+    # 预备位：底盘略前伸、躯干抬起、双臂零位（与 hello_go1.cpp dual_arm 一致）
     "dual_arm": {
         "base_joint1": 1.25,
         "base_joint2": 0.0,
@@ -166,11 +167,23 @@ JOINT_TARGETS = {
         "r_arm_joint5": 2.1201,
         "r_arm_joint6": -1.5702,
     },
+    "right_arm": {
+        "r_arm_joint1": -1.8697,
+        "r_arm_joint2": 0.2,
+        "r_arm_joint3": 0.135997,
+        "r_arm_joint4": 1.23459,
+        "r_arm_joint5": 2.1201,
+        "r_arm_joint6": -1.5702,
+    },
+    "left_arm": {
+        "l_arm_joint1": 1.8697,
+        "l_arm_joint2": 0.2,
+        "l_arm_joint3": 0.135997,
+        "l_arm_joint4": 1.23459,
+        "l_arm_joint5": 2.1201,
+        "l_arm_joint6": -1.5702,
+    },
 }
-
-# 全机关节顺序（与 comm.py / /g01/joint_states 一致），规划起点须包含全部关节
-ALL_JOINT_NAMES = list(JOINT_TARGETS["dual_arm"].keys())
-JOINT_STATE_TOPIC = "/g01/joint_states"
 
 # 位姿规划时作为起始状态的关节（不含底盘，与 left_body 组一致）
 POSE_START_JOINTS = list(JOINT_TARGETS.get(POSE_GROUP, {}).keys())
@@ -183,17 +196,18 @@ PLANNER_ID = "RRTConnect"
 NUM_ATTEMPTS = 20
 PLAN_TIME_SEC = 10.0
 MOVE_MAX_RETRIES = 5  # move_action 失败后再试几次（应对 INVALID_MOTION_PLAN 等 OMPL 随机性失败）
+PLAN_FRAME = "base_link"  # 末端位姿约束坐标系
 
 # 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
 DEFAULT_SPEED_SCALE = 0.5
 
-# 深框障碍物（固定在 world，与机器人 base_link 无关）
-SCENE_FRAME = "world"
-PLAN_FRAME = "base_link"  # 末端位姿约束坐标系
+# 深框障碍物（相对于 base_link 发布）
+SCENE_FRAME = "base_link"
 FRAME_ID = "深框"
-FRAME_SIZE = (0.9, 0.9, 0.6)  # 长×宽×高 [m]
-WALL_T = 0.02
-FRAME_CENTER = (2.0, 0.0, 0.0)  # 底面中心 [m]
+FRAME_SIZE = (1.18, 1.18, 0.58)  # 深框整体外尺寸：长×宽×高 [m]
+WALL_T = 0.09  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
+FRAME_CENTER = (-0.81, -0.363, -0.1)  # 深框整体外轮廓中心，相对于 base_link [m]
+FRAME_RPY_DEG = (90.0, -0.0, 180.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 
 # 位姿标记圆柱（仅 RViz Marker 显示，不进入规划场景碰撞）
@@ -237,6 +251,12 @@ PLACE_JOINTS = {
     "dual_arm": [
         1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
         ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
+    ],
+    "right_arm": [
+        -2.283, 1.02, 1.300752, 0.543868, -0.143126, -0.338787
+    ],
+    "left_arm": [
+        -2.283, 1.02, 1.300752, 0.543868, -0.143126, -0.338787
     ],
 }
 
@@ -293,9 +313,7 @@ def read_vision_pose(sock: socket.socket, log) -> list[float] | None:
             log.error(message)
             print(message)
             return None
-        pose = numbers[-6:]
-        # log.info(f"viewer pose = {pose}")
-        return pose
+        return numbers[-6:]
     except OSError as exc:
         message = f"viewer 获取 pose 失败：{exc}"
         log.error(message)
@@ -340,6 +358,29 @@ def make_pose(x: float, y: float, z: float, roll=0.0, pitch=0.0, yaw=0.0) -> Pos
     return p
 
 
+def rotate_xyz_by_quat(
+    x: float,
+    y: float,
+    z: float,
+    qx: float,
+    qy: float,
+    qz: float,
+    qw: float,
+) -> tuple[float, float, float]:
+    """用四元数旋转向量。"""
+    return (
+        (1.0 - 2.0 * (qy * qy + qz * qz)) * x
+        + 2.0 * (qx * qy - qz * qw) * y
+        + 2.0 * (qx * qz + qy * qw) * z,
+        2.0 * (qx * qy + qz * qw) * x
+        + (1.0 - 2.0 * (qx * qx + qz * qz)) * y
+        + 2.0 * (qy * qz - qx * qw) * z,
+        2.0 * (qx * qz - qy * qw) * x
+        + 2.0 * (qy * qz + qx * qw) * y
+        + (1.0 - 2.0 * (qx * qx + qy * qy)) * z,
+    )
+
+
 def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
     """沿 pose 自身坐标系 z 轴方向平移 dz 米，得到新位姿（姿态不变）。
 
@@ -370,11 +411,14 @@ def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
 def make_deep_frame() -> CollisionObject:
     """
     深框 = 1 块底板 + 4 块侧墙（BOX  primitive），顶部无盖。
-    所有墙板中心相对 FRAME_CENTER 偏移，在 SCENE_FRAME 下发布。
+    FRAME_SIZE 为深框整体外尺寸，FRAME_CENTER 为外轮廓中心。
+    WALL_T 只向内部收缩，外轮廓保持 L × W × H。
     """
     L, W, H = FRAME_SIZE
     t = WALL_T
     bx, by, bz = FRAME_CENTER
+    roll, pitch, yaw = (math.radians(v) for v in FRAME_RPY_DEG)
+    qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
 
     obj = CollisionObject()
     obj.header.frame_id = SCENE_FRAME
@@ -385,15 +429,18 @@ def make_deep_frame() -> CollisionObject:
         prim = SolidPrimitive()
         prim.type = SolidPrimitive.BOX
         prim.dimensions = [dx, dy, dz]
-        pose = make_pose(bx + ox, by + oy, bz + oz)
+        rx, ry, rz = rotate_xyz_by_quat(ox, oy, oz, qx, qy, qz, qw)
+        pose = make_pose(bx + rx, by + ry, bz + rz, roll, pitch, yaw)
         obj.primitives.append(prim)
         obj.primitive_poses.append(pose)
 
-    add_box(L, W, t, 0, 0, t / 2)                      # 底板
-    add_box(t, W, H, L / 2 - t / 2, 0, H / 2)          # +X 侧墙
-    add_box(t, W, H, -(L / 2 - t / 2), 0, H / 2)      # -X 侧墙
-    add_box(L - 2 * t, t, H, 0, W / 2 - t / 2, H / 2)  # +Y 侧墙
-    add_box(L - 2 * t, t, H, 0, -(W / 2 - t / 2), H / 2)  # -Y 侧墙
+    wall_h = H - t
+    wall_z = -H / 2 + t + wall_h / 2
+    add_box(L, W, t, 0, 0, -H / 2 + t / 2)                    # 底板
+    add_box(t, W, wall_h, L / 2 - t / 2, 0, wall_z)           # +X 侧墙
+    add_box(t, W, wall_h, -(L / 2 - t / 2), 0, wall_z)        # -X 侧墙
+    add_box(L - 2 * t, t, wall_h, 0, W / 2 - t / 2, wall_z)   # +Y 侧墙
+    add_box(L - 2 * t, t, wall_h, 0, -(W / 2 - t / 2), wall_z)  # -Y 侧墙
     return obj
 
 
@@ -547,7 +594,7 @@ class G01Demo(Node):
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
-        self.create_subscription(JointState, JOINT_STATE_TOPIC, self._on_js, 10)
+        self.create_subscription(JointState, "joint_states", self._on_js, 10)
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 10)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
@@ -581,34 +628,6 @@ class G01Demo(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
         self.get_logger().error(f"读取关节超时，缺失: {[n for n in names if n not in self._joints]}")
         return None
-
-    def _planning_start(
-        self,
-        overrides: dict[str, float] | None = None,
-        wait_new: bool = False,
-        timeout: float = 10.0,
-    ) -> dict[str, float] | None:
-        """从 /g01/joint_states 读取全机关节作为规划起点，可用 overrides 覆盖部分关节。"""
-        base = self._get_joints(ALL_JOINT_NAMES, wait_new=wait_new, timeout=timeout)
-        if base is None:
-            return dict(overrides) if overrides else None
-        if overrides:
-            base.update(overrides)
-        return base
-
-    def _set_robot_start_state(
-        self,
-        robot_state: RobotState,
-        overrides: dict[str, float] | None = None,
-        wait_new: bool = False,
-    ) -> bool:
-        start = self._planning_start(overrides, wait_new=wait_new)
-        robot_state.is_diff = True
-        if start is None:
-            return overrides is None
-        robot_state.joint_state.name = list(start.keys())
-        robot_state.joint_state.position = list(start.values())
-        return True
 
     def _get_link_pose_fk(
         self,
@@ -754,13 +773,9 @@ class G01Demo(Node):
             g.request.max_velocity_scaling_factor = s
             g.request.max_acceleration_scaling_factor = s
         g.request.start_state.is_diff = True
-        start_full = self._planning_start(start)
-        if start_full is None and start is not None:
-            log.error("无法从 /g01/joint_states 读取全机关节起点")
-            return False, elapsed_ms(), None, None
-        if start_full:
-            g.request.start_state.joint_state.name = list(start_full.keys())
-            g.request.start_state.joint_state.position = list(start_full.values())
+        if start:
+            g.request.start_state.joint_state.name = list(start.keys())
+            g.request.start_state.joint_state.position = list(start.values())
         g.planning_options.plan_only = plan_only
 
         send_fut = self._move_cli.send_goal_async(g)
@@ -1005,10 +1020,9 @@ class G01Demo(Node):
             log.error(f"服务 {SVC_CARTESIAN_PATH} 不可用")
             return None
 
-        if start_joints is not None:
-            start = self._planning_start(start_joints, wait_new=True)
-        else:
-            start = self._planning_start(wait_new=True)
+        start = start_joints if start_joints is not None else self._get_joints(
+            list(joint_names) if joint_names is not None else POSE_START_JOINTS, wait_new=True
+        )
         if start is None:
             return None
 
@@ -1559,79 +1573,77 @@ def main(argv: list[str] | None = None) -> int:
         if ACTIVE_GROUP not in JOINT_TARGETS:
             log.error(f"未知 ACTIVE_GROUP={ACTIVE_GROUP}，可选: {list(JOINT_TARGETS)}")
             return 1
-            
+
         # 视觉识别
         vision_sock = connect_vision(log)
         if vision_sock is not None:
             pose = read_vision_pose(vision_sock, log)
             print(f"viewer pose = {pose}")
-        return 1
-        
-        # --- 1. 添加深框 ---
 
+        # --- 1. 添加深框 ---
         log.info(f"添加碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
         if not node.add_frame():
             return 1
         frame_added = True
 
-        # --- 2. 关节空间运动 ---   
-        targets = JOINT_TARGETS[ACTIVE_GROUP]
-        joint_names = list(targets.keys())
-        q1 = [1.25, 0.0, -0.25, 1.1, 
-        3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477, 
-        3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477,]
-        # q2 = [1.25, 0.0, -0.25, 1.1, 
-        # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
-        # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+        # # --- 2. 关节空间运动 ---   
+        # targets = JOINT_TARGETS[ACTIVE_GROUP]
+        # joint_names = list(targets.keys())
+        # q1 = [1.25, 0.0, -0.25, 1.1, 
+        # 1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477, 
+        # 1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,]
+        # # q2 = [1.25, 0.0, -0.25, 1.1, 
+        # # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
+        # # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
 
-        waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
+        # waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
 
-        log.info(f"关节规划组: {ACTIVE_GROUP}")
-        current = node._get_joints(joint_names)
-        if current is None:
-            log.error("读取当前关节位置失败，无法规划")
-            return 1
-        log.info("规划前当前关节位置 [rad]:")
-        log.info("  " + ", ".join(joint_names))
-        log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
+        # log.info(f"关节规划组: {ACTIVE_GROUP}")
+        # current = node._get_joints(joint_names)
+        # if current is None:
+        #     log.error("读取当前关节位置失败，无法规划")
+        #     return 1
+        # log.info("规划前当前关节位置 [rad]:")
+        # log.info("  " + ", ".join(joint_names))
+        # log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
-        node.show_cylinder_at_pose(EE_POSE2)
+        # node.show_cylinder_at_pose(EE_POSE2)
 
-        log.info("按回车继续，输入 q 回车退出并移除深框 …")
-        try:
-            if input().strip().lower() == "q":
-                return 0
-        except EOFError:
-            pass
+        # log.info("按回车继续，输入 q 回车退出并移除深框 …")
+        # try:
+        #     if input().strip().lower() == "q":
+        #         return 0
+        # except EOFError:
+        #     pass
 
-        if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
-            log.error("关节规划/执行失败")
-            return 1
-        # --- 3. 抓取流程 ---
-        pick_group = POSE_GROUP
-        pick_joint_names = joint_names_for_group(pick_group)
-        if pick_group not in PLACE_JOINTS:
-            log.error(f"PLACE_JOINTS 中未配置 group={pick_group}")
-            return 1
-        ep = EE_POSE2
-        target_pose = make_pose(
-            ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
-        )
-        log.info(
-            f"抓取: group={pick_group}, link={EE_LINK}, frame={PLAN_FRAME}"
-        )
-        if not node.pick_and_return(
-            target_pose=target_pose,
-            speed_scale=0.2,
-            group=pick_group,
-            link=EE_LINK,
-            plan_frame=PLAN_FRAME,
-            joint_names=pick_joint_names,
-            place_joints=PLACE_JOINTS[pick_group],
-            place_speed_scale=0.5,
-        ):
-            log.error("抓取流程失败")
-            return 1
+        # if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
+        #     log.error("关节规划/执行失败")
+        #     return 1
+        # # --- 3. 抓取流程 ---
+        # pick_group = POSE_GROUP
+        # pick_joint_names = joint_names_for_group(pick_group)
+        # if pick_group not in PLACE_JOINTS:
+        #     log.error(f"PLACE_JOINTS 中未配置 group={pick_group}")
+        #     return 1
+        # ep = EE_POSE2
+        # target_pose = make_pose(
+        #     ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
+        # )
+        # log.info(
+        #     f"抓取: group={pick_group}, link={EE_LINK}, frame={PLAN_FRAME}"
+        # )
+        # if not node.pick_and_return(
+        #     target_pose=target_pose,
+        #     speed_scale=0.2,
+        #     group=pick_group,
+        #     link=EE_LINK,
+        #     plan_frame=PLAN_FRAME,
+        #     joint_names=pick_joint_names,
+        #     place_joints=PLACE_JOINTS[pick_group],
+        #     place_speed_scale=0.5,
+        # ):
+        #     log.error("抓取流程失败")
+        #     return 1
 
         log.info("按回车继续，输入 q 回车退出并移除深框 …")
         try:

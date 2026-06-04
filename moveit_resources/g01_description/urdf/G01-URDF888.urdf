@@ -1069,4 +1069,18 @@
         <origin xyz="0 0 0.15" rpy="0 0 0"/>
   </joint>
 
+  <link name="l_base_link" />
+  <joint name="l_base_link_to_YB" type="fixed">
+        <parent link="YB" />
+        <child link="l_base_link"/>
+        <origin xyz="0.000 0.378 0.0565" rpy="0 0 -3.1415926"/>
+  </joint>
+
+  <link name="r_base_link" />
+  <joint name="r_base_link_to_YB" type="fixed">
+        <parent link="YB" />
+        <child link="r_base_link"/>
+        <origin xyz="-0.000 0.378 -0.2445" rpy="-3.1415926 0 0"/>
+  </joint>
+
 </robot>
