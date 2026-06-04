@@ -34,6 +34,7 @@ G01 MoveIt 演示脚本
 from __future__ import annotations
 
 import copy
+import json
 import math
 import multiprocessing
 import random
@@ -66,7 +67,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, String
 from visualization_msgs.msg import Marker
 from dobot_msgs_v4.srv import SetToolPower
 
@@ -229,6 +230,8 @@ SVC_COMPUTE_IK = "compute_ik"
 SVC_COMPUTE_FK = "compute_fk"
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
+GRASP_CMD_TOPIC = "/grasp_cmd"
+GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
 ACT_MOVE_GROUP = "move_action"
 ACT_EXEC_TRAJ = "execute_trajectory"
 
@@ -663,10 +666,69 @@ class G01Demo(Node):
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
+        self._latest_grasp_cmd: dict | None = None
+        self._start_grasp_cmd: dict | None = None
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
+        self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
+        self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 10)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
+
+    def _on_grasp_cmd(self, msg: String):
+        """解析 /grasp_cmd 的 JSON 字符串，cmd_type=1 表示启动抓取。"""
+        log = self.get_logger()
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError as exc:
+            log.error(f"{GRASP_CMD_TOPIC} JSON 解析失败: {exc}; data={msg.data!r}")
+            return
+
+        if not isinstance(data, dict):
+            log.error(f"{GRASP_CMD_TOPIC} JSON 必须是 object: {msg.data!r}")
+            return
+
+        try:
+            cmd_type = int(data.get("cmd_type", 0))
+            grasp_number = int(data.get("grasp_number", 0))
+            release_number = int(data.get("release_number", 0))
+        except (TypeError, ValueError) as exc:
+            log.error(f"{GRASP_CMD_TOPIC} 字段类型错误: {exc}; data={msg.data!r}")
+            return
+
+        parsed = {
+            "cmd_type": cmd_type,
+            "grasp_number": grasp_number,
+            "release_number": release_number,
+        }
+        self._latest_grasp_cmd = parsed
+        log.info(
+            f"收到抓取命令: cmd_type={cmd_type}, "
+            f"grasp_number={grasp_number}, release_number={release_number}"
+        )
+        if cmd_type == 1:
+            self._start_grasp_cmd = parsed
+
+    def wait_for_grasp_start(self) -> dict | None:
+        """等待 /grasp_cmd 收到 cmd_type=1。"""
+        log = self.get_logger()
+        log.info(f"等待 {GRASP_CMD_TOPIC} JSON 命令 cmd_type=1 后开始视觉识别 …")
+        while rclpy.ok():
+            if self._start_grasp_cmd is not None:
+                return self._start_grasp_cmd
+            rclpy.spin_once(self, timeout_sec=0.1)
+        return None
+
+    def publish_grasp_cmd_result(self, result: bool, success_grasp_number: int):
+        """发布 /grasp_cmd_result 的 JSON 字符串。"""
+        data = {
+            "result": bool(result),
+            "success_grasp_number": int(success_grasp_number),
+        }
+        msg = String()
+        msg.data = json.dumps(data, ensure_ascii=False)
+        self._grasp_result_pub.publish(msg)
+        self.get_logger().info(f"发布抓取结果 {GRASP_CMD_RESULT_TOPIC}: {msg.data}")
 
     def _on_js(self, msg: JointState):
         """每次收到 joint_states 更新缓存并递增计数（用于检测「新帧」）。"""
@@ -1683,25 +1745,39 @@ def main(argv: list[str] | None = None) -> int:
     code = 1
     frame_added = False
     vision_sock = None
+    result_published = False
+
+    def finish(result: bool, success_grasp_number: int, exit_code: int) -> int:
+        nonlocal result_published
+        if not result_published:
+            node.publish_grasp_cmd_result(result, success_grasp_number)
+            result_published = True
+        return exit_code
 
     try:
         if ACTIVE_GROUP not in JOINT_TARGETS:
             log.error(f"未知 ACTIVE_GROUP={ACTIVE_GROUP}，可选: {list(JOINT_TARGETS)}")
             return 1
 
+        grasp_cmd = node.wait_for_grasp_start()
+        if grasp_cmd is None:
+            return 1
+    
         # 视觉识别
         vision_sock = connect_vision(log)
-        if vision_sock is not None:
-            pose = read_vision_pose(vision_sock, log)
-            print(f"viewer pose = {pose}")
-            if pose is not None:
-                x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
-                print(
-                    "viewer pose transformed: "
-                    f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
-                    f"z={z_mm / 1000.0:.6f} m, "
-                    f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
-                )
+        if vision_sock is None:
+            return finish(False, 0, 1)
+        pose = read_vision_pose(vision_sock, log)
+        print(f"viewer pose = {pose}")
+        if pose is None:
+            return finish(False, 0, 1)
+        x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        print(
+            "viewer pose transformed: "
+            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
+            f"z={z_mm / 1000.0:.6f} m, "
+            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
+        )
         EE_POSE2 = dict(
             x=x_mm / 1000.0,
             y=y_mm / 1000.0,
@@ -1718,7 +1794,7 @@ def main(argv: list[str] | None = None) -> int:
         # --- 1. 添加深框 ---
         log.info(f"添加碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
         if not node.add_frame():
-            return 1
+            return finish(False, 0, 1)
         frame_added = True
 
         # --- 2. 关节空间运动 ---   
@@ -1737,7 +1813,7 @@ def main(argv: list[str] | None = None) -> int:
         current = node._get_joints(joint_names)
         if current is None:
             log.error("读取当前关节位置失败，无法规划")
-            return 1
+            return finish(False, 0, 1)
         log.info("规划前当前关节位置 [rad]:")
         log.info("  " + ", ".join(joint_names))
         log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
@@ -1747,19 +1823,19 @@ def main(argv: list[str] | None = None) -> int:
         log.info("按回车继续，输入 q 回车退出")
         try:
             if input().strip().lower() == "q":
-                return 0
+                return finish(False, 0, 0)
         except EOFError:
             pass
 
         if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, 0.2, joint_names, waypoints):
             log.error("关节规划/执行失败")
-            return 1
+            return finish(False, 0, 1)
         # --- 3. 抓取流程 ---
         pick_group = POSE_GROUP
         pick_joint_names = joint_names_for_group(pick_group)
         if pick_group not in PLACE_JOINTS:
             log.error(f"PLACE_JOINTS 中未配置 group={pick_group}")
-            return 1
+            return finish(False, 0, 1)
         ep = EE_POSE2
         target_pose = make_pose(
             ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
@@ -1779,7 +1855,9 @@ def main(argv: list[str] | None = None) -> int:
             place_speed_scale=0.2,
         ):
             log.error("抓取流程失败")
-            return 1
+            return finish(False, 0, 1)
+
+        finish(True, 1, 0)
 
         log.info("按回车继续，输入 q 回车退出并移除深框 …")
         try:
