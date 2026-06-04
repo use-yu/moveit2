@@ -86,14 +86,14 @@ PLAN_FRAME = "r_base_link"  # 末端位姿约束坐标系
 EE_LINK = "r_tool"
 
 # r_base_link r_tool
-EE_POSE2 = dict(
-    x=-0.865,
-    y=0.240,
-    z=0.103,
-    roll=-2.125,
-    pitch=-0.131,
-    yaw=1.044,
-)
+# EE_POSE2 = dict(
+#     x=-0.865,
+#     y=0.240,
+#     z=0.103,
+#     roll=-2.125,
+#     pitch=-0.131,
+#     yaw=1.044,
+# )
 
 # L6
 # EE_POSE2 = dict(
@@ -278,6 +278,12 @@ VISION_TRIGGER_COMMAND = "320,1,2,1,1,0"
 VISION_CONNECT_TIMEOUT = 3.0
 VISION_RECV_TIMEOUT = 20.0
 NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+VISION_LEFT_TRANSFORM_MM = [
+    [-0.0589, 0.6938, -0.7178, -79.0463],
+    [0.0530, 0.7202, 0.6918, -121.0375],
+    [0.9969, 0.0027, -0.0792, -56.4165],
+    [0.0, 0.0, 0.0, 1.0],
+]
 
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
 IK_N_CANDIDATES = 200          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
@@ -333,6 +339,61 @@ def close_vision(sock: socket.socket | None, log) -> None:
         return
     sock.close()
     log.info("已关闭视觉 TCP 连接")
+
+
+def matmul4(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def rpy_to_rot(roll: float, pitch: float, yaw: float) -> list[list[float]]:
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+
+
+def rot_to_rpy(rot: list[list[float]]) -> tuple[float, float, float]:
+    pitch = math.atan2(-rot[2][0], math.hypot(rot[0][0], rot[1][0]))
+    if abs(math.cos(pitch)) < 1e-9:
+        roll = 0.0
+        yaw = math.atan2(-rot[0][1], rot[1][1])
+    else:
+        roll = math.atan2(rot[2][1], rot[2][2])
+        yaw = math.atan2(rot[1][0], rot[0][0])
+    return roll, pitch, yaw
+
+
+def pose_mm_deg_to_matrix(pose: Sequence[float]) -> list[list[float]]:
+    x, y, z, roll_deg, pitch_deg, yaw_deg = [float(value) for value in pose[:6]]
+    rot = rpy_to_rot(math.radians(roll_deg), math.radians(pitch_deg), math.radians(yaw_deg))
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x],
+        [rot[1][0], rot[1][1], rot[1][2], y],
+        [rot[2][0], rot[2][1], rot[2][2], z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def matrix_to_xyz_rpy(matrix: list[list[float]]) -> tuple[float, float, float, float, float, float]:
+    rot = [row[:3] for row in matrix[:3]]
+    roll, pitch, yaw = rot_to_rpy(rot)
+    return (
+        matrix[0][3],
+        matrix[1][3],
+        matrix[2][3],
+        roll,
+        pitch,
+        yaw,
+    )
+
+
+def transform_vision_pose(pose: Sequence[float]) -> tuple[float, float, float, float, float, float]:
+    """viewer pose 为 mm/deg；左乘标定矩阵后返回 xyz(mm), rpy(rad)。"""
+    return matrix_to_xyz_rpy(matmul4(VISION_LEFT_TRANSFORM_MM, pose_mm_deg_to_matrix(pose)))
 
 
 def quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
@@ -1532,7 +1593,7 @@ class G01Demo(Node):
             input()
         except EOFError:
             pass
-            
+
         if not self.set_tool_power("right", 0):
             log.error("[pick] 右臂工具下电失败")
             return False
@@ -1629,11 +1690,28 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         # 视觉识别
-        # vision_sock = connect_vision(log)
-        # if vision_sock is not None:
-        #     pose = read_vision_pose(vision_sock, log)
-        #     print(f"viewer pose = {pose}")
+        vision_sock = connect_vision(log)
+        if vision_sock is not None:
+            pose = read_vision_pose(vision_sock, log)
+            print(f"viewer pose = {pose}")
+            if pose is not None:
+                x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+                print(
+                    "viewer pose transformed: "
+                    f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
+                    f"z={z_mm / 1000.0:.6f} m, "
+                    f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
+                )
+        EE_POSE2 = dict(
+            x=x_mm / 1000.0,
+            y=y_mm / 1000.0,
+            z=z_mm / 1000.0,
+            roll=roll,
+            pitch=pitch,
+            yaw=yaw,
+        )
 
+        # return 1
         # --- 1. 添加深框 ---
         log.info(f"添加碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
         if not node.add_frame():
@@ -1683,6 +1761,7 @@ def main(argv: list[str] | None = None) -> int:
         target_pose = make_pose(
             ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
         )
+        print(f"target_pose = {target_pose}")
         log.info(
             f"抓取: group={pick_group}, link={EE_LINK}, frame={PLAN_FRAME}"
         )
