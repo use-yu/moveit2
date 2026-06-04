@@ -19,6 +19,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray
+from dobot_msgs_v4.srv import SetToolPower
 
 MyType = np.dtype([('len', np.int64,), ('digital_input_bits', np.uint64,), ('digital_output_bits',
                                                                             np.uint64,), ('robot_mode', np.uint64,),
@@ -110,6 +111,8 @@ JOINT_ORDER = [
 LEFT_JOINTS = JOINT_ORDER[4:10]
 RIGHT_JOINTS = JOINT_ORDER[10:16]
 COMMAND_TOPIC = "/g01/joint_commands"
+LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
+RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 
 
 class fankuis():
@@ -147,6 +150,8 @@ class ArmRosBridge(Node):
         self.left_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/state", 10)
         self.right_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/state", 10)
         self.create_subscription(JointState, COMMAND_TOPIC, self._on_joint_commands, 10)
+        self.create_service(SetToolPower, LEFT_TOOL_COMMAND_SERVICE, self._on_left_tool_command)
+        self.create_service(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE, self._on_right_tool_command)
 
     def publish_arm_state(self, side, q):
         msg = Float32MultiArray()
@@ -178,6 +183,23 @@ class ArmRosBridge(Node):
             ServoJ(self.arm_clients[0], [math.degrees(value) for value in left_cmd])
         if right_cmd is not None:
             ServoJ(self.arm_clients[1], [math.degrees(value) for value in right_cmd])
+
+    def _on_tool_command(self, request, response, side, client):
+        status = int(request.status)
+        if status not in (0, 1):
+            response.res = -1
+            self.get_logger().error(f"SetToolPower status 非法：{status}，只允许 0/1")
+            return response
+
+        response.res = send_set_tool_power(client, status)
+        self.get_logger().info(f"/g01/{side}/tool_commands: SetToolPower({status}), res={response.res}")
+        return response
+
+    def _on_left_tool_command(self, request, response):
+        return self._on_tool_command(request, response, "left", self.arm_clients[0])
+
+    def _on_right_tool_command(self, request, response):
+        return self._on_tool_command(request, response, "right", self.arm_clients[1])
 
 
 q_actual = {"left": [], "right": []}
@@ -223,6 +245,12 @@ def ServoJ(client, joints):
     # buf = client.recv(200).decode()  # 接收反馈信息的长度
     # print(buf)
 
+def send_set_tool_power(client, status):
+    tcp_command = "SetToolPower(%d)" % int(status)
+    tcp_command = tcp_command.encode()
+    client.sendall(tcp_command)
+    return 0
+
 def servoj_2(client, J1_angle):
     tcp_command = "servoj(%f,0,0,0,0,0,t=2,aheadtime=50, gain=500)" % (J1_angle)
     tcp_command = tcp_command.encode()
@@ -238,6 +266,26 @@ def EnableRobot(client):
     if (index_str == ''):
         return -1
     return buf[buf.find('{') + 1:buf.find('}')]
+
+def parse_dashboard_result(text):
+    try:
+        return int(text.split(",", 1)[0].strip())
+    except (ValueError, IndexError):
+        return -1
+
+def send_dashboard_once(ip, port, command):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(3.0)
+    try:
+        sock.connect((ip, port))
+        sock.sendall(command.encode())
+        return parse_dashboard_result(sock.recv(200).decode(errors="ignore"))
+    except OSError as e:
+        print(f"{ip}:{port} {command} 失败：{e}")
+        return -1
+    finally:
+        sock.close()
+
 stop = True
 SERVER_ADDRESSES = ['192.168.5.1', '192.168.5.2']
 SERVER_PORT = 29999
