@@ -68,6 +68,7 @@ from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
+from dobot_msgs_v4.srv import SetToolPower
 
 # =============================================================================
 # 用户可调参数（改这里即可，无需动下面逻辑）
@@ -226,6 +227,8 @@ SVC_APPLY_SCENE = "apply_planning_scene"
 SVC_CARTESIAN_PATH = "compute_cartesian_path"
 SVC_COMPUTE_IK = "compute_ik"
 SVC_COMPUTE_FK = "compute_fk"
+LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
+RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 ACT_MOVE_GROUP = "move_action"
 ACT_EXEC_TRAJ = "execute_trajectory"
 
@@ -592,6 +595,8 @@ class G01Demo(Node):
         self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
         self._ik_cli = self.create_client(GetPositionIK, SVC_COMPUTE_IK)
         self._fk_cli = self.create_client(GetPositionFK, SVC_COMPUTE_FK)
+        self._left_tool_cli = self.create_client(SetToolPower, LEFT_TOOL_COMMAND_SERVICE)
+        self._right_tool_cli = self.create_client(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE)
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
         self._exec_cli = ActionClient(self, ExecuteTrajectory, ACT_EXEC_TRAJ)
         # 缓存最新 joint_states，供规划起点使用
@@ -672,6 +677,37 @@ class G01Demo(Node):
             )
             return None
         return res.pose_stamped[0].pose
+
+    def set_tool_power(self, side: str, status: int, timeout: float = 7.0) -> bool:
+        """调用左右工具电源服务，要求返回 res=0。"""
+        log = self.get_logger()
+        if side == "left":
+            cli = self._left_tool_cli
+            service_name = LEFT_TOOL_COMMAND_SERVICE
+        elif side == "right":
+            cli = self._right_tool_cli
+            service_name = RIGHT_TOOL_COMMAND_SERVICE
+        else:
+            log.error(f"未知工具电源 side={side}")
+            return False
+
+        if not cli.wait_for_service(timeout_sec=timeout):
+            log.error(f"服务 {service_name} 不可用")
+            return False
+
+        req = SetToolPower.Request()
+        req.status = int(status)
+        fut = cli.call_async(req)
+        if not self._spin_until(fut, timeout):
+            log.error(f"{service_name} SetToolPower({status}) 超时")
+            return False
+
+        res = fut.result().res
+        if res != 0:
+            log.error(f"{service_name} SetToolPower({status}) 失败：res={res}")
+            return False
+        log.info(f"{service_name} SetToolPower({status}) 成功")
+        return True
 
     def _apply_scene(self, objects: list[CollisionObject], colors: list[ObjectColor] | None = None) -> bool:
         """向 move_group 提交规划场景 diff（添加/删除障碍物）。"""
@@ -1465,10 +1501,15 @@ class G01Demo(Node):
             return False
 
         log.info("[pick] 3/8  到达抓取位置，按回车继续 …")
+
         try:
             input()
         except EOFError:
             pass
+
+        if not self.set_tool_power("right", 1):
+            log.error("[pick] 右臂工具上电失败")
+            return False
 
         log.info(
             "[pick] 4/8  第一段复位：反向 approach + 1/8 OMPL → 1/8 初始位置"
@@ -1485,6 +1526,16 @@ class G01Demo(Node):
             "[pick] 第一段复位完成，已回到 1/8 初始位置: "
             + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
         )
+
+        log.info("按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
+            
+        if not self.set_tool_power("right", 0):
+            log.error("[pick] 右臂工具下电失败")
+            return False
 
         # log.info("[pick] 5/8  OMPL  → 运动到放置位置")
         # current = self._get_joints(joint_names, wait_new=True)
