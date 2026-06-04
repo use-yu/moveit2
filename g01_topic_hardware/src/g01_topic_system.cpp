@@ -108,11 +108,13 @@ void G01TopicSystem::setup_trajectory_action_watchers()
   }
 
   controller_executing_.clear();
+  controller_joint_indices_.clear();
   action_status_subs_.clear();
 
   for (const auto & controller : split_csv(controllers_csv)) {
     auto executing_flag = std::make_shared<std::atomic<bool>>(false);
     controller_executing_.push_back(executing_flag);
+    controller_joint_indices_.push_back(joint_indices_for_controller(controller));
 
     const std::string status_topic =
       "/" + controller + "/follow_joint_trajectory/_action/status";
@@ -135,6 +137,37 @@ void G01TopicSystem::setup_trajectory_action_watchers()
       rclcpp::get_logger("g01_topic_hardware"),
       "Trajectory gate: %s", status_topic.c_str());
   }
+}
+
+std::vector<size_t> G01TopicSystem::joint_indices_for_controller(const std::string & controller) const
+{
+  std::vector<std::string> names;
+  if (controller == "left_arm_controller") {
+    names = {
+      "l_arm_joint1", "l_arm_joint2", "l_arm_joint3",
+      "l_arm_joint4", "l_arm_joint5", "l_arm_joint6"};
+  } else if (controller == "right_arm_controller") {
+    names = {
+      "r_arm_joint1", "r_arm_joint2", "r_arm_joint3",
+      "r_arm_joint4", "r_arm_joint5", "r_arm_joint6"};
+  } else if (controller == "body_controller") {
+    names = {"base_joint1", "base_joint2", "body_joint1", "body_joint2"};
+  } else {
+    RCLCPP_WARN(
+      rclcpp::get_logger("g01_topic_hardware"),
+      "Unknown trajectory controller '%s'; it will not command any joints.",
+      controller.c_str());
+  }
+
+  std::vector<size_t> indices;
+  indices.reserve(names.size());
+  for (const auto & name : names) {
+    auto it = joint_index_.find(name);
+    if (it != joint_index_.end()) {
+      indices.push_back(it->second);
+    }
+  }
+  return indices;
 }
 
 bool G01TopicSystem::is_trajectory_executing() const
@@ -262,7 +295,18 @@ hardware_interface::return_type G01TopicSystem::write(
   msg.position.resize(joint_names_.size());
   {
     std::scoped_lock lk(state_mutex_);
-    msg.position = pos_cmd_;
+    msg.position = pos_state_;
+    for (size_t i = 0; i < controller_executing_.size(); ++i) {
+      const auto & flag = controller_executing_[i];
+      if (!flag || !flag->load() || i >= controller_joint_indices_.size()) {
+        continue;
+      }
+      for (const auto idx : controller_joint_indices_[i]) {
+        if (idx < msg.position.size() && idx < pos_cmd_.size()) {
+          msg.position[idx] = pos_cmd_[idx];
+        }
+      }
+    }
   }
 
   command_pub_->publish(std::move(msg));

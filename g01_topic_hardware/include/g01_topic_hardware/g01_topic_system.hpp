@@ -37,6 +37,7 @@ public:
 private:
   void on_joint_state(const sensor_msgs::msg::JointState & msg);
   void setup_trajectory_action_watchers();
+  std::vector<size_t> joint_indices_for_controller(const std::string & controller) const;
   bool is_trajectory_executing() const;
   bool has_valid_state() const;
 
@@ -64,6 +65,7 @@ private:
   std::atomic<int64_t> last_state_rx_ns_{0};
   double state_timeout_sec_{0.5};
 
+  std::vector<std::vector<size_t>> controller_joint_indices_;
   std::vector<std::shared_ptr<std::atomic<bool>>> controller_executing_;
   std::vector<rclcpp::SubscriptionBase::SharedPtr> action_status_subs_;
 };
