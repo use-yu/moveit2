@@ -1568,9 +1568,9 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        if not self.set_tool_power("right", 1):
-            log.error("[pick] 右臂工具上电失败")
-            return False
+        # if not self.set_tool_power("right", 1):
+        #     log.error("[pick] 右臂工具上电失败")
+        #     return False
 
         log.info(
             "[pick] 4/8  第一段复位：反向 approach + 1/8 OMPL → 1/8 初始位置"
@@ -1594,9 +1594,9 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        if not self.set_tool_power("right", 0):
-            log.error("[pick] 右臂工具下电失败")
-            return False
+        # if not self.set_tool_power("right", 0):
+        #     log.error("[pick] 右臂工具下电失败")
+        #     return False
 
         # log.info("[pick] 5/8  OMPL  → 运动到放置位置")
         # current = self._get_joints(joint_names, wait_new=True)
@@ -1706,11 +1706,14 @@ def main(argv: list[str] | None = None) -> int:
             x=x_mm / 1000.0,
             y=y_mm / 1000.0,
             z=z_mm / 1000.0,
-            roll=roll,
-            pitch=pitch,
-            yaw=yaw,
+            # roll=roll,
+            # pitch=pitch,
+            # yaw=yaw,
+            roll=1.531,
+            pitch=0.459,
+            yaw=-2.358,
         )
-
+        print(f"EE_POSE2 = {EE_POSE2}")
         # return 1
         # --- 1. 添加深框 ---
         log.info(f"添加碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
@@ -1721,7 +1724,7 @@ def main(argv: list[str] | None = None) -> int:
         # --- 2. 关节空间运动 ---   
         targets = JOINT_TARGETS[ACTIVE_GROUP]
         joint_names = list(targets.keys())
-        q1 = [0.0, 0.0, 0.0, 30 * math.pi / 180, 
+        q1 = [0.0, 0.0, 0.0, 45 * math.pi / 180, 
         -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477, 
         1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,]
         # q2 = [1.25, 0.0, -0.25, 1.1, 
@@ -1767,7 +1770,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not node.pick_and_return(
             target_pose=target_pose,
-            speed_scale=0.2,
+            speed_scale=0.1,
             group=pick_group,
             link=EE_LINK,
             plan_frame=PLAN_FRAME,
