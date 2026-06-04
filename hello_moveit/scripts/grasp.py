@@ -77,17 +77,21 @@ from visualization_msgs.msg import Marker
 ACTIVE_GROUP = "dual_arm"
 
 # 第二步：末端位姿规划组与目标（连杆 L6，坐标系 base_link）
-POSE_GROUP = "left_body"
+POSE_GROUP = "right_arm"
+
+PLAN_FRAME = "r_base_link"  # 末端位姿约束坐标系
 
 # EE_LINK 必须在 末端linkL6 下游、用 fixed joint 连上去的子 link（例如 l_tool）
-EE_LINK = "l_tool"
+EE_LINK = "r_tool"
+
+# r_base_link r_tool
 EE_POSE2 = dict(
-    x=-0.724,
-    y=-0.184,
-    z=0.058,
-    roll=1.731,
-    pitch=-0.149,
-    yaw=-0.232,
+    x=-0.865,
+    y=0.240,
+    z=0.103,
+    roll=-2.125,
+    pitch=-0.131,
+    yaw=1.044,
 )
 
 # L6
@@ -196,7 +200,6 @@ PLANNER_ID = "RRTConnect"
 NUM_ATTEMPTS = 20
 PLAN_TIME_SEC = 10.0
 MOVE_MAX_RETRIES = 5  # move_action 失败后再试几次（应对 INVALID_MOTION_PLAN 等 OMPL 随机性失败）
-PLAN_FRAME = "base_link"  # 末端位姿约束坐标系
 
 # 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
 DEFAULT_SPEED_SCALE = 0.5
@@ -206,7 +209,7 @@ SCENE_FRAME = "base_link"
 FRAME_ID = "深框"
 FRAME_SIZE = (1.18, 1.18, 0.58)  # 深框整体外尺寸：长×宽×高 [m]
 WALL_T = 0.09  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
-FRAME_CENTER = (-0.81, -0.363, -0.1)  # 深框整体外轮廓中心，相对于 base_link [m]
+FRAME_CENTER = (-0.81 - 0.005, -0.363, -0.1)  # 深框整体外轮廓中心，相对于 base_link [m]
 FRAME_RPY_DEG = (90.0, -0.0, 180.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 
@@ -594,7 +597,7 @@ class G01Demo(Node):
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
-        self.create_subscription(JointState, "joint_states", self._on_js, 10)
+        self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 10)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
@@ -1483,74 +1486,74 @@ class G01Demo(Node):
             + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
         )
 
-        log.info("[pick] 5/8  OMPL  → 运动到放置位置")
-        current = self._get_joints(joint_names, wait_new=True)
-        if current is None:
-            log.error("[pick] 读取当前关节失败")
-            return False
-        goal = [make_joint_constraints_from_vector(group, joint_names, place_joints)]
-        ok, used_ms, to_place_traj = self.move(
-            group, goal, start=current, plan_only=False, speed_scale=place_speed_scale
-        )
-        log.info(f"[pick] OMPL → 放置位置: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
-        if not ok:
-            log.error("[pick] 运动到放置位置失败")
-            return False
-        if to_place_traj is None or not to_place_traj.joint_trajectory.points:
-            log.error("[pick] 5/8 未返回 OMPL 轨迹，无法原路返回")
-            return False
-        log.info(
-            "[pick] 放置位关节: "
-            + ", ".join(f"{n}={v:.3f}" for n, v in zip(joint_names, place_joints))
-        )
+        # log.info("[pick] 5/8  OMPL  → 运动到放置位置")
+        # current = self._get_joints(joint_names, wait_new=True)
+        # if current is None:
+        #     log.error("[pick] 读取当前关节失败")
+        #     return False
+        # goal = [make_joint_constraints_from_vector(group, joint_names, place_joints)]
+        # ok, used_ms, to_place_traj = self.move(
+        #     group, goal, start=current, plan_only=False, speed_scale=place_speed_scale
+        # )
+        # log.info(f"[pick] OMPL → 放置位置: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        # if not ok:
+        #     log.error("[pick] 运动到放置位置失败")
+        #     return False
+        # if to_place_traj is None or not to_place_traj.joint_trajectory.points:
+        #     log.error("[pick] 5/8 未返回 OMPL 轨迹，无法原路返回")
+        #     return False
+        # log.info(
+        #     "[pick] 放置位关节: "
+        #     + ", ".join(f"{n}={v:.3f}" for n, v in zip(joint_names, place_joints))
+        # )
 
-        log.info(
-            f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
-            f"（笛卡尔，从当前位姿 FK 偏移）"
-        )
-        current = self._get_joints(joint_names, wait_new=True)
-        if current is None:
-            log.error("[pick] 读取当前关节失败")
-            return False
-        ee_pose = self._get_link_pose_fk(
-            link, current, joint_names=joint_names, plan_frame=plan_frame
-        )
-        if ee_pose is None:
-            log.error("[pick] FK 读取当前末端位姿失败")
-            return False
-        offset_pose = pose_offset_local_z(ee_pose, POST_RETURN_Z_OFFSET)
-        z_offset_traj = self._cartesian_plan(
-            group, link, offset_pose,
-            speed_scale=speed_scale,
-            joint_names=joint_names,
-            plan_frame=plan_frame,
-        )
-        if z_offset_traj is None:
-            log.error("[pick] 6/8 笛卡尔直线规划失败")
-            return False
-        if not self._execute_traj(z_offset_traj):
-            log.error("[pick] 6/8 沿末端 z 轴直线移动执行失败")
-            return False
+        # log.info(
+        #     f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
+        #     f"（笛卡尔，从当前位姿 FK 偏移）"
+        # )
+        # current = self._get_joints(joint_names, wait_new=True)
+        # if current is None:
+        #     log.error("[pick] 读取当前关节失败")
+        #     return False
+        # ee_pose = self._get_link_pose_fk(
+        #     link, current, joint_names=joint_names, plan_frame=plan_frame
+        # )
+        # if ee_pose is None:
+        #     log.error("[pick] FK 读取当前末端位姿失败")
+        #     return False
+        # offset_pose = pose_offset_local_z(ee_pose, POST_RETURN_Z_OFFSET)
+        # z_offset_traj = self._cartesian_plan(
+        #     group, link, offset_pose,
+        #     speed_scale=speed_scale,
+        #     joint_names=joint_names,
+        #     plan_frame=plan_frame,
+        # )
+        # if z_offset_traj is None:
+        #     log.error("[pick] 6/8 笛卡尔直线规划失败")
+        #     return False
+        # if not self._execute_traj(z_offset_traj):
+        #     log.error("[pick] 6/8 沿末端 z 轴直线移动执行失败")
+        #     return False
 
-        log.info(
-            f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
-            f"（{len(z_offset_traj.joint_trajectory.points)} 点）"
-        )
-        if not self._execute_traj(self._reverse_trajectory(z_offset_traj)):
-            log.error("[pick] 7/8 反向播放 6/8 失败")
-            return False
+        # log.info(
+        #     f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
+        #     f"（{len(z_offset_traj.joint_trajectory.points)} 点）"
+        # )
+        # if not self._execute_traj(self._reverse_trajectory(z_offset_traj)):
+        #     log.error("[pick] 7/8 反向播放 6/8 失败")
+        #     return False
 
-        log.info(
-            f"[pick] 8/8  原路返回 ②：反向播放 5/8 → 1/8 初始位置 "
-            f"（{len(to_place_traj.joint_trajectory.points)} 点）"
-        )
-        if not self._execute_traj(self._reverse_trajectory(to_place_traj)):
-            log.error("[pick] 8/8 反向播放 5/8 失败")
-            return False
-        log.info(
-            "[pick] 原路返回完成，当前应在 1/8 初始位置: "
-            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
-        )
+        # log.info(
+        #     f"[pick] 8/8  原路返回 ②：反向播放 5/8 → 1/8 初始位置 "
+        #     f"（{len(to_place_traj.joint_trajectory.points)} 点）"
+        # )
+        # if not self._execute_traj(self._reverse_trajectory(to_place_traj)):
+        #     log.error("[pick] 8/8 反向播放 5/8 失败")
+        #     return False
+        # log.info(
+        #     "[pick] 原路返回完成，当前应在 1/8 初始位置: "
+        #     + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
+        # )
 
         log.info("[pick] 抓取流程完成。")
         return True
@@ -1575,10 +1578,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         # 视觉识别
-        vision_sock = connect_vision(log)
-        if vision_sock is not None:
-            pose = read_vision_pose(vision_sock, log)
-            print(f"viewer pose = {pose}")
+        # vision_sock = connect_vision(log)
+        # if vision_sock is not None:
+        #     pose = read_vision_pose(vision_sock, log)
+        #     print(f"viewer pose = {pose}")
 
         # --- 1. 添加深框 ---
         log.info(f"添加碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
@@ -1586,64 +1589,64 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         frame_added = True
 
-        # # --- 2. 关节空间运动 ---   
-        # targets = JOINT_TARGETS[ACTIVE_GROUP]
-        # joint_names = list(targets.keys())
-        # q1 = [1.25, 0.0, -0.25, 1.1, 
-        # 1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477, 
-        # 1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,]
-        # # q2 = [1.25, 0.0, -0.25, 1.1, 
-        # # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
-        # # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
+        # --- 2. 关节空间运动 ---   
+        targets = JOINT_TARGETS[ACTIVE_GROUP]
+        joint_names = list(targets.keys())
+        q1 = [0.0, 0.0, 0.0, 30 * math.pi / 180, 
+        -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477, 
+        1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,]
+        # q2 = [1.25, 0.0, -0.25, 1.1, 
+        # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
+        # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
 
-        # waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
+        waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
 
-        # log.info(f"关节规划组: {ACTIVE_GROUP}")
-        # current = node._get_joints(joint_names)
-        # if current is None:
-        #     log.error("读取当前关节位置失败，无法规划")
-        #     return 1
-        # log.info("规划前当前关节位置 [rad]:")
-        # log.info("  " + ", ".join(joint_names))
-        # log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
+        log.info(f"关节规划组: {ACTIVE_GROUP}")
+        current = node._get_joints(joint_names)
+        if current is None:
+            log.error("读取当前关节位置失败，无法规划")
+            return 1
+        log.info("规划前当前关节位置 [rad]:")
+        log.info("  " + ", ".join(joint_names))
+        log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
-        # node.show_cylinder_at_pose(EE_POSE2)
+        node.show_cylinder_at_pose(EE_POSE2)
 
-        # log.info("按回车继续，输入 q 回车退出并移除深框 …")
-        # try:
-        #     if input().strip().lower() == "q":
-        #         return 0
-        # except EOFError:
-        #     pass
+        log.info("按回车继续，输入 q 回车退出")
+        try:
+            if input().strip().lower() == "q":
+                return 0
+        except EOFError:
+            pass
 
-        # if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, DEFAULT_SPEED_SCALE, joint_names, waypoints):
-        #     log.error("关节规划/执行失败")
-        #     return 1
-        # # --- 3. 抓取流程 ---
-        # pick_group = POSE_GROUP
-        # pick_joint_names = joint_names_for_group(pick_group)
-        # if pick_group not in PLACE_JOINTS:
-        #     log.error(f"PLACE_JOINTS 中未配置 group={pick_group}")
-        #     return 1
-        # ep = EE_POSE2
-        # target_pose = make_pose(
-        #     ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
-        # )
-        # log.info(
-        #     f"抓取: group={pick_group}, link={EE_LINK}, frame={PLAN_FRAME}"
-        # )
-        # if not node.pick_and_return(
-        #     target_pose=target_pose,
-        #     speed_scale=0.2,
-        #     group=pick_group,
-        #     link=EE_LINK,
-        #     plan_frame=PLAN_FRAME,
-        #     joint_names=pick_joint_names,
-        #     place_joints=PLACE_JOINTS[pick_group],
-        #     place_speed_scale=0.5,
-        # ):
-        #     log.error("抓取流程失败")
-        #     return 1
+        if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, 0.2, joint_names, waypoints):
+            log.error("关节规划/执行失败")
+            return 1
+        # --- 3. 抓取流程 ---
+        pick_group = POSE_GROUP
+        pick_joint_names = joint_names_for_group(pick_group)
+        if pick_group not in PLACE_JOINTS:
+            log.error(f"PLACE_JOINTS 中未配置 group={pick_group}")
+            return 1
+        ep = EE_POSE2
+        target_pose = make_pose(
+            ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
+        )
+        log.info(
+            f"抓取: group={pick_group}, link={EE_LINK}, frame={PLAN_FRAME}"
+        )
+        if not node.pick_and_return(
+            target_pose=target_pose,
+            speed_scale=0.2,
+            group=pick_group,
+            link=EE_LINK,
+            plan_frame=PLAN_FRAME,
+            joint_names=pick_joint_names,
+            place_joints=PLACE_JOINTS[pick_group],
+            place_speed_scale=0.2,
+        ):
+            log.error("抓取流程失败")
+            return 1
 
         log.info("按回车继续，输入 q 回车退出并移除深框 …")
         try:
