@@ -169,10 +169,11 @@ class ArmRosBridge(Node):
         for i, name in enumerate(msg.name):
             if i < len(msg.position):
                 name_to_pos[str(name)] = float(msg.position[i])
-
+    
         left_cmd = self._extract_arm_command(name_to_pos, LEFT_JOINTS)
         right_cmd = self._extract_arm_command(name_to_pos, RIGHT_JOINTS)
 
+        # 把数据写入内核发送缓冲区，没 recv(200)
         if left_cmd is not None:
             ServoJ(self.arm_clients[0], [math.degrees(value) for value in left_cmd])
         if right_cmd is not None:

@@ -37,6 +37,8 @@ import copy
 import math
 import multiprocessing
 import random
+import re
+import socket
 import sys
 import time
 from typing import Iterable, Sequence
@@ -243,6 +245,14 @@ PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距�
 POST_RETURN_Z_OFFSET = 0.1  # 复位后沿末端 +z 轴直线移动距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 
+# 视觉 TCP 配置
+VISION_IP = "192.168.5.111"
+VISION_PORT = 5700
+VISION_TRIGGER_COMMAND = "320,1,2,1,1,0"
+VISION_CONNECT_TIMEOUT = 3.0
+VISION_RECV_TIMEOUT = 20.0
+NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
 IK_N_CANDIDATES = 200          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
 IK_SEED_PERTURB = math.pi/2     # 随机种子各关节的最大扰动幅度 [rad]，越大解越分散
@@ -253,6 +263,52 @@ IK_RANDOM_SEED = 42           # 让 IK 多解枚举可复现；改成 None 则�
 # =============================================================================
 # 几何与消息构造（纯函数，无 ROS 通信）
 # =============================================================================
+
+
+def connect_vision(log) -> socket.socket | None:
+    """连接视觉 TCP，后续可复用同一个 socket 多次读取。"""
+    try:
+        sock = socket.create_connection(
+            (VISION_IP, VISION_PORT),
+            timeout=VISION_CONNECT_TIMEOUT,
+        )
+        sock.settimeout(VISION_RECV_TIMEOUT)
+        log.info(f"已连接视觉 TCP：{VISION_IP}:{VISION_PORT}")
+        return sock
+    except OSError as exc:
+        message = f"viewer 连接失败：{exc}"
+        log.error(message)
+        print(message)
+        return None
+
+
+def read_vision_pose(sock: socket.socket, log) -> list[float] | None:
+    """复用已连接 socket，触发一次视觉并返回解析后的 Dobot pose。"""
+    try:
+        sock.sendall(VISION_TRIGGER_COMMAND.encode("utf-8"))
+        raw_text = sock.recv(4096).decode("utf-8", errors="ignore").strip()
+        numbers = [float(item) for item in NUMBER_PATTERN.findall(raw_text)]
+        if len(numbers) < 6:
+            message = f"viewer 返回数字不足 6 个：{raw_text}"
+            log.error(message)
+            print(message)
+            return None
+        pose = numbers[-6:]
+        # log.info(f"viewer pose = {pose}")
+        return pose
+    except OSError as exc:
+        message = f"viewer 获取 pose 失败：{exc}"
+        log.error(message)
+        print(message)
+        return None
+
+
+def close_vision(sock: socket.socket | None, log) -> None:
+    """关闭视觉 TCP 连接。"""
+    if sock is None:
+        return
+    sock.close()
+    log.info("已关闭视觉 TCP 连接")
 
 
 def quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
@@ -1497,13 +1553,22 @@ def main(argv: list[str] | None = None) -> int:
     log = node.get_logger()
     code = 1
     frame_added = False
+    vision_sock = None
 
     try:
         if ACTIVE_GROUP not in JOINT_TARGETS:
             log.error(f"未知 ACTIVE_GROUP={ACTIVE_GROUP}，可选: {list(JOINT_TARGETS)}")
             return 1
-
+            
+        # 视觉识别
+        vision_sock = connect_vision(log)
+        if vision_sock is not None:
+            pose = read_vision_pose(vision_sock, log)
+            print(f"viewer pose = {pose}")
+        return 1
+        
         # --- 1. 添加深框 ---
+
         log.info(f"添加碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
         if not node.add_frame():
             return 1
@@ -1577,6 +1642,7 @@ def main(argv: list[str] | None = None) -> int:
         code = 0
 
     finally:
+        close_vision(vision_sock, log)
         node.remove_cylinder_at_pose()
         if frame_added:
             log.info(f"移除「{FRAME_ID}」…")

@@ -14,9 +14,9 @@ viewer.py
 
 默认配置等价于：
   input_mode: "tcp"
-  vision_ip: "192.168.5.11"
+  vision_ip: "192.168.5.111"
   vision_port: 5700
-  vision_trigger_command: "320,1,1,1,1,0"
+  vision_trigger_command: "320,1,2,1,1,0"
   vision_request_interval: 0.1
   vision_single_shot: true
   vision_pose_is_robot_pose: true
@@ -53,10 +53,10 @@ class VisionTcpViewer(Node):
 
         # 声明并读取 ROS2 参数；没有外部 yaml 时使用这里的默认值。
         self.input_mode = self.declare_parameter("input_mode", "tcp").value
-        self.vision_ip = self.declare_parameter("vision_ip", "192.168.5.11").value
+        self.vision_ip = self.declare_parameter("vision_ip", "192.168.5.111").value
         self.vision_port = self.declare_parameter("vision_port", 5700).value
         self.trigger_command = self.declare_parameter(
-            "vision_trigger_command", "320,1,1,1,1,0"
+            "vision_trigger_command", "320,1,2,1,1,0"
         ).value
         self.request_interval = self.declare_parameter(
             "vision_request_interval", 0.1
@@ -99,7 +99,7 @@ class VisionTcpViewer(Node):
             (str(self.vision_ip), int(self.vision_port)),
             timeout=3.0,
         )
-        self.sock.settimeout(3.0)
+        self.sock.settimeout(20.0)
         self.get_logger().info("已连接视觉 TCP 服务")
 
     def close(self) -> None:
