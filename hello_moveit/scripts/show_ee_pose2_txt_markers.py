@@ -3,7 +3,7 @@
 """
 读取 txt 文件中的 EE_POSE2 位姿列表，在 RViz 中显示所有圆柱体 Marker。
 按回车退出时，移除全部 Marker。
-
+base_link
 txt 行格式兼容 sample/reach 脚本输出（以 \t 分隔的 key=value）：
     i    x=...    y=...    z=...    roll=...    pitch=...    yaw=...    ...
 """

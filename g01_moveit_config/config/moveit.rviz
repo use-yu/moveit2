@@ -156,6 +156,22 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          l_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          l_tool:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          r_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          r_tool:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           world:
             Alpha: 1
             Show Axes: false
@@ -184,7 +200,7 @@ Visualization Manager:
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
         Planning Group: right_body
-        Query Goal State: false
+        Query Goal State: true
         Query Start State: false
         Show Workspace: false
         Start State Alpha: 1
@@ -291,6 +307,22 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          l_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          l_tool:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          r_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          r_tool:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           world:
             Alpha: 1
             Show Axes: false
@@ -403,6 +435,22 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
+        l_base_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        l_tool:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        r_base_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        r_tool:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
         world:
           Alpha: 1
           Show Axes: false
@@ -454,6 +502,14 @@ Visualization Manager:
           Value: true
         base_x_link:
           Value: false
+        l_base_link:
+          Value: true
+        l_tool:
+          Value: true
+        r_base_link:
+          Value: true
+        r_tool:
+          Value: true
         world:
           Value: true
       Marker Scale: 1
@@ -474,14 +530,20 @@ Visualization Manager:
                           L4:
                             L5:
                               L6:
-                                {}
+                                l_tool:
+                                  {}
                     R1:
                       R2:
                         R3:
                           R4:
                             R5:
                               R6:
-                                {}
+                                r_tool:
+                                  {}
+                    l_base_link:
+                      {}
+                    r_base_link:
+                      {}
       Update Interval: 0
       Value: true
   Enabled: true
@@ -509,18 +571,18 @@ Visualization Manager:
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 1.5131192207336426
-        Y: -0.13363100588321686
-        Z: 0.5235469341278076
+        X: 0.4266139268875122
+        Y: -0.12249746918678284
+        Z: 0.7628470659255981
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.5047964453697205
+      Pitch: 0.23979665338993073
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 1.3619825839996338
+      Yaw: 5.920164108276367
     Saved: ~
 Window Geometry:
   Displays:
@@ -534,7 +596,7 @@ Window Geometry:
     collapsed: false
   MotionPlanning - Trajectory Slider:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000002b4000003a8fc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000001600000016fb000000100044006900730070006c006100790073010000003b00000187000000c700fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e006701000001c80000021b0000016900fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000043c00000109000000a000ffffff00000490000003a800000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000002b4000003a8fc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb000000100044006900730070006c006100790073010000003b00000187000000c700fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e006701000001c80000021b0000016900fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000043c00000109000000a000ffffff00000490000003a800000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
   Width: 1866

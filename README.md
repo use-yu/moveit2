@@ -6,6 +6,10 @@ ros2 launch g01_moveit_config demo.launch.py
 官方例子
 ros2 launch moveit2_tutorials demo.launch.py
 
+显示可达点
+show_ee_pose2_txt_markers.py
+
+
 qj2m：
 ros2 launch qj2m_moveit_config demo.launch.py
 ros2 run hello_moveit hello_qj2m
