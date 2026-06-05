@@ -69,7 +69,7 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    
+
     <!-- 桌子 -->
     <visual>
       <origin xyz="0.0 -0.023 0.0" rpy="0 0 0" />
@@ -86,13 +86,23 @@
           <box size="0.425 0.1 0.9" />
       </geometry>
     </collision>
+
     <!-- 底盘 -->
-    <!-- <collision>
+    <!-- <visual>
       <origin xyz="0.13 -0.52 0.0" rpy="0 0 0" />
       <geometry>
-          <box size="0.78 0.19 0.65" />
+        <box size="0.78 0.19 0.65" />
       </geometry>
-    </collision> -->
+      <material name="base_link_box_transparent">
+        <color rgba="1 0 0 0.5" />
+      </material>
+    </visual> -->
+    <collision>
+      <origin xyz="0.13 -0.52 0.0" rpy="0 0 0" />
+      <geometry>
+          <box size="0.785 0.19 0.65" />
+      </geometry>
+    </collision>
     <!-- 后舱/电池仓 -->
     <collision>
       <origin xyz="0.26 -0.255 0.0" rpy="0 0 0" />
@@ -265,7 +275,7 @@
       xyz="0 -1 0" />
     <limit
       lower="-0.25"
-      upper="0.0"
+      upper="0"
       effort="100"
       velocity="1" />
   </joint>
@@ -299,13 +309,19 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-    <!-- <collision>
+    <collision>
       <origin xyz="-0.02 0.19752 -0.094" rpy="0 0 0" />
       <geometry>
         <box size="0.23 0.51 0.32" />
       </geometry>
-    </collision> -->
+    </collision>
     <collision>
+      <origin xyz="-0.15 0.28 -0.094" rpy="0 0 0" />
+      <geometry>
+        <box size="0.05 0.05 0.09" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -313,7 +329,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/YB.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
 
   <!-- <link name="base_link_yb">
@@ -355,7 +371,7 @@
       lower="0"
       upper="1.5708"
       effort="100"
-      velocity="0.1" />
+      velocity="0.26" />
   </joint>
   <link
     name="R1">
@@ -388,14 +404,20 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="-0.000 0.001 0.081" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.065" length="0.170" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/R1.STL"/>
+          filename="package://moveit_resources_g01_description/meshes/R1.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="r_arm_joint1"
@@ -446,6 +468,24 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="0.000 0.000 0.086" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.065" length="0.160" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.000 -0.374 0.086" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.065" length="0.160" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.000 -0.188 0.082" rpy="1.57079631189374 0 0" />
+      <geometry>
+        <cylinder radius="0.06" length="0.240" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -453,7 +493,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/R2.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="r_arm_joint2"
@@ -505,6 +545,24 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="-0.000 0.000 0.046" rpy="0 0 0" />
+      <geometry>
+    <cylinder radius="0.065" length="0.10" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.000 -0.306 0.046" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.045" length="0.140" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.000 -0.161 0.039" rpy="-1.57079631189374 0 0" />
+      <geometry>
+        <cylinder radius="0.045" length="0.180" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -512,7 +570,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/R3.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="r_arm_joint3"
@@ -563,6 +621,12 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="0.006 -0.000 0.043" rpy="-3.1416 1.57079631189374 -3.1416" />
+      <geometry>
+        <cylinder radius="0.045" length="0.140" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -570,7 +634,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/R4.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="r_arm_joint4"
@@ -621,6 +685,12 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="-0.000 -0.013 0.044" rpy="-1.57079631189374 0 0" />
+      <geometry>
+        <cylinder radius="0.045" length="0.150" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -628,7 +698,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/R5.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="r_arm_joint5"
@@ -679,14 +749,26 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="0.001 -0.001 0.122" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.085" length="0.10" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.000 0.000 0.033" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.045" length="0.07" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/R6.STL"/>
+          filename="package://moveit_resources_g01_description/meshes/R6.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="r_arm_joint6"
@@ -737,6 +819,12 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="-0.000 0.001 0.081" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.065" length="0.170" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -744,7 +832,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/L1.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="l_arm_joint1"
@@ -757,7 +845,7 @@
     <child
       link="L1" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -795,6 +883,24 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="0.000 0.000 0.086" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.065" length="0.160" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.000 -0.374 0.086" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.065" length="0.160" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.000 -0.188 0.082" rpy="1.57079631189374 0 0" />
+      <geometry>
+        <cylinder radius="0.06" length="0.240" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -802,7 +908,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/L2.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="l_arm_joint2"
@@ -815,7 +921,7 @@
     <child
       link="L2" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -853,6 +959,24 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="-0.000 0.000 0.046" rpy="0 0 0" />
+      <geometry>
+    <cylinder radius="0.065" length="0.10" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.000 -0.306 0.046" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.045" length="0.140" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.000 -0.161 0.039" rpy="-1.57079631189374 0 0" />
+      <geometry>
+        <cylinder radius="0.045" length="0.180" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -860,7 +984,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/L3.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="l_arm_joint3"
@@ -873,7 +997,7 @@
     <child
       link="L3" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-2.79"
       upper="2.79"
@@ -911,6 +1035,12 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="0.000 0.006 0.045" rpy="1.57079631189374 0 0" />
+      <geometry>
+        <cylinder radius="0.045" length="0.140" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -918,7 +1048,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/L4.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="l_arm_joint4"
@@ -931,7 +1061,7 @@
     <child
       link="L4" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -969,6 +1099,12 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="-0.000 -0.013 0.044" rpy="-1.57079631189374 0 0" />
+      <geometry>
+        <cylinder radius="0.045" length="0.150" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -976,7 +1112,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/L5.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="l_arm_joint5"
@@ -989,7 +1125,7 @@
     <child
       link="L5" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -1027,6 +1163,18 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="0.001 -0.001 0.122" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.085" length="0.10" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.000 0.000 0.033" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.045" length="0.07" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -1034,7 +1182,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/L6.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="l_arm_joint6"
@@ -1047,7 +1195,7 @@
     <child
       link="L6" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -1069,18 +1217,30 @@
         <origin xyz="0 0 0.15" rpy="0 0 0"/>
   </joint>
 
+  <!-- <link name="l_base_link" />
+  <joint name="l_base_link_to_L6" type="fixed">
+        <parent link="L1" />
+        <child link="l_base_link"/>
+        <origin xyz="0 0 -0.064" rpy="0 0 -1.5707963267949"/>
+  </joint>
+
+  <link name="r_base_link" />
+  <joint name="r_base_link_to_L6" type="fixed">
+        <parent link="R1" />
+        <child link="r_base_link"/>
+        <origin xyz="0 0 -0.064" rpy="0 0 1.5707963267949"/>
+  </joint> -->
   <link name="l_base_link" />
   <joint name="l_base_link_to_YB" type="fixed">
         <parent link="YB" />
         <child link="l_base_link"/>
-        <origin xyz="0.000 0.378 0.0565" rpy="0 0 -3.1415926"/>
+        <origin xyz="0.000 0.378 0.056" rpy="0 0 -3.1415926"/>
   </joint>
 
   <link name="r_base_link" />
   <joint name="r_base_link_to_YB" type="fixed">
         <parent link="YB" />
         <child link="r_base_link"/>
-        <origin xyz="-0.000 0.378 -0.2445" rpy="-3.1415926 0 0"/>
+        <origin xyz="-0.000 0.378 -0.244" rpy="-3.1415926 0 0"/>
   </joint>
-
 </robot>
