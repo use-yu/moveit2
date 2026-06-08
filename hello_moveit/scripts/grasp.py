@@ -1625,10 +1625,10 @@ class G01Demo(Node):
 
         log.info("[pick] 3/8  到达抓取位置，按回车继续 …")
 
-        try:
-            input()
-        except EOFError:
-            pass
+        # try:
+        #     input()
+        # except EOFError:
+        #     pass
 
         # if not self.set_tool_power("right", 1):
         #     log.error("[pick] 右臂工具上电失败")
@@ -1656,9 +1656,9 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        # if not self.set_tool_power("right", 0):
-        #     log.error("[pick] 右臂工具下电失败")
-        #     return False
+        if not self.set_tool_power("right", 0):
+            log.error("[pick] 右臂工具下电失败")
+            return False
 
         # log.info("[pick] 5/8  OMPL  → 运动到放置位置")
         # current = self._get_joints(joint_names, wait_new=True)
@@ -1759,38 +1759,11 @@ def main(argv: list[str] | None = None) -> int:
             log.error(f"未知 ACTIVE_GROUP={ACTIVE_GROUP}，可选: {list(JOINT_TARGETS)}")
             return 1
 
-        grasp_cmd = node.wait_for_grasp_start()
-        if grasp_cmd is None:
-            return 1
+        # 上位机通信
+        # grasp_cmd = node.wait_for_grasp_start()
+        # if grasp_cmd is None:
+        #     return 1
     
-        # 视觉识别
-        vision_sock = connect_vision(log)
-        if vision_sock is None:
-            return finish(False, 0, 1)
-        pose = read_vision_pose(vision_sock, log)
-        print(f"viewer pose = {pose}")
-        if pose is None:
-            return finish(False, 0, 1)
-        x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
-        print(
-            "viewer pose transformed: "
-            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
-            f"z={z_mm / 1000.0:.6f} m, "
-            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
-        )
-        EE_POSE2 = dict(
-            x=x_mm / 1000.0,
-            y=y_mm / 1000.0,
-            z=z_mm / 1000.0,
-            # roll=roll,
-            # pitch=pitch,
-            # yaw=yaw,
-            roll=1.531,
-            pitch=0.459,
-            yaw=-2.358,
-        )
-        print(f"EE_POSE2 = {EE_POSE2}")
-        # return 1
         # --- 1. 添加深框 ---
         log.info(f"添加碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
         if not node.add_frame():
@@ -1818,18 +1791,51 @@ def main(argv: list[str] | None = None) -> int:
         log.info("  " + ", ".join(joint_names))
         log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
-        node.show_cylinder_at_pose(EE_POSE2)
-
-        log.info("按回车继续，输入 q 回车退出")
-        try:
-            if input().strip().lower() == "q":
-                return finish(False, 0, 0)
-        except EOFError:
-            pass
+        # log.info("按回车继续，输入 q 回车退出")
+        # try:
+        #     if input().strip().lower() == "q":
+        #         return finish(False, 0, 0)
+        # except EOFError:
+        #     pass
 
         if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, 0.2, joint_names, waypoints):
             log.error("关节规划/执行失败")
             return finish(False, 0, 1)
+
+
+        # 视觉识别
+        vision_sock = connect_vision(log)
+        if vision_sock is None:
+            return finish(False, 0, 1)
+        pose = read_vision_pose(vision_sock, log)
+        if pose is not None and len(pose) >= 6:
+            pose[3], pose[5] = pose[5], pose[3]  # 索引3是第4位，索引5是第6位
+        print(f"viewer pose = {pose}")
+        if pose is None:
+            return finish(False, 0, 1)
+        x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        print(
+            "viewer pose transformed: "
+            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
+            f"z={z_mm / 1000.0:.6f} m, "
+            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
+        )
+        EE_POSE2 = dict(
+            x=x_mm / 1000.0,
+            y=y_mm / 1000.0,
+            z=z_mm / 1000.0,
+            roll=roll,
+            pitch=pitch,
+            yaw=yaw,
+            # roll=1.531,
+            # pitch=0.459,
+            # yaw=-2.358,
+        )
+        print(f"EE_POSE2 = {EE_POSE2}")
+        # return 1
+
+        node.show_cylinder_at_pose(EE_POSE2)
+
         # --- 3. 抓取流程 ---
         pick_group = POSE_GROUP
         pick_joint_names = joint_names_for_group(pick_group)
@@ -1859,12 +1865,12 @@ def main(argv: list[str] | None = None) -> int:
 
         finish(True, 1, 0)
 
-        log.info("按回车继续，输入 q 回车退出并移除深框 …")
-        try:
-            if input().strip().lower() == "q":
-                return 0
-        except EOFError:
-            pass
+        # log.info("按回车继续，输入 q 回车退出并移除深框 …")
+        # try:
+        #     if input().strip().lower() == "q":
+        #         return 0
+        # except EOFError:
+        #     pass
         code = 0
 
     finally:
