@@ -262,16 +262,19 @@ def EnableRobot(client):
     tcp_command = tcp_command.encode()
     client.send(tcp_command)
     buf = client.recv(200).decode()  # 接收反馈信息的长度
-    index_str = buf[buf.find('{') + 1:buf.find('}')]
-    if (index_str == ''):
-        return -1
-    return buf[buf.find('{') + 1:buf.find('}')]
+    return parse_dashboard_result(buf)
 
 def parse_dashboard_result(text):
     try:
         return int(text.split(",", 1)[0].strip())
     except (ValueError, IndexError):
         return -1
+
+def iter_dashboard_responses(text):
+    for chunk in text.split(";"):
+        chunk = chunk.strip()
+        if chunk:
+            yield parse_dashboard_result(chunk), chunk
 
 def send_dashboard_once(ip, port, command):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -302,18 +305,32 @@ def create_client_socket(ip, port):
 client_sockets = [create_client_socket(ip, SERVER_PORT) for ip in SERVER_ADDRESSES]
 def worker(client_socket, name):  #子线程接受模式
     global stop
-    while True:
+    recv_buffer = ""
+    while stop:
         try:
             data = client_socket.recv(1024).decode()
             if data:
-                #print(data)
-                index_str = data[data.find('{') + 1:data.find('}')]
-                if (index_str == ''):
-                    stop = False
-                    print(f'{name} 返回异常，停止运动')
-                    break
+                recv_buffer += data
+                responses = recv_buffer.split(";")
+                recv_buffer = responses.pop()
+                for result, response_text in iter_dashboard_responses(";".join(responses)):
+                    if result != 0:
+                        stop = False
+                        print(f'{name} 返回异常({result})：{response_text};，停止运动')
+                        break
+            else:
+                stop = False
+                print(f'{name} 连接断开，停止运动')
+                break
+            if not stop:
+                break
         except BlockingIOError:
             time.sleep(0.001)
+        except OSError as e:
+            if stop:
+                stop = False
+                print(f'{name} 接收失败：{e}，停止运动')
+            break
 time_h = time.time()
 state_node = None
 try:
