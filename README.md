@@ -1,4 +1,8 @@
 # moveit2
+
+[INFO] [1781004077.470543739] [g01_demo]: [grasp-select] 候选 IK 3/3：retreat 可行 ✓ (轨迹 14 点)
+
+
 运行代码：
 
 g01实际部署：

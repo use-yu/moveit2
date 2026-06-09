@@ -10,6 +10,7 @@ from std_msgs.msg import Float32
 COMMAND_TOPIC = "/g01/joint_commands"
 BODY_JOINT = "body_joint2"
 WAIST_COMMAND_TOPIC = "/taihu_motor_control/positon"
+WAIST_FIXED_COMMAND = 0.655417263507843
 
 
 class WaistCommandBridge(Node):
@@ -27,7 +28,7 @@ class WaistCommandBridge(Node):
                 continue
             if index >= len(msg.position):
                 return
-            self._pub.publish(Float32(data=float(msg.position[index])))
+            self._pub.publish(Float32(data=WAIST_FIXED_COMMAND))
             return
 
 

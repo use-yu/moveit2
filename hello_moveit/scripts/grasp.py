@@ -245,6 +245,12 @@ _ORI_TOL = 1e-3
 # 笛卡尔直线运动参数
 CART_EEF_STEP = 0.005     # 服务端 IK 离散步长（m）
 CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截断）
+CART_JUMP_THRESHOLD = 2.0  # 相对关节跳变阈值；0 表示关闭，容易接受绕腕跳解
+CART_REVOLUTE_JUMP_THRESHOLD = 0.08  # 单步任一转动关节超过该值 [rad] 视为跳解
+CART_PRISMATIC_JUMP_THRESHOLD = 0.02  # 单步任一移动关节超过该值 [m] 视为跳解
+CART_JUMP_STEP_FACTOR = 2.0  # 单步关节空间距离超过平均值该倍数，直接淘汰
+CART_MAX_POINT_FACTOR = 2.0  # 实际点数超过理论直线点数该倍数时，认为 IK 分支不稳
+CART_MAX_POINT_EXTRA = 5
 
 # left_body 放置位关节目标 [rad]（键顺序与 JOINT_TARGETS[group] 一致）
 PLACE_JOINTS = {
@@ -583,6 +589,69 @@ def make_cylinder_marker(
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
+
+def _pose_distance(a: Pose, b: Pose) -> float:
+    dx = a.position.x - b.position.x
+    dy = a.position.y - b.position.y
+    dz = a.position.z - b.position.z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _trajectory_joint_stats(traj: RobotTrajectory) -> tuple[float, float]:
+    """返回 (关节空间累计路程, 最大单步关节变化)。"""
+    pts = traj.joint_trajectory.points
+    if len(pts) < 2:
+        return 0.0, 0.0
+
+    total = 0.0
+    max_step = 0.0
+    for prev, cur in zip(pts, pts[1:]):
+        if not prev.positions or not cur.positions:
+            continue
+        deltas = [abs(b - a) for a, b in zip(prev.positions, cur.positions)]
+        if not deltas:
+            continue
+        total += sum(deltas)
+        max_step = max(max_step, max(deltas))
+    return total, max_step
+
+
+def _trajectory_joint_jump_reason(traj: RobotTrajectory) -> str | None:
+    """检测笛卡尔插补中的关节跳变；有跳变时返回原因，否则返回 None。"""
+    pts = traj.joint_trajectory.points
+    if len(pts) < 3:
+        return None
+
+    step_norms = []
+    max_joint_step = 0.0
+    for prev, cur in zip(pts, pts[1:]):
+        if not prev.positions or not cur.positions:
+            continue
+        deltas = [abs(b - a) for a, b in zip(prev.positions, cur.positions)]
+        if not deltas:
+            continue
+        max_joint_step = max(max_joint_step, max(deltas))
+        step_norms.append(math.sqrt(sum(d * d for d in deltas)))
+
+    if not step_norms:
+        return None
+
+    if max_joint_step > CART_REVOLUTE_JUMP_THRESHOLD:
+        return (
+            f"单关节单步 {max_joint_step:.3f} rad "
+            f"> {CART_REVOLUTE_JUMP_THRESHOLD:.3f} rad"
+        )
+
+    avg_step = sum(step_norms) / len(step_norms)
+    max_step = max(step_norms)
+    if avg_step > 1e-9 and max_step > avg_step * CART_JUMP_STEP_FACTOR:
+        return (
+            f"关节空间单步 {max_step:.3f} "
+            f"> 平均 {avg_step:.3f} * {CART_JUMP_STEP_FACTOR:.1f}"
+        )
+
+    return None
 
 
 def _moveit_error_name(val: int) -> str:
@@ -1301,7 +1370,9 @@ class G01Demo(Node):
         req.link_name = link
         req.waypoints = [end_pose]
         req.max_step = eef_step
-        req.jump_threshold = 0.0
+        req.jump_threshold = CART_JUMP_THRESHOLD
+        req.revolute_jump_threshold = CART_REVOLUTE_JUMP_THRESHOLD
+        req.prismatic_jump_threshold = CART_PRISMATIC_JUMP_THRESHOLD
         req.avoid_collisions = avoid_collisions
 
         p = end_pose.position
@@ -1310,6 +1381,7 @@ class G01Demo(Node):
                 f"[{group}] 笛卡尔直线 {link} @ {plan_frame}: "
                 f"end pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
                 f"max_step={eef_step:.4f}, avoid_collisions={avoid_collisions}, "
+                f"jump={CART_JUMP_THRESHOLD:.1f}/{CART_REVOLUTE_JUMP_THRESHOLD:.2f}rad, "
                 f"speed_scale={_clamp01(speed_scale):.2f}"
             )
 
@@ -1580,6 +1652,15 @@ class G01Demo(Node):
             log.error("[grasp-select] target_pose 在该 group 上没有任何 IK 解")
             return None
 
+        line_distance = _pose_distance(target_pose, pre_pose)
+        expected_points = int(math.ceil(line_distance / max(CART_EEF_STEP, 1e-6))) + 2
+        max_points = max(
+            expected_points + CART_MAX_POINT_EXTRA,
+            int(math.ceil(expected_points * CART_MAX_POINT_FACTOR)),
+        )
+        best = None
+        best_score = float("inf")
+
         for idx, q_target in enumerate(candidates):
             retreat_traj = self._cartesian_plan(
                 group, link, pre_pose,
@@ -1595,13 +1676,42 @@ class G01Demo(Node):
                 )
                 continue
 
+            point_count = len(retreat_traj.joint_trajectory.points)
+            total_motion, max_step = _trajectory_joint_stats(retreat_traj)
+            if point_count > max_points:
+                log.warning(
+                    f"[grasp-select] 候选 IK {idx + 1}/{len(candidates)}："
+                    f"retreat 点数异常 {point_count}>{max_points} "
+                    f"(理论约 {expected_points} 点, 直线距离 {line_distance:.3f} m) → 淘汰"
+                )
+                continue
+            jump_reason = _trajectory_joint_jump_reason(retreat_traj)
+            if jump_reason:
+                log.warning(
+                    f"[grasp-select] 候选 IK {idx + 1}/{len(candidates)}："
+                    f"检测到关节跳变（{jump_reason}）→ 淘汰"
+                )
+                continue
+
             approach_traj = self._reverse_trajectory(retreat_traj)
             last_pt = retreat_traj.joint_trajectory.points[-1]
             names = list(retreat_traj.joint_trajectory.joint_names)
             q_pre = {n: p for n, p in zip(names, last_pt.positions)}
+            score = total_motion + 0.01 * point_count
             log.info(
                 f"[grasp-select] 候选 IK {idx + 1}/{len(candidates)}：retreat 可行 ✓ "
-                f"(轨迹 {len(retreat_traj.joint_trajectory.points)} 点)"
+                f"(轨迹 {point_count} 点, joint_motion={total_motion:.3f}, "
+                f"max_step={max_step:.3f}, score={score:.3f})"
+            )
+            if score < best_score:
+                best_score = score
+                best = (q_pre, q_target, approach_traj, idx + 1, point_count, total_motion, max_step)
+
+        if best is not None:
+            q_pre, q_target, approach_traj, best_idx, point_count, total_motion, max_step = best
+            log.info(
+                f"[grasp-select] 选用候选 IK {best_idx}/{len(candidates)}："
+                f"{point_count} 点, joint_motion={total_motion:.3f}, max_step={max_step:.3f}"
             )
             return q_pre, q_target, approach_traj
 
@@ -1979,6 +2089,12 @@ def main(argv: list[str] | None = None) -> int:
         # return 1
 
         node.show_cylinder_at_pose(EE_POSE2)
+
+        log.info("按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
 
         # --- 3. 抓取流程 ---
         pick_group = POSE_GROUP
