@@ -113,6 +113,8 @@ RIGHT_JOINTS = JOINT_ORDER[10:16]
 COMMAND_TOPIC = "/g01/joint_commands"
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
+DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 45.0)
+TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 87.0)
 
 
 class fankuis():
@@ -192,7 +194,15 @@ class ArmRosBridge(Node):
             return response
 
         response.res = send_set_tool_power(client, status)
-        self.get_logger().info(f"/g01/{side}/tool_commands: SetToolPower({status}), res={response.res}")
+        payload = TOOL_POWER_ON_PAYLOAD if status == 1 else DEFAULT_PAYLOAD
+        payload_res = send_set_payload(client, *payload)
+        if response.res == 0:
+            response.res = payload_res
+        self.get_logger().info(
+            f"/g01/{side}/tool_commands: SetToolPower({status}), "
+            f"SetPayload(load={payload[0]}, x={payload[1]}, y={payload[2]}, z={payload[3]}), "
+            f"res={response.res}"
+        )
         return response
 
     def _on_left_tool_command(self, request, response):
@@ -247,6 +257,17 @@ def ServoJ(client, joints):
 
 def send_set_tool_power(client, status):
     tcp_command = "SetToolPower(%d)" % int(status)
+    tcp_command = tcp_command.encode()
+    client.sendall(tcp_command)
+    return 0
+
+def send_set_payload(client, load, x, y, z):
+    tcp_command = "SetPayload(%s,%s,%s,%s)" % (
+        float(load),
+        float(x),
+        float(y),
+        float(z),
+    )
     tcp_command = tcp_command.encode()
     client.sendall(tcp_command)
     return 0
@@ -344,6 +365,7 @@ try:
         feed_thread1.start()
     for client_socket in client_sockets:
         EnableRobot(client_socket)
+        send_set_payload(client_socket, *DEFAULT_PAYLOAD)
     for index, client_socket in enumerate(client_sockets, start=1):
         feed_thread = threading.Thread(
             target=worker,
