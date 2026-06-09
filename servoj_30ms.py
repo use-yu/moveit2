@@ -219,7 +219,7 @@ def joint(ip, side, state_node):
     while stop:
         actual = feed_v.feed()
         #print(actual)
-        if actual[0] != "NG":
+        if actual != ["NG"]:
            q_actual[side] = [round(num, 6) for num in actual[1]]
            state_node.publish_arm_state(side, q_actual[side])
            #print(q_actual[side])  # 输出: [3.141593, 2.718282, 1.414214]
@@ -261,7 +261,7 @@ def send_set_tool_power(client, status):
     client.sendall(tcp_command)
     return 0
 
-def send_set_payload(client, load, x, y, z):
+def send_set_payload(client, load, x, y, z, wait_response=False):
     tcp_command = "SetPayload(%s,%s,%s,%s)" % (
         float(load),
         float(x),
@@ -270,7 +270,11 @@ def send_set_payload(client, load, x, y, z):
     )
     tcp_command = tcp_command.encode()
     client.sendall(tcp_command)
-    return 0
+    if not wait_response:
+        return 0
+    buf = client.recv(200).decode()  # 接收反馈信息的长度
+    print(buf.strip())
+    return parse_dashboard_result(buf)
 
 def servoj_2(client, J1_angle):
     tcp_command = "servoj(%f,0,0,0,0,0,t=2,aheadtime=50, gain=500)" % (J1_angle)
@@ -335,6 +339,7 @@ def worker(client_socket, name):  #子线程接受模式
                 responses = recv_buffer.split(";")
                 recv_buffer = responses.pop()
                 for result, response_text in iter_dashboard_responses(";".join(responses)):
+                    print(f'{name} 返回：{response_text};')
                     if result != 0:
                         stop = False
                         print(f'{name} 返回异常({result})：{response_text};，停止运动')
@@ -365,7 +370,7 @@ try:
         feed_thread1.start()
     for client_socket in client_sockets:
         EnableRobot(client_socket)
-        send_set_payload(client_socket, *DEFAULT_PAYLOAD)
+        send_set_payload(client_socket, *DEFAULT_PAYLOAD, wait_response=True)
     for index, client_socket in enumerate(client_sockets, start=1):
         feed_thread = threading.Thread(
             target=worker,

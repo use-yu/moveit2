@@ -12,6 +12,8 @@ g01实际部署：
 启动moveit：
     ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true
     
+ros2 service call /g01/right/tool_commands dobot_msgs_v4/srv/SetToolPower "{status: 0}"
+
 官方 ros2 SDK：
     ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py
 
