@@ -11,7 +11,7 @@ G01 MoveIt 演示脚本
   4. 程序退出时在 finally 中自动移除深框
 
 前提：
-  - 已启动 move_group：ros2 launch g01_moveit_config demo.launch.py
+  - 已启动 move_group： ros2 launch g01_moveit_config demo.launch.py
   - 本节点与 move_group 在同一 ROS 域
   ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true
 
@@ -1625,10 +1625,10 @@ class G01Demo(Node):
 
         log.info("[pick] 3/8  到达抓取位置，按回车继续 …")
 
-        # try:
-        #     input()
-        # except EOFError:
-        #     pass
+        try:
+            input()
+        except EOFError:
+            pass
 
         # if not self.set_tool_power("right", 1):
         #     log.error("[pick] 右臂工具上电失败")
@@ -1769,7 +1769,13 @@ def main(argv: list[str] | None = None) -> int:
         if not node.add_frame():
             return finish(False, 0, 1)
         frame_added = True
-
+        
+        log.info("按回车继续，输入 q 回车退出并移除深框 …")
+        try:
+            if input().strip().lower() == "q":
+                return 0
+        except EOFError:
+            pass
         # --- 2. 关节空间运动 ---   
         targets = JOINT_TARGETS[ACTIVE_GROUP]
         joint_names = list(targets.keys())
@@ -1803,30 +1809,36 @@ def main(argv: list[str] | None = None) -> int:
             return finish(False, 0, 1)
 
 
-        # 视觉识别
-        vision_sock = connect_vision(log)
-        if vision_sock is None:
-            return finish(False, 0, 1)
-        pose = read_vision_pose(vision_sock, log)
-        if pose is not None and len(pose) >= 6:
-            pose[3], pose[5] = pose[5], pose[3]  # 索引3是第4位，索引5是第6位
-        print(f"viewer pose = {pose}")
-        if pose is None:
-            return finish(False, 0, 1)
-        x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
-        print(
-            "viewer pose transformed: "
-            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
-            f"z={z_mm / 1000.0:.6f} m, "
-            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
-        )
+        # # 视觉识别
+        # vision_sock = connect_vision(log)
+        # if vision_sock is None:
+        #     return finish(False, 0, 1)
+        # pose = read_vision_pose(vision_sock, log)
+        # if pose is not None and len(pose) >= 6:
+        #     pose[3], pose[5] = pose[5], pose[3]  # 索引3是第4位，索引5是第6位
+        # print(f"viewer pose = {pose}")
+        # if pose is None:
+        #     return finish(False, 0, 1)
+        # x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        # print(
+        #     "viewer pose transformed: "
+        #     f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
+        #     f"z={z_mm / 1000.0:.6f} m, "
+        #     f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
+        # )
         EE_POSE2 = dict(
-            x=x_mm / 1000.0,
-            y=y_mm / 1000.0,
-            z=z_mm / 1000.0,
-            roll=roll,
-            pitch=pitch,
-            yaw=yaw,
+            # x=x_mm / 1000.0,
+            # y=y_mm / 1000.0,
+            # z=z_mm / 1000.0,
+            # roll=roll,
+            # pitch=pitch,
+            # yaw=yaw,
+            x=-714.3421 / 1000.0,
+            y=226.8677 / 1000.0,
+            z=-205.5378 / 1000.0,
+            roll=79.5274,
+            pitch=1.3792,
+            yaw=36.9753,
             # roll=1.531,
             # pitch=0.459,
             # yaw=-2.358,

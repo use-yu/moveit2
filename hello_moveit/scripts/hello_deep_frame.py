@@ -41,7 +41,7 @@ FRAME_HEIGHT = 0.7
 WALL_THICKNESS = 0.02
 
 # 深框底面中心在规划坐标系下的位置 [m]
-BASE_X = 2.0
+BASE_X = 1.0
 BASE_Y = 0.0
 BASE_Z = 0.0
 
