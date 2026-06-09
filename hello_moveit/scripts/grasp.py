@@ -280,7 +280,7 @@ PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 # 视觉 TCP 配置
 VISION_IP = "192.168.5.111"
 VISION_PORT = 5700
-VISION_TRIGGER_COMMAND = "320,1,2,1,1,0"
+VISION_TRIGGER_COMMAND = "320,1,1,1,1,0"
 VISION_CONNECT_TIMEOUT = 3.0
 VISION_RECV_TIMEOUT = 20.0
 NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
@@ -702,7 +702,7 @@ class G01Demo(Node):
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
         self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
-        self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 10)
+        self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
 
@@ -1651,6 +1651,7 @@ class G01Demo(Node):
         joint_names: Sequence[str],
         place_joints: Sequence[float],
         place_speed_scale: float = PLACE_SPEED_SCALE,
+        cutoff_joint_names: Sequence[str] | None = None,
     ) -> bool:
         """抓取流程（IK 多解 + approach 预检 + 放置 + 原路返回）。
 
@@ -1663,9 +1664,11 @@ class G01Demo(Node):
             joint_names       : group 内关节名顺序（与 place_joints 一一对应）
             place_joints      : 放置位关节目标 [rad]（向量，顺序同 joint_names）
             place_speed_scale : 5/8 OMPL 到放置位的速度缩放（0~1）
+            cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
         """
         log = self.get_logger()
         joint_names = list(joint_names)
+        cutoff_joint_names = list(cutoff_joint_names) if cutoff_joint_names is not None else joint_names
         if len(place_joints) != len(joint_names):
             log.error(
                 f"[pick] place_joints 长度 {len(place_joints)} 与 joint_names 长度 "
@@ -1708,10 +1711,33 @@ class G01Demo(Node):
             return False
         pick_start_joints = current
         goal = [make_joint_constraints(group, q_pre)]
-        ok, used_ms, to_pre_traj = self.move(
-            group, goal, start=current, plan_only=False, speed_scale=speed_scale
-        )
+
+        # IK 多解与 q_pre → q_target 直线 approach 预检在无隔板场景下完成；
+        # 隔板只用于这一段 OMPL：从当前状态运动到 q_pre。
+        cutoff_added = False
+        cutoff_removed = True
+        try:
+            if not self.add_frame_cutoff_for_pose(
+                target_pose,
+                source_frame=plan_frame,
+                target_frame=SCENE_FRAME,
+                joint_names=cutoff_joint_names,
+            ):
+                log.error("[pick] 添加 q_pre OMPL 隔板失败")
+                return False
+            cutoff_added = True
+            ok, used_ms, to_pre_traj = self.move(
+                group, goal, start=current, plan_only=False, speed_scale=speed_scale
+            )
+        finally:
+            if cutoff_added:
+                log.info(f"[pick] 移除「{FRAME_CUTOFF_ID}」，后续直线 approach 不使用隔板")
+                cutoff_removed = self.remove_frame_cutoff()
+
         log.info(f"[pick] OMPL → q_pre: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        if not cutoff_removed:
+            log.error("[pick] 移除 q_pre OMPL 隔板失败")
+            return False
         if not ok:
             log.error("[pick] OMPL 到 q_pre 失败")
             return False
@@ -1848,7 +1874,6 @@ def main(argv: list[str] | None = None) -> int:
     log = node.get_logger()
     code = 1
     frame_added = False
-    frame_cutoff_added = False
     vision_sock = None
     result_published = False
 
@@ -1941,31 +1966,15 @@ def main(argv: list[str] | None = None) -> int:
             x=-714.3421 / 1000.0,
             y=226.8677 / 1000.0,
             z=-205.5378 / 1000.0,
-            roll=79.5274,
-            pitch=1.3792,
-            yaw=36.9753,
-            # roll=1.531,
-            # pitch=0.459,
-            # yaw=-2.358,
+            roll=1.531,
+            pitch=0.459,
+            yaw=-2.358,
         )
         print(f"EE_POSE2 = {EE_POSE2}")
         # return 1
 
         node.show_cylinder_at_pose(EE_POSE2)
-        if not node.add_frame_cutoff_for_pose(
-            EE_POSE2,
-            source_frame=PLAN_FRAME,
-            target_frame=SCENE_FRAME,
-            joint_names=joint_names,
-        ):
-            return finish(False, 0, 1)
-        frame_cutoff_added = True
-        log.info("按回车继续，输入 q 回车退出")
-        try:
-            if input().strip().lower() == "q":
-                return finish(False, 0, 0)
-        except EOFError:
-            pass
+
         # --- 3. 抓取流程 ---
         pick_group = POSE_GROUP
         pick_joint_names = joint_names_for_group(pick_group)
@@ -1989,6 +1998,7 @@ def main(argv: list[str] | None = None) -> int:
             joint_names=pick_joint_names,
             place_joints=PLACE_JOINTS[pick_group],
             place_speed_scale=0.2,
+            cutoff_joint_names=joint_names,
         ):
             log.error("抓取流程失败")
             return finish(False, 0, 1)
@@ -2006,10 +2016,6 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         close_vision(vision_sock, log)
         node.remove_cylinder_at_pose()
-        if frame_cutoff_added:
-            log.info(f"移除「{FRAME_CUTOFF_ID}」…")
-            if not node.remove_frame_cutoff():
-                code = 1
         if frame_added:
             log.info(f"移除「{FRAME_ID}」…")
             if not node.remove_frame():
