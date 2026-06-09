@@ -848,7 +848,7 @@
     <child
       link="L1" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -924,7 +924,7 @@
     <child
       link="L2" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -1000,7 +1000,7 @@
     <child
       link="L3" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
       lower="-2.79"
       upper="2.79"
@@ -1064,7 +1064,7 @@
     <child
       link="L4" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -1128,7 +1128,7 @@
     <child
       link="L5" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
       upper="3.1416"
@@ -1198,7 +1198,7 @@
     <child
       link="L6" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="-3.1416"
       upper="3.1416"

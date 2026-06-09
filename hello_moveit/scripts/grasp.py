@@ -214,6 +214,9 @@ WALL_T = 0.09  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
 FRAME_CENTER = (-0.81 - 0.005, -0.363, -0.1)  # 深框整体外轮廓中心，相对于 base_link [m]
 FRAME_RPY_DEG = (90.0, -0.0, 180.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
+FRAME_CUTOFF_ID = "深框隔离面"
+FRAME_CUTOFF_THICKNESS = 0.01  # 薄隔离面厚度 [m]，沿深框局部 z 轴；在 SCENE_FRAME 中等价于 y 方向厚度
+FRAME_CUTOFF_COLOR = ColorRGBA(r=1.0, g=0.25, b=0.1, a=0.35)
 
 # 位姿标记圆柱（仅 RViz Marker 显示，不进入规划场景碰撞）
 CYLINDER_MARKER_ID = "ee_pose_cylinder"
@@ -514,6 +517,34 @@ def make_deep_frame() -> CollisionObject:
     return obj
 
 
+def make_deep_frame_cutoff(scene_y: float) -> CollisionObject:
+    """在深框内生成一张薄隔离面，顶面位于 SCENE_FRAME 的 scene_y。"""
+    L, W, _ = FRAME_SIZE
+    t = WALL_T
+    bx, _, bz = FRAME_CENTER
+    roll, pitch, yaw = (math.radians(v) for v in FRAME_RPY_DEG)
+    qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
+
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = FRAME_CUTOFF_ID
+    obj.operation = CollisionObject.ADD
+
+    prim = SolidPrimitive()
+    prim.type = SolidPrimitive.BOX
+    prim.dimensions = [
+        max(0.0, L - 2.0 * t),
+        max(0.0, W - 2.0 * t),
+        FRAME_CUTOFF_THICKNESS,
+    ]
+    ox, oy, oz = rotate_xyz_by_quat(
+        0.0, 0.0, -FRAME_CUTOFF_THICKNESS / 2.0, qx, qy, qz, qw
+    )
+    obj.primitives.append(prim)
+    obj.primitive_poses.append(make_pose(bx + ox, scene_y + oy, bz + oz, roll, pitch, yaw))
+    return obj
+
+
 def pose_from_dict(ep: dict) -> Pose:
     """EE_POSE2 风格字典 → geometry_msgs/Pose（位置 + roll/pitch/yaw）。"""
     return make_pose(
@@ -801,6 +832,48 @@ class G01Demo(Node):
             return None
         return res.pose_stamped[0].pose
 
+    def _pose_position_in_frame(
+        self,
+        pose: Pose | dict,
+        source_frame: str,
+        target_frame: str,
+        joint_names: Sequence[str] | None = None,
+    ) -> tuple[float, float, float] | None:
+        """把 pose 原点从 source_frame 转到 target_frame，只返回位置。"""
+        p = pose if isinstance(pose, Pose) else pose_from_dict(pose)
+        if source_frame == target_frame:
+            return (p.position.x, p.position.y, p.position.z)
+
+        joints = None
+        if joint_names is not None:
+            joints = self._get_joints(list(joint_names), timeout=2.0)
+            if joints is None:
+                return None
+
+        source_pose = self._get_link_pose_fk(
+            source_frame,
+            joints=joints,
+            joint_names=joint_names,
+            plan_frame=target_frame,
+        )
+        if source_pose is None:
+            return None
+
+        qx, qy, qz, qw = (
+            source_pose.orientation.x,
+            source_pose.orientation.y,
+            source_pose.orientation.z,
+            source_pose.orientation.w,
+        )
+        rx, ry, rz = rotate_xyz_by_quat(
+            p.position.x, p.position.y, p.position.z, qx, qy, qz, qw
+        )
+        return (
+            source_pose.position.x + rx,
+            source_pose.position.y + ry,
+            source_pose.position.z + rz,
+        )
+
     def set_tool_power(self, side: str, status: int, timeout: float = 7.0) -> bool:
         """调用左右工具电源服务，要求返回 res=0。"""
         log = self.get_logger()
@@ -857,6 +930,37 @@ class G01Demo(Node):
     def remove_frame(self) -> bool:
         """从场景中删除深框。"""
         rm = CollisionObject(id=FRAME_ID, operation=CollisionObject.REMOVE)
+        return self._apply_scene([rm])
+
+    def add_frame_cutoff_for_pose(
+        self,
+        pose: Pose | dict,
+        source_frame: str = PLAN_FRAME,
+        target_frame: str = SCENE_FRAME,
+        joint_names: Sequence[str] | None = None,
+    ) -> bool:
+        """按目标 pose 在 SCENE_FRAME 下的 y 高度添加深框隔离面。"""
+        pos = self._pose_position_in_frame(
+            pose,
+            source_frame=source_frame,
+            target_frame=target_frame,
+            joint_names=joint_names,
+        )
+        if pos is None:
+            self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
+            return False
+
+        scene_y = pos[1]
+        color = ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR)
+        self.get_logger().info(
+            f"添加碰撞体「{FRAME_CUTOFF_ID}」到 {target_frame}: "
+            f"目标 y={scene_y:.3f} m, 厚度={FRAME_CUTOFF_THICKNESS:.3f} m"
+        )
+        return self._apply_scene([make_deep_frame_cutoff(scene_y)], [color])
+
+    def remove_frame_cutoff(self) -> bool:
+        """从场景中删除深框隔离面。"""
+        rm = CollisionObject(id=FRAME_CUTOFF_ID, operation=CollisionObject.REMOVE)
         return self._apply_scene([rm])
 
     def _cylinder_marker_numeric_id(self, object_id: str) -> int:
@@ -1744,6 +1848,7 @@ def main(argv: list[str] | None = None) -> int:
     log = node.get_logger()
     code = 1
     frame_added = False
+    frame_cutoff_added = False
     vision_sock = None
     result_published = False
 
@@ -1847,7 +1952,20 @@ def main(argv: list[str] | None = None) -> int:
         # return 1
 
         node.show_cylinder_at_pose(EE_POSE2)
-
+        if not node.add_frame_cutoff_for_pose(
+            EE_POSE2,
+            source_frame=PLAN_FRAME,
+            target_frame=SCENE_FRAME,
+            joint_names=joint_names,
+        ):
+            return finish(False, 0, 1)
+        frame_cutoff_added = True
+        log.info("按回车继续，输入 q 回车退出")
+        try:
+            if input().strip().lower() == "q":
+                return finish(False, 0, 0)
+        except EOFError:
+            pass
         # --- 3. 抓取流程 ---
         pick_group = POSE_GROUP
         pick_joint_names = joint_names_for_group(pick_group)
@@ -1888,6 +2006,10 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         close_vision(vision_sock, log)
         node.remove_cylinder_at_pose()
+        if frame_cutoff_added:
+            log.info(f"移除「{FRAME_CUTOFF_ID}」…")
+            if not node.remove_frame_cutoff():
+                code = 1
         if frame_added:
             log.info(f"移除「{FRAME_ID}」…")
             if not node.remove_frame():
