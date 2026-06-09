@@ -5,7 +5,9 @@
      简化了部分碰撞模型
      采用圆柱体代替mesh文件，避免凹体放大不了 -->
 <robot
+  xmlns:xacro="http://www.ros.org/wiki/xacro"
   name="G01">
+  <xacro:property name="arm_collision_scale" value="1.05" />
   <link name="world" />
   <joint name="world_to_base_footprint" type="fixed">
         <parent link="world" />
@@ -407,7 +409,7 @@
     <collision>
       <origin xyz="-0.000 0.001 0.081" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.065" length="0.170" />
+        <cylinder radius="${arm_collision_scale * 0.065}" length="${arm_collision_scale * 0.170}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -471,19 +473,19 @@
     <collision>
       <origin xyz="0.000 0.000 0.086" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.065" length="0.160" />
+        <cylinder radius="${arm_collision_scale * 0.065}" length="${arm_collision_scale * 0.160}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="0.000 -0.374 0.086" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.065" length="0.160" />
+        <cylinder radius="${arm_collision_scale * 0.065}" length="${arm_collision_scale * 0.160}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="-0.000 -0.188 0.082" rpy="1.57079631189374 0 0" />
       <geometry>
-        <cylinder radius="0.06" length="0.240" />
+        <cylinder radius="${arm_collision_scale * 0.06}" length="${arm_collision_scale * 0.240}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -548,19 +550,19 @@
     <collision>
       <origin xyz="-0.000 0.000 0.046" rpy="0 0 0" />
       <geometry>
-    <cylinder radius="0.065" length="0.10" />
+    <cylinder radius="${arm_collision_scale * 0.065}" length="${arm_collision_scale * 0.10}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="-0.000 -0.306 0.046" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.045" length="0.140" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.140}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="0.000 -0.161 0.039" rpy="-1.57079631189374 0 0" />
       <geometry>
-        <cylinder radius="0.045" length="0.180" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.180}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -624,7 +626,7 @@
     <collision>
       <origin xyz="0.006 -0.000 0.043" rpy="-3.1416 1.57079631189374 -3.1416" />
       <geometry>
-        <cylinder radius="0.045" length="0.140" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.140}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -688,7 +690,7 @@
     <collision>
       <origin xyz="-0.000 -0.013 0.044" rpy="-1.57079631189374 0 0" />
       <geometry>
-        <cylinder radius="0.045" length="0.150" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.150}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -752,13 +754,13 @@
     <collision>
       <origin xyz="0.001 -0.001 0.122" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.085" length="0.10" />
+        <cylinder radius="${arm_collision_scale * 0.085}" length="${arm_collision_scale * 0.10}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="-0.000 0.000 0.033" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.045" length="0.07" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.07}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -822,7 +824,7 @@
     <collision>
       <origin xyz="-0.000 0.001 0.081" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.065" length="0.170" />
+        <cylinder radius="${arm_collision_scale * 0.065}" length="${arm_collision_scale * 0.170}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -886,19 +888,19 @@
     <collision>
       <origin xyz="0.000 0.000 0.086" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.065" length="0.160" />
+        <cylinder radius="${arm_collision_scale * 0.065}" length="${arm_collision_scale * 0.160}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="0.000 -0.374 0.086" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.065" length="0.160" />
+        <cylinder radius="${arm_collision_scale * 0.065}" length="${arm_collision_scale * 0.160}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="-0.000 -0.188 0.082" rpy="1.57079631189374 0 0" />
       <geometry>
-        <cylinder radius="0.06" length="0.240" />
+        <cylinder radius="${arm_collision_scale * 0.06}" length="${arm_collision_scale * 0.240}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -962,19 +964,19 @@
     <collision>
       <origin xyz="-0.000 0.000 0.046" rpy="0 0 0" />
       <geometry>
-    <cylinder radius="0.065" length="0.10" />
+    <cylinder radius="${arm_collision_scale * 0.065}" length="${arm_collision_scale * 0.10}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="-0.000 -0.306 0.046" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.045" length="0.140" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.140}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="0.000 -0.161 0.039" rpy="-1.57079631189374 0 0" />
       <geometry>
-        <cylinder radius="0.045" length="0.180" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.180}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -1038,7 +1040,7 @@
     <collision>
       <origin xyz="0.000 0.006 0.045" rpy="1.57079631189374 0 0" />
       <geometry>
-        <cylinder radius="0.045" length="0.140" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.140}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -1102,7 +1104,7 @@
     <collision>
       <origin xyz="-0.000 -0.013 0.044" rpy="-1.57079631189374 0 0" />
       <geometry>
-        <cylinder radius="0.045" length="0.150" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.150}" />
       </geometry>
     </collision>
     <!-- <collision>
@@ -1166,13 +1168,13 @@
     <collision>
       <origin xyz="0.001 -0.001 0.122" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.085" length="0.10" />
+        <cylinder radius="${arm_collision_scale * 0.085}" length="${arm_collision_scale * 0.10}" />
       </geometry>
     </collision>
     <collision>
       <origin xyz="-0.000 0.000 0.033" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.045" length="0.07" />
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.07}" />
       </geometry>
     </collision>
     <!-- <collision>
