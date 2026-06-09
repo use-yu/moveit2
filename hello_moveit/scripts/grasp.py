@@ -1680,6 +1680,10 @@ class G01Demo(Node):
             f"[pick] group={group}, link={link}, plan_frame={plan_frame}"
         )
 
+        if not self.set_tool_power("right", 0):
+            log.error("[pick] 右臂工具下电失败")
+            return False
+
         pre_pose = pose_offset_local_z(target_pose, PRE_GRASP_OFFSET)
         pp = pre_pose.position
         tp = target_pose.position
@@ -1760,9 +1764,9 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        # if not self.set_tool_power("right", 1):
-        #     log.error("[pick] 右臂工具上电失败")
-        #     return False
+        if not self.set_tool_power("right", 1):
+            log.error("[pick] 右臂工具上电失败")
+            return False
 
         log.info(
             "[pick] 4/8  第一段复位：反向 approach + 1/8 OMPL → 1/8 初始位置"
