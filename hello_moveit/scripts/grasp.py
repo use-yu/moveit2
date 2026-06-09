@@ -248,7 +248,7 @@ CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截�
 CART_JUMP_THRESHOLD = 2.0  # 相对关节跳变阈值；0 表示关闭，容易接受绕腕跳解
 CART_REVOLUTE_JUMP_THRESHOLD = 0.08  # 单步任一转动关节超过该值 [rad] 视为跳解
 CART_PRISMATIC_JUMP_THRESHOLD = 0.02  # 单步任一移动关节超过该值 [m] 视为跳解
-CART_JUMP_STEP_FACTOR = 2.0  # 单步关节空间距离超过平均值该倍数，直接淘汰
+CART_JUMP_STEP_FACTOR = 3.0  # 单步关节空间距离超过平均值该倍数，直接淘汰
 CART_MAX_POINT_FACTOR = 2.0  # 实际点数超过理论直线点数该倍数时，认为 IK 分支不稳
 CART_MAX_POINT_EXTRA = 5
 
@@ -2023,7 +2023,7 @@ def main(argv: list[str] | None = None) -> int:
         # --- 2. 关节空间运动 ---   
         targets = JOINT_TARGETS[ACTIVE_GROUP]
         joint_names = list(targets.keys())
-        q1 = [0.0, 0.0, 0.0, 37 * math.pi / 180, 
+        q1 = [0.0, 0.0, 0.0, 30 * math.pi / 180, 
         -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477, 
         1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,]
         # q2 = [1.25, 0.0, -0.25, 1.1, 

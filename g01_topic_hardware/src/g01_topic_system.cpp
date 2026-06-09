@@ -284,29 +284,33 @@ hardware_interface::return_type G01TopicSystem::write(
     return hardware_interface::return_type::OK;
   }
 
+  const bool executing = is_trajectory_executing();
+
   // 仅 MoveIt 点 Execute、FollowJointTrajectory 进入 EXECUTING 后才发 command_topic
-  if (!is_trajectory_executing()) {
+  if (!executing) {
     return hardware_interface::return_type::OK;
   }
 
   sensor_msgs::msg::JointState msg;
   msg.header.stamp = node_->get_clock()->now();
-  msg.name = joint_names_;
-  msg.position.resize(joint_names_.size());
   {
     std::scoped_lock lk(state_mutex_);
-    msg.position = pos_state_;
     for (size_t i = 0; i < controller_executing_.size(); ++i) {
       const auto & flag = controller_executing_[i];
       if (!flag || !flag->load() || i >= controller_joint_indices_.size()) {
         continue;
       }
       for (const auto idx : controller_joint_indices_[i]) {
-        if (idx < msg.position.size() && idx < pos_cmd_.size()) {
-          msg.position[idx] = pos_cmd_[idx];
+        if (idx < joint_names_.size() && idx < pos_cmd_.size()) {
+          msg.name.push_back(joint_names_[idx]);
+          msg.position.push_back(pos_cmd_[idx]);
         }
       }
     }
+  }
+
+  if (msg.name.empty()) {
+    return hardware_interface::return_type::OK;
   }
 
   command_pub_->publish(std::move(msg));
