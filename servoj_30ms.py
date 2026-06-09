@@ -272,9 +272,9 @@ def send_set_payload(client, load, x, y, z, wait_response=False):
     client.sendall(tcp_command)
     if not wait_response:
         return 0
-    buf = client.recv(200).decode()  # 接收反馈信息的长度
-    print(buf.strip())
-    return parse_dashboard_result(buf)
+    response_text = recv_dashboard_response(client)
+    print(response_text)
+    return parse_dashboard_result(response_text)
 
 def servoj_2(client, J1_angle):
     tcp_command = "servoj(%f,0,0,0,0,0,t=2,aheadtime=50, gain=500)" % (J1_angle)
@@ -282,18 +282,124 @@ def servoj_2(client, J1_angle):
     print(tcp_command)
     client.send(tcp_command)
 
-def EnableRobot(client):
-    tcp_command = "EnableRobot()"
-    tcp_command = tcp_command.encode()
-    client.send(tcp_command)
-    buf = client.recv(200).decode()  # 接收反馈信息的长度
-    return parse_dashboard_result(buf)
-
 def parse_dashboard_result(text):
     try:
         return int(text.split(",", 1)[0].strip())
     except (ValueError, IndexError):
         return -1
+
+def parse_dashboard_payload(text):
+    start = text.find("{")
+    end = text.find("}", start + 1)
+    if start < 0 or end < 0:
+        return ""
+    return text[start + 1:end].strip()
+
+def recv_dashboard_response(client, timeout=3.0):
+    old_timeout = client.gettimeout()
+    client.settimeout(timeout)
+    response_text = ""
+    try:
+        while ";" not in response_text:
+            data = client.recv(1024)
+            if not data:
+                raise ConnectionError("dashboard 连接断开")
+            response_text += data.decode(errors="ignore")
+    except socket.timeout as e:
+        raise TimeoutError("等待 dashboard 返回超时") from e
+    finally:
+        client.settimeout(old_timeout)
+    return response_text.split(";", 1)[0].strip() + ";"
+
+DASHBOARD_ERROR_HINTS = {
+    -2: "当前仍是报警状态，需要 ClearError 或处理无法清除的报警",
+    -3: "急停仍被按下，需要释放实体急停后再清错",
+    -4: "本体下电，需要 PowerOn",
+    -5: "脚本运行中，需要 Stop",
+    -7: "脚本暂停中，需要 Stop",
+    -8: "机器人认证过期，TCP 不可用",
+}
+
+ROBOT_MODE_NAMES = {
+    1: "INIT",
+    2: "BRAKE_OPEN",
+    3: "POWEROFF",
+    4: "DISABLED",
+    5: "ENABLE",
+    6: "BACKDRIVE",
+    7: "RUNNING",
+    8: "SINGLE_MOVE",
+    9: "ERROR",
+    10: "PAUSE",
+    11: "COLLISION",
+}
+
+def dashboard_error_hint(result):
+    return DASHBOARD_ERROR_HINTS.get(result, "请查看控制器返回码")
+
+def dashboard_command(client, command, name="", required=False, timeout=3.0):
+    client.sendall(command.encode())
+    response_text = recv_dashboard_response(client, timeout=timeout)
+    result = parse_dashboard_result(response_text)
+    prefix = f"{name} " if name else ""
+    print(f"{prefix}{command} 返回：{response_text}")
+    if required and result != 0:
+        hint = dashboard_error_hint(result)
+        raise RuntimeError(f"{prefix}{command} 失败：{response_text}，{hint}")
+    return result, response_text
+
+def get_robot_mode(client, name=""):
+    result, response_text = dashboard_command(client, "RobotMode()", name=name, required=True)
+    payload = parse_dashboard_payload(response_text)
+    try:
+        mode = int(payload.split(",", 1)[0].strip())
+    except (ValueError, IndexError):
+        raise RuntimeError(f"{name} RobotMode 返回解析失败：{response_text}")
+    return mode
+
+def wait_robot_mode(client, name, expected_mode=5, timeout=3.0):
+    deadline = time.time() + timeout
+    last_mode = None
+    while time.time() < deadline:
+        mode = get_robot_mode(client, name)
+        last_mode = mode
+        if mode == expected_mode:
+            return mode
+        time.sleep(0.2)
+    mode_name = ROBOT_MODE_NAMES.get(last_mode, "UNKNOWN")
+    raise RuntimeError(f"{name} 初始化后状态不是 ENABLE(5)，当前 {last_mode}({mode_name})")
+
+def EnableRobot(client):
+    result, _ = dashboard_command(client, "EnableRobot()", required=True)
+    return result
+
+def prepare_robot_for_servoj(client, name):
+    print(f"{name} 初始化：释放急停/停止脚本/清错/切 TCP/上使能")
+
+    # 这些命令用于清理控制器残留状态，失败时继续向后恢复，最终由关键步骤兜底。
+    for command in ("EmergencyStop(0)", "Stop()", "ClearError()", "PowerOn()", "DisableRobot()"):
+        try:
+            dashboard_command(client, command, name=name, required=False)
+        except (ConnectionError, TimeoutError, OSError) as e:
+            print(f"{name} {command} 发送失败：{e}")
+        time.sleep(0.1)
+
+    result, response_text = dashboard_command(client, "RequestControl()", name=name, required=False)
+    if result != 0:
+        print(f"{name} 第一次切 TCP 模式失败：{response_text}，再清一次状态后重试")
+        for command in ("EmergencyStop(0)", "Stop()", "ClearError()", "PowerOn()", "DisableRobot()"):
+            dashboard_command(client, command, name=name, required=False)
+            time.sleep(0.1)
+        dashboard_command(client, "RequestControl()", name=name, required=True)
+
+    for command in ("Stop()", "EmergencyStop(0)", "ClearError()", "PowerOn()"):
+        dashboard_command(client, command, name=name, required=False)
+        time.sleep(0.1)
+
+    dashboard_command(client, "EnableRobot()", name=name, required=True)
+    mode = wait_robot_mode(client, name, expected_mode=5, timeout=3.0)
+    mode_name = ROBOT_MODE_NAMES.get(mode, "UNKNOWN")
+    print(f"{name} 初始化完成：RobotMode={mode}({mode_name})")
 
 def iter_dashboard_responses(text):
     for chunk in text.split(";"):
@@ -368,9 +474,11 @@ try:
             args=(ip, side, state_node))  # 机器状态反馈线程
         feed_thread1.daemon = True
         feed_thread1.start()
-    for client_socket in client_sockets:
-        EnableRobot(client_socket)
-        send_set_payload(client_socket, *DEFAULT_PAYLOAD, wait_response=True)
+    for index, client_socket in enumerate(client_sockets, start=1):
+        prepare_robot_for_servoj(client_socket, f'第{index}个机械臂')
+        payload_result = send_set_payload(client_socket, *DEFAULT_PAYLOAD, wait_response=True)
+        if payload_result != 0:
+            raise RuntimeError(f"第{index}个机械臂 SetPayload 失败，返回码：{payload_result}")
     for index, client_socket in enumerate(client_sockets, start=1):
         feed_thread = threading.Thread(
             target=worker,

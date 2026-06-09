@@ -10,9 +10,6 @@ Panels:
         - /RobotModel1
         - /TF1
         - /TF1/Frames1
-        - /Marker1
-        - /Marker1/Status1
-        - /Marker1/Topic1
       Splitter Ratio: 0.5
     Tree Height: 393
   - Class: rviz_common/Help
@@ -203,7 +200,7 @@ Visualization Manager:
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
         Planning Group: left_arm
-        Query Goal State: false
+        Query Goal State: true
         Query Start State: false
         Show Workspace: false
         Start State Alpha: 1
@@ -580,7 +577,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2.8247644901275635
+      Distance: 3.5433847904205322
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
