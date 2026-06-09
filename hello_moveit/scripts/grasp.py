@@ -216,7 +216,7 @@ FRAME_RPY_DEG = (90.0, -0.0, 180.0)  # 深框整体姿态，相对于 base_link 
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 FRAME_CUTOFF_ID = "深框隔离面"
 FRAME_CUTOFF_THICKNESS = 0.01  # 薄隔离面厚度 [m]，沿深框局部 z 轴；在 SCENE_FRAME 中等价于 y 方向厚度
-FRAME_CUTOFF_COLOR = ColorRGBA(r=1.0, g=0.25, b=0.1, a=0.35)
+FRAME_CUTOFF_COLOR = ColorRGBA(r=1.0, g=0.25, b=0.1, a=1.0)
 
 # 位姿标记圆柱（仅 RViz Marker 显示，不进入规划场景碰撞）
 CYLINDER_MARKER_ID = "ee_pose_cylinder"
@@ -1938,37 +1938,38 @@ def main(argv: list[str] | None = None) -> int:
             log.error("关节规划/执行失败")
             return finish(False, 0, 1)
 
-
-        # # 视觉识别
-        # vision_sock = connect_vision(log)
-        # if vision_sock is None:
-        #     return finish(False, 0, 1)
-        # pose = read_vision_pose(vision_sock, log)
+        time.sleep(1)
+        # 视觉识别
+        vision_sock = connect_vision(log)
+        if vision_sock is None:
+            return finish(False, 0, 1)
+        pose = read_vision_pose(vision_sock, log)
+        #交换rx rz
         # if pose is not None and len(pose) >= 6:
         #     pose[3], pose[5] = pose[5], pose[3]  # 索引3是第4位，索引5是第6位
-        # print(f"viewer pose = {pose}")
-        # if pose is None:
-        #     return finish(False, 0, 1)
-        # x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
-        # print(
-        #     "viewer pose transformed: "
-        #     f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
-        #     f"z={z_mm / 1000.0:.6f} m, "
-        #     f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
-        # )
+        print(f"viewer pose = {pose}")
+        if pose is None:
+            return finish(False, 0, 1)
+        x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        print(
+            "viewer pose transformed: "
+            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
+            f"z={z_mm / 1000.0:.6f} m, "
+            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
+        )
         EE_POSE2 = dict(
-            # x=x_mm / 1000.0,
-            # y=y_mm / 1000.0,
-            # z=z_mm / 1000.0,
-            # roll=roll,
-            # pitch=pitch,
-            # yaw=yaw,
-            x=-714.3421 / 1000.0,
-            y=226.8677 / 1000.0,
-            z=-205.5378 / 1000.0,
-            roll=1.531,
-            pitch=0.459,
-            yaw=-2.358,
+            x=x_mm / 1000.0,
+            y=y_mm / 1000.0,
+            z=z_mm / 1000.0,
+            roll=roll,
+            pitch=pitch,
+            yaw=yaw,
+            # x=-714.3421 / 1000.0,
+            # y=226.8677 / 1000.0,
+            # z=-205.5378 / 1000.0,
+            # roll=1.531,
+            # pitch=0.459,
+            # yaw=-2.358,
         )
         print(f"EE_POSE2 = {EE_POSE2}")
         # return 1
@@ -2001,6 +2002,11 @@ def main(argv: list[str] | None = None) -> int:
             cutoff_joint_names=joint_names,
         ):
             log.error("抓取流程失败")
+            log.info("按回车退出 …")
+            try:
+                input()
+            except EOFError:
+                pass
             return finish(False, 0, 1)
 
         finish(True, 1, 0)
