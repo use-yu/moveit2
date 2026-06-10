@@ -763,6 +763,22 @@
         <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.07}" />
       </geometry>
     </collision>
+    <!-- 相机 -->
+    <visual>
+        <origin xyz="0.078 -0.0 0.066" rpy="0 0 0" />
+        <geometry>
+          <box size="0.12 0.05 0.015" />
+        </geometry>
+        <material name="base_link_box_transparent">
+          <color rgba="1 0 0 1" />
+        </material>
+      </visual>
+    <collision>
+      <origin xyz="0.078 -0.0 0.066" rpy="0 0 0" />
+      <geometry>
+        <box size="0.12 0.05 0.015" />
+      </geometry>
+    </collision>
     <!-- <collision>
       <origin
         xyz="0 0 0"
