@@ -2091,11 +2091,11 @@ def main(argv: list[str] | None = None) -> int:
 
         node.show_cylinder_at_pose(EE_POSE2)
         
-        # log.info("按回车继续 …")
-        # try:
-        #     input()
-        # except EOFError:
-        #     pass
+        log.info("按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
 
         # --- 3. 抓取流程 ---
         pick_group = POSE_GROUP
