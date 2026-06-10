@@ -261,6 +261,10 @@ def send_set_tool_power(client, status):
     client.sendall(tcp_command)
     return 0
 
+DASHBOARD_COMMAND_TIMEOUT = 5.0
+DASHBOARD_POWERON_TIMEOUT = 15.0
+DASHBOARD_RECV_BUFFERS = {}
+
 def send_set_payload(client, load, x, y, z, wait_response=False):
     tcp_command = "SetPayload(%s,%s,%s,%s)" % (
         float(load),
@@ -268,11 +272,10 @@ def send_set_payload(client, load, x, y, z, wait_response=False):
         float(y),
         float(z),
     )
-    tcp_command = tcp_command.encode()
-    client.sendall(tcp_command)
+    client.sendall(tcp_command.encode())
     if not wait_response:
         return 0
-    response_text = recv_dashboard_response(client)
+    response_text = recv_dashboard_response(client, expected_command=tcp_command)
     print(response_text)
     return parse_dashboard_result(response_text)
 
@@ -295,21 +298,71 @@ def parse_dashboard_payload(text):
         return ""
     return text[start + 1:end].strip()
 
-def recv_dashboard_response(client, timeout=3.0):
+def dashboard_command_name(command):
+    return command.split("(", 1)[0].strip()
+
+def dashboard_response_command(response_text):
+    response_text = response_text.strip().rstrip(";")
+    payload_end = response_text.find("}")
+    if payload_end >= 0:
+        command_text = response_text[payload_end + 1:].strip()
+        if command_text.startswith(","):
+            command_text = command_text[1:].strip()
+        return command_text
+    parts = response_text.split(",", 2)
+    if len(parts) < 3:
+        return ""
+    return parts[2].strip()
+
+def dashboard_response_matches(response_text, command):
+    expected_name = dashboard_command_name(command)
+    response_command = dashboard_response_command(response_text)
+    return response_command.startswith(f"{expected_name}(")
+
+def dashboard_timeout_for(command):
+    if dashboard_command_name(command) == "PowerOn":
+        return DASHBOARD_POWERON_TIMEOUT
+    return DASHBOARD_COMMAND_TIMEOUT
+
+def recv_dashboard_response(client, timeout=DASHBOARD_COMMAND_TIMEOUT, expected_command=None, name=""):
     old_timeout = client.gettimeout()
-    client.settimeout(timeout)
-    response_text = ""
+    deadline = time.time() + timeout
+    recv_buffer = DASHBOARD_RECV_BUFFERS.get(client, "")
+    last_unmatched = None
     try:
-        while ";" not in response_text:
-            data = client.recv(1024)
-            if not data:
-                raise ConnectionError("dashboard 连接断开")
-            response_text += data.decode(errors="ignore")
+        while True:
+            while ";" not in recv_buffer:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    if last_unmatched is not None and expected_command:
+                        raise TimeoutError(
+                            f"等待 dashboard 返回超时，未收到 {expected_command} 的返回，最后收到：{last_unmatched}"
+                        )
+                    raise TimeoutError("等待 dashboard 返回超时")
+                client.settimeout(remaining)
+                data = client.recv(1024)
+                if not data:
+                    raise ConnectionError("dashboard 连接断开")
+                recv_buffer += data.decode(errors="ignore")
+
+            response_text, recv_buffer = recv_buffer.split(";", 1)
+            DASHBOARD_RECV_BUFFERS[client] = recv_buffer
+            response_text = response_text.strip() + ";"
+            if expected_command is None or dashboard_response_matches(response_text, expected_command):
+                return response_text
+
+            last_unmatched = response_text
+            prefix = f"{name} " if name else ""
+            print(f"{prefix}跳过非当前命令返回：{response_text}")
     except socket.timeout as e:
+        if last_unmatched is not None and expected_command:
+            raise TimeoutError(
+                f"等待 dashboard 返回超时，未收到 {expected_command} 的返回，最后收到：{last_unmatched}"
+            ) from e
         raise TimeoutError("等待 dashboard 返回超时") from e
     finally:
+        DASHBOARD_RECV_BUFFERS[client] = recv_buffer
         client.settimeout(old_timeout)
-    return response_text.split(";", 1)[0].strip() + ";"
 
 DASHBOARD_ERROR_HINTS = {
     -2: "当前仍是报警状态，需要 ClearError 或处理无法清除的报警",
@@ -337,9 +390,11 @@ ROBOT_MODE_NAMES = {
 def dashboard_error_hint(result):
     return DASHBOARD_ERROR_HINTS.get(result, "请查看控制器返回码")
 
-def dashboard_command(client, command, name="", required=False, timeout=3.0):
+def dashboard_command(client, command, name="", required=False, timeout=None):
+    if timeout is None:
+        timeout = dashboard_timeout_for(command)
     client.sendall(command.encode())
-    response_text = recv_dashboard_response(client, timeout=timeout)
+    response_text = recv_dashboard_response(client, timeout=timeout, expected_command=command, name=name)
     result = parse_dashboard_result(response_text)
     prefix = f"{name} " if name else ""
     print(f"{prefix}{command} 返回：{response_text}")
@@ -347,6 +402,14 @@ def dashboard_command(client, command, name="", required=False, timeout=3.0):
         hint = dashboard_error_hint(result)
         raise RuntimeError(f"{prefix}{command} 失败：{response_text}，{hint}")
     return result, response_text
+
+def safe_dashboard_command(client, command, name="", timeout=None):
+    try:
+        return dashboard_command(client, command, name=name, required=False, timeout=timeout)
+    except (ConnectionError, TimeoutError, OSError) as e:
+        prefix = f"{name} " if name else ""
+        print(f"{prefix}{command} 发送失败：{e}")
+        return None, ""
 
 def get_robot_mode(client, name=""):
     result, response_text = dashboard_command(client, "RobotMode()", name=name, required=True)
@@ -357,49 +420,120 @@ def get_robot_mode(client, name=""):
         raise RuntimeError(f"{name} RobotMode 返回解析失败：{response_text}")
     return mode
 
+def robot_mode_name(mode):
+    return ROBOT_MODE_NAMES.get(mode, "UNKNOWN")
+
+def robot_mode_text(mode):
+    return f"{mode}({robot_mode_name(mode)})"
+
+def print_robot_mode(client, name, label):
+    mode = get_robot_mode(client, name)
+    print(f"{name} {label}：RobotMode={robot_mode_text(mode)}")
+    return mode
+
 def wait_robot_mode(client, name, expected_mode=5, timeout=3.0):
-    deadline = time.time() + timeout
-    last_mode = None
-    while time.time() < deadline:
-        mode = get_robot_mode(client, name)
-        last_mode = mode
-        if mode == expected_mode:
-            return mode
-        time.sleep(0.2)
-    mode_name = ROBOT_MODE_NAMES.get(last_mode, "UNKNOWN")
-    raise RuntimeError(f"{name} 初始化后状态不是 ENABLE(5)，当前 {last_mode}({mode_name})")
+    time.sleep(min(timeout, 0.5))
+    mode = get_robot_mode(client, name)
+    if mode == expected_mode:
+        return mode
+    raise RuntimeError(f"{name} 初始化后状态不是 ENABLE(5)，当前 RobotMode={robot_mode_text(mode)}")
+
+def wait_robot_mode_in(client, name, expected_modes, timeout, label):
+    expected_modes = set(expected_modes)
+    time.sleep(min(timeout, 0.5))
+    mode = get_robot_mode(client, name)
+    if mode in expected_modes:
+        return mode
+    expected_text = "/".join(robot_mode_text(mode_value) for mode_value in sorted(expected_modes))
+    raise RuntimeError(f"{name} {label} 后状态异常，期望 {expected_text}，当前 RobotMode={robot_mode_text(mode)}")
+
+def get_error_id(client, name):
+    result, response_text = dashboard_command(client, "GetErrorID()", name=name, required=False)
+    if result == 0:
+        print(f"{name} 当前报警信息：{parse_dashboard_payload(response_text)}")
+    return result, response_text
 
 def EnableRobot(client):
     result, _ = dashboard_command(client, "EnableRobot()", required=True)
     return result
 
+def request_tcp_control(client, name, required=True):
+    try:
+        result, response_text = dashboard_command(client, "RequestControl()", name=name, required=False)
+    except (ConnectionError, TimeoutError, OSError) as e:
+        if required:
+            raise RuntimeError(f"{name} RequestControl() 发送失败：{e}") from e
+        print(f"{name} RequestControl() 发送失败：{e}，先读取 RobotMode() 再决定后续动作")
+        return False
+
+    if result == 0:
+        return True
+
+    if required:
+        raise RuntimeError(
+            f"{name} RequestControl() 失败：{response_text}。"
+            "请确认控制器处于未上电/下使能状态、未开启手自动模式，且没有其它客户端占用控制权"
+        )
+    print(f"{name} RequestControl() 未成功，先读取 RobotMode() 再决定后续动作")
+    return False
+
 def prepare_robot_for_servoj(client, name):
-    print(f"{name} 初始化：释放急停/停止脚本/清错/切 TCP/上使能")
+    print(f"{name} 初始化：先切 TCP，再读取状态，按需上电/使能")
+    tcp_ready = request_tcp_control(client, name, required=False)
+    mode = print_robot_mode(client, name, "当前状态")
 
-    # 这些命令用于清理控制器残留状态，失败时继续向后恢复，最终由关键步骤兜底。
-    for command in ("EmergencyStop(0)", "Stop()", "ClearError()", "PowerOn()", "DisableRobot()"):
-        try:
-            dashboard_command(client, command, name=name, required=False)
-        except (ConnectionError, TimeoutError, OSError) as e:
-            print(f"{name} {command} 发送失败：{e}")
-        time.sleep(0.1)
+    if mode == 5:
+        print(f"{name} 已是 ENABLE 可运行状态，跳过 Stop/PowerOn/EnableRobot")
+        return
 
-    result, response_text = dashboard_command(client, "RequestControl()", name=name, required=False)
-    if result != 0:
-        print(f"{name} 第一次切 TCP 模式失败：{response_text}，再清一次状态后重试")
-        for command in ("EmergencyStop(0)", "Stop()", "ClearError()", "PowerOn()", "DisableRobot()"):
-            dashboard_command(client, command, name=name, required=False)
-            time.sleep(0.1)
-        dashboard_command(client, "RequestControl()", name=name, required=True)
+    if mode == 1:
+        mode = wait_robot_mode_in(client, name, (3, 4, 5), timeout=10.0, label="等待初始化完成")
+        print(f"{name} 初始化状态结束：RobotMode={robot_mode_text(mode)}")
+        if mode == 5:
+            print(f"{name} 已是 ENABLE 可运行状态，跳过 Stop/PowerOn/EnableRobot")
+            return
 
-    for command in ("Stop()", "EmergencyStop(0)", "ClearError()", "PowerOn()"):
-        dashboard_command(client, command, name=name, required=False)
-        time.sleep(0.1)
+    if mode in (6, 7, 8, 10):
+        print(f"{name} 当前处于运动/暂停/拖拽状态，先 Stop()")
+        safe_dashboard_command(client, "StopDrag()", name=name)
+        dashboard_command(client, "Stop()", name=name, required=True)
+        mode = wait_robot_mode_in(client, name, (3, 4, 5), timeout=5.0, label="等待 Stop 后空闲")
+        if mode == 5:
+            print(f"{name} Stop 后已是 ENABLE 可运行状态")
+            return
 
-    dashboard_command(client, "EnableRobot()", name=name, required=True)
+    if mode in (9, 11):
+        print(f"{name} 当前为错误/碰撞状态，读取报警并清错")
+        get_error_id(client, name)
+        for command in ("EmergencyStop(0)", "Stop()", "ClearError()"):
+            safe_dashboard_command(client, command, name=name)
+            time.sleep(0.15)
+        mode = wait_robot_mode_in(client, name, (3, 4, 5), timeout=5.0, label="等待清错完成")
+        if mode == 5:
+            print(f"{name} 清错后已是 ENABLE 可运行状态")
+            return
+
+    if mode == 5:
+        print(f"{name} 已是 ENABLE 可运行状态")
+        return
+
+    if mode not in (3, 4):
+        raise RuntimeError(f"{name} 无法进入允许 RequestControl 的状态，当前 RobotMode={robot_mode_text(mode)}")
+
+    if not tcp_ready:
+        request_tcp_control(client, name, required=True)
+
+    if mode == 3:
+        dashboard_command(client, "PowerOn()", name=name, required=True)
+        mode = wait_robot_mode_in(client, name, (4, 5), timeout=5.0, label="等待上电完成")
+
+    if mode == 4:
+        dashboard_command(client, "EnableRobot()", name=name, required=True)
+    elif mode != 5:
+        raise RuntimeError(f"{name} 上电后状态异常：RobotMode={robot_mode_text(mode)}")
+
     mode = wait_robot_mode(client, name, expected_mode=5, timeout=3.0)
-    mode_name = ROBOT_MODE_NAMES.get(mode, "UNKNOWN")
-    print(f"{name} 初始化完成：RobotMode={mode}({mode_name})")
+    print(f"{name} 初始化完成：RobotMode={robot_mode_text(mode)}")
 
 def iter_dashboard_responses(text):
     for chunk in text.split(";"):
@@ -436,7 +570,7 @@ def create_client_socket(ip, port):
 client_sockets = [create_client_socket(ip, SERVER_PORT) for ip in SERVER_ADDRESSES]
 def worker(client_socket, name):  #子线程接受模式
     global stop
-    recv_buffer = ""
+    recv_buffer = DASHBOARD_RECV_BUFFERS.pop(client_socket, "")
     while stop:
         try:
             data = client_socket.recv(1024).decode()

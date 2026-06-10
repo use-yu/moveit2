@@ -1874,9 +1874,9 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        # if not self.set_tool_power("right", 1):
-        #     log.error("[pick] 右臂工具上电失败")
-        #     return False
+        if not self.set_tool_power("right", 1):
+            log.error("[pick] 右臂工具上电失败")
+            return False
 
         log.info(
             "[pick] 4/8  第一段复位：反向 approach + 1/8 OMPL → 1/8 初始位置"
@@ -2020,6 +2020,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
         except EOFError:
             pass
+        # time.sleep(5)
         # --- 2. 关节空间运动 ---   
         targets = JOINT_TARGETS[ACTIVE_GROUP]
         joint_names = list(targets.keys())
@@ -2089,12 +2090,12 @@ def main(argv: list[str] | None = None) -> int:
         # return 1
 
         node.show_cylinder_at_pose(EE_POSE2)
-
-        log.info("按回车继续 …")
-        try:
-            input()
-        except EOFError:
-            pass
+        
+        # log.info("按回车继续 …")
+        # try:
+        #     input()
+        # except EOFError:
+        #     pass
 
         # --- 3. 抓取流程 ---
         pick_group = POSE_GROUP
@@ -2118,7 +2119,7 @@ def main(argv: list[str] | None = None) -> int:
             plan_frame=PLAN_FRAME,
             joint_names=pick_joint_names,
             place_joints=PLACE_JOINTS[pick_group],
-            place_speed_scale=0.2,
+            place_speed_scale=0.1,
             cutoff_joint_names=joint_names,
         ):
             log.error("抓取流程失败")
