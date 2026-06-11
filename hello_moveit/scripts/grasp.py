@@ -603,6 +603,27 @@ def _pose_distance(a: Pose, b: Pose) -> float:
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
+def _pose_position_delta(actual: Pose, target: Pose) -> tuple[float, float, float, float]:
+    dx = actual.position.x - target.position.x
+    dy = actual.position.y - target.position.y
+    dz = actual.position.z - target.position.z
+    return dx, dy, dz, math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _pose_orientation_error_rad(actual: Pose, target: Pose) -> float:
+    aq = actual.orientation
+    tq = target.orientation
+    actual_norm = math.sqrt(aq.x * aq.x + aq.y * aq.y + aq.z * aq.z + aq.w * aq.w)
+    target_norm = math.sqrt(tq.x * tq.x + tq.y * tq.y + tq.z * tq.z + tq.w * tq.w)
+    if actual_norm <= 0.0 or target_norm <= 0.0:
+        return float("nan")
+    dot = (
+        aq.x * tq.x + aq.y * tq.y + aq.z * tq.z + aq.w * tq.w
+    ) / (actual_norm * target_norm)
+    dot = max(-1.0, min(1.0, abs(dot)))
+    return 2.0 * math.acos(dot)
+
+
 def _trajectory_joint_stats(traj: RobotTrajectory) -> tuple[float, float]:
     """返回 (关节空间累计路程, 最大单步关节变化)。"""
     pts = traj.joint_trajectory.points
@@ -905,6 +926,50 @@ class G01Demo(Node):
             )
             return None
         return res.pose_stamped[0].pose
+
+    def _log_actual_fk_error(
+        self,
+        label: str,
+        link: str,
+        target_pose: Pose,
+        plan_frame: str,
+        joint_names: Sequence[str],
+    ) -> None:
+        """用实际 joint_states 做 FK，并打印实际末端与目标位姿的误差。"""
+        log = self.get_logger()
+        joints = self._get_joints(list(joint_names), wait_new=True, timeout=3.0)
+        if joints is None:
+            log.error(f"{label} 读取实际关节失败，无法计算 FK 误差")
+            return
+
+        actual_pose = self._get_link_pose_fk(
+            link,
+            joints=joints,
+            plan_frame=plan_frame,
+        )
+        if actual_pose is None:
+            log.error(f"{label} FK 计算失败，无法比较实际位姿")
+            return
+
+        dx, dy, dz, pos_err = _pose_position_delta(actual_pose, target_pose)
+        ori_err = _pose_orientation_error_rad(actual_pose, target_pose)
+        ap = actual_pose.position
+        tp = target_pose.position
+        ao = actual_pose.orientation
+        to = target_pose.orientation
+        log.info(
+            f"{label} 实际 FK {link} @ {plan_frame}: "
+            f"actual=({ap.x:.6f}, {ap.y:.6f}, {ap.z:.6f}), "
+            f"target=({tp.x:.6f}, {tp.y:.6f}, {tp.z:.6f}), "
+            f"actual_quat=({ao.x:.6f}, {ao.y:.6f}, {ao.z:.6f}, {ao.w:.6f}), "
+            f"target_quat=({to.x:.6f}, {to.y:.6f}, {to.z:.6f}, {to.w:.6f})"
+        )
+        log.info(
+            f"{label} 位姿误差: "
+            f"dxyz=({dx * 1000.0:.2f}, {dy * 1000.0:.2f}, {dz * 1000.0:.2f}) mm, "
+            f"|pos|={pos_err * 1000.0:.2f} mm, "
+            f"orientation={math.degrees(ori_err):.3f} deg"
+        )
 
     def _pose_position_in_frame(
         self,
@@ -1873,6 +1938,13 @@ class G01Demo(Node):
             return False
 
         log.info("[pick] 3/8  到达抓取位置，按回车继续 …")
+        self._log_actual_fk_error(
+            "[pick] 3/8",
+            link=link,
+            target_pose=target_pose,
+            plan_frame=plan_frame,
+            joint_names=joint_names,
+        )
 
         try:
             input()
