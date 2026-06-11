@@ -159,6 +159,8 @@
     <disable_collisions link1="L1" link2="R5" reason="Never"/>
     <disable_collisions link1="L1" link2="SJ" reason="Never"/>
     <disable_collisions link1="L1" link2="YB" reason="Adjacent"/>
+    <disable_collisions link1="l_base_link" link2="YB" reason="Adjacent"/>
+    <disable_collisions link1="l_base_link" link2="L1" reason="Adjacent"/>
     <!-- <disable_collisions link1="L1" link2="base_link" reason="Never"/> -->
     <disable_collisions link1="L2" link2="L3" reason="Adjacent"/>
     <disable_collisions link1="L2" link2="R1" reason="Never"/>
@@ -182,6 +184,8 @@
     <disable_collisions link1="R1" link2="R4" reason="Never"/>
     <disable_collisions link1="R1" link2="SJ" reason="Never"/>
     <disable_collisions link1="R1" link2="YB" reason="Adjacent"/>
+    <disable_collisions link1="r_base_link" link2="YB" reason="Adjacent"/>
+    <disable_collisions link1="r_base_link" link2="R1" reason="Adjacent"/>
     <!-- <disable_collisions link1="R1" link2="base_link" reason="Never"/> -->
     <disable_collisions link1="R2" link2="R3" reason="Adjacent"/>
     <disable_collisions link1="R2" link2="SJ" reason="Never"/>
