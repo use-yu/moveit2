@@ -286,17 +286,22 @@ PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 # 视觉 TCP 配置
 VISION_IP = "192.168.5.111"
 VISION_PORT = 5700
-VISION_TRIGGER_COMMAND = "320,1,1,1,1,0"
+VISION_TRIGGER_COMMAND = "320,2,1,1,1,0"
 VISION_CONNECT_TIMEOUT = 3.0
 VISION_RECV_TIMEOUT = 20.0
 NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+# VISION_LEFT_TRANSFORM_MM = [
+#     [-0.0589, 0.6938, -0.7178, -79.0463],
+#     [0.0530, 0.7202, 0.6918, -121.0375],
+#     [0.9969, 0.0027, -0.0792, -56.4165],
+#     [0.0, 0.0, 0.0, 1.0],
+# ]
 VISION_LEFT_TRANSFORM_MM = [
-    [-0.0589, 0.6938, -0.7178, -79.0463],
-    [0.0530, 0.7202, 0.6918, -121.0375],
-    [0.9969, 0.0027, -0.0792, -56.4165],
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ]
-
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
 IK_N_CANDIDATES = 200          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
 IK_SEED_PERTURB = math.pi/2     # 随机种子各关节的最大扰动幅度 [rad]，越大解越分散
@@ -2079,12 +2084,12 @@ def main(argv: list[str] | None = None) -> int:
             roll=roll,
             pitch=pitch,
             yaw=yaw,
-            # x=-714.3421 / 1000.0,
-            # y=226.8677 / 1000.0,
-            # z=-205.5378 / 1000.0,
-            # roll=1.531,
-            # pitch=0.459,
-            # yaw=-2.358,
+            # x=-672.48065 / 1000.0,
+            # y=426.67697 / 1000.0,
+            # z=-92.88865 / 1000.0,
+            # roll=-86.19341,
+            # pitch=120.29546,
+            # yaw=35.23914,
         )
         print(f"EE_POSE2 = {EE_POSE2}")
         # return 1
