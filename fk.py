@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CR7 forward kinematics from the xacro/URDF model.
+"""CR7 forward kinematics from the URDF model.
 
 By default command-line angles are degrees. Use --radians for ROS/MoveIt
 joint-state values.
@@ -19,9 +19,8 @@ from typing import Iterable, Sequence
 
 DEFAULT_URDF = (
     Path(__file__).resolve().parent
-    / "moveit_resources/g01_description/urdf/cr7_robot.urdf"
+    / "DOBOT_6Axis_ROS2/dobot_rviz/urdf/cr7_robot.urdf"
 )
-
 
 def _matmul(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> list[list[float]]:
     return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
@@ -85,8 +84,12 @@ def _numbers(value: str | None, default: Sequence[float]) -> list[float]:
     return [float(part) for part in value.split()]
 
 
-def _expand_cr7_xacro(urdf_path: str | Path = DEFAULT_URDF) -> ET.Element:
+def _load_urdf_root(urdf_path: str | Path = DEFAULT_URDF) -> ET.Element:
     urdf_path = Path(urdf_path).resolve()
+    text = urdf_path.read_text(encoding="utf-8")
+    if "xacro:" not in text:
+        return ET.fromstring(text)
+
     wrapper = f"""<?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="cr7_fk">
   <xacro:include filename="{urdf_path}" />
@@ -152,15 +155,19 @@ def _joint_info(elem: ET.Element) -> dict[str, object]:
 def _load_chain(
     urdf_path: str | Path = DEFAULT_URDF,
     *,
-    include_tool: bool = True,
+    include_tool: bool = False,
 ) -> list[dict[str, object]]:
-    root = _expand_cr7_xacro(urdf_path)
+    root = _load_urdf_root(urdf_path)
     joints_by_parent: dict[str, list[dict[str, object]]] = defaultdict(list)
     for elem in root.iter("joint"):
         joint = _joint_info(elem)
         joints_by_parent[str(joint["parent"])].append(joint)
 
     target_link = "tool" if include_tool else "Link6"
+    link_names = {elem.attrib["name"] for elem in root.iter("link") if "name" in elem.attrib}
+    if target_link not in link_names:
+        raise ValueError(f"target link {target_link!r} not found in {urdf_path}")
+
     current_link = "base_link"
     chain: list[dict[str, object]] = []
     while current_link != target_link:
@@ -179,10 +186,10 @@ def fk(
     joint_angles: Sequence[float] | Iterable[float] | float,
     *more_angles: float,
     urdf_path: str | Path = DEFAULT_URDF,
-    include_tool: bool = True,
+    include_tool: bool = False,
     degrees: bool = True,
 ) -> dict[str, object]:
-    """Compute CR7 FK from base_link to tool, or to Link6 with include_tool=False."""
+    """Compute CR7 FK from base_link to Link6, or to tool with include_tool=True."""
     if more_angles:
         q = [float(joint_angles), *[float(value) for value in more_angles]]
     elif isinstance(joint_angles, (int, float)):
@@ -222,8 +229,9 @@ def _main() -> int:
     parser = argparse.ArgumentParser(description="Compute CR7 forward kinematics")
     parser.add_argument("q", nargs="*", type=float, help="joint1..joint6 angles; default unit is degree")
     parser.add_argument("--radians", action="store_true", help="input angles are radians")
-    parser.add_argument("--link6", action="store_true", help="return FK to Link6 instead of tool")
-    parser.add_argument("--urdf", default=str(DEFAULT_URDF), help="path to cr7_robot.urdf xacro file")
+    parser.add_argument("--tool", action="store_true", help="return FK to tool if the URDF contains a tool link")
+    parser.add_argument("--link6", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--urdf", default=str(DEFAULT_URDF), help="path to cr7_robot.urdf file")
     args = parser.parse_args()
 
     if args.q:
@@ -236,7 +244,7 @@ def _main() -> int:
     result = fk(
         joint_angles,
         urdf_path=args.urdf,
-        include_tool=not args.link6,
+        include_tool=args.tool and not args.link6,
         degrees=not args.radians,
     )
 
