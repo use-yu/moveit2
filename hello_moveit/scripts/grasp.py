@@ -74,7 +74,8 @@ from dobot_msgs_v4.srv import SetToolPower
 # =============================================================================
 # 用户可调参数（改这里即可，无需动下面逻辑）
 # =============================================================================
-
+GREEN = '\033[32m'
+RESET = '\033[0m'
 # 第一步：关节空间规划使用哪个 SRDF 组
 ACTIVE_GROUP = "dual_arm"
 
@@ -965,10 +966,10 @@ class G01Demo(Node):
             f"target_quat=({to.x:.6f}, {to.y:.6f}, {to.z:.6f}, {to.w:.6f})"
         )
         log.info(
-            f"{label} 位姿误差: "
+            f"{GREEN}{label} 位姿误差: "
             f"dxyz=({dx * 1000.0:.2f}, {dy * 1000.0:.2f}, {dz * 1000.0:.2f}) mm, "
             f"|pos|={pos_err * 1000.0:.2f} mm, "
-            f"orientation={math.degrees(ori_err):.3f} deg"
+            f"orientation={math.degrees(ori_err):.3f} deg{RESET}"
         )
 
     def _pose_position_in_frame(
@@ -1937,7 +1938,7 @@ class G01Demo(Node):
             log.error("[pick] 直线接近执行失败")
             return False
 
-        log.info("[pick] 3/8  到达抓取位置，按回车继续 …")
+        
         self._log_actual_fk_error(
             "[pick] 3/8",
             link=link,
@@ -1945,7 +1946,7 @@ class G01Demo(Node):
             plan_frame=plan_frame,
             joint_names=joint_names,
         )
-
+        log.info("[pick] 3/8  到达抓取位置，按回车继续 …")
         try:
             input()
         except EOFError:
@@ -1954,7 +1955,7 @@ class G01Demo(Node):
         if not self.set_tool_power("right", 1):
             log.error("[pick] 右臂工具上电失败")
             return False
-
+        print("\033[32m上电成功\033[0m")
         log.info(
             "[pick] 4/8  第一段复位：反向 approach + 1/8 OMPL → 1/8 初始位置"
         )
@@ -1980,7 +1981,7 @@ class G01Demo(Node):
         if not self.set_tool_power("right", 0):
             log.error("[pick] 右臂工具下电失败")
             return False
-
+        print("\033[32m下电成功\033[0m")
         # log.info("[pick] 5/8  OMPL  → 运动到放置位置")
         # current = self._get_joints(joint_names, wait_new=True)
         # if current is None:
@@ -2139,7 +2140,7 @@ def main(argv: list[str] | None = None) -> int:
         #交换rx rz
         # if pose is not None and len(pose) >= 6:
         #     pose[3], pose[5] = pose[5], pose[3]  # 索引3是第4位，索引5是第6位
-        print(f"viewer pose = {pose}")
+        print(f"\033[32mviewer pose = {pose}\033[0m")
         if pose is None:
             return finish(False, 0, 1)
         x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
