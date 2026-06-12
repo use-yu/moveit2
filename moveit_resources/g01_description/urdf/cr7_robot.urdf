@@ -5,12 +5,13 @@
 <robot
   xmlns:xacro="http://www.ros.org/wiki/xacro"
   name="cr7_robot">
-  <xacro:property name="cr7_structure" value="${xacro.load_yaml('struct.json')}" />
-  <xacro:property name="cr7_a" value="${cr7_structure['a']}" />
-  <xacro:property name="cr7_d" value="${cr7_structure['d']}" />
-  <xacro:property name="cr7_alpha" value="${cr7_structure['alpha']}" />
-  <xacro:property name="mm_to_m" value="0.001" />
-  <xacro:property name="deg_to_rad" value="0.017453292519943295" />
+  <xacro:property name="cr7_transforms" value="${xacro.load_yaml('m_dh_transforms.json')['1084']}" />
+  <xacro:property name="cr7_frame_01" value="${cr7_transforms['frame_0_to_frame_1']}" />
+  <xacro:property name="cr7_frame_12" value="${cr7_transforms['frame_1_to_frame_2']}" />
+  <xacro:property name="cr7_frame_23" value="${cr7_transforms['frame_2_to_frame_3']}" />
+  <xacro:property name="cr7_frame_34" value="${cr7_transforms['frame_3_to_frame_4']}" />
+  <xacro:property name="cr7_frame_45" value="${cr7_transforms['frame_4_to_frame_5']}" />
+  <xacro:property name="cr7_frame_56" value="${cr7_transforms['frame_5_to_frame_6']}" />
 
   <xacro:macro name="cr7_robot" params="prefix link_prefix joint_prefix parent xyz rpy">
   <joint name="${prefix}base_link_to_${parent}" type="fixed">
@@ -104,8 +105,8 @@
     name="${joint_prefix}1"
     type="revolute">
     <origin
-      xyz="0 0 ${cr7_d[0] * mm_to_m}"
-      rpy="0 0 ${cr7_alpha[0] * deg_to_rad}" />
+      xyz="${cr7_frame_01['xyz'][0]} ${cr7_frame_01['xyz'][1]} ${cr7_frame_01['xyz'][2]}"
+      rpy="${cr7_frame_01['rpy'][0]} ${cr7_frame_01['rpy'][1]} ${cr7_frame_01['rpy'][2]}" />
     <parent
       link="${prefix}base_link" />
     <child
@@ -162,8 +163,8 @@
     name="${joint_prefix}2"
     type="revolute">
     <origin
-      xyz="${cr7_a[1] * mm_to_m} 0 ${cr7_d[1] * mm_to_m}"
-      rpy="${-cr7_alpha[1] * deg_to_rad} ${pi / 2.0} ${-pi}" />
+      xyz="${cr7_frame_12['xyz'][0]} ${cr7_frame_12['xyz'][1]} ${cr7_frame_12['xyz'][2]}"
+      rpy="${cr7_frame_12['rpy'][0]} ${cr7_frame_12['rpy'][1]} ${cr7_frame_12['rpy'][2]}" />
     <parent
       link="${link_prefix}1" />
     <child
@@ -194,7 +195,7 @@
     </inertial>
     <visual>
       <origin
-        xyz="0 0 0"
+        xyz="0 0 0.025"
         rpy="0 0 0" />
       <geometry>
         <mesh
@@ -208,7 +209,7 @@
     </visual>
     <collision>
       <origin
-        xyz="0 0 0"
+        xyz="0 0 0.025"
         rpy="0 0 0" />
       <geometry>
         <mesh
@@ -220,8 +221,8 @@
     name="${joint_prefix}3"
     type="revolute">
     <origin
-      xyz="${cr7_a[2] * mm_to_m} 0 ${(cr7_d[3] - cr7_d[4]) * mm_to_m}"
-      rpy="${cr7_alpha[2] * deg_to_rad} 0 0" />
+      xyz="${cr7_frame_23['xyz'][0]} ${cr7_frame_23['xyz'][1]} ${cr7_frame_23['xyz'][2]}"
+      rpy="${cr7_frame_23['rpy'][0]} ${cr7_frame_23['rpy'][1]} ${cr7_frame_23['rpy'][2]}" />
     <parent
       link="${link_prefix}2" />
     <child
@@ -278,8 +279,8 @@
     name="${joint_prefix}4"
     type="revolute">
     <origin
-      xyz="${cr7_a[3] * mm_to_m} 0 ${cr7_d[4] * mm_to_m}"
-      rpy="${cr7_alpha[3] * deg_to_rad} 0 ${-pi / 2.0}" />
+      xyz="${cr7_frame_34['xyz'][0]} ${cr7_frame_34['xyz'][1]} ${cr7_frame_34['xyz'][2]}"
+      rpy="${cr7_frame_34['rpy'][0]} ${cr7_frame_34['rpy'][1]} ${cr7_frame_34['rpy'][2]}" />
     <parent
       link="${link_prefix}3" />
     <child
@@ -336,8 +337,8 @@
     name="${joint_prefix}5"
     type="revolute">
     <origin
-      xyz="${cr7_a[4] * mm_to_m} ${-cr7_d[4] * mm_to_m} 0"
-      rpy="${cr7_alpha[4] * deg_to_rad} 0 0" />
+      xyz="${cr7_frame_45['xyz'][0]} ${cr7_frame_45['xyz'][1]} ${cr7_frame_45['xyz'][2]}"
+      rpy="${cr7_frame_45['rpy'][0]} ${cr7_frame_45['rpy'][1]} ${cr7_frame_45['rpy'][2]}" />
     <parent
       link="${link_prefix}4" />
     <child
@@ -394,8 +395,8 @@
     name="${joint_prefix}6"
     type="revolute">
     <origin
-      xyz="${cr7_a[5] * mm_to_m} ${cr7_d[5] * mm_to_m} 0"
-      rpy="${cr7_alpha[5] * deg_to_rad} 0 0" />
+      xyz="${cr7_frame_56['xyz'][0]} ${cr7_frame_56['xyz'][1]} ${cr7_frame_56['xyz'][2]}"
+      rpy="${cr7_frame_56['rpy'][0]} ${cr7_frame_56['rpy'][1]} ${cr7_frame_56['rpy'][2]}" />
     <parent
       link="${link_prefix}5" />
     <child
