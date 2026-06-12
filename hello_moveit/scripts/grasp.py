@@ -719,7 +719,7 @@ def make_joint_constraints(group: str, joints: dict[str, float]) -> Constraints:
         jc = JointConstraint()
         jc.joint_name = name
         jc.position = pos
-        jc.tolerance_above = jc.tolerance_below = 1e-3
+        jc.tolerance_above = jc.tolerance_below = 1e-5
         jc.weight = 1.0
         c.joint_constraints.append(jc)
     return c
