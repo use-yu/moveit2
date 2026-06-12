@@ -211,7 +211,7 @@ SCENE_FRAME = "base_link"
 FRAME_ID = "深框"
 FRAME_SIZE = (1.18, 1.18, 0.58)  # 深框整体外尺寸：长×宽×高 [m]
 WALL_T = 0.09  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
-FRAME_CENTER = (-0.81 - 0.005, -0.363, -0.1)  # 深框整体外轮廓中心，相对于 base_link [m]
+FRAME_CENTER = (-0.81 - 0.005, -0.363, -0.08)  # 深框整体外轮廓中心，相对于 base_link [m]
 FRAME_RPY_DEG = (90.0, -0.0, 180.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 FRAME_CUTOFF_ID = "深框隔离面"
@@ -239,8 +239,8 @@ ACT_MOVE_GROUP = "move_action"
 ACT_EXEC_TRAJ = "execute_trajectory"
 
 # 末端目标容差（与 MoveGroupInterface 默认一致）
-_POS_TOL = 1e-4
-_ORI_TOL = 1e-3
+_POS_TOL = 1e-5
+_ORI_TOL = 1e-5
 
 # 笛卡尔直线运动参数
 CART_EEF_STEP = 0.005     # 服务端 IK 离散步长（m）

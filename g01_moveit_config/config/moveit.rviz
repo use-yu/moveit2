@@ -160,6 +160,7 @@ Visualization Manager:
             Alpha: 1
             Show Axes: false
             Show Trail: false
+            Value: true
           l_tool:
             Alpha: 1
             Show Axes: false
@@ -168,6 +169,7 @@ Visualization Manager:
             Alpha: 1
             Show Axes: false
             Show Trail: false
+            Value: true
           r_tool:
             Alpha: 1
             Show Axes: false
@@ -200,7 +202,7 @@ Visualization Manager:
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
         Planning Group: left_arm
-        Query Goal State: true
+        Query Goal State: false
         Query Start State: false
         Show Workspace: false
         Start State Alpha: 1
@@ -311,6 +313,7 @@ Visualization Manager:
             Alpha: 1
             Show Axes: false
             Show Trail: false
+            Value: true
           l_tool:
             Alpha: 1
             Show Axes: false
@@ -319,6 +322,7 @@ Visualization Manager:
             Alpha: 1
             Show Axes: false
             Show Trail: false
+            Value: true
           r_tool:
             Alpha: 1
             Show Axes: false
@@ -439,6 +443,7 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
+          Value: true
         l_tool:
           Alpha: 1
           Show Axes: false
@@ -447,6 +452,7 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
+          Value: true
         r_tool:
           Alpha: 1
           Show Axes: false
@@ -524,26 +530,24 @@ Visualization Manager:
               base_link:
                 SJ:
                   YB:
-                    L1:
-                      L2:
-                        L3:
-                          L4:
-                            L5:
-                              L6:
-                                l_tool:
-                                  {}
-                    R1:
-                      R2:
-                        R3:
-                          R4:
-                            R5:
-                              R6:
-                                r_tool:
-                                  {}
                     l_base_link:
-                      {}
+                      L1:
+                        L2:
+                          L3:
+                            L4:
+                              L5:
+                                L6:
+                                  l_tool:
+                                    {}
                     r_base_link:
-                      {}
+                      R1:
+                        R2:
+                          R3:
+                            R4:
+                              R5:
+                                R6:
+                                  r_tool:
+                                    {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Marker
@@ -577,25 +581,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.2743234634399414
+      Distance: 4.74065637588501
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.1459263563156128
-        Y: 0.1507946103811264
-        Z: 1.4524554014205933
+        X: -0.12381840497255325
+        Y: -0.026849042624235153
+        Z: 1.3190042972564697
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.15479688346385956
+      Pitch: -0.05520310997962952
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 5.005174160003662
+      Yaw: 5.445176124572754
     Saved: ~
 Window Geometry:
   Displays:
