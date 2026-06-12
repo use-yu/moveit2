@@ -238,7 +238,7 @@ GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
 ACT_MOVE_GROUP = "move_action"
 ACT_EXEC_TRAJ = "execute_trajectory"
 
-# 末端目标容差（与 MoveGroupInterface 默认一致）
+# 末端目标容差（与 MoveGroupInterface 默认一致）没用到
 _POS_TOL = 1e-5
 _ORI_TOL = 1e-5
 

@@ -382,6 +382,18 @@
       </material>
     </visual>
     <collision>
+      <origin xyz="0.001 -0.001 0.0878" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="${arm_collision_scale * 0.085}" length="${arm_collision_scale * 0.10}" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.000 0.000 -0.0012" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.07}" />
+      </geometry>
+    </collision>
+    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -389,7 +401,7 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/cr7/J6.STL" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint
     name="${joint_prefix}6"
