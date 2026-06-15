@@ -285,11 +285,12 @@ POST_RETURN_Z_OFFSET = 0.1  # 复位后沿末端 +z 轴直线移动距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 
 # 视觉 TCP 配置
-VISION_IP = "192.168.5.111"
-VISION_PORT = 5700
-VISION_TRIGGER_COMMAND = "320,2,1,1,1,0"
+VISION_IP = "192.168.5.100"
+VISION_PORT = 50000
+VISION_TRIGGER_COMMAND = "p,1"
 VISION_CONNECT_TIMEOUT = 3.0
 VISION_RECV_TIMEOUT = 20.0
+# 正则表达式，用来匹配字符串里的数字：
 NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # VISION_LEFT_TRANSFORM_MM = [
 #     [-0.0589, 0.6938, -0.7178, -79.0463],
@@ -297,10 +298,11 @@ NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 #     [0.9969, 0.0027, -0.0792, -56.4165],
 #     [0.0, 0.0, 0.0, 1.0],
 # ]
+# 平移毫米
 VISION_LEFT_TRANSFORM_MM = [
-    [1.0, 0.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0, 0.0],
+    [0.0145257833, 0.7109580433, -0.7030843920, -103.281],
+    [0.0045172404, 0.7031047425, 0.7110719483, -178.077],
+    [0.9998842914, -0.0135048783, 0.0070015787, -105.783],
     [0.0, 0.0, 0.0, 1.0],
 ]
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
@@ -333,17 +335,17 @@ def connect_vision(log) -> socket.socket | None:
 
 
 def read_vision_pose(sock: socket.socket, log) -> list[float] | None:
-    """复用已连接 socket，触发一次视觉并返回解析后的 Dobot pose。"""
+    """复用已连接 socket，触发一次视觉并返回 xyz(mm) + quat(wxyz)。"""
     try:
         sock.sendall(VISION_TRIGGER_COMMAND.encode("utf-8"))
         raw_text = sock.recv(4096).decode("utf-8", errors="ignore").strip()
         numbers = [float(item) for item in NUMBER_PATTERN.findall(raw_text)]
-        if len(numbers) < 6:
-            message = f"viewer 返回数字不足 6 个：{raw_text}"
+        if len(numbers) < 7:
+            message = f"viewer 返回数字不足 7 个：{raw_text}"
             log.error(message)
             print(message)
             return None
-        return numbers[-6:]
+        return numbers[-7:]
     except OSError as exc:
         message = f"viewer 获取 pose 失败：{exc}"
         log.error(message)
@@ -396,6 +398,41 @@ def pose_mm_deg_to_matrix(pose: Sequence[float]) -> list[list[float]]:
     ]
 
 
+def quat_wxyz_to_rot(qw: float, qx: float, qy: float, qz: float) -> list[list[float]]:
+    norm = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if norm < 1e-12:
+        raise ValueError("viewer 四元数长度为 0")
+    qw, qx, qy, qz = qw / norm, qx / norm, qy / norm, qz / norm
+    return [
+        [
+            1.0 - 2.0 * (qy * qy + qz * qz),
+            2.0 * (qx * qy - qz * qw),
+            2.0 * (qx * qz + qy * qw),
+        ],
+        [
+            2.0 * (qx * qy + qz * qw),
+            1.0 - 2.0 * (qx * qx + qz * qz),
+            2.0 * (qy * qz - qx * qw),
+        ],
+        [
+            2.0 * (qx * qz - qy * qw),
+            2.0 * (qy * qz + qx * qw),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ],
+    ]
+
+
+def pose_mm_wxyz_to_matrix(pose: Sequence[float]) -> list[list[float]]:
+    x, y, z, qw, qx, qy, qz = [float(value) for value in pose[:7]]
+    rot = quat_wxyz_to_rot(qw, qx, qy, qz)
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x],
+        [rot[1][0], rot[1][1], rot[1][2], y],
+        [rot[2][0], rot[2][1], rot[2][2], z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
 def matrix_to_xyz_rpy(matrix: list[list[float]]) -> tuple[float, float, float, float, float, float]:
     rot = [row[:3] for row in matrix[:3]]
     roll, pitch, yaw = rot_to_rpy(rot)
@@ -410,8 +447,8 @@ def matrix_to_xyz_rpy(matrix: list[list[float]]) -> tuple[float, float, float, f
 
 
 def transform_vision_pose(pose: Sequence[float]) -> tuple[float, float, float, float, float, float]:
-    """viewer pose 为 mm/deg；左乘标定矩阵后返回 xyz(mm), rpy(rad)。"""
-    return matrix_to_xyz_rpy(matmul4(VISION_LEFT_TRANSFORM_MM, pose_mm_deg_to_matrix(pose)))
+    """viewer pose 为 xyz(mm) + quat(wxyz)；左乘标定矩阵后返回 xyz(mm), rpy(rad)。"""
+    return matrix_to_xyz_rpy(matmul4(VISION_LEFT_TRANSFORM_MM, pose_mm_wxyz_to_matrix(pose)))
 
 
 def quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
@@ -2137,13 +2174,17 @@ def main(argv: list[str] | None = None) -> int:
         if vision_sock is None:
             return finish(False, 0, 1)
         pose = read_vision_pose(vision_sock, log)
-        #交换rx rz
-        # if pose is not None and len(pose) >= 6:
-        #     pose[3], pose[5] = pose[5], pose[3]  # 索引3是第4位，索引5是第6位
+
         print(f"\033[32mviewer pose = {pose}\033[0m")
         if pose is None:
             return finish(False, 0, 1)
-        x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        try:
+            x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        except ValueError as exc:
+            message = f"viewer pose 解析失败：{exc}"
+            log.error(message)
+            print(message)
+            return finish(False, 0, 1)
         print(
             "viewer pose transformed: "
             f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
@@ -2165,7 +2206,7 @@ def main(argv: list[str] | None = None) -> int:
             # yaw=35.23914,
         )
         print(f"EE_POSE2 = {EE_POSE2}")
-        # return 1
+        return 1
 
         node.show_cylinder_at_pose(EE_POSE2)
         
@@ -2185,7 +2226,7 @@ def main(argv: list[str] | None = None) -> int:
         target_pose = make_pose(
             ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
         )
-        print(f"target_pose = {target_pose}")
+        print(f"\033[32mtarget_pose = {target_pose}\033[0m")
         log.info(
             f"抓取: group={pick_group}, link={EE_LINK}, frame={PLAN_FRAME}"
         )
