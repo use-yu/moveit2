@@ -277,7 +277,7 @@ PLACE_JOINTS = {
         0.9618226289749146, -0.6597065329551697, -1.4834308624267578, -0.9613705277442932, -2.68591570854187, -1.7255382537841797
     ],
     "left_arm": [
-        -2.283, 1.02, 1.300752, 0.543868, -0.143126, -0.338787
+        -1.012291, 0.767945, 1.623156, -2.286381, -2.652900, 0.436332
     ],
 }
 
@@ -1900,20 +1900,35 @@ class G01Demo(Node):
         group: str,
         link: str,
         plan_frame: str,
-        joint_names: Sequence[str],
-        pick_start_joints: dict[str, float],
         cartesian_speed: float | None = None,
     ) -> bool:
-        """执行放置段：OMPL 到放置位、末端直线抬起、下电、按两段轨迹原路返回。"""
+        """执行放置段：OMPL 到放置位、末端直线抬起、下电、按两段轨迹原路返回。
+
+        参数：
+            speed             : 5/8 OMPL 到放置关节位的速度缩放（0~1）。
+            place_joints      : 放置位关节目标 [rad]，顺序必须与 group 推导出的关节顺序一致。
+            group             : SRDF 规划组，如 right_arm。
+            link              : 末端 link，如 r_tool。
+            plan_frame        : 笛卡尔/FK 使用的规划坐标系，如 r_base_link。
+            cartesian_speed   : 6/8 末端 +z 笛卡尔直线速度；None 时复用 speed。
+        """
         log = self.get_logger()
+        place_joint_names = joint_names_for_group(group)
         cartesian_speed = speed if cartesian_speed is None else cartesian_speed
+        if len(place_joints) != len(place_joint_names):
+            log.error(
+                f"[pick] place_joints 长度 {len(place_joints)} 与 group={group} "
+                f"关节数 {len(place_joint_names)} 不一致"
+            )
+            return False
 
         log.info("[pick] 5/8  OMPL  → 运动到放置位置")
-        current = self._get_joints(list(joint_names), wait_new=True)
+        current = self._get_joints(place_joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
-        goal = [make_joint_constraints_from_vector(group, joint_names, place_joints)]
+        place_start_joints = current
+        goal = [make_joint_constraints_from_vector(group, place_joint_names, place_joints)]
         ok, used_ms, to_place_traj = self.move(
             group, goal, start=current, plan_only=False, speed_scale=speed
         )
@@ -1926,7 +1941,7 @@ class G01Demo(Node):
             return False
         log.info(
             "[pick] 放置位关节: "
-            + ", ".join(f"{n}={v:.3f}" for n, v in zip(joint_names, place_joints))
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(place_joint_names, place_joints))
         )
 
         log.info("按回车继续 …")
@@ -1939,12 +1954,12 @@ class G01Demo(Node):
             f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
             f"（笛卡尔，从当前位姿 FK 偏移）"
         )
-        current = self._get_joints(list(joint_names), wait_new=True)
+        current = self._get_joints(place_joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
         ee_pose = self._get_link_pose_fk(
-            link, current, joint_names=joint_names, plan_frame=plan_frame
+            link, current, joint_names=place_joint_names, plan_frame=plan_frame
         )
         if ee_pose is None:
             log.error("[pick] FK 读取当前末端位姿失败")
@@ -1953,7 +1968,7 @@ class G01Demo(Node):
         z_offset_traj = self._cartesian_plan(
             group, link, offset_pose,
             speed_scale=cartesian_speed,
-            joint_names=joint_names,
+            joint_names=place_joint_names,
             plan_frame=plan_frame,
         )
         if z_offset_traj is None:
@@ -1990,8 +2005,8 @@ class G01Demo(Node):
             log.error("[pick] 8/8 反向播放 5/8 失败")
             return False
         log.info(
-            "[pick] 原路返回完成，当前应在 1/8 初始位置: "
-            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
+            "[pick] 原路返回完成，当前应在放置前位置: "
+            + ", ".join(f"{n}={place_start_joints[n]:.3f}" for n in place_joint_names)
         )
         return True
 
@@ -2151,7 +2166,16 @@ class G01Demo(Node):
                 + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
             )
             
-            return True
+            if not self._place_and_return(
+                place_speed_scale,
+                place_joints=PLACE_JOINTS["left_arm"],
+                group="left_arm",
+                link="l_tool",
+                plan_frame="l_base_link",
+                cartesian_speed=speed_scale,
+            ):
+                return False
+            
         else:
             retreat_to_start = self._reverse_trajectory(to_pre_traj)
             if not self._execute_traj(retreat_to_start):
@@ -2161,19 +2185,16 @@ class G01Demo(Node):
                 "[pick] 第一段复位完成，已回到 1/8 初始位置: "
                 + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
             )
-
         
-        if not self._place_and_return(
-            place_speed_scale,
-            place_joints,
-            group=group,
-            link=link,
-            plan_frame=plan_frame,
-            joint_names=joint_names,
-            pick_start_joints=pick_start_joints,
-            cartesian_speed=speed_scale,
-        ):
-            return False
+            if not self._place_and_return(
+                place_speed_scale,
+                place_joints,
+                group=group,
+                link=link,
+                plan_frame=plan_frame,
+                cartesian_speed=speed_scale,
+            ):
+                return False
 
         log.info("[pick] 抓取流程完成。")
         return True
@@ -2322,15 +2343,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not node.pick_and_return(
             target_pose=target_pose,
-            speed_scale=0.1,
+            speed_scale=0.5,
             group=pick_group,
             link=EE_LINK,
             plan_frame=PLAN_FRAME,
             joint_names=pick_joint_names,
             place_joints=PLACE_JOINTS[pick_group],
-            place_speed_scale=0.1,
+            place_speed_scale=0.5,
             cutoff_joint_names=joint_names,
-            first_return_mode=1,
+            first_return_mode=0,
         ):
             log.error("抓取流程失败")
             log.info("按回车退出 …")
