@@ -1,4 +1,24 @@
 ## ROS2 Service 列表（含说明）
+下使能：
+ros2 service call /dobot_right/dobot_bringup_ros2/srv/DisableRobot dobot_msgs_v4/srv/DisableRobot "{}"
+返回
+int32 res
+0   成功
+-1  命令执行失败
+-2  当前错误状态，需 ClearError
+-3  当前急停按下，需松开急停并 ClearError
+-4  当前下电状态
+
+清除急停：
+ros2 service call /dobot_right/dobot_bringup_ros2/srv/EmergencyStop dobot_msgs_v4/srv/EmergencyStop "{value: 0}"
+返回
+int32 res
+res: 0   成功
+res: -1  执行失败
+res: -2  当前错误状态，需 ClearError
+res: -3  急停仍被按下，需松开急停并清错
+res: -4  当前下电，需 PowerOn
+
 ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py
 
 以下服务由 Dobot bringup 节点提供。

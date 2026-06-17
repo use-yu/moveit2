@@ -285,6 +285,7 @@ PLACE_JOINTS = {
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
 POST_RETURN_Z_OFFSET = 0.115  # 复位后沿末端 +z 轴直线移动距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
+FIRST_RETURN_MODE = 0       # 0: 直线+OMPL 回到 1/8 初始位置；1: 只反向直线回到 q_pre
 
 # 视觉 TCP 配置
 VISION_IP = "192.168.5.100"
@@ -1902,6 +1903,7 @@ class G01Demo(Node):
         place_joints: Sequence[float],
         place_speed_scale: float = PLACE_SPEED_SCALE,
         cutoff_joint_names: Sequence[str] | None = None,
+        first_return_mode: int = 0,
     ) -> bool:
         """抓取流程（IK 多解 + approach 预检 + 放置 + 原路返回）。
 
@@ -1915,10 +1917,15 @@ class G01Demo(Node):
             place_joints      : 放置位关节目标 [rad]（向量，顺序同 joint_names）
             place_speed_scale : 5/8 OMPL 到放置位的速度缩放（0~1）
             cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
+            first_return_mode : 0=反向 approach + 1/8 OMPL 回初始位置；1=只反向 approach 回 q_pre
         """
         log = self.get_logger()
         joint_names = list(joint_names)
         cutoff_joint_names = list(cutoff_joint_names) if cutoff_joint_names is not None else joint_names
+        first_return_mode = int(first_return_mode)
+        if first_return_mode not in (0, 1):
+            log.error(f"[pick] first_return_mode 只能是 0 或 1，当前={first_return_mode}")
+            return False
         if len(place_joints) != len(joint_names):
             log.error(
                 f"[pick] place_joints 长度 {len(place_joints)} 与 joint_names 长度 "
@@ -2007,7 +2014,6 @@ class G01Demo(Node):
             log.error("[pick] 直线接近执行失败")
             return False
 
-        
         self._log_actual_fk_error(
             "[pick] 3/8",
             link=link,
@@ -2025,21 +2031,33 @@ class G01Demo(Node):
             log.error("[pick] 右臂工具上电失败")
             return False
         print("\033[32m上电成功\033[0m")
-        log.info(
-            "[pick] 4/8  第一段复位：反向 approach + 1/8 OMPL → 1/8 初始位置"
+        # 日志
+        return_desc = (
+            "反向 approach → q_pre"
+            if first_return_mode == 1
+            else "反向 approach + 1/8 OMPL → 1/8 初始位置"
         )
+        log.info(f"[pick] 4/8  第一段复位：{return_desc}")
         retreat_approach = self._reverse_trajectory(approach_traj)
         if not self._execute_traj(retreat_approach):
             log.error("[pick] 反向播放 approach 失败")
             return False
-        retreat_to_start = self._reverse_trajectory(to_pre_traj)
-        if not self._execute_traj(retreat_to_start):
-            log.error("[pick] 反向播放 1/8 OMPL 回到初始位置失败")
-            return False
-        log.info(
-            "[pick] 第一段复位完成，已回到 1/8 初始位置: "
-            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
-        )
+        if first_return_mode == 1:
+            log.info(
+                "[pick] 第一段复位完成，已反向直线回到 q_pre: "
+                + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
+            )
+            
+            return True
+        else:
+            retreat_to_start = self._reverse_trajectory(to_pre_traj)
+            if not self._execute_traj(retreat_to_start):
+                log.error("[pick] 反向播放 1/8 OMPL 回到初始位置失败")
+                return False
+            log.info(
+                "[pick] 第一段复位完成，已回到 1/8 初始位置: "
+                + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
+            )
 
         
         log.info("[pick] 5/8  OMPL  → 运动到放置位置")
@@ -2209,41 +2227,44 @@ def main(argv: list[str] | None = None) -> int:
             return finish(False, 0, 1)
 
         time.sleep(1)
-        # 视觉识别
-        vision_sock = connect_vision(log)
-        if vision_sock is None:
-            return finish(False, 0, 1)
-        pose = read_vision_pose(vision_sock, log)
+        # # 视觉识别
+        # vision_sock = connect_vision(log)
+        # if vision_sock is None:
+        #     return finish(False, 0, 1)
+        # pose = read_vision_pose(vision_sock, log)
 
-        print(f"\033[32mviewer pose = {pose}\033[0m")
-        if pose is None:
-            return finish(False, 0, 1)
-        try:
-            x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
-        except ValueError as exc:
-            message = f"viewer pose 解析失败：{exc}"
-            log.error(message)
-            print(message)
-            return finish(False, 0, 1)
-        print(
-            "viewer pose transformed: "
-            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
-            f"z={z_mm / 1000.0:.6f} m, "
-            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
-        )
+        # print(f"\033[32mviewer pose = {pose}\033[0m")
+        # if pose is None:
+        #     return finish(False, 0, 1)
+        # try:
+        #     x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        # except ValueError as exc:
+        #     message = f"viewer pose 解析失败：{exc}"
+        #     log.error(message)
+        #     print(message)
+        #     return finish(False, 0, 1)
+        # print(
+        #     "viewer pose transformed: "
+        #     f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
+        #     f"z={z_mm / 1000.0:.6f} m, "
+        #     f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
+        # )
+        # EE_POSE2 = dict(
+        #     x=x_mm / 1000.0,
+        #     y=y_mm / 1000.0,
+        #     z=z_mm / 1000.0,
+        #     roll=roll,
+        #     pitch=pitch,
+        #     yaw=yaw,
+        # )
+        #sim
         EE_POSE2 = dict(
-            x=x_mm / 1000.0,
-            y=y_mm / 1000.0,
-            z=z_mm / 1000.0,
-            roll=roll,
-            pitch=pitch,
-            yaw=yaw,
-            # x=-0.5838529295608973,
-            # y=0.47421900873192807,
-            # z=0.024792295551118827,
-            # roll = -1.5516086668226448,
-            # pitch=0.8213446404921059,
-            # yaw=0.529204741098486
+            x=-0.5838529295608973,
+            y=0.47421900873192807,
+            z=0.024792295551118827,
+            roll = -1.5516086668226448,
+            pitch=0.8213446404921059,
+            yaw=0.529204741098486
         )
         print(f"EE_POSE2 = {EE_POSE2}")
         # return 1
@@ -2280,6 +2301,7 @@ def main(argv: list[str] | None = None) -> int:
             place_joints=PLACE_JOINTS[pick_group],
             place_speed_scale=0.1,
             cutoff_joint_names=joint_names,
+            first_return_mode=1,
         ):
             log.error("抓取流程失败")
             log.info("按回车退出 …")
