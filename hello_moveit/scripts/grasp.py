@@ -274,7 +274,7 @@ PLACE_JOINTS = {
         ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
     ],
     "right_arm": [
-        -2.775073511, 0.680678408, 1.431169987, 1.082104136, -0.139626340, -1.797689129
+        0.9618226289749146, -0.6597065329551697, -1.4834308624267578, -0.9613705277442932, -2.68591570854187, -1.7255382537841797
     ],
     "left_arm": [
         -2.283, 1.02, 1.300752, 0.543868, -0.143126, -0.338787
@@ -283,7 +283,7 @@ PLACE_JOINTS = {
 
 # 抓取流程默认参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
-POST_RETURN_Z_OFFSET = 0.07  # 复位后沿末端 +z 轴直线移动距离 [m]
+POST_RETURN_Z_OFFSET = 0.115  # 复位后沿末端 +z 轴直线移动距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 
 # 视觉 TCP 配置
@@ -2041,16 +2041,7 @@ class G01Demo(Node):
             + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
         )
 
-        log.info("按回车继续 …")
-        try:
-            input()
-        except EOFError:
-            pass
-
-        if not self.set_tool_power("right", 0):
-            log.error("[pick] 右臂工具下电失败")
-            return False
-        print("\033[32m下电成功\033[0m")
+        
         log.info("[pick] 5/8  OMPL  → 运动到放置位置")
         current = self._get_joints(joint_names, wait_new=True)
         if current is None:
@@ -2071,6 +2062,12 @@ class G01Demo(Node):
             "[pick] 放置位关节: "
             + ", ".join(f"{n}={v:.3f}" for n, v in zip(joint_names, place_joints))
         )
+
+        log.info("按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
 
         log.info(
             f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
@@ -2099,6 +2096,17 @@ class G01Demo(Node):
         if not self._execute_traj(z_offset_traj):
             log.error("[pick] 6/8 沿末端 z 轴直线移动执行失败")
             return False
+
+        log.info("按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
+
+        if not self.set_tool_power("right", 0):
+            log.error("[pick] 右臂工具下电失败")
+            return False
+        print("\033[32m下电成功\033[0m")
 
         log.info(
             f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
