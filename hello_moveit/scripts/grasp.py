@@ -29,6 +29,8 @@ G01 MoveIt 演示脚本
 
 3. moveit先plan再execute时，耗时较长
 本代码采用先plan+execute的方法
+
+腰部30度/0.523598 放置和交换
 """
 
 from __future__ import annotations
@@ -272,7 +274,7 @@ PLACE_JOINTS = {
         ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
     ],
     "right_arm": [
-        -2.283, 1.02, 1.300752, 0.543868, -0.143126, -0.338787
+        -2.775073511, 0.680678408, 1.431169987, 1.082104136, -0.139626340, -1.797689129
     ],
     "left_arm": [
         -2.283, 1.02, 1.300752, 0.543868, -0.143126, -0.338787
@@ -281,7 +283,7 @@ PLACE_JOINTS = {
 
 # 抓取流程默认参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
-POST_RETURN_Z_OFFSET = 0.1  # 复位后沿末端 +z 轴直线移动距离 [m]
+POST_RETURN_Z_OFFSET = 0.07  # 复位后沿末端 +z 轴直线移动距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 
 # 视觉 TCP 配置
@@ -292,19 +294,49 @@ VISION_CONNECT_TIMEOUT = 3.0
 VISION_RECV_TIMEOUT = 20.0
 # 正则表达式，用来匹配字符串里的数字：
 NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
-# VISION_LEFT_TRANSFORM_MM = [
-#     [-0.0589, 0.6938, -0.7178, -79.0463],
-#     [0.0530, 0.7202, 0.6918, -121.0375],
-#     [0.9969, 0.0027, -0.0792, -56.4165],
-#     [0.0, 0.0, 0.0, 1.0],
-# ]
-# 平移毫米
-VISION_LEFT_TRANSFORM_MM = [
-    [0.0150812085, 0.7158285146, -0.6981132393, -103.660],
-    [0.0045275844, 0.6981365966, 0.7159502731, -177.649],
-    [0.9998760214, -0.0139581620, 0.0072877696, -105.821],
-    [0.0, 0.0, 0.0, 1.0],
+# 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
+# 下面会转成平移单位为毫米的 4x4 矩阵，与 viewer pose 的毫米单位保持一致。
+VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
+    -0.153056, -0.140874, -0.110922, 0.650114, -0.266715, -0.658118, -0.270360
 ]
+
+
+def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
+    if len(transform) != 7:
+        raise ValueError(f"标定参数需要 7 个数: x, y, z, qw, qx, qy, qz，实际 {len(transform)} 个")
+
+    x_m, y_m, z_m, qw, qx, qy, qz = [float(value) for value in transform]
+    norm = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if norm < 1e-12:
+        raise ValueError("标定四元数长度为 0")
+    qw, qx, qy, qz = qw / norm, qx / norm, qy / norm, qz / norm
+
+    rot = [
+        [
+            1.0 - 2.0 * (qy * qy + qz * qz),
+            2.0 * (qx * qy - qz * qw),
+            2.0 * (qx * qz + qy * qw),
+        ],
+        [
+            2.0 * (qx * qy + qz * qw),
+            1.0 - 2.0 * (qx * qx + qz * qz),
+            2.0 * (qy * qz - qx * qw),
+        ],
+        [
+            2.0 * (qx * qz - qy * qw),
+            2.0 * (qy * qz + qx * qw),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ],
+    ]
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x_m * 1000.0],
+        [rot[1][0], rot[1][1], rot[1][2], y_m * 1000.0],
+        [rot[2][0], rot[2][1], rot[2][2], z_m * 1000.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+VISION_LEFT_TRANSFORM_MM = _transform_xyz_wxyz_m_to_matrix_mm(VISION_LEFT_TRANSFORM_XYZ_WXYZ)
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
 IK_N_CANDIDATES = 200          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
 IK_SEED_PERTURB = math.pi/2     # 随机种子各关节的最大扰动幅度 [rad]，越大解越分散
@@ -2019,74 +2051,74 @@ class G01Demo(Node):
             log.error("[pick] 右臂工具下电失败")
             return False
         print("\033[32m下电成功\033[0m")
-        # log.info("[pick] 5/8  OMPL  → 运动到放置位置")
-        # current = self._get_joints(joint_names, wait_new=True)
-        # if current is None:
-        #     log.error("[pick] 读取当前关节失败")
-        #     return False
-        # goal = [make_joint_constraints_from_vector(group, joint_names, place_joints)]
-        # ok, used_ms, to_place_traj = self.move(
-        #     group, goal, start=current, plan_only=False, speed_scale=place_speed_scale
-        # )
-        # log.info(f"[pick] OMPL → 放置位置: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
-        # if not ok:
-        #     log.error("[pick] 运动到放置位置失败")
-        #     return False
-        # if to_place_traj is None or not to_place_traj.joint_trajectory.points:
-        #     log.error("[pick] 5/8 未返回 OMPL 轨迹，无法原路返回")
-        #     return False
-        # log.info(
-        #     "[pick] 放置位关节: "
-        #     + ", ".join(f"{n}={v:.3f}" for n, v in zip(joint_names, place_joints))
-        # )
+        log.info("[pick] 5/8  OMPL  → 运动到放置位置")
+        current = self._get_joints(joint_names, wait_new=True)
+        if current is None:
+            log.error("[pick] 读取当前关节失败")
+            return False
+        goal = [make_joint_constraints_from_vector(group, joint_names, place_joints)]
+        ok, used_ms, to_place_traj = self.move(
+            group, goal, start=current, plan_only=False, speed_scale=place_speed_scale
+        )
+        log.info(f"[pick] OMPL → 放置位置: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        if not ok:
+            log.error("[pick] 运动到放置位置失败")
+            return False
+        if to_place_traj is None or not to_place_traj.joint_trajectory.points:
+            log.error("[pick] 5/8 未返回 OMPL 轨迹，无法原路返回")
+            return False
+        log.info(
+            "[pick] 放置位关节: "
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(joint_names, place_joints))
+        )
 
-        # log.info(
-        #     f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
-        #     f"（笛卡尔，从当前位姿 FK 偏移）"
-        # )
-        # current = self._get_joints(joint_names, wait_new=True)
-        # if current is None:
-        #     log.error("[pick] 读取当前关节失败")
-        #     return False
-        # ee_pose = self._get_link_pose_fk(
-        #     link, current, joint_names=joint_names, plan_frame=plan_frame
-        # )
-        # if ee_pose is None:
-        #     log.error("[pick] FK 读取当前末端位姿失败")
-        #     return False
-        # offset_pose = pose_offset_local_z(ee_pose, POST_RETURN_Z_OFFSET)
-        # z_offset_traj = self._cartesian_plan(
-        #     group, link, offset_pose,
-        #     speed_scale=speed_scale,
-        #     joint_names=joint_names,
-        #     plan_frame=plan_frame,
-        # )
-        # if z_offset_traj is None:
-        #     log.error("[pick] 6/8 笛卡尔直线规划失败")
-        #     return False
-        # if not self._execute_traj(z_offset_traj):
-        #     log.error("[pick] 6/8 沿末端 z 轴直线移动执行失败")
-        #     return False
+        log.info(
+            f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
+            f"（笛卡尔，从当前位姿 FK 偏移）"
+        )
+        current = self._get_joints(joint_names, wait_new=True)
+        if current is None:
+            log.error("[pick] 读取当前关节失败")
+            return False
+        ee_pose = self._get_link_pose_fk(
+            link, current, joint_names=joint_names, plan_frame=plan_frame
+        )
+        if ee_pose is None:
+            log.error("[pick] FK 读取当前末端位姿失败")
+            return False
+        offset_pose = pose_offset_local_z(ee_pose, POST_RETURN_Z_OFFSET)
+        z_offset_traj = self._cartesian_plan(
+            group, link, offset_pose,
+            speed_scale=speed_scale,
+            joint_names=joint_names,
+            plan_frame=plan_frame,
+        )
+        if z_offset_traj is None:
+            log.error("[pick] 6/8 笛卡尔直线规划失败")
+            return False
+        if not self._execute_traj(z_offset_traj):
+            log.error("[pick] 6/8 沿末端 z 轴直线移动执行失败")
+            return False
 
-        # log.info(
-        #     f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
-        #     f"（{len(z_offset_traj.joint_trajectory.points)} 点）"
-        # )
-        # if not self._execute_traj(self._reverse_trajectory(z_offset_traj)):
-        #     log.error("[pick] 7/8 反向播放 6/8 失败")
-        #     return False
+        log.info(
+            f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
+            f"（{len(z_offset_traj.joint_trajectory.points)} 点）"
+        )
+        if not self._execute_traj(self._reverse_trajectory(z_offset_traj)):
+            log.error("[pick] 7/8 反向播放 6/8 失败")
+            return False
 
-        # log.info(
-        #     f"[pick] 8/8  原路返回 ②：反向播放 5/8 → 1/8 初始位置 "
-        #     f"（{len(to_place_traj.joint_trajectory.points)} 点）"
-        # )
-        # if not self._execute_traj(self._reverse_trajectory(to_place_traj)):
-        #     log.error("[pick] 8/8 反向播放 5/8 失败")
-        #     return False
-        # log.info(
-        #     "[pick] 原路返回完成，当前应在 1/8 初始位置: "
-        #     + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
-        # )
+        log.info(
+            f"[pick] 8/8  原路返回 ②：反向播放 5/8 → 1/8 初始位置 "
+            f"（{len(to_place_traj.joint_trajectory.points)} 点）"
+        )
+        if not self._execute_traj(self._reverse_trajectory(to_place_traj)):
+            log.error("[pick] 8/8 反向播放 5/8 失败")
+            return False
+        log.info(
+            "[pick] 原路返回完成，当前应在 1/8 初始位置: "
+            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
+        )
 
         log.info("[pick] 抓取流程完成。")
         return True
@@ -2198,6 +2230,12 @@ def main(argv: list[str] | None = None) -> int:
             roll=roll,
             pitch=pitch,
             yaw=yaw,
+            # x=-0.5838529295608973,
+            # y=0.47421900873192807,
+            # z=0.024792295551118827,
+            # roll = -1.5516086668226448,
+            # pitch=0.8213446404921059,
+            # yaw=0.529204741098486
         )
         print(f"EE_POSE2 = {EE_POSE2}")
         # return 1
