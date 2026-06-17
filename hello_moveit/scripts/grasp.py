@@ -1892,6 +1892,109 @@ class G01Demo(Node):
         log.info(f"[{group}] cartesian plan+exec: {(time.monotonic() - t0) * 1000.0:.3f} ms (success)")
         return True
 
+    def _place_and_return(
+        self,
+        speed: float,
+        place_joints: Sequence[float],
+        *,
+        group: str,
+        link: str,
+        plan_frame: str,
+        joint_names: Sequence[str],
+        pick_start_joints: dict[str, float],
+        cartesian_speed: float | None = None,
+    ) -> bool:
+        """执行放置段：OMPL 到放置位、末端直线抬起、下电、按两段轨迹原路返回。"""
+        log = self.get_logger()
+        cartesian_speed = speed if cartesian_speed is None else cartesian_speed
+
+        log.info("[pick] 5/8  OMPL  → 运动到放置位置")
+        current = self._get_joints(list(joint_names), wait_new=True)
+        if current is None:
+            log.error("[pick] 读取当前关节失败")
+            return False
+        goal = [make_joint_constraints_from_vector(group, joint_names, place_joints)]
+        ok, used_ms, to_place_traj = self.move(
+            group, goal, start=current, plan_only=False, speed_scale=speed
+        )
+        log.info(f"[pick] OMPL → 放置位置: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        if not ok:
+            log.error("[pick] 运动到放置位置失败")
+            return False
+        if to_place_traj is None or not to_place_traj.joint_trajectory.points:
+            log.error("[pick] 5/8 未返回 OMPL 轨迹，无法原路返回")
+            return False
+        log.info(
+            "[pick] 放置位关节: "
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(joint_names, place_joints))
+        )
+
+        log.info("按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
+
+        log.info(
+            f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
+            f"（笛卡尔，从当前位姿 FK 偏移）"
+        )
+        current = self._get_joints(list(joint_names), wait_new=True)
+        if current is None:
+            log.error("[pick] 读取当前关节失败")
+            return False
+        ee_pose = self._get_link_pose_fk(
+            link, current, joint_names=joint_names, plan_frame=plan_frame
+        )
+        if ee_pose is None:
+            log.error("[pick] FK 读取当前末端位姿失败")
+            return False
+        offset_pose = pose_offset_local_z(ee_pose, POST_RETURN_Z_OFFSET)
+        z_offset_traj = self._cartesian_plan(
+            group, link, offset_pose,
+            speed_scale=cartesian_speed,
+            joint_names=joint_names,
+            plan_frame=plan_frame,
+        )
+        if z_offset_traj is None:
+            log.error("[pick] 6/8 笛卡尔直线规划失败")
+            return False
+        if not self._execute_traj(z_offset_traj):
+            log.error("[pick] 6/8 沿末端 z 轴直线移动执行失败")
+            return False
+
+        log.info("按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
+
+        if not self.set_tool_power("right", 0):
+            log.error("[pick] 右臂工具下电失败")
+            return False
+        print("\033[32m下电成功\033[0m")
+
+        log.info(
+            f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
+            f"（{len(z_offset_traj.joint_trajectory.points)} 点）"
+        )
+        if not self._execute_traj(self._reverse_trajectory(z_offset_traj)):
+            log.error("[pick] 7/8 反向播放 6/8 失败")
+            return False
+
+        log.info(
+            f"[pick] 8/8  原路返回 ②：反向播放 5/8 → 1/8 初始位置 "
+            f"（{len(to_place_traj.joint_trajectory.points)} 点）"
+        )
+        if not self._execute_traj(self._reverse_trajectory(to_place_traj)):
+            log.error("[pick] 8/8 反向播放 5/8 失败")
+            return False
+        log.info(
+            "[pick] 原路返回完成，当前应在 1/8 初始位置: "
+            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
+        )
+        return True
+
     def pick_and_return(
         self,
         target_pose: Pose,
@@ -2060,91 +2163,17 @@ class G01Demo(Node):
             )
 
         
-        log.info("[pick] 5/8  OMPL  → 运动到放置位置")
-        current = self._get_joints(joint_names, wait_new=True)
-        if current is None:
-            log.error("[pick] 读取当前关节失败")
-            return False
-        goal = [make_joint_constraints_from_vector(group, joint_names, place_joints)]
-        ok, used_ms, to_place_traj = self.move(
-            group, goal, start=current, plan_only=False, speed_scale=place_speed_scale
-        )
-        log.info(f"[pick] OMPL → 放置位置: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
-        if not ok:
-            log.error("[pick] 运动到放置位置失败")
-            return False
-        if to_place_traj is None or not to_place_traj.joint_trajectory.points:
-            log.error("[pick] 5/8 未返回 OMPL 轨迹，无法原路返回")
-            return False
-        log.info(
-            "[pick] 放置位关节: "
-            + ", ".join(f"{n}={v:.3f}" for n, v in zip(joint_names, place_joints))
-        )
-
-        log.info("按回车继续 …")
-        try:
-            input()
-        except EOFError:
-            pass
-
-        log.info(
-            f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
-            f"（笛卡尔，从当前位姿 FK 偏移）"
-        )
-        current = self._get_joints(joint_names, wait_new=True)
-        if current is None:
-            log.error("[pick] 读取当前关节失败")
-            return False
-        ee_pose = self._get_link_pose_fk(
-            link, current, joint_names=joint_names, plan_frame=plan_frame
-        )
-        if ee_pose is None:
-            log.error("[pick] FK 读取当前末端位姿失败")
-            return False
-        offset_pose = pose_offset_local_z(ee_pose, POST_RETURN_Z_OFFSET)
-        z_offset_traj = self._cartesian_plan(
-            group, link, offset_pose,
-            speed_scale=speed_scale,
-            joint_names=joint_names,
+        if not self._place_and_return(
+            place_speed_scale,
+            place_joints,
+            group=group,
+            link=link,
             plan_frame=plan_frame,
-        )
-        if z_offset_traj is None:
-            log.error("[pick] 6/8 笛卡尔直线规划失败")
+            joint_names=joint_names,
+            pick_start_joints=pick_start_joints,
+            cartesian_speed=speed_scale,
+        ):
             return False
-        if not self._execute_traj(z_offset_traj):
-            log.error("[pick] 6/8 沿末端 z 轴直线移动执行失败")
-            return False
-
-        log.info("按回车继续 …")
-        try:
-            input()
-        except EOFError:
-            pass
-
-        if not self.set_tool_power("right", 0):
-            log.error("[pick] 右臂工具下电失败")
-            return False
-        print("\033[32m下电成功\033[0m")
-
-        log.info(
-            f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
-            f"（{len(z_offset_traj.joint_trajectory.points)} 点）"
-        )
-        if not self._execute_traj(self._reverse_trajectory(z_offset_traj)):
-            log.error("[pick] 7/8 反向播放 6/8 失败")
-            return False
-
-        log.info(
-            f"[pick] 8/8  原路返回 ②：反向播放 5/8 → 1/8 初始位置 "
-            f"（{len(to_place_traj.joint_trajectory.points)} 点）"
-        )
-        if not self._execute_traj(self._reverse_trajectory(to_place_traj)):
-            log.error("[pick] 8/8 反向播放 5/8 失败")
-            return False
-        log.info(
-            "[pick] 原路返回完成，当前应在 1/8 初始位置: "
-            + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
-        )
 
         log.info("[pick] 抓取流程完成。")
         return True
