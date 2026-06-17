@@ -14,7 +14,7 @@ g01实际部署：
 启动腰部控制通信：
     python3 waist.py
 
-ros2 topic pub -r 50 /driver_report/taihu_motor_status std_msgs/msg/Float32MultiArray "{data: [0.0, 0.52]}"
+ros2 topic pub -r 50 /driver_report/taihu_motor_info pkg_msg_define/msg/MotorRuntimeInfo "{state: 0, error_code: 0, reserved: 0, position: 0.523598, speed: 0.0}"
 
 启动moveit：
     ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true

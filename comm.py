@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import rclpy
+from pkg_msg_define.msg import MotorRuntimeInfo
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray
@@ -54,7 +56,7 @@ class HwTopics:
     state_topic: str
 
     # Arm state topics use Float32MultiArray with fixed joint ordering.
-    # Body state topic uses Float32MultiArray.
+    # Body state topic uses MotorRuntimeInfo.
     left_state_topic: str
     right_state_topic: str
     body_state_topic: str
@@ -65,7 +67,7 @@ def _load_topics() -> HwTopics:
         state_topic="/g01/joint_states",
         left_state_topic="/g01/left_arm/state",
         right_state_topic="/g01/right_arm/state",
-        body_state_topic="/driver_report/taihu_motor_status",
+        body_state_topic="/driver_report/taihu_motor_info",
     )
 
 
@@ -92,7 +94,7 @@ class G01Comm(Node):
         )
 
         self.create_subscription(
-            Float32MultiArray, self._topics.body_state_topic, self._on_body_state_array, 10
+            MotorRuntimeInfo, self._topics.body_state_topic, self._on_body_state, 10
         )
 
         # 周期发布 joint_states；只有三部分都收到过才开始发布
@@ -102,7 +104,7 @@ class G01Comm(Node):
         self.create_timer(1.0 / max(self._publish_hz, 1.0), self._publish_joint_states)
 
         self.get_logger().info(
-            f"Bridge: arm states(Float32MultiArray) + body state(Float32MultiArray)->{self._topics.state_topic}"
+            f"Bridge: arm states(Float32MultiArray) + body state(MotorRuntimeInfo)->{self._topics.state_topic}"
         )
 
     def _touch_group(self, group: str) -> None:
@@ -133,11 +135,8 @@ class G01Comm(Node):
             self._pos[joint] = float(data[i])
         self._touch_group("right")
 
-    def _on_body_state_array(self, msg: Float32MultiArray) -> None:
-        data = list(msg.data)
-        if len(data) < 2:
-            return
-        self._pos[BODY_JOINT] = float(data[1])
+    def _on_body_state(self, msg: MotorRuntimeInfo) -> None:
+        self._pos[BODY_JOINT] = float(msg.position)
         self._touch_group("body")
 
     def _publish_joint_states(self) -> None:
@@ -168,10 +167,13 @@ def main() -> None:
     try:
         node = G01Comm()
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         if node is not None:
             node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
