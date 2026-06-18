@@ -1,7 +1,7 @@
 # moveit2
 
-[INFO] [1781004077.470543739] [g01_demo]: [grasp-select] 候选 IK 3/3：retreat 可行 ✓ (轨迹 14 点)
-
+pgrep -af taihu_motor_node
+kill 10568 11065 691478
 
 运行代码：
 

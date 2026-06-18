@@ -5,15 +5,14 @@
 <robot
   xmlns:xacro="http://www.ros.org/wiki/xacro"
   name="cr7_robot">
-  <xacro:property name="cr7_transforms" value="${xacro.load_yaml('m_dh_transforms.json')['1084']}" />
+  <xacro:macro name="cr7_robot" params="prefix link_prefix joint_prefix parent xyz rpy dh_id">
+  <xacro:property name="cr7_transforms" value="${xacro.load_yaml('m_dh_transforms.json')[dh_id]}" />
   <xacro:property name="cr7_frame_01" value="${cr7_transforms['frame_0_to_frame_1']}" />
   <xacro:property name="cr7_frame_12" value="${cr7_transforms['frame_1_to_frame_2']}" />
   <xacro:property name="cr7_frame_23" value="${cr7_transforms['frame_2_to_frame_3']}" />
   <xacro:property name="cr7_frame_34" value="${cr7_transforms['frame_3_to_frame_4']}" />
   <xacro:property name="cr7_frame_45" value="${cr7_transforms['frame_4_to_frame_5']}" />
   <xacro:property name="cr7_frame_56" value="${cr7_transforms['frame_5_to_frame_6']}" />
-
-  <xacro:macro name="cr7_robot" params="prefix link_prefix joint_prefix parent xyz rpy">
   <joint name="${prefix}base_link_to_${parent}" type="fixed">
     <parent link="${parent}" />
     <child link="${prefix}base_link" />
