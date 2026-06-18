@@ -315,7 +315,7 @@ EXCHANGE_Q2 = [
 ]
 
 # 视觉 TCP 配置
-VISION_IP = "192.168.5.100"
+VISION_IP = "192.168.5.110"
 VISION_PORT = 50000
 VISION_TRIGGER_COMMAND = "p,1"
 VISION_CONNECT_TIMEOUT = 3.0
@@ -2193,23 +2193,23 @@ class G01Demo(Node):
                 + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
             )
             
-            if not self.dual_arm_exchange(
-                EXCHANGE_Q1,
-                EXCHANGE_Q2,
-                dual_speed=place_speed_scale,
-                cartesian_speed=speed_scale,
-            ):
-                return False
+            # if not self.dual_arm_exchange(
+            #     EXCHANGE_Q1,
+            #     EXCHANGE_Q2,
+            #     dual_speed=place_speed_scale,
+            #     cartesian_speed=speed_scale,
+            # ):
+            #     return False
 
-            if not self._place_and_return(
-                place_speed_scale,
-                place_joints=PLACE_JOINTS["left_arm"],
-                group="left_arm",
-                link="l_tool",
-                plan_frame="l_base_link",
-                cartesian_speed=speed_scale,
-            ):
-                return False
+            # if not self._place_and_return(
+            #     place_speed_scale,
+            #     place_joints=PLACE_JOINTS["left_arm"],
+            #     group="left_arm",
+            #     link="l_tool",
+            #     plan_frame="l_base_link",
+            #     cartesian_speed=speed_scale,
+            # ):
+            #     return False
 
             
 
@@ -2244,7 +2244,7 @@ class G01Demo(Node):
         *,
         dual_speed: float = 0.2,
         cartesian_speed: float = 0.2,
-        z_down_distance: float = 0.10,
+        z_down_distance: float = -0.10,
     ) -> bool:
         """双臂交换流程：dual_arm 到 q2，右臂沿 z 向下，再原直线返回，最后 dual_arm 到 q1。"""
         log = self.get_logger()
@@ -2389,45 +2389,45 @@ def main(argv: list[str] | None = None) -> int:
             return finish(False, 0, 1)
 
         time.sleep(1)
-        # # 视觉识别
-        # vision_sock = connect_vision(log)
-        # if vision_sock is None:
-        #     return finish(False, 0, 1)
-        # pose = read_vision_pose(vision_sock, log)
+        # 视觉识别
+        vision_sock = connect_vision(log)
+        if vision_sock is None:
+            return finish(False, 0, 1)
+        pose = read_vision_pose(vision_sock, log)
 
-        # print(f"\033[32mviewer pose = {pose}\033[0m")
-        # if pose is None:
-        #     return finish(False, 0, 1)
-        # try:
-        #     x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
-        # except ValueError as exc:
-        #     message = f"viewer pose 解析失败：{exc}"
-        #     log.error(message)
-        #     print(message)
-        #     return finish(False, 0, 1)
-        # print(
-        #     "viewer pose transformed: "
-        #     f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
-        #     f"z={z_mm / 1000.0:.6f} m, "
-        #     f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
-        # )
-        # EE_POSE2 = dict(
-        #     x=x_mm / 1000.0,
-        #     y=y_mm / 1000.0,
-        #     z=z_mm / 1000.0,
-        #     roll=roll,
-        #     pitch=pitch,
-        #     yaw=yaw,
-        # )
-        #sim
-        EE_POSE2 = dict(
-            x=-0.5838529295608973,
-            y=0.47421900873192807,
-            z=0.024792295551118827,
-            roll = -1.5516086668226448,
-            pitch=0.8213446404921059,
-            yaw=0.529204741098486
+        print(f"\033[32mviewer pose = {pose}\033[0m")
+        if pose is None:
+            return finish(False, 0, 1)
+        try:
+            x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        except ValueError as exc:
+            message = f"viewer pose 解析失败：{exc}"
+            log.error(message)
+            print(message)
+            return finish(False, 0, 1)
+        print(
+            "viewer pose transformed: "
+            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
+            f"z={z_mm / 1000.0:.6f} m, "
+            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
         )
+        EE_POSE2 = dict(
+            x=x_mm / 1000.0,
+            y=y_mm / 1000.0,
+            z=z_mm / 1000.0,
+            roll=roll,
+            pitch=pitch,
+            yaw=yaw,
+        )
+        #sim
+        # EE_POSE2 = dict(
+        #     x=-0.5838529295608973,
+        #     y=0.47421900873192807,
+        #     z=0.024792295551118827,
+        #     roll = -1.5516086668226448,
+        #     pitch=0.8213446404921059,
+        #     yaw=0.529204741098486
+        # )
         print(f"EE_POSE2 = {EE_POSE2}")
         # return 1
 
@@ -2455,13 +2455,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not node.pick_and_return(
             target_pose=target_pose,
-            speed_scale=0.5,
+            speed_scale=0.1,
             group=pick_group,
             link=EE_LINK,
             plan_frame=PLAN_FRAME,
             joint_names=pick_joint_names,
             place_joints=PLACE_JOINTS[pick_group],
-            place_speed_scale=0.5,
+            place_speed_scale=0.1,
             cutoff_joint_names=joint_names,
             first_return_mode=1,
         ):
