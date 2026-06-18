@@ -79,7 +79,7 @@ from dobot_msgs_v4.srv import SetToolPower
 GREEN = '\033[32m'
 RESET = '\033[0m'
 # 第一步：关节空间规划使用哪个 SRDF 组
-ACTIVE_GROUP = "dual_arm"
+ACTIVE_GROUP = "dual_arm_y"
 
 # 第二步：末端位姿规划组与目标（连杆 L6，坐标系 base_link）
 POSE_GROUP = "right_arm"
@@ -130,6 +130,21 @@ JOINT_TARGETS = {
         "base_joint1": 1.25,
         "base_joint2": 0.0,
         "body_joint1": -0.25,
+        "body_joint2": 1.1,
+        "l_arm_joint1": -20 * math.pi / 180,
+        "l_arm_joint2": -102 * math.pi / 180,
+        "l_arm_joint3": -92 * math.pi / 180,
+        "l_arm_joint4": 137 * math.pi / 180,
+        "l_arm_joint5": -0 * math.pi,
+        "l_arm_joint6": -0 * math.pi / 180,
+        "r_arm_joint1": 80 * math.pi / 180,
+        "r_arm_joint2": -102 * math.pi / 180,
+        "r_arm_joint3": -92 * math.pi / 180,
+        "r_arm_joint4": 137 * math.pi / 180,
+        "r_arm_joint5": -0 * math.pi,
+        "r_arm_joint6": -0 * math.pi / 180,
+    },
+    "dual_arm_y": {
         "body_joint2": 1.1,
         "l_arm_joint1": -20 * math.pi / 180,
         "l_arm_joint2": -102 * math.pi / 180,
@@ -277,7 +292,7 @@ PLACE_JOINTS = {
         0.9618226289749146, -0.6597065329551697, -1.4834308624267578, -0.9613705277442932, -2.68591570854187, -1.7255382537841797
     ],
     "left_arm": [
-        -1.012291, 0.767945, 1.623156, -2.286381, -2.652900, 0.436332
+        -1.012291, 0.767945, 1.623156, -2.286381, -2.42900, 0.436332
     ],
 }
 
@@ -286,6 +301,18 @@ PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距�
 POST_RETURN_Z_OFFSET = 0.115  # 复位后沿末端 +z 轴直线移动距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 FIRST_RETURN_MODE = 0       # 0: 直线+OMPL 回到 1/8 初始位置；1: 只反向直线回到 q_pre
+EXCHANGE_Q1 = [
+    30 * math.pi / 180,
+    -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
+    1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
+]
+EXCHANGE_Q2 = [
+    30 * math.pi / 180,
+
+    -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
+
+    -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
+]
 
 # 视觉 TCP 配置
 VISION_IP = "192.168.5.100"
@@ -2166,6 +2193,14 @@ class G01Demo(Node):
                 + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
             )
             
+            if not self.dual_arm_exchange(
+                EXCHANGE_Q1,
+                EXCHANGE_Q2,
+                dual_speed=place_speed_scale,
+                cartesian_speed=speed_scale,
+            ):
+                return False
+
             if not self._place_and_return(
                 place_speed_scale,
                 place_joints=PLACE_JOINTS["left_arm"],
@@ -2175,6 +2210,9 @@ class G01Demo(Node):
                 cartesian_speed=speed_scale,
             ):
                 return False
+
+            
+
             
         else:
             retreat_to_start = self._reverse_trajectory(to_pre_traj)
@@ -2197,6 +2235,87 @@ class G01Demo(Node):
                 return False
 
         log.info("[pick] 抓取流程完成。")
+        return True
+
+    def dual_arm_exchange(
+        self,
+        q1: Sequence[float],
+        q2: Sequence[float],
+        *,
+        dual_speed: float = 0.2,
+        cartesian_speed: float = 0.2,
+        z_down_distance: float = 0.10,
+    ) -> bool:
+        """双臂交换流程：dual_arm 到 q2，右臂沿 z 向下，再原直线返回，最后 dual_arm 到 q1。"""
+        log = self.get_logger()
+        dual_group = "dual_arm_y"
+        right_group = "right_arm"
+        right_link = "r_tool"
+        right_plan_frame = "r_base_link"
+        dual_joint_names = joint_names_for_group(dual_group)
+        right_joint_names = joint_names_for_group(right_group)
+
+        if len(q1) != len(dual_joint_names):
+            log.error(f"[exchange] q1 长度错误: {len(q1)} != {len(dual_joint_names)}")
+            return False
+        if len(q2) != len(dual_joint_names):
+            log.error(f"[exchange] q2 长度错误: {len(q2)} != {len(dual_joint_names)}")
+            return False
+
+        log.info("[exchange] 1/4  dual_arm 规划执行到 q2")
+        if not self.plan_execute_joint_waypoints(dual_group, dual_speed, dual_joint_names, [q2]):
+            log.error("[exchange] dual_arm 到 q2 失败")
+            return False
+
+        log.info(
+            f"[exchange] 2/4  right_arm 沿 {right_link} 末端坐标系 -z 轴直线移动 "
+            f"{z_down_distance:.3f} m"
+        )
+        current = self._get_joints(right_joint_names, wait_new=True)
+        if current is None:
+            log.error("[exchange] 读取 right_arm 当前关节失败")
+            return False
+
+        ee_pose = self._get_link_pose_fk(
+            right_link,
+            current,
+            joint_names=right_joint_names,
+            plan_frame=right_plan_frame,
+        )
+        if ee_pose is None:
+            log.error("[exchange] FK 读取 right_arm 当前末端位姿失败")
+            return False
+
+        down_pose = pose_offset_local_z(ee_pose, -abs(z_down_distance))
+        down_traj = self._cartesian_plan(
+            right_group,
+            right_link,
+            down_pose,
+            speed_scale=cartesian_speed,
+            joint_names=right_joint_names,
+            plan_frame=right_plan_frame,
+        )
+        if down_traj is None or not down_traj.joint_trajectory.points:
+            log.error("[exchange] right_arm z 向下直线规划失败")
+            return False
+        if not self._execute_traj(down_traj):
+            log.error("[exchange] right_arm z 向下直线执行失败")
+            return False
+
+        log.info(
+            f"[exchange] 3/4  right_arm 沿刚才直线返回 "
+            f"（{len(down_traj.joint_trajectory.points)} 点）"
+        )
+        if not self._execute_traj(self._reverse_trajectory(down_traj)):
+            log.error("[exchange] right_arm 反向直线返回失败")
+            return False
+
+        log.info("[exchange] 4/4  dual_arm 规划执行到 q1")
+        if not self.plan_execute_joint_waypoints(dual_group, dual_speed, dual_joint_names, [q1]):
+            log.error("[exchange] dual_arm 到 q1 失败")
+            return False
+
+        log.info("[exchange] 双臂交换流程完成")
         return True
 
 
@@ -2247,14 +2366,7 @@ def main(argv: list[str] | None = None) -> int:
         # --- 2. 关节空间运动 ---   
         targets = JOINT_TARGETS[ACTIVE_GROUP]
         joint_names = list(targets.keys())
-        q1 = [0.0, 0.0, 0.0, 30 * math.pi / 180, 
-        -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477, 
-        1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,]
-        # q2 = [1.25, 0.0, -0.25, 1.1, 
-        # 80 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180, 
-        # 120 * math.pi / 180, -102 * math.pi / 180, -92 * math.pi / 180, 137 * math.pi / 180, -0 * math.pi, -0 * math.pi / 180]
-
-        waypoints = [q1]  # 需要多点时：继续 waypoints.append(q3) ...
+        waypoints = [EXCHANGE_Q1]  # 需要多点时：继续 waypoints.append(q3) ...
 
         log.info(f"关节规划组: {ACTIVE_GROUP}")
         current = node._get_joints(joint_names)
@@ -2351,7 +2463,7 @@ def main(argv: list[str] | None = None) -> int:
             place_joints=PLACE_JOINTS[pick_group],
             place_speed_scale=0.5,
             cutoff_joint_names=joint_names,
-            first_return_mode=0,
+            first_return_mode=1,
         ):
             log.error("抓取流程失败")
             log.info("按回车退出 …")

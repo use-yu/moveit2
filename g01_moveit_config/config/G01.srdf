@@ -32,6 +32,22 @@
         <joint name="r_arm_joint6"/>
     </group>
 
+    <group name="dual_arm_y">
+        <joint name="body_joint2"/>
+        <joint name="l_arm_joint1"/>
+        <joint name="l_arm_joint2"/>
+        <joint name="l_arm_joint3"/>
+        <joint name="l_arm_joint4"/>
+        <joint name="l_arm_joint5"/>
+        <joint name="l_arm_joint6"/>
+        <joint name="r_arm_joint1"/>
+        <joint name="r_arm_joint2"/>
+        <joint name="r_arm_joint3"/>
+        <joint name="r_arm_joint4"/>
+        <joint name="r_arm_joint5"/>
+        <joint name="r_arm_joint6"/>
+    </group>
+
     <group name="left">
         <joint name="virtual_joint"/>
         <joint name="world_to_base_footprint"/>
