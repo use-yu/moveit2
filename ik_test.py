@@ -28,16 +28,22 @@ from scipy.spatial.transform import Rotation
 URDF_XACRO = Path(__file__).parent / "moveit_resources/g01_description/urdf/G01-URDF888.urdf"
 
 # 基坐标系和末端坐标系 link 名。右臂可改成 BASE_LINK="r_base_link", EE_LINK="r_tool"。
-BASE_LINK = "YB"
-EE_LINK = "r_tool"
+BASE_LINK = "SJ"
+EE_LINK = "l_tool"
 
 # 目标末端位姿，表达在 BASE_LINK 坐标系下，单位：m / rad。
-TARGET_XYZ = [0.453178, -0.207244, -0.129587]
-TARGET_RPY = [90.0, 0.0, 0.0]
+TARGET_XYZ = [-0.738, 0.44, 0]
+TARGET_RPY = [60.0, -90.0, -150.0]
 
-# IK 迭代初始关节角。顺序为 BASE_LINK -> EE_LINK 链上可动关节。
-# 当前左臂顺序: l_arm_joint1, l_arm_joint2, ..., l_arm_joint6。
-SEED_JOINTS = [11.0, -79.0, -56.0, -44.0, 41.0, -5.0]
+# 固定腰部角度。BASE_LINK="SJ" 到 EE_LINK="r_tool" 的链上会经过 body_joint2。
+WAIST_JOINT = "body_joint2"
+WAIST_ANGLE = 30.0
+WAIST_ANGLE_DEG = True
+
+# IK 迭代初始关节角。腰部已固定，这里只填右臂 6 个关节。
+# 当前顺序: r_arm_joint1, r_arm_joint2, ..., r_arm_joint6。
+# SEED_JOINTS = [-108.0, -88.0, -48.0, -42.0, 43.0, 178.0]
+SEED_JOINTS = [23, -87.0, -35.0, -60.0, 53.0, -2.0]
 
 # 如果 TARGET_RPY / SEED_JOINTS 里写的是角度，把对应开关改成 True。
 TARGET_RPY_DEG = True
@@ -202,6 +208,18 @@ def is_active_joint(joint: Joint) -> bool:
     return joint.type in ("revolute", "continuous", "prismatic")
 
 
+def configured_fixed_joint_values(chain: Sequence[Joint]) -> dict[str, float]:
+    values = {}
+    for joint in chain:
+        if joint.name != WAIST_JOINT:
+            continue
+        value = WAIST_ANGLE
+        if WAIST_ANGLE_DEG and joint.type in ("revolute", "continuous"):
+            value = math.radians(value)
+        values[joint.name] = float(value)
+    return values
+
+
 def seed_vector(active_joints: Sequence[Joint]) -> np.ndarray:
     if len(SEED_JOINTS) != len(active_joints):
         names = ", ".join(joint.name for joint in active_joints)
@@ -232,8 +250,12 @@ def forward_kinematics(
     chain: Sequence[Joint],
     active_joints: Sequence[Joint],
     q: Sequence[float],
+    fixed_values: dict[str, float] | None = None,
 ) -> tuple[np.ndarray, list[tuple[Joint, np.ndarray, np.ndarray]]]:
     q_by_name = {joint.name: float(value) for joint, value in zip(active_joints, q)}
+    if fixed_values:
+        q_by_name.update(fixed_values)
+    active_names = {joint.name for joint in active_joints}
     t = np.eye(4)
     joint_frames = []
 
@@ -241,7 +263,8 @@ def forward_kinematics(
         t_origin = t @ joint.origin
         if is_active_joint(joint):
             axis_base = t_origin[:3, :3] @ joint.axis
-            joint_frames.append((joint, t_origin[:3, 3].copy(), axis_base))
+            if joint.name in active_names:
+                joint_frames.append((joint, t_origin[:3, 3].copy(), axis_base))
             value = q_by_name[joint.name]
             if joint.type in ("revolute", "continuous"):
                 t = t_origin @ matrix_from_axis_angle(joint.axis, value)
@@ -268,6 +291,7 @@ def solve_ik(
     target_xyz: Sequence[float],
     target_rpy: Sequence[float],
     seed: Sequence[float],
+    fixed_values: dict[str, float],
 ) -> tuple[bool, np.ndarray, int, float, float]:
     q = clip_to_limits(np.array(seed, dtype=float), active_joints)
     target = matrix_from_xyz_rpy(target_xyz, target_rpy)
@@ -275,7 +299,7 @@ def solve_ik(
     last_pos_err = float("inf")
     last_ori_err = float("inf")
     for iteration in range(1, MAX_ITERS + 1):
-        current, joint_frames = forward_kinematics(chain, active_joints, q)
+        current, joint_frames = forward_kinematics(chain, active_joints, q, fixed_values)
         pos_err, rot_err = pose_error(target, current)
         last_pos_err = float(np.linalg.norm(pos_err))
         last_ori_err = float(np.linalg.norm(rot_err))
@@ -315,6 +339,27 @@ def format_named_values(names: Sequence[str], values: Sequence[float], degrees: 
     return ", ".join(rows)
 
 
+def full_solution_from_chain(
+    chain: Sequence[Joint],
+    active_joints: Sequence[Joint],
+    q: Sequence[float],
+    fixed_values: dict[str, float],
+) -> tuple[list[str], list[float]]:
+    active_values = {joint.name: float(value) for joint, value in zip(active_joints, q)}
+    names = []
+    values = []
+    for joint in chain:
+        if not is_active_joint(joint):
+            continue
+        if joint.name in fixed_values:
+            names.append(joint.name)
+            values.append(fixed_values[joint.name])
+        elif joint.name in active_values:
+            names.append(joint.name)
+            values.append(active_values[joint.name])
+    return names, values
+
+
 def main() -> int:
     target_rpy = np.array(TARGET_RPY, dtype=float)
     if TARGET_RPY_DEG:
@@ -322,34 +367,48 @@ def main() -> int:
 
     child_to_joint = parse_urdf_joints(expand_xacro(URDF_XACRO))
     chain = find_chain(child_to_joint, BASE_LINK, EE_LINK)
-    active_joints = [joint for joint in chain if is_active_joint(joint)]
+    fixed_values = configured_fixed_joint_values(chain)
+    active_joints = [
+        joint for joint in chain
+        if is_active_joint(joint) and joint.name not in fixed_values
+    ]
     if not active_joints:
         raise RuntimeError(f"{BASE_LINK!r} -> {EE_LINK!r} 链上没有可动关节")
 
     seed = seed_vector(active_joints)
-    ok, q, iters, pos_err, ori_err = solve_ik(chain, active_joints, TARGET_XYZ, target_rpy, seed)
-    fk, _ = forward_kinematics(chain, active_joints, q)
+    ok, q, iters, pos_err, ori_err = solve_ik(
+        chain, active_joints, TARGET_XYZ, target_rpy, seed, fixed_values
+    )
+    fk, _ = forward_kinematics(chain, active_joints, q, fixed_values)
     fk_rpy = rpy_from_matrix(fk[:3, :3])
     active_names = [joint.name for joint in active_joints]
+    fixed_names = list(fixed_values.keys())
+    fixed_q = list(fixed_values.values())
+    full_names, full_q = full_solution_from_chain(chain, active_joints, q, fixed_values)
 
     print(f"success: {ok}")
     print(f"iterations: {iters}")
-    print(f"base_link: {BASE_LINK}")
-    print(f"ee_link: {EE_LINK}")
-    print("chain_joints:", " -> ".join(joint.name for joint in chain))
+    # print(f"base_link: {BASE_LINK}")
+    # print(f"ee_link: {EE_LINK}")
+    # print("chain_joints:", " -> ".join(joint.name for joint in chain))
     print("active_joints:", ", ".join(active_names))
-    print("target_xyz:", " ".join(f"{v:.9f}" for v in TARGET_XYZ))
-    print("target_rpy_rad:", " ".join(f"{v:.9f}" for v in target_rpy))
-    print("seed_rad:", format_named_values(active_names, seed))
+    # print("target_xyz:", " ".join(f"{v:.9f}" for v in TARGET_XYZ))
+    # print("target_rpy_rad:", " ".join(f"{v:.9f}" for v in target_rpy))
+    # print("seed_rad:", format_named_values(active_names, seed))
+    if fixed_names:
+        print("fixed_joints_rad:", format_named_values(fixed_names, fixed_q))
+        print("fixed_joints_deg:", format_named_values(fixed_names, fixed_q, degrees=True))
     print("solution_rad:", format_named_values(active_names, q))
     print("solution_deg:", format_named_values(active_names, q, degrees=True))
-    print(
-        "fk_ee_xyz:",
-        f"{fk[0, 3]:.9f}",
-        f"{fk[1, 3]:.9f}",
-        f"{fk[2, 3]:.9f}",
-    )
-    print("fk_ee_rpy_rad:", " ".join(f"{v:.9f}" for v in fk_rpy))
+    print("full_solution_rad:", format_named_values(full_names, full_q))
+    print("full_solution_deg:", format_named_values(full_names, full_q, degrees=True))
+    # print(
+    #     "fk_ee_xyz:",
+    #     f"{fk[0, 3]:.9f}",
+    #     f"{fk[1, 3]:.9f}",
+    #     f"{fk[2, 3]:.9f}",
+    # )
+    # print("fk_ee_rpy_rad:", " ".join(f"{v:.9f}" for v in fk_rpy))
     print(f"position_error_m: {pos_err:.9g}")
     print(f"orientation_error_rad: {ori_err:.9g}")
     return 0 if ok else 2

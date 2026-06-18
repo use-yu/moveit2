@@ -32,7 +32,10 @@ G01 MoveIt 演示脚本
 
 腰部30度/0.523598 放置和交换
 """
-
+# solution_rad: r_arm_joint1=-1.944364063, r_arm_joint2=-1.597215489, r_arm_joint3=-0.565983840, r_arm_joint4=-0.979311147, r_arm_joint5=0.851759446, r_arm_joint6=3.140000000
+# solution_deg: r_arm_joint1=-111.403854650, r_arm_joint2=-91.513706512, r_arm_joint3=-32.428485315, r_arm_joint4=-56.110395575, r_arm_joint5=48.802221443, r_arm_joint6=179.908747671
+# solution_rad: l_arm_joint1=0.070556798, l_arm_joint2=-1.414919441, l_arm_joint3=-1.053385853, l_arm_joint4=-0.663103266, l_arm_joint5=0.585734181, l_arm_joint6=-0.010876821
+# solution_deg: l_arm_joint1=4.042606739, l_arm_joint2=-81.068912306, l_arm_joint3=-60.354563592, l_arm_joint4=-37.993018506, l_arm_joint5=33.560096466, l_arm_joint6=-0.623195926
 from __future__ import annotations
 
 import copy
