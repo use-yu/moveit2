@@ -148,7 +148,6 @@ JOINT_TARGETS = {
         "r_arm_joint6": -0 * math.pi / 180,
     },
     "dual_arm_y": {
-        "body_joint2": 1.1,
         "l_arm_joint1": -20 * math.pi / 180,
         "l_arm_joint2": -102 * math.pi / 180,
         "l_arm_joint3": -92 * math.pi / 180,
@@ -305,16 +304,16 @@ POST_RETURN_Z_OFFSET = 0.115  # 复位后沿末端 +z 轴直线移动距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 FIRST_RETURN_MODE = 0       # 0: 直线+OMPL 回到 1/8 初始位置；1: 只反向直线回到 q_pre
 EXCHANGE_Q1 = [
-    30 * math.pi / 180,
     -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
     1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
 ]
 EXCHANGE_Q2 = [
-    30 * math.pi / 180,
+    # -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
+    0.070556798, -1.414919441, -1.053385853, -0.663103266, 0.585734181, -0.010876821,
 
-    -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
+    -1.894577323, -1.514870555, -0.775900502, -0.852465895, 0.728284578, 0.0
 
-    -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
+    
 ]
 
 # 视觉 TCP 配置
@@ -2196,23 +2195,30 @@ class G01Demo(Node):
                 + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
             )
             
-            # if not self.dual_arm_exchange(
-            #     EXCHANGE_Q1,
-            #     EXCHANGE_Q2,
-            #     dual_speed=place_speed_scale,
-            #     cartesian_speed=speed_scale,
-            # ):
-            #     return False
+            log.info("[pick] 3/8  到达抓取位置，按回车继续 …")
+            try:
+                input()
+            except EOFError:
+                pass
 
-            # if not self._place_and_return(
-            #     place_speed_scale,
-            #     place_joints=PLACE_JOINTS["left_arm"],
-            #     group="left_arm",
-            #     link="l_tool",
-            #     plan_frame="l_base_link",
-            #     cartesian_speed=speed_scale,
-            # ):
-            #     return False
+
+            if not self.dual_arm_exchange(
+                EXCHANGE_Q1,
+                EXCHANGE_Q2,
+                dual_speed=place_speed_scale,
+                cartesian_speed=speed_scale,
+            ):
+                return False
+
+            if not self._place_and_return(
+                place_speed_scale,
+                place_joints=PLACE_JOINTS["left_arm"],
+                group="left_arm",
+                link="l_tool",
+                plan_frame="l_base_link",
+                cartesian_speed=speed_scale,
+            ):
+                return False
 
             
 
@@ -2247,7 +2253,7 @@ class G01Demo(Node):
         *,
         dual_speed: float = 0.2,
         cartesian_speed: float = 0.2,
-        z_down_distance: float = -0.10,
+        z_down_distance: float = 0.10,
     ) -> bool:
         """双臂交换流程：dual_arm 到 q2，右臂沿 z 向下，再原直线返回，最后 dual_arm 到 q1。"""
         log = self.get_logger()
@@ -2289,7 +2295,7 @@ class G01Demo(Node):
             log.error("[exchange] FK 读取 right_arm 当前末端位姿失败")
             return False
 
-        down_pose = pose_offset_local_z(ee_pose, -abs(z_down_distance))
+        down_pose = pose_offset_local_z(ee_pose, abs(z_down_distance))
         down_traj = self._cartesian_plan(
             right_group,
             right_link,
@@ -2367,11 +2373,16 @@ def main(argv: list[str] | None = None) -> int:
             pass
         # time.sleep(5)
         # --- 2. 关节空间运动 ---   
-        targets = JOINT_TARGETS[ACTIVE_GROUP]
+        targets = JOINT_TARGETS["dual_arm"]
         joint_names = list(targets.keys())
-        waypoints = [EXCHANGE_Q1]  # 需要多点时：继续 waypoints.append(q3) ...
+        Q1 = [
+            0.0, 0.0, 0.0, 30 * math.pi / 180,
+            -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
+            1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
+        ]
+        waypoints = [Q1]  # 需要多点时：继续 waypoints.append(q3) ...
 
-        log.info(f"关节规划组: {ACTIVE_GROUP}")
+        # log.info(f"关节规划组: {"dual_arm"}")
         current = node._get_joints(joint_names)
         if current is None:
             log.error("读取当前关节位置失败，无法规划")
@@ -2387,50 +2398,50 @@ def main(argv: list[str] | None = None) -> int:
         # except EOFError:
         #     pass
 
-        if not node.plan_execute_joint_waypoints(ACTIVE_GROUP, 0.2, joint_names, waypoints):
+        if not node.plan_execute_joint_waypoints("dual_arm", 0.2, joint_names, waypoints):
             log.error("关节规划/执行失败")
             return finish(False, 0, 1)
 
         time.sleep(1)
-        # 视觉识别
-        vision_sock = connect_vision(log)
-        if vision_sock is None:
-            return finish(False, 0, 1)
-        pose = read_vision_pose(vision_sock, log)
+        # # 视觉识别
+        # vision_sock = connect_vision(log)
+        # if vision_sock is None:
+        #     return finish(False, 0, 1)
+        # pose = read_vision_pose(vision_sock, log)
 
-        print(f"\033[32mviewer pose = {pose}\033[0m")
-        if pose is None:
-            return finish(False, 0, 1)
-        try:
-            x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
-        except ValueError as exc:
-            message = f"viewer pose 解析失败：{exc}"
-            log.error(message)
-            print(message)
-            return finish(False, 0, 1)
-        print(
-            "viewer pose transformed: "
-            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
-            f"z={z_mm / 1000.0:.6f} m, "
-            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
-        )
-        EE_POSE2 = dict(
-            x=x_mm / 1000.0,
-            y=y_mm / 1000.0,
-            z=z_mm / 1000.0,
-            roll=roll,
-            pitch=pitch,
-            yaw=yaw,
-        )
-        #sim
-        # EE_POSE2 = dict(
-        #     x=-0.5838529295608973,
-        #     y=0.47421900873192807,
-        #     z=0.024792295551118827,
-        #     roll = -1.5516086668226448,
-        #     pitch=0.8213446404921059,
-        #     yaw=0.529204741098486
+        # print(f"\033[32mviewer pose = {pose}\033[0m")
+        # if pose is None:
+        #     return finish(False, 0, 1)
+        # try:
+        #     x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        # except ValueError as exc:
+        #     message = f"viewer pose 解析失败：{exc}"
+        #     log.error(message)
+        #     print(message)
+        #     return finish(False, 0, 1)
+        # print(
+        #     "viewer pose transformed: "
+        #     f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
+        #     f"z={z_mm / 1000.0:.6f} m, "
+        #     f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
         # )
+        # EE_POSE2 = dict(
+        #     x=x_mm / 1000.0,
+        #     y=y_mm / 1000.0,
+        #     z=z_mm / 1000.0,
+        #     roll=roll,
+        #     pitch=pitch,
+        #     yaw=yaw,
+        # )
+        #sim
+        EE_POSE2 = dict(
+            x=-0.5838529295608973,
+            y=0.47421900873192807,
+            z=0.024792295551118827,
+            roll = -1.5516086668226448,
+            pitch=0.8213446404921059,
+            yaw=0.529204741098486
+        )
         print(f"EE_POSE2 = {EE_POSE2}")
         # return 1
 
@@ -2458,13 +2469,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not node.pick_and_return(
             target_pose=target_pose,
-            speed_scale=0.1,
+            speed_scale=0.7,
             group=pick_group,
             link=EE_LINK,
             plan_frame=PLAN_FRAME,
             joint_names=pick_joint_names,
             place_joints=PLACE_JOINTS[pick_group],
-            place_speed_scale=0.1,
+            place_speed_scale=0.7,
             cutoff_joint_names=joint_names,
             first_return_mode=1,
         ):

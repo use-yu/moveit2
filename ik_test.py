@@ -29,11 +29,11 @@ URDF_XACRO = Path(__file__).parent / "moveit_resources/g01_description/urdf/G01-
 
 # 基坐标系和末端坐标系 link 名。右臂可改成 BASE_LINK="r_base_link", EE_LINK="r_tool"。
 BASE_LINK = "SJ"
-EE_LINK = "l_tool"
+EE_LINK = "r_tool"
 
 # 目标末端位姿，表达在 BASE_LINK 坐标系下，单位：m / rad。
-TARGET_XYZ = [-0.738, 0.44, 0]
-TARGET_RPY = [60.0, -90.0, -150.0]
+TARGET_XYZ = [-0.738, 0.55, 0]
+TARGET_RPY = [-90.0, -90.0, 180.0]
 
 # 固定腰部角度。BASE_LINK="SJ" 到 EE_LINK="r_tool" 的链上会经过 body_joint2。
 WAIST_JOINT = "body_joint2"
@@ -42,8 +42,8 @@ WAIST_ANGLE_DEG = True
 
 # IK 迭代初始关节角。腰部已固定，这里只填右臂 6 个关节。
 # 当前顺序: r_arm_joint1, r_arm_joint2, ..., r_arm_joint6。
-# SEED_JOINTS = [-108.0, -88.0, -48.0, -42.0, 43.0, 178.0]
-SEED_JOINTS = [23, -87.0, -35.0, -60.0, 53.0, -2.0]
+SEED_JOINTS = [-108.0, -88.0, -48.0, -42.0, 43.0, 0.0]
+# SEED_JOINTS = [23, -87.0, -35.0, -60.0, 53.0, -2.0]
 
 # 如果 TARGET_RPY / SEED_JOINTS 里写的是角度，把对应开关改成 True。
 TARGET_RPY_DEG = True

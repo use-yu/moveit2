@@ -33,7 +33,6 @@
     </group>
 
     <group name="dual_arm_y">
-        <joint name="body_joint2"/>
         <joint name="l_arm_joint1"/>
         <joint name="l_arm_joint2"/>
         <joint name="l_arm_joint3"/>
