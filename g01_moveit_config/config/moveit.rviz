@@ -338,7 +338,7 @@ Visualization Manager:
       Velocity_Scaling_Factor: 0.1
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
-      Collision Enabled: false
+      Collision Enabled: true
       Description File: ""
       Description Source: Topic
       Description Topic:
@@ -554,7 +554,7 @@ Visualization Manager:
       Enabled: true
       Name: Pose Cylinder Marker
       Namespaces:
-        {}
+        g01_pose_cylinder: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -581,25 +581,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 5.436285972595215
+      Distance: 3.445511817932129
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.3088361322879791
-        Y: 0.27449843287467957
-        Z: 1.520330548286438
+        X: 0.4939438998699188
+        Y: 0.13778123259544373
+        Z: 0.8508925437927246
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.04479699954390526
+      Pitch: 0.1197969987988472
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 5.220180034637451
+      Yaw: 5.980184555053711
     Saved: ~
 Window Geometry:
   Displays:

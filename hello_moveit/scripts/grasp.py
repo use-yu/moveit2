@@ -2252,7 +2252,7 @@ class G01Demo(Node):
         *,
         dual_speed: float = 0.2,
         cartesian_speed: float = 0.2,
-        z_down_distance: float = 0.01,
+        z_down_distance: float = 0.02,
     ) -> bool:
         """双臂交换流程：dual_arm 到 q2，右臂沿 z 向下，再原直线返回，最后 dual_arm 到 q1。"""
         log = self.get_logger()
@@ -2300,6 +2300,7 @@ class G01Demo(Node):
             right_link,
             down_pose,
             speed_scale=cartesian_speed,
+            avoid_collisions=False,
             joint_names=right_joint_names,
             plan_frame=right_plan_frame,
         )
@@ -2309,6 +2310,12 @@ class G01Demo(Node):
         if not self._execute_traj(down_traj):
             log.error("[exchange] right_arm z 向下直线执行失败")
             return False
+
+        log.info("按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
 
         log.info(
             f"[exchange] 3/4  right_arm 沿刚才直线返回 "
