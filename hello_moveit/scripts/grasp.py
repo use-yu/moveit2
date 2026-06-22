@@ -231,7 +231,7 @@ SCENE_FRAME = "base_link"
 FRAME_ID = "深框"
 FRAME_SIZE = (1.18, 1.18, 0.58)  # 深框整体外尺寸：长×宽×高 [m]
 WALL_T = 0.09  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
-FRAME_CENTER = (-0.81 - 0.005, -0.363, -0.08)  # 深框整体外轮廓中心，相对于 base_link [m]
+FRAME_CENTER = (-0.81 - 0.005, -0.35, -0.08)  # 深框整体外轮廓中心，相对于 base_link [m]
 FRAME_RPY_DEG = (90.0, -0.0, 180.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 FRAME_CUTOFF_ID = "深框隔离面"
@@ -294,7 +294,7 @@ PLACE_JOINTS = {
         0.9618226289749146, -0.6597065329551697, -1.4834308624267578, -0.9613705277442932, -2.68591570854187, -1.7255382537841797
     ],
     "left_arm": [
-        -1.012291, 0.767945, 1.623156, -2.286381, -2.42900, 0.436332
+        -0.963150337, 0.616290531, 1.406139833, 1.115760915, 2.690830547, 1.371585746
     ],
 }
 
@@ -2277,7 +2277,7 @@ class G01Demo(Node):
         *,
         dual_speed: float = 0.2,
         cartesian_speed: float = 0.2,
-        z_down_distance: float = 0.105,
+        z_down_distance: float = -0.1095,
     ) -> bool:
         """双臂交换流程：dual_arm 到 q2，右臂沿 z 向下，再原直线返回，最后 dual_arm 到 q1。"""
         log = self.get_logger()
@@ -2308,6 +2308,13 @@ class G01Demo(Node):
             f"[exchange] 2/4  right_arm 沿 {right_link} 末端坐标系 -z 轴直线移动 "
             f"{z_down_distance:.3f} m"
         )
+
+        log.info("按回车继续 …")
+        try:
+            input()
+        except EOFError:
+            pass
+
         current = self._get_joints(right_joint_names, wait_new=True)
         if current is None:
             log.error("[exchange] 读取 right_arm 当前关节失败")
