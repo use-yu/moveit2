@@ -395,18 +395,29 @@ def connect_vision(log) -> socket.socket | None:
         return None
 
 
-def read_vision_pose(sock: socket.socket, log) -> list[float] | None:
-    """复用已连接 socket，触发一次视觉并返回 xyz(mm) + quat(wxyz)。"""
+def read_vision_pose(sock: socket.socket, log) -> tuple[int, list[float]] | None:
+    """复用已连接 socket，触发一次视觉并返回 first_return_mode 与 xyz(mm)+quat(wxyz)。"""
     try:
         sock.sendall(VISION_TRIGGER_COMMAND.encode("utf-8"))
         raw_text = sock.recv(4096).decode("utf-8", errors="ignore").strip()
         numbers = [float(item) for item in NUMBER_PATTERN.findall(raw_text)]
-        if len(numbers) < 7:
-            message = f"viewer 返回数字不足 7 个：{raw_text}"
+        if len(numbers) < 8:
+            message = f"viewer 返回数字不足 8 个：{raw_text}"
             log.error(message)
             print(message)
             return None
-        return numbers[-7:]
+        payload = numbers[-8:]
+        mode_code = int(payload[0])
+        if mode_code == 1:
+            first_return_mode = 1
+        elif mode_code == 2:
+            first_return_mode = 0
+        else:
+            message = f"viewer 返回模式码无效：{mode_code}，原始返回：{raw_text}"
+            log.error(message)
+            print(message)
+            return None
+        return first_return_mode, payload[1:]
     except OSError as exc:
         message = f"viewer 获取 pose 失败：{exc}"
         log.error(message)
@@ -2332,6 +2343,15 @@ class G01Demo(Node):
         except EOFError:
             pass
 
+        if not self.set_tool_power("right", 0):
+            log.error("[exchange] 右臂工具下电失败")
+            return False
+        if not self.set_tool_power("left", 1):
+            log.error("[exchange] 左臂工具上电失败")
+            return False
+        print("\033[32m右臂下电、左臂上电成功\033[0m")
+
+
         log.info(
             f"[exchange] 3/4  right_arm 沿刚才直线返回 "
             f"（{len(down_traj.joint_trajectory.points)} 点）"
@@ -2424,45 +2444,46 @@ def main(argv: list[str] | None = None) -> int:
             return finish(False, 0, 1)
 
         time.sleep(1)
-        # # 视觉识别
-        # vision_sock = connect_vision(log)
-        # if vision_sock is None:
-        #     return finish(False, 0, 1)
-        # pose = read_vision_pose(vision_sock, log)
+        # 视觉识别
+        vision_sock = connect_vision(log)
+        if vision_sock is None:
+            return finish(False, 0, 1)
+        vision_result = read_vision_pose(vision_sock, log)
 
-        # print(f"\033[32mviewer pose = {pose}\033[0m")
-        # if pose is None:
-        #     return finish(False, 0, 1)
-        # try:
-        #     x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
-        # except ValueError as exc:
-        #     message = f"viewer pose 解析失败：{exc}"
-        #     log.error(message)
-        #     print(message)
-        #     return finish(False, 0, 1)
-        # print(
-        #     "viewer pose transformed: "
-        #     f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
-        #     f"z={z_mm / 1000.0:.6f} m, "
-        #     f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
-        # )
-        # EE_POSE2 = dict(
-        #     x=x_mm / 1000.0,
-        #     y=y_mm / 1000.0,
-        #     z=z_mm / 1000.0,
-        #     roll=roll,
-        #     pitch=pitch,
-        #     yaw=yaw,
-        # )
-        #sim
-        EE_POSE2 = dict(
-            x=-0.5838529295608973,
-            y=0.47421900873192807,
-            z=0.024792295551118827,
-            roll = -1.5516086668226448,
-            pitch=0.8213446404921059,
-            yaw=0.529204741098486
+        if vision_result is None:
+            return finish(False, 0, 1)
+        first_return_mode, pose = vision_result
+        print(f"\033[32mviewer first_return_mode = {first_return_mode}, pose = {pose}\033[0m")
+        try:
+            x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+        except ValueError as exc:
+            message = f"viewer pose 解析失败：{exc}"
+            log.error(message)
+            print(message)
+            return finish(False, 0, 1)
+        print(
+            "viewer pose transformed: "
+            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
+            f"z={z_mm / 1000.0:.6f} m, "
+            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
         )
+        EE_POSE2 = dict(
+            x=x_mm / 1000.0,
+            y=y_mm / 1000.0,
+            z=z_mm / 1000.0,
+            roll=roll,
+            pitch=pitch,
+            yaw=yaw,
+        )
+        #sim
+        # EE_POSE2 = dict(
+        #     x=-0.5838529295608973,
+        #     y=0.47421900873192807,
+        #     z=0.024792295551118827,
+        #     roll = -1.5516086668226448,
+        #     pitch=0.8213446404921059,
+        #     yaw=0.529204741098486
+        # )
         print(f"EE_POSE2 = {EE_POSE2}")
         # return 1
 
@@ -2490,15 +2511,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not node.pick_and_return(
             target_pose=target_pose,
-            speed_scale=0.7,
+            speed_scale=0.2,
             group=pick_group,
             link=EE_LINK,
             plan_frame=PLAN_FRAME,
             joint_names=pick_joint_names,
             place_joints=PLACE_JOINTS[pick_group],
-            place_speed_scale=0.7,
+            place_speed_scale=0.2,
             cutoff_joint_names=joint_names,
-            first_return_mode=1,
+            first_return_mode=first_return_mode,
         ):
             log.error("抓取流程失败")
             log.info("按回车退出 …")
