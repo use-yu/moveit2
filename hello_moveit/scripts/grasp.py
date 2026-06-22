@@ -532,6 +532,16 @@ def joint_names_for_group(group: str) -> list[str]:
     return list(JOINT_TARGETS[group].keys())
 
 
+def tool_side_for_group_link(group: str, link: str) -> str | None:
+    group_l = group.lower()
+    link_l = link.lower()
+    if group_l.startswith("left") or link_l.startswith("l_"):
+        return "left"
+    if group_l.startswith("right") or link_l.startswith("r_"):
+        return "right"
+    return None
+
+
 def make_pose(x: float, y: float, z: float, roll=0.0, pitch=0.0, yaw=0.0) -> Pose:
     """构造 geometry_msgs/Pose。"""
     p = Pose()
@@ -2012,10 +2022,15 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        if not self.set_tool_power("right", 0):
-            log.error("[pick] 右臂工具下电失败")
+        tool_side = tool_side_for_group_link(group, link)
+        if tool_side is None:
+            log.error(f"[pick] 无法根据 group={group}, link={link} 判断工具侧")
             return False
-        print("\033[32m下电成功\033[0m")
+        tool_label = "左臂" if tool_side == "left" else "右臂"
+        if not self.set_tool_power(tool_side, 0):
+            log.error(f"[pick] {tool_label}工具下电失败")
+            return False
+        print(f"\033[32m{tool_label}下电成功\033[0m")
 
         log.info(
             f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
