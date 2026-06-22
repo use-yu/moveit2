@@ -309,9 +309,8 @@ EXCHANGE_Q1 = [
 ]
 EXCHANGE_Q2 = [
     # 0.070556798, -1.414919441, -1.053385853, -0.663103266, 0.585734181, -0.010876821,
-    0.113294418, -1.437068599, -0.988852452, -0.706645469, 0.628907724, -0.009678419,
-    -1.894577323, -1.514870555, -0.775900502, -0.852465895, 0.728284578, 0.0
-
+    0.113298828, -1.437132878, -0.988730233, -0.706701256, 0.628914758, -0.009681208,
+    -1.894577193, -1.514854650, -0.775937512, -0.852444980, 0.728284757, 0.001667991
     
 ]
 
@@ -326,7 +325,7 @@ NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
 # 下面会转成平移单位为毫米的 4x4 矩阵，与 viewer pose 的毫米单位保持一致。
 VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
-    -0.153056, -0.140874, -0.110922, 0.650114, -0.266715, -0.658118, -0.270360
+    -0.153120, -0.139930, -0.109680, 0.648397, -0.269843, -0.657337, -0.273266
 ]
 
 
@@ -2278,7 +2277,7 @@ class G01Demo(Node):
         *,
         dual_speed: float = 0.2,
         cartesian_speed: float = 0.2,
-        z_down_distance: float = 0.02,
+        z_down_distance: float = 0.105,
     ) -> bool:
         """双臂交换流程：dual_arm 到 q2，右臂沿 z 向下，再原直线返回，最后 dual_arm 到 q1。"""
         log = self.get_logger()
@@ -2288,6 +2287,10 @@ class G01Demo(Node):
         right_plan_frame = "r_base_link"
         dual_joint_names = joint_names_for_group(dual_group)
         right_joint_names = joint_names_for_group(right_group)
+
+        if not self.set_tool_power("left", 0):
+            log.error("[exchange] 左臂工具下电失败")
+            return False
 
         if len(q1) != len(dual_joint_names):
             log.error(f"[exchange] q1 长度错误: {len(q1)} != {len(dual_joint_names)}")
