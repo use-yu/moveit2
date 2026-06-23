@@ -566,12 +566,12 @@ def joint_names_for_group(group: str) -> list[str]:
     return list(JOINT_TARGETS[group].keys())
 
 
-def tool_side_for_group_link(group: str, link: str) -> str | None:
-    group_l = group.lower()
+def tool_side_for_link(link: str) -> str | None:
+    """只根据末端工具 link 判断左右臂。"""
     link_l = link.lower()
-    if group_l.startswith("left") or link_l.startswith("l_"):
+    if link_l == "l_tool":
         return "left"
-    if group_l.startswith("right") or link_l.startswith("r_"):
+    if link_l == "r_tool":
         return "right"
     return None
 
@@ -758,9 +758,9 @@ def make_z_axis_marker(
     m.action = Marker.ADD
     m.pose.orientation.w = 1.0
     m.points = [start, end]
-    m.scale.x = 0.004  # 箭杆直径
-    m.scale.y = 0.012  # 箭头直径
-    m.scale.z = 0.010  # 箭头长度
+    m.scale.x = 0.01  # 箭杆直径
+    m.scale.y = 0.015  # 箭头直径
+    m.scale.z = 0.012  # 箭头长度
     m.color = color or Z_AXIS_COLOR
     return m
 
@@ -967,6 +967,7 @@ class G01Demo(Node):
         self._js_count = 0
         self._latest_grasp_cmd: dict | None = None
         self._start_grasp_cmd: dict | None = None
+        self.last_pick_failure_reason: str | None = None
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
         self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
@@ -2116,9 +2117,9 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        tool_side = tool_side_for_group_link(group, link)
+        tool_side = tool_side_for_link(link)
         if tool_side is None:
-            log.error(f"[pick] 无法根据 group={group}, link={link} 判断工具侧")
+            log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
             return False
         tool_label = "左臂" if tool_side == "left" else "右臂"
         if not self.set_tool_power(tool_side, 0):
@@ -2175,6 +2176,7 @@ class G01Demo(Node):
             first_return_mode : 0=反向 approach + 1/8 OMPL 回初始位置；1=只反向 approach 回 q_pre
         """
         log = self.get_logger()
+        self.last_pick_failure_reason = None
         joint_names = list(joint_names)
         cutoff_joint_names = list(cutoff_joint_names) if cutoff_joint_names is not None else joint_names
         first_return_mode = int(first_return_mode)
@@ -2193,9 +2195,14 @@ class G01Demo(Node):
         log.info(
             f"[pick] group={group}, link={link}, plan_frame={plan_frame}"
         )
-
-        if not self.set_tool_power("right", 0):
-            log.error("[pick] 右臂工具下电失败")
+        # 抓取前先下电
+        tool_side = tool_side_for_link(link)
+        if tool_side is None:
+            log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断抓取工具侧")
+            return False
+        tool_label = "左臂" if tool_side == "left" else "右臂"
+        if not self.set_tool_power(tool_side, 0):
+            log.error(f"[pick] {tool_label}工具下电失败")
             return False
 
         pre_pose = pose_offset_local_z(target_pose, PRE_GRASP_OFFSET)
@@ -2215,6 +2222,7 @@ class G01Demo(Node):
         )
         if picked is None:
             log.error("[pick] 未找到「IK 可解 + cartesian approach 可行」的 IK 解")
+            self.last_pick_failure_reason = "no_ik"
             return False
         q_pre, q_target, approach_traj = picked
         log.info(
@@ -2258,6 +2266,7 @@ class G01Demo(Node):
             return False
         if not ok:
             log.error("[pick] OMPL 到 q_pre 失败")
+            self.last_pick_failure_reason = "q_pre"
             return False
         if to_pre_traj is None or not to_pre_traj.joint_trajectory.points:
             log.error("[pick] 1/8 未返回 OMPL 轨迹，无法原路退回初始位置")
@@ -2284,10 +2293,10 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        if not self.set_tool_power("right", 1):
-            log.error("[pick] 右臂工具上电失败")
+        if not self.set_tool_power(tool_side, 1):
+            log.error(f"[pick] {tool_label}工具上电失败")
             return False
-        print("\033[32m上电成功\033[0m")
+        print(f"\033[32m{tool_label}上电成功\033[0m")
         # 日志
         return_desc = (
             "反向 approach → q_pre"
@@ -2329,8 +2338,6 @@ class G01Demo(Node):
                 line_speed=speed_scale,
             ):
                 return False
-
-            
 
             
         else:
@@ -2540,40 +2547,40 @@ def main(argv: list[str] | None = None) -> int:
             return finish(False, 0, 1)
 
         time.sleep(1)
-        # 视觉识别
-        vision_sock = connect_vision(log)
-        if vision_sock is None:
-            return finish(False, 0, 1)
-        vision_result = read_vision_pose(vision_sock, log)
+        # # 视觉识别
+        # vision_sock = connect_vision(log)
+        # if vision_sock is None:
+        #     return finish(False, 0, 1)
+        # vision_result = read_vision_pose(vision_sock, log)
 
-        if vision_result is None:
-            return finish(False, 0, 1)
-        first_return_mode, pose = vision_result
-        print(f"\033[32mviewer first_return_mode = {first_return_mode}, pose = {pose}\033[0m")
-        try:
-            right_xyz_rpy = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
-            left_xyz_rpy = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
-        except ValueError as exc:
-            message = f"viewer pose 解析失败：{exc}"
-            log.error(message)
-            print(message)
-            return finish(False, 0, 1)
+        # if vision_result is None:
+        #     return finish(False, 0, 1)
+        # first_return_mode, pose = vision_result
+        # print(f"\033[32mviewer first_return_mode = {first_return_mode}, pose = {pose}\033[0m")
+        # try:
+        #     right_xyz_rpy = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
+        #     left_xyz_rpy = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
+        # except ValueError as exc:
+        #     message = f"viewer pose 解析失败：{exc}"
+        #     log.error(message)
+        #     print(message)
+        #     return finish(False, 0, 1)
 
-        def ee_pose_from_xyz_rpy_mm(values: Sequence[float]) -> dict[str, float]:
-            x_mm, y_mm, z_mm, roll, pitch, yaw = values
-            return dict(
-                x=x_mm / 1000.0,
-                y=y_mm / 1000.0,
-                z=z_mm / 1000.0,
-                roll=roll,
-                pitch=pitch,
-                yaw=yaw,
-            )
+        # def ee_pose_from_xyz_rpy_mm(values: Sequence[float]) -> dict[str, float]:
+        #     x_mm, y_mm, z_mm, roll, pitch, yaw = values
+        #     return dict(
+        #         x=x_mm / 1000.0,
+        #         y=y_mm / 1000.0,
+        #         z=z_mm / 1000.0,
+        #         roll=roll,
+        #         pitch=pitch,
+        #         yaw=yaw,
+        #     )
 
-        EE_POSE_RIGHT = ee_pose_from_xyz_rpy_mm(right_xyz_rpy)
-        EE_POSE_LEFT = ee_pose_from_xyz_rpy_mm(left_xyz_rpy)
-        print(f"viewer pose transformed (right): {EE_POSE_RIGHT}")
-        print(f"viewer pose transformed (left):  {EE_POSE_LEFT}")
+        # EE_POSE_RIGHT = ee_pose_from_xyz_rpy_mm(right_xyz_rpy)
+        # EE_POSE_LEFT = ee_pose_from_xyz_rpy_mm(left_xyz_rpy)
+        # print(f"viewer pose transformed (right): {EE_POSE_RIGHT}")
+        # print(f"viewer pose transformed (left):  {EE_POSE_LEFT}")
         #sim
         # EE_POSE_RIGHT = dict(
         #     x=-0.5838529295608973,
@@ -2583,56 +2590,95 @@ def main(argv: list[str] | None = None) -> int:
         #     pitch=0.8213446404921059,
         #     yaw=0.529204741098486
         # )
-        # --- 3. 抓取流程 ---
-        pick_group = POSE_GROUP
-        if pick_group.startswith("right"):
-            ep = EE_POSE_RIGHT
-        elif pick_group.startswith("left"):
-            ep = EE_POSE_LEFT
-        else:
-            log.error(f"无法根据 POSE_GROUP={pick_group} 选择左/右视觉坐标变换")
-            return finish(False, 0, 1)
+        EE_POSE_RIGHT = dict(
+            x=-0.5838529295608973,
+            y=0.47421900873192807,
+            z=10.024792295551118827,
+            roll = -1.5516086668226448,
+            pitch=0.8213446404921059,
+            yaw=0.529204741098486
+        )
+        EE_POSE_LEFT = dict(
+            x=0.776093,
+            y=0.409232,
+            z=0.035247,
+            roll = -1.228403,
+            pitch=-0.888468,
+            yaw=-0.870621
+        )
 
-        print(f"抓取使用 {pick_group} 目标位姿: {ep}")
-        node.show_cylinder_at_pose(ep, frame_id=PLAN_FRAME)
-        node.show_z_axis_at_pose(ep, frame_id=PLAN_FRAME)
+        target_pose_right = make_pose(
+            EE_POSE_RIGHT["x"], EE_POSE_RIGHT["y"], EE_POSE_RIGHT["z"],
+            EE_POSE_RIGHT["roll"], EE_POSE_RIGHT["pitch"], EE_POSE_RIGHT["yaw"],
+        )
+        target_pose_left = make_pose(
+            EE_POSE_LEFT["x"], EE_POSE_LEFT["y"], EE_POSE_LEFT["z"],
+            EE_POSE_LEFT["roll"], EE_POSE_LEFT["pitch"], EE_POSE_LEFT["yaw"],
+        )
 
-        log.info("按回车继续 …")
+        # --- 3. 抓取流程：优先右臂；仅在无可用 IK 或到 q_pre 失败时改用左臂 ---
+        right_group = "right_arm"
+        right_link = "r_tool"
+        right_frame = "r_base_link"
+        left_group = "left_arm"
+        left_link = "l_tool"
+        left_frame = "l_base_link"
+
+        node.show_cylinder_at_pose(EE_POSE_RIGHT, frame_id=right_frame)
+        node.show_z_axis_at_pose(EE_POSE_RIGHT, frame_id=right_frame)
+        log.info("抓取优先尝试右臂，按回车继续 …")
         try:
             input()
         except EOFError:
             pass
 
-        pick_joint_names = joint_names_for_group(pick_group)
-        if pick_group not in PLACE_JOINTS:
-            log.error(f"PLACE_JOINTS 中未配置 group={pick_group}")
-            return finish(False, 0, 1)
-        target_pose = make_pose(
-            ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
-        )
-        print(f"\033[32mtarget_pose = {target_pose}\033[0m")
-        log.info(
-            f"抓取: group={pick_group}, link={EE_LINK}, frame={PLAN_FRAME}"
-        )
-        if not node.pick_and_return(
-            target_pose=target_pose,
-            speed_scale=0.2,
-            group=pick_group,
-            link=EE_LINK,
-            plan_frame=PLAN_FRAME,
-            joint_names=pick_joint_names,
-            place_joints=PLACE_JOINTS[pick_group],
-            place_speed_scale=0.2,
+        right_ok = node.pick_and_return(
+            target_pose=target_pose_right,
+            speed_scale=0.7,
+            group=right_group,
+            link=right_link,
+            plan_frame=right_frame,
+            joint_names=joint_names_for_group(right_group),
+            place_joints=PLACE_JOINTS[right_group],
+            place_speed_scale=0.7,
             cutoff_joint_names=joint_names,
             first_return_mode=0,
-        ):
-            log.error("抓取流程失败")
-            log.info("按回车退出 …")
-            try:
-                input()
-            except EOFError:
-                pass
-            return finish(False, 0, 1)
+        )
+
+        if not right_ok:
+            right_failure = node.last_pick_failure_reason
+            if right_failure not in ("no_ik", "q_pre"):
+                log.error("右臂抓取在非回退阶段失败，终止抓取流程")
+                log.info("按回车退出 …")
+                try:
+                    input()
+                except EOFError:
+                    pass
+                return finish(False, 0, 1)
+
+            reason_text = "无可用 IK/直线接近解" if right_failure == "no_ik" else "到 q_pre 失败"
+            log.warning(f"右臂{reason_text}，切换左臂抓取")
+
+            left_ok = node.pick_and_return(
+                target_pose=target_pose_left,
+                speed_scale=0.7,
+                group=left_group,
+                link=left_link,
+                plan_frame=left_frame,
+                joint_names=joint_names_for_group(left_group),
+                place_joints=PLACE_JOINTS[left_group],
+                place_speed_scale=0.7,
+                cutoff_joint_names=joint_names,
+                first_return_mode=0,
+            )
+            if not left_ok:
+                log.error("左臂抓取仍然失败，退出抓取流程")
+                log.info("按回车退出 …")
+                try:
+                    input()
+                except EOFError:
+                    pass
+                return finish(False, 0, 1)
 
         finish(True, 1, 0)
 
