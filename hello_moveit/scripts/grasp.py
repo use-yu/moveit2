@@ -338,10 +338,12 @@ VISION_RECV_TIMEOUT = 30.0
 NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
 # 下面会转成平移单位为毫米的 4x4 矩阵，与 viewer pose 的毫米单位保持一致。
-VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
+VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
     -0.153120, -0.139930, -0.109680, 0.648397, -0.269843, -0.657337, -0.273266
 ]
-
+VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
+    0.154162, -0.137877, -0.190333, 0.654702, -0.277334, 0.647870, 0.273341
+]
 
 def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
     if len(transform) != 7:
@@ -378,7 +380,9 @@ def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[
     ]
 
 
+VISION_RIGHT_TRANSFORM_MM = _transform_xyz_wxyz_m_to_matrix_mm(VISION_RIGHT_TRANSFORM_XYZ_WXYZ)
 VISION_LEFT_TRANSFORM_MM = _transform_xyz_wxyz_m_to_matrix_mm(VISION_LEFT_TRANSFORM_XYZ_WXYZ)
+
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
 IK_N_CANDIDATES = 200          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
 IK_SEED_PERTURB = math.pi/2     # 随机种子各关节的最大扰动幅度 [rad]，越大解越分散
@@ -531,9 +535,12 @@ def matrix_to_xyz_rpy(matrix: list[list[float]]) -> tuple[float, float, float, f
     )
 
 
-def transform_vision_pose(pose: Sequence[float]) -> tuple[float, float, float, float, float, float]:
-    """viewer pose 为 xyz(mm) + quat(wxyz)；左乘标定矩阵后返回 xyz(mm), rpy(rad)。"""
-    return matrix_to_xyz_rpy(matmul4(VISION_LEFT_TRANSFORM_MM, pose_mm_wxyz_to_matrix(pose)))
+def transform_vision_pose(
+    pose: Sequence[float],
+    transform_mm: list[list[float]],
+) -> tuple[float, float, float, float, float, float]:
+    """viewer pose 为 xyz(mm) + quat(wxyz)；左乘指定标定矩阵后返回 xyz(mm), rpy(rad)。"""
+    return matrix_to_xyz_rpy(matmul4(transform_mm, pose_mm_wxyz_to_matrix(pose)))
 
 
 def quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
@@ -2492,28 +2499,31 @@ def main(argv: list[str] | None = None) -> int:
         first_return_mode, pose = vision_result
         print(f"\033[32mviewer first_return_mode = {first_return_mode}, pose = {pose}\033[0m")
         try:
-            x_mm, y_mm, z_mm, roll, pitch, yaw = transform_vision_pose(pose)
+            right_xyz_rpy = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
+            left_xyz_rpy = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
         except ValueError as exc:
             message = f"viewer pose 解析失败：{exc}"
             log.error(message)
             print(message)
             return finish(False, 0, 1)
-        print(
-            "viewer pose transformed: "
-            f"x={x_mm / 1000.0:.6f} m, y={y_mm / 1000.0:.6f} m, "
-            f"z={z_mm / 1000.0:.6f} m, "
-            f"roll={roll:.6f} rad, pitch={pitch:.6f} rad, yaw={yaw:.6f} rad"
-        )
-        EE_POSE2 = dict(
-            x=x_mm / 1000.0,
-            y=y_mm / 1000.0,
-            z=z_mm / 1000.0,
-            roll=roll,
-            pitch=pitch,
-            yaw=yaw,
-        )
+
+        def ee_pose_from_xyz_rpy_mm(values: Sequence[float]) -> dict[str, float]:
+            x_mm, y_mm, z_mm, roll, pitch, yaw = values
+            return dict(
+                x=x_mm / 1000.0,
+                y=y_mm / 1000.0,
+                z=z_mm / 1000.0,
+                roll=roll,
+                pitch=pitch,
+                yaw=yaw,
+            )
+
+        EE_POSE_RIGHT = ee_pose_from_xyz_rpy_mm(right_xyz_rpy)
+        EE_POSE_LEFT = ee_pose_from_xyz_rpy_mm(left_xyz_rpy)
+        print(f"viewer pose transformed (right): {EE_POSE_RIGHT}")
+        print(f"viewer pose transformed (left):  {EE_POSE_LEFT}")
         #sim
-        # EE_POSE2 = dict(
+        # EE_POSE_RIGHT = dict(
         #     x=-0.5838529295608973,
         #     y=0.47421900873192807,
         #     z=0.024792295551118827,
@@ -2521,24 +2531,29 @@ def main(argv: list[str] | None = None) -> int:
         #     pitch=0.8213446404921059,
         #     yaw=0.529204741098486
         # )
-        print(f"EE_POSE2 = {EE_POSE2}")
-        # return 1
+        # --- 3. 抓取流程 ---
+        pick_group = POSE_GROUP
+        if pick_group.startswith("right"):
+            ep = EE_POSE_RIGHT
+        elif pick_group.startswith("left"):
+            ep = EE_POSE_LEFT
+        else:
+            log.error(f"无法根据 POSE_GROUP={pick_group} 选择左/右视觉坐标变换")
+            return finish(False, 0, 1)
 
-        node.show_cylinder_at_pose(EE_POSE2)
-        
+        print(f"抓取使用 {pick_group} 目标位姿: {ep}")
+        node.show_cylinder_at_pose(ep, frame_id=PLAN_FRAME)
+
         log.info("按回车继续 …")
         try:
             input()
         except EOFError:
             pass
 
-        # --- 3. 抓取流程 ---
-        pick_group = POSE_GROUP
         pick_joint_names = joint_names_for_group(pick_group)
         if pick_group not in PLACE_JOINTS:
             log.error(f"PLACE_JOINTS 中未配置 group={pick_group}")
             return finish(False, 0, 1)
-        ep = EE_POSE2
         target_pose = make_pose(
             ep["x"], ep["y"], ep["z"], ep["roll"], ep["pitch"], ep["yaw"]
         )
