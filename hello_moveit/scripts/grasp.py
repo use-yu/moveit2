@@ -291,7 +291,7 @@ PLACE_JOINTS = {
         ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
     ],
     "right_arm": [
-        0.9618226289749146, -0.6597065329551697, -1.4834308624267578, -0.9613705277442932, -2.68591570854187, -1.7255382537841797
+        0.964369312, -0.653831720, -1.451408878, -1.029183310, -2.691709649, -1.747299640
     ],
     "left_arm": [
         -0.963150337, 0.616290531, 1.406139833, 1.115760915, 2.690830547, 1.371585746
@@ -319,7 +319,7 @@ VISION_IP = "192.168.5.110"
 VISION_PORT = 50000
 VISION_TRIGGER_COMMAND = "p,1"
 VISION_CONNECT_TIMEOUT = 3.0
-VISION_RECV_TIMEOUT = 20.0
+VISION_RECV_TIMEOUT = 30.0
 # 正则表达式，用来匹配字符串里的数字：
 NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
@@ -2529,7 +2529,7 @@ def main(argv: list[str] | None = None) -> int:
             place_joints=PLACE_JOINTS[pick_group],
             place_speed_scale=0.2,
             cutoff_joint_names=joint_names,
-            first_return_mode=first_return_mode,
+            first_return_mode=0,
         ):
             log.error("抓取流程失败")
             log.info("按回车退出 …")
