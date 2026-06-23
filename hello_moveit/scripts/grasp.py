@@ -52,7 +52,7 @@ from typing import Iterable, Sequence
 import rclpy
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration as DurationMsg
-from geometry_msgs.msg import Pose, PoseStamped
+from geometry_msgs.msg import Point, Pose, PoseStamped
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     BoundingVolume,
@@ -245,6 +245,9 @@ CYLINDER_MARKER_TOPIC = "g01_pose_cylinder"
 CYLINDER_DIAMETER = 0.15   # 直径 [m]
 CYLINDER_HEIGHT = 0.06     # 高度 [m]（沿位姿局部 z 轴）
 CYLINDER_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.45)
+Z_AXIS_MARKER_ID = "ee_pose_z_axis"
+Z_AXIS_LENGTH = CYLINDER_HEIGHT / 2.0  # 从圆柱中心到局部 +z 端面，不超出物体
+Z_AXIS_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
 
 # ROS 接口名（move_group 默认）
 SVC_APPLY_SCENE = "apply_planning_scene"
@@ -729,6 +732,36 @@ def make_cylinder_marker(
     m.scale.y = diameter
     m.scale.z = height
     m.color = color or CYLINDER_COLOR
+    return m
+
+
+def make_z_axis_marker(
+    pose: Pose,
+    marker_id: int,
+    frame_id: str = PLAN_FRAME,
+    length: float = Z_AXIS_LENGTH,
+    color: ColorRGBA | None = None,
+    ns: str = CYLINDER_MARKER_NS,
+) -> Marker:
+    """构造从 pose 原点指向其局部 +z 方向的红色箭头。"""
+    q = pose.orientation
+    dx, dy, dz = rotate_xyz_by_quat(0.0, 0.0, length, q.x, q.y, q.z, q.w)
+
+    start = Point(x=pose.position.x, y=pose.position.y, z=pose.position.z)
+    end = Point(x=start.x + dx, y=start.y + dy, z=start.z + dz)
+
+    m = Marker()
+    m.header.frame_id = frame_id
+    m.ns = ns
+    m.id = marker_id
+    m.type = Marker.ARROW
+    m.action = Marker.ADD
+    m.pose.orientation.w = 1.0
+    m.points = [start, end]
+    m.scale.x = 0.004  # 箭杆直径
+    m.scale.y = 0.012  # 箭头直径
+    m.scale.z = 0.010  # 箭头长度
+    m.color = color or Z_AXIS_COLOR
     return m
 
 
@@ -1273,6 +1306,25 @@ class G01Demo(Node):
             f"已发布圆柱 Marker（仅显示）id={object_id} topic={CYLINDER_MARKER_TOPIC} "
             f"@ {frame_id} pos=({p.position.x:.3f}, {p.position.y:.3f}, {p.position.z:.3f}), "
             f"Ø{diameter * 100:.0f}cm × H{height * 100:.0f}cm"
+        )
+        return True
+
+    def show_z_axis_at_pose(
+        self,
+        pose: Pose | dict,
+        object_id: str = Z_AXIS_MARKER_ID,
+        frame_id: str = PLAN_FRAME,
+        length: float = Z_AXIS_LENGTH,
+    ) -> bool:
+        """在 RViz 中用红色箭头显示 pose 的局部 +z 轴方向。"""
+        p = pose if isinstance(pose, Pose) else pose_from_dict(pose)
+        mid = self._cylinder_marker_numeric_id(object_id)
+        marker = make_z_axis_marker(p, mid, frame_id=frame_id, length=length)
+        marker.header.stamp = self.get_clock().now().to_msg()
+        self._cylinder_marker_pub.publish(marker)
+        self.get_logger().info(
+            f"已发布红色 +z 轴 Marker id={object_id} topic={CYLINDER_MARKER_TOPIC} "
+            f"@ {frame_id} length={length:.3f} m"
         )
         return True
 
@@ -2543,6 +2595,7 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"抓取使用 {pick_group} 目标位姿: {ep}")
         node.show_cylinder_at_pose(ep, frame_id=PLAN_FRAME)
+        node.show_z_axis_at_pose(ep, frame_id=PLAN_FRAME)
 
         log.info("按回车继续 …")
         try:
@@ -2594,6 +2647,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         close_vision(vision_sock, log)
         node.remove_cylinder_at_pose()
+        node.remove_cylinder_at_pose(object_id=Z_AXIS_MARKER_ID)
         if frame_added:
             log.info(f"移除「{FRAME_ID}」…")
             if not node.remove_frame():
