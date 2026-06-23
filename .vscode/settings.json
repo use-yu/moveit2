@@ -1,7 +1,10 @@
 {
-  "git.enabled": true,
-  "git.decorations.enabled": true,
-  "scm.diffDecorations": "all",
-  "diffEditor.renderSideBySide": true,
-  "diffEditor.ignoreTrimWhitespace": false
+    "http.proxy": "http://127.0.0.1:7890",
+    "http.proxyStrictSSL": false,
+    "http.proxySupport": "override",
+    "http.noProxy": [],
+    "workbench.colorTheme": "Dark Modern",
+    "editor.fontSize": 20,
+    "terminal.integrated.fontSize": 20,
+    "editor.renderWhitespace": "all"
 }

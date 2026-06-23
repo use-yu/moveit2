@@ -29,16 +29,17 @@ URDF_XACRO = Path(__file__).parent / "moveit_resources/g01_description/urdf/G01-
 
 # 基坐标系和末端坐标系 link 名。右臂可改成 BASE_LINK="r_base_link", EE_LINK="r_tool"。
 BASE_LINK = "SJ"
-EE_LINK = "r_tool"
+EE_LINK = "l_tool"
 
 # 目标末端位姿，表达在 BASE_LINK 坐标系下，单位：m / rad。
 # 右臂放
-TARGET_XYZ = [0.318969, 0.051979+0.115, -0.325231]
-TARGET_RPY = [-90.0, -10.553436, -180.0]
-SEED_JOINTS = [66.0, -42.0, -76.0, -60.0, -144.0, -100.0]
+# TARGET_XYZ = [0.318955+0.0005, 0.051979, -0.325236+0.001]
+# TARGET_RPY = [-90.0, -11.576622, -180.0]
+# SEED_JOINTS = [66.0, -42.0, -76.0, -60.0, -144.0, -100.0]
 # 左臂放
-# TARGET_XYZ = [0.319742, 0.051979+0.115, 0.355548]
-# TARGET_RPY = [-90.0, -11.137174, 180.0]
+TARGET_XYZ = [0.319742, 0.051979, 0.355548]
+TARGET_RPY = [-90.0, -11.137174, 180.0]
+SEED_JOINTS = [-66.0, 40.0, 72.0, 68.0, 144.0, 77.0]
 # 交换
 # TARGET_XYZ = [-0.738, 0.55, 0]
 # TARGET_RPY = [-120.0, 90.0, 150.0]
@@ -54,7 +55,7 @@ WAIST_ANGLE_DEG = True
 # SEED_JOINTS = [-108.0, -88.0, -48.0, -42.0, 43.0, 0.0]
 #l
 # SEED_JOINTS = [23, -87.0, -35.0, -60.0, 53.0, -2.0]
-# SEED_JOINTS = [-66.0, 40.0, 72.0, 68.0, 144.0, 77.0]
+
 # 如果 TARGET_RPY / SEED_JOINTS 里写的是角度，把对应开关改成 True。
 TARGET_RPY_DEG = True
 SEED_JOINTS_DEG = True
@@ -408,7 +409,7 @@ def main() -> int:
     if fixed_names:
         print("fixed_joints_rad:", format_named_values(fixed_names, fixed_q))
         print("fixed_joints_deg:", format_named_values(fixed_names, fixed_q, degrees=True))
-    print("solution_rad:", format_named_values(active_names, q))
+    print(",".join(f"{value:.9f}" for value in q))
     print("solution_deg:", format_named_values(active_names, q, degrees=True))
     print("full_solution_rad:", format_named_values(full_names, full_q))
     print("full_solution_deg:", format_named_values(full_names, full_q, degrees=True))

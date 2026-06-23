@@ -272,7 +272,8 @@ CART_JUMP_STEP_FACTOR = 3.0  # 单步关节空间距离超过平均值该倍数�
 CART_MAX_POINT_FACTOR = 2.0  # 实际点数超过理论直线点数该倍数时，认为 IK 分支不稳
 CART_MAX_POINT_EXTRA = 5
 
-# left_body 放置位关节目标 [rad]（键顺序与 JOINT_TARGETS[group] 一致）
+# 放置位关节目标 [rad]（数组顺序与 JOINT_TARGETS[group] 一致）。
+# 单臂使用 yubei → fang 两段式放置：先到预备位，再做末端笛卡尔直线到放置位。
 PLACE_JOINTS = {
     "left_body": [
         -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
@@ -290,17 +291,30 @@ PLACE_JOINTS = {
         1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
         ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
     ],
-    "right_arm": [
-        0.964369312, -0.653831720, -1.451408878, -1.029183310, -2.691709649, -1.747299640
-    ],
-    "left_arm": [
-        -0.963150337, 0.616290531, 1.406139833, 1.115760915, 2.690830547, 1.371585746
-    ],
+    "right_arm": {
+        "yubei": [
+            0.963949906, -0.656333421, -1.450484542,
+            -1.027639165, -2.692130812, -1.765195710,
+        ],
+        "fang": [
+            1.157131898, -0.733122350, -1.304636258,
+            -1.099388006, -2.499712252, -1.767715948,
+        ],
+    },
+    "left_arm": {
+        "yubei": [
+            -0.963150337, 0.616290531, 1.406139833,
+            1.115760915, 2.690830547, 1.371585746,
+        ],
+        "fang": [
+            -1.156464494, 0.696983675, 1.258988021,
+            1.184260626, 2.498507345, 1.373094234,
+        ],
+    },
 }
 
 # 抓取流程默认参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
-POST_RETURN_Z_OFFSET = 0.115  # 复位后沿末端 +z 轴直线移动距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 FIRST_RETURN_MODE = 0       # 0: 直线+OMPL 回到 1/8 初始位置；1: 只反向直线回到 q_pre
 EXCHANGE_Q1 = [
@@ -1943,53 +1957,58 @@ class G01Demo(Node):
     def _place_and_return(
         self,
         speed: float,
-        place_joints: Sequence[float],
+        place_joints: dict[str, Sequence[float]],
         *,
         group: str,
         link: str,
         plan_frame: str,
-        cartesian_speed: float | None = None,
+        line_speed: float | None = None,
     ) -> bool:
-        """执行放置段：OMPL 到放置位、末端直线抬起、下电、按两段轨迹原路返回。
+        """执行放置段：到 yubei、末端笛卡尔直线到 fang、下电、按两段轨迹原路返回。
 
         参数：
-            speed             : 5/8 OMPL 到放置关节位的速度缩放（0~1）。
-            place_joints      : 放置位关节目标 [rad]，顺序必须与 group 推导出的关节顺序一致。
-            group             : SRDF 规划组，如 right_arm。
-            link              : 末端 link，如 r_tool。
-            plan_frame        : 笛卡尔/FK 使用的规划坐标系，如 r_base_link。
-            cartesian_speed   : 6/8 末端 +z 笛卡尔直线速度；None 时复用 speed。
+            speed        : 5/8 OMPL 到 yubei 的速度缩放（0~1）。
+            place_joints : 包含 yubei、fang 的关节目标 [rad]，数组顺序与 group 一致。
+            group        : SRDF 规划组，如 right_arm。
+            link         : 做笛卡尔直线运动的末端 link。
+            plan_frame   : FK 与笛卡尔路径使用的规划坐标系。
+            line_speed   : 6/8 yubei → fang 笛卡尔直线速度；None 时复用 speed。
         """
         log = self.get_logger()
         place_joint_names = joint_names_for_group(group)
-        cartesian_speed = speed if cartesian_speed is None else cartesian_speed
-        if len(place_joints) != len(place_joint_names):
+        line_speed = speed if line_speed is None else line_speed
+        if not isinstance(place_joints, dict) or "yubei" not in place_joints or "fang" not in place_joints:
+            log.error(f"[pick] group={group} 的放置配置必须包含 yubei 和 fang")
+            return False
+        yubei_joints = list(place_joints["yubei"])
+        fang_joints = list(place_joints["fang"])
+        if len(yubei_joints) != len(place_joint_names) or len(fang_joints) != len(place_joint_names):
             log.error(
-                f"[pick] place_joints 长度 {len(place_joints)} 与 group={group} "
-                f"关节数 {len(place_joint_names)} 不一致"
+                f"[pick] group={group} 放置配置长度错误：yubei={len(yubei_joints)}, "
+                f"fang={len(fang_joints)}, 关节数={len(place_joint_names)}"
             )
             return False
 
-        log.info("[pick] 5/8  OMPL  → 运动到放置位置")
+        log.info("[pick] 5/8  OMPL → yubei 放置预备位")
         current = self._get_joints(place_joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
         place_start_joints = current
-        goal = [make_joint_constraints_from_vector(group, place_joint_names, place_joints)]
-        ok, used_ms, to_place_traj = self.move(
+        goal = [make_joint_constraints_from_vector(group, place_joint_names, yubei_joints)]
+        ok, used_ms, to_yubei_traj = self.move(
             group, goal, start=current, plan_only=False, speed_scale=speed
         )
-        log.info(f"[pick] OMPL → 放置位置: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        log.info(f"[pick] OMPL → yubei: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not ok:
-            log.error("[pick] 运动到放置位置失败")
+            log.error("[pick] 运动到 yubei 失败")
             return False
-        if to_place_traj is None or not to_place_traj.joint_trajectory.points:
-            log.error("[pick] 5/8 未返回 OMPL 轨迹，无法原路返回")
+        if to_yubei_traj is None or not to_yubei_traj.joint_trajectory.points:
+            log.error("[pick] 5/8 未返回到 yubei 的轨迹，无法原路返回")
             return False
         log.info(
-            "[pick] 放置位关节: "
-            + ", ".join(f"{n}={v:.3f}" for n, v in zip(place_joint_names, place_joints))
+            "[pick] yubei 关节: "
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(place_joint_names, yubei_joints))
         )
 
         log.info("按回车继续 …")
@@ -1998,33 +2017,39 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        log.info(
-            f"[pick] 6/8  沿末端 +z 轴直线移动 {POST_RETURN_Z_OFFSET:.3f} m "
-            f"（笛卡尔，从当前位姿 FK 偏移）"
-        )
+        log.info("[pick] 6/8  末端笛卡尔直线 yubei → fang")
         current = self._get_joints(place_joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
-        ee_pose = self._get_link_pose_fk(
-            link, current, joint_names=place_joint_names, plan_frame=plan_frame
+        fang_state = dict(zip(place_joint_names, fang_joints))
+        fang_pose = self._get_link_pose_fk(
+            link,
+            joints=fang_state,
+            plan_frame=plan_frame,
         )
-        if ee_pose is None:
-            log.error("[pick] FK 读取当前末端位姿失败")
+        if fang_pose is None:
+            log.error("[pick] 无法由 fang 关节角计算目标末端位姿")
             return False
-        offset_pose = pose_offset_local_z(ee_pose, POST_RETURN_Z_OFFSET)
-        z_offset_traj = self._cartesian_plan(
-            group, link, offset_pose,
-            speed_scale=cartesian_speed,
+        yubei_to_fang_traj = self._cartesian_plan(
+            group,
+            link,
+            fang_pose,
+            speed_scale=line_speed,
+            start_joints=current,
             joint_names=place_joint_names,
             plan_frame=plan_frame,
         )
-        if z_offset_traj is None:
-            log.error("[pick] 6/8 笛卡尔直线规划失败")
+        if yubei_to_fang_traj is None:
+            log.error("[pick] yubei → fang 笛卡尔直线规划失败")
             return False
-        if not self._execute_traj(z_offset_traj):
-            log.error("[pick] 6/8 沿末端 z 轴直线移动执行失败")
+        if not self._execute_traj(yubei_to_fang_traj):
+            log.error("[pick] yubei → fang 笛卡尔直线执行失败")
             return False
+        log.info(
+            "[pick] fang 目标关节（用于 FK 生成直线终点）: "
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(place_joint_names, fang_joints))
+        )
 
         log.info("按回车继续 …")
         try:
@@ -2043,18 +2068,18 @@ class G01Demo(Node):
         print(f"\033[32m{tool_label}下电成功\033[0m")
 
         log.info(
-            f"[pick] 7/8  原路返回 ①：反向播放 6/8 → 放置位置 "
-            f"（{len(z_offset_traj.joint_trajectory.points)} 点）"
+            f"[pick] 7/8  原路返回 ①：反向播放 6/8，fang → yubei "
+            f"（{len(yubei_to_fang_traj.joint_trajectory.points)} 点）"
         )
-        if not self._execute_traj(self._reverse_trajectory(z_offset_traj)):
+        if not self._execute_traj(self._reverse_trajectory(yubei_to_fang_traj)):
             log.error("[pick] 7/8 反向播放 6/8 失败")
             return False
 
         log.info(
             f"[pick] 8/8  原路返回 ②：反向播放 5/8 → 1/8 初始位置 "
-            f"（{len(to_place_traj.joint_trajectory.points)} 点）"
+            f"（{len(to_yubei_traj.joint_trajectory.points)} 点）"
         )
-        if not self._execute_traj(self._reverse_trajectory(to_place_traj)):
+        if not self._execute_traj(self._reverse_trajectory(to_yubei_traj)):
             log.error("[pick] 8/8 反向播放 5/8 失败")
             return False
         log.info(
@@ -2071,7 +2096,7 @@ class G01Demo(Node):
         link: str,
         plan_frame: str,
         joint_names: Sequence[str],
-        place_joints: Sequence[float],
+        place_joints: dict[str, Sequence[float]],
         place_speed_scale: float = PLACE_SPEED_SCALE,
         cutoff_joint_names: Sequence[str] | None = None,
         first_return_mode: int = 0,
@@ -2084,9 +2109,9 @@ class G01Demo(Node):
             group             : SRDF 规划组（如 left_body）
             link              : 末端连杆名（如 L6）
             plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 base_link、world）
-            joint_names       : group 内关节名顺序（与 place_joints 一一对应）
-            place_joints      : 放置位关节目标 [rad]（向量，顺序同 joint_names）
-            place_speed_scale : 5/8 OMPL 到放置位的速度缩放（0~1）
+            joint_names       : group 内关节名顺序（与 yubei/fang 数组一一对应）
+            place_joints      : 含 yubei、fang 的放置关节目标 [rad]
+            place_speed_scale : 放置段的速度缩放（0~1）
             cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
             first_return_mode : 0=反向 approach + 1/8 OMPL 回初始位置；1=只反向 approach 回 q_pre
         """
@@ -2097,10 +2122,12 @@ class G01Demo(Node):
         if first_return_mode not in (0, 1):
             log.error(f"[pick] first_return_mode 只能是 0 或 1，当前={first_return_mode}")
             return False
-        if len(place_joints) != len(joint_names):
+        if not isinstance(place_joints, dict) or "yubei" not in place_joints or "fang" not in place_joints:
+            log.error("[pick] place_joints 必须包含 yubei 和 fang")
+            return False
+        if any(len(place_joints[name]) != len(joint_names) for name in ("yubei", "fang")):
             log.error(
-                f"[pick] place_joints 长度 {len(place_joints)} 与 joint_names 长度 "
-                f"{len(joint_names)} 不一致"
+                f"[pick] yubei/fang 的关节数必须等于 joint_names 长度 {len(joint_names)}"
             )
             return False
 
@@ -2240,7 +2267,7 @@ class G01Demo(Node):
                 group="left_arm",
                 link="l_tool",
                 plan_frame="l_base_link",
-                cartesian_speed=speed_scale,
+                line_speed=speed_scale,
             ):
                 return False
 
@@ -2263,7 +2290,7 @@ class G01Demo(Node):
                 group=group,
                 link=link,
                 plan_frame=plan_frame,
-                cartesian_speed=speed_scale,
+                line_speed=speed_scale,
             ):
                 return False
 
