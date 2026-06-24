@@ -295,6 +295,14 @@ PLACE_JOINTS = {
         ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
     ],
     "right_arm": {
+        "yubei_j": [
+            0.9902063012123108, -0.6606103777885437, -1.4372066259384155,
+            -1.0370503664016724, -2.6659367084503174, -1.7743221521377563,
+        ],
+        "fang_j": [
+            1.15645432472229, -0.7307567596435547, -1.304102897644043,
+            -1.1022419929504395, -2.5003864765167236, -1.7764145135879517,
+        ],
         "yubei": [
             0.963949906, -0.656333421, -1.450484542,
             -1.027639165, -2.692130812, -1.765195710,
@@ -305,13 +313,21 @@ PLACE_JOINTS = {
         ],
     },
     "left_arm": {
-        "yubei": [
+        "yubei_j": [
             -0.963150337, 0.616290531, 1.406139833,
             1.115760915, 2.690830547, 1.371585746,
         ],
-        "fang": [
+        "fang_j": [
             -1.156464494, 0.696983675, 1.258988021,
             1.184260626, 2.498507345, 1.373094234,
+        ],
+        "yubei": [
+            -1.0180552005767822, 0.6380873322486877, 1.3786671161651611,
+            1.1222147941589355, 2.6360809803009033, 1.3320913314819336,
+        ],
+        "fang": [
+            -1.1511389017105103, 0.7001933455467224, 1.2645522356033325,
+            1.1755129098892212, 2.5037715435028076, 1.33302640914917,
         ],
     },
 }
@@ -319,7 +335,7 @@ PLACE_JOINTS = {
 # 抓取流程默认参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
-FIRST_RETURN_MODE = 0       # 0: 直线+OMPL 回到 1/8 初始位置；1: 只反向直线回到 q_pre
+FIRST_RETURN_MODE = 2       # 1: 只反向直线回到 q_pre；2: 直线+OMPL 回到 1/8 初始位置
 EXCHANGE_Q1 = [
     -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
     1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
@@ -420,28 +436,27 @@ def connect_vision(log) -> socket.socket | None:
 
 
 def read_vision_pose(sock: socket.socket, log) -> tuple[int, list[float]] | None:
-    """复用已连接 socket，触发一次视觉并返回 first_return_mode 与 xyz(mm)+quat(wxyz)。"""
+    """解析 9 个数：第 1 个忽略，第 2–8 个为 xyz(mm)+quat(wxyz)，第 9 个为模式码。"""
     try:
         sock.sendall(VISION_TRIGGER_COMMAND.encode("utf-8"))
         raw_text = sock.recv(4096).decode("utf-8", errors="ignore").strip()
         numbers = [float(item) for item in NUMBER_PATTERN.findall(raw_text)]
-        if len(numbers) < 8:
-            message = f"viewer 返回数字不足 8 个：{raw_text}"
+        if len(numbers) < 9:
+            message = f"viewer 返回数字不足 9 个：{raw_text}"
             log.error(message)
             print(message)
             return None
-        payload = numbers[-8:]
-        mode_code = int(payload[0])
-        if mode_code == 1:
-            first_return_mode = 1
-        elif mode_code == 2:
-            first_return_mode = 0
-        else:
+        payload = numbers[-9:]
+        pose = payload[1:8]
+        mode_value = payload[8]
+        if mode_value not in (1.0, 2.0):
+            mode_code = mode_value
             message = f"viewer 返回模式码无效：{mode_code}，原始返回：{raw_text}"
             log.error(message)
             print(message)
             return None
-        return first_return_mode, payload[1:]
+        first_return_mode = int(mode_value)
+        return first_return_mode, pose
     except OSError as exc:
         message = f"viewer 获取 pose 失败：{exc}"
         log.error(message)
@@ -2026,34 +2041,38 @@ class G01Demo(Node):
         group: str,
         link: str,
         plan_frame: str,
+        first_return_mode: int,
         line_speed: float | None = None,
     ) -> bool:
-        """执行放置段：到 yubei、末端笛卡尔直线到 fang、下电、按两段轨迹原路返回。
+        """执行放置段：模式 1 使用 *_j 放置点，其余模式使用普通放置点。
 
         参数：
             speed        : 5/8 OMPL 到 yubei 的速度缩放（0~1）。
-            place_joints : 包含 yubei、fang 的关节目标 [rad]，数组顺序与 group 一致。
+            place_joints : 包含 yubei/fang 和 yubei_j/fang_j 的关节目标。
             group        : SRDF 规划组，如 right_arm。
             link         : 做笛卡尔直线运动的末端 link。
             plan_frame   : FK 与笛卡尔路径使用的规划坐标系。
+            first_return_mode: 1 选择 *_j；0/2 选择普通 yubei/fang。
             line_speed   : 6/8 yubei → fang 笛卡尔直线速度；None 时复用 speed。
         """
         log = self.get_logger()
         place_joint_names = joint_names_for_group(group)
         line_speed = speed if line_speed is None else line_speed
-        if not isinstance(place_joints, dict) or "yubei" not in place_joints or "fang" not in place_joints:
-            log.error(f"[pick] group={group} 的放置配置必须包含 yubei 和 fang")
+        yubei_key = "yubei_j" if first_return_mode == 1 else "yubei"
+        fang_key = "fang_j" if first_return_mode == 1 else "fang"
+        if not isinstance(place_joints, dict) or yubei_key not in place_joints or fang_key not in place_joints:
+            log.error(f"[pick] group={group} 的放置配置必须包含 {yubei_key} 和 {fang_key}")
             return False
-        yubei_joints = list(place_joints["yubei"])
-        fang_joints = list(place_joints["fang"])
+        yubei_joints = list(place_joints[yubei_key])
+        fang_joints = list(place_joints[fang_key])
         if len(yubei_joints) != len(place_joint_names) or len(fang_joints) != len(place_joint_names):
             log.error(
-                f"[pick] group={group} 放置配置长度错误：yubei={len(yubei_joints)}, "
-                f"fang={len(fang_joints)}, 关节数={len(place_joint_names)}"
+                f"[pick] group={group} 放置配置长度错误：{yubei_key}={len(yubei_joints)}, "
+                f"{fang_key}={len(fang_joints)}, 关节数={len(place_joint_names)}"
             )
             return False
 
-        log.info("[pick] 5/8  OMPL → yubei 放置预备位")
+        log.info(f"[pick] 5/8  OMPL → {yubei_key} 放置预备位")
         current = self._get_joints(place_joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
@@ -2063,15 +2082,15 @@ class G01Demo(Node):
         ok, used_ms, to_yubei_traj = self.move(
             group, goal, start=current, plan_only=False, speed_scale=speed
         )
-        log.info(f"[pick] OMPL → yubei: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        log.info(f"[pick] OMPL → {yubei_key}: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not ok:
-            log.error("[pick] 运动到 yubei 失败")
+            log.error(f"[pick] 运动到 {yubei_key} 失败")
             return False
         if to_yubei_traj is None or not to_yubei_traj.joint_trajectory.points:
-            log.error("[pick] 5/8 未返回到 yubei 的轨迹，无法原路返回")
+            log.error(f"[pick] 5/8 未返回到 {yubei_key} 的轨迹，无法原路返回")
             return False
         log.info(
-            "[pick] yubei 关节: "
+            f"[pick] {yubei_key} 关节: "
             + ", ".join(f"{n}={v:.3f}" for n, v in zip(place_joint_names, yubei_joints))
         )
 
@@ -2081,7 +2100,7 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        log.info("[pick] 6/8  末端笛卡尔直线 yubei → fang")
+        log.info(f"[pick] 6/8  末端笛卡尔直线 {yubei_key} → {fang_key}")
         current = self._get_joints(place_joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前关节失败")
@@ -2093,7 +2112,7 @@ class G01Demo(Node):
             plan_frame=plan_frame,
         )
         if fang_pose is None:
-            log.error("[pick] 无法由 fang 关节角计算目标末端位姿")
+            log.error(f"[pick] 无法由 {fang_key} 关节角计算目标末端位姿")
             return False
         yubei_to_fang_traj = self._cartesian_plan(
             group,
@@ -2105,13 +2124,13 @@ class G01Demo(Node):
             plan_frame=plan_frame,
         )
         if yubei_to_fang_traj is None:
-            log.error("[pick] yubei → fang 笛卡尔直线规划失败")
+            log.error(f"[pick] {yubei_key} → {fang_key} 笛卡尔直线规划失败")
             return False
         if not self._execute_traj(yubei_to_fang_traj):
-            log.error("[pick] yubei → fang 笛卡尔直线执行失败")
+            log.error(f"[pick] {yubei_key} → {fang_key} 笛卡尔直线执行失败")
             return False
         log.info(
-            "[pick] fang 目标关节（用于 FK 生成直线终点）: "
+            f"[pick] {fang_key} 目标关节（用于 FK 生成直线终点）: "
             + ", ".join(f"{n}={v:.3f}" for n, v in zip(place_joint_names, fang_joints))
         )
 
@@ -2132,7 +2151,7 @@ class G01Demo(Node):
         print(f"\033[32m{tool_label}下电成功\033[0m")
 
         log.info(
-            f"[pick] 7/8  原路返回 ①：反向播放 6/8，fang → yubei "
+            f"[pick] 7/8  原路返回 ①：反向播放 6/8，{fang_key} → {yubei_key} "
             f"（{len(yubei_to_fang_traj.joint_trajectory.points)} 点）"
         )
         if not self._execute_traj(self._reverse_trajectory(yubei_to_fang_traj)):
@@ -2163,7 +2182,7 @@ class G01Demo(Node):
         place_joints: dict[str, Sequence[float]],
         place_speed_scale: float = PLACE_SPEED_SCALE,
         cutoff_joint_names: Sequence[str] | None = None,
-        first_return_mode: int = 0,
+        first_return_mode: int = FIRST_RETURN_MODE,
     ) -> bool:
         """抓取流程（IK 多解 + approach 预检 + 放置 + 原路返回）。
 
@@ -2177,22 +2196,24 @@ class G01Demo(Node):
             place_joints      : 含 yubei、fang 的放置关节目标 [rad]
             place_speed_scale : 放置段的速度缩放（0~1）
             cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
-            first_return_mode : 0=反向 approach + 1/8 OMPL 回初始位置；1=只反向 approach 回 q_pre
+            first_return_mode : 1=使用 *_j 并交换；2=使用普通放置点；0 兼容旧普通模式
         """
         log = self.get_logger()
         self.last_pick_failure_reason = None
         joint_names = list(joint_names)
         cutoff_joint_names = list(cutoff_joint_names) if cutoff_joint_names is not None else joint_names
         first_return_mode = int(first_return_mode)
-        if first_return_mode not in (0, 1):
-            log.error(f"[pick] first_return_mode 只能是 0 或 1，当前={first_return_mode}")
+        if first_return_mode not in (0, 1, 2):
+            log.error(f"[pick] first_return_mode 只能是 0、1 或 2，当前={first_return_mode}")
             return False
-        if not isinstance(place_joints, dict) or "yubei" not in place_joints or "fang" not in place_joints:
-            log.error("[pick] place_joints 必须包含 yubei 和 fang")
+        yubei_key = "yubei_j" if first_return_mode == 1 else "yubei"
+        fang_key = "fang_j" if first_return_mode == 1 else "fang"
+        if not isinstance(place_joints, dict) or yubei_key not in place_joints or fang_key not in place_joints:
+            log.error(f"[pick] place_joints 必须包含 {yubei_key} 和 {fang_key}")
             return False
-        if any(len(place_joints[name]) != len(joint_names) for name in ("yubei", "fang")):
+        if any(len(place_joints[name]) != len(joint_names) for name in (yubei_key, fang_key)):
             log.error(
-                f"[pick] yubei/fang 的关节数必须等于 joint_names 长度 {len(joint_names)}"
+                f"[pick] {yubei_key}/{fang_key} 的关节数必须等于 joint_names 长度 {len(joint_names)}"
             )
             return False
 
@@ -2349,6 +2370,7 @@ class G01Demo(Node):
                 group=place_group,
                 link=place_link,
                 plan_frame=place_frame,
+                first_return_mode=first_return_mode,
                 line_speed=speed_scale,
             ):
                 return False
@@ -2370,6 +2392,7 @@ class G01Demo(Node):
                 group=group,
                 link=link,
                 plan_frame=plan_frame,
+                first_return_mode=first_return_mode,
                 line_speed=speed_scale,
             ):
                 return False
@@ -2385,7 +2408,7 @@ class G01Demo(Node):
         source_link: str,
         dual_speed: float = 0.2,
         cartesian_speed: float = 0.2,
-        z_down_distance: float = -0.1095,
+        z_down_distance: float | None = None,
     ) -> bool:
         """双臂交换：根据持物末端选择 Q2、运动臂和相反侧接物工具。"""
         log = self.get_logger()
@@ -2396,6 +2419,8 @@ class G01Demo(Node):
         if source_side is None:
             log.error(f"[exchange] source_link={source_link} 不是 l_tool 或 r_tool")
             return False
+        if z_down_distance is None:
+            z_down_distance = -0.1095 if source_side == "right" else -0.1215
         receiver_side = "left" if source_side == "right" else "right"
         source_label = "右臂" if source_side == "right" else "左臂"
         receiver_label = "左臂" if receiver_side == "left" else "右臂"
@@ -2579,40 +2604,40 @@ def main(argv: list[str] | None = None) -> int:
             return finish(False, 0, 1)
 
         time.sleep(1)
-        # # 视觉识别
-        # vision_sock = connect_vision(log)
-        # if vision_sock is None:
-        #     return finish(False, 0, 1)
-        # vision_result = read_vision_pose(vision_sock, log)
+        # 视觉识别
+        vision_sock = connect_vision(log)
+        if vision_sock is None:
+            return finish(False, 0, 1)
+        vision_result = read_vision_pose(vision_sock, log)
 
-        # if vision_result is None:
-        #     return finish(False, 0, 1)
-        # first_return_mode, pose = vision_result
-        # print(f"\033[32mviewer first_return_mode = {first_return_mode}, pose = {pose}\033[0m")
-        # try:
-        #     right_xyz_rpy = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
-        #     left_xyz_rpy = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
-        # except ValueError as exc:
-        #     message = f"viewer pose 解析失败：{exc}"
-        #     log.error(message)
-        #     print(message)
-        #     return finish(False, 0, 1)
+        if vision_result is None:
+            return finish(False, 0, 1)
+        first_return_mode, pose = vision_result
+        print(f"\033[32mviewer first_return_mode = {first_return_mode}, pose = {pose}\033[0m")
+        try:
+            right_xyz_rpy = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
+            left_xyz_rpy = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
+        except ValueError as exc:
+            message = f"viewer pose 解析失败：{exc}"
+            log.error(message)
+            print(message)
+            return finish(False, 0, 1)
 
-        # def ee_pose_from_xyz_rpy_mm(values: Sequence[float]) -> dict[str, float]:
-        #     x_mm, y_mm, z_mm, roll, pitch, yaw = values
-        #     return dict(
-        #         x=x_mm / 1000.0,
-        #         y=y_mm / 1000.0,
-        #         z=z_mm / 1000.0,
-        #         roll=roll,
-        #         pitch=pitch,
-        #         yaw=yaw,
-        #     )
+        def ee_pose_from_xyz_rpy_mm(values: Sequence[float]) -> dict[str, float]:
+            x_mm, y_mm, z_mm, roll, pitch, yaw = values
+            return dict(
+                x=x_mm / 1000.0,
+                y=y_mm / 1000.0,
+                z=z_mm / 1000.0,
+                roll=roll,
+                pitch=pitch,
+                yaw=yaw,
+            )
 
-        # EE_POSE_RIGHT = ee_pose_from_xyz_rpy_mm(right_xyz_rpy)
-        # EE_POSE_LEFT = ee_pose_from_xyz_rpy_mm(left_xyz_rpy)
-        # print(f"viewer pose transformed (right): {EE_POSE_RIGHT}")
-        # print(f"viewer pose transformed (left):  {EE_POSE_LEFT}")
+        EE_POSE_RIGHT = ee_pose_from_xyz_rpy_mm(right_xyz_rpy)
+        EE_POSE_LEFT = ee_pose_from_xyz_rpy_mm(left_xyz_rpy)
+        print(f"viewer pose transformed (right): {EE_POSE_RIGHT}")
+        print(f"viewer pose transformed (left):  {EE_POSE_LEFT}")
         #sim
         # EE_POSE_RIGHT = dict(
         #     x=-0.5838529295608973,
@@ -2622,22 +2647,22 @@ def main(argv: list[str] | None = None) -> int:
         #     pitch=0.8213446404921059,
         #     yaw=0.529204741098486
         # )
-        EE_POSE_RIGHT = dict(
-            x=-0.5838529295608973,
-            y=0.47421900873192807,
-            z=10.024792295551118827,
-            roll = -1.5516086668226448,
-            pitch=0.8213446404921059,
-            yaw=0.529204741098486
-        )
-        EE_POSE_LEFT = dict(
-            x=0.776093,
-            y=0.409232,
-            z=0.035247,
-            roll = -1.228403,
-            pitch=-0.888468,
-            yaw=-0.870621
-        )
+        # EE_POSE_RIGHT = dict(
+        #     x=-0.5838529295608973,
+        #     y=0.47421900873192807,
+        #     z=10.024792295551118827,
+        #     roll = -1.5516086668226448,
+        #     pitch=0.8213446404921059,
+        #     yaw=0.529204741098486
+        # )
+        # EE_POSE_LEFT = dict(
+        #     x=0.776093,
+        #     y=0.409232,
+        #     z=0.035247,
+        #     roll = -1.228403,
+        #     pitch=-0.888468,
+        #     yaw=-0.870621
+        # )
 
         target_pose_right = make_pose(
             EE_POSE_RIGHT["x"], EE_POSE_RIGHT["y"], EE_POSE_RIGHT["z"],
@@ -2664,54 +2689,73 @@ def main(argv: list[str] | None = None) -> int:
         except EOFError:
             pass
 
-        right_ok = node.pick_and_return(
-            target_pose=target_pose_right,
-            speed_scale=0.7,
-            group=right_group,
-            link=right_link,
-            plan_frame=right_frame,
-            joint_names=joint_names_for_group(right_group),
-            place_joints=PLACE_JOINTS[right_group],
-            place_speed_scale=0.7,
-            cutoff_joint_names=joint_names,
-            first_return_mode=0,
-        )
+        # right_ok = node.pick_and_return(
+        #     target_pose=target_pose_right,
+        #     speed_scale=0.2,
+        #     group=right_group,
+        #     link=right_link,
+        #     plan_frame=right_frame,
+        #     joint_names=joint_names_for_group(right_group),
+        #     place_joints=PLACE_JOINTS[right_group],
+        #     place_speed_scale=0.2,
+        #     cutoff_joint_names=joint_names,
+        #     first_return_mode=first_return_mode,
+        # )
 
-        if not right_ok:
-            right_failure = node.last_pick_failure_reason
-            if right_failure not in ("no_ik", "q_pre"):
-                log.error("右臂抓取在非回退阶段失败，终止抓取流程")
-                log.info("按回车退出 …")
-                try:
-                    input()
-                except EOFError:
-                    pass
-                return finish(False, 0, 1)
+        # if not right_ok:
+        #     right_failure = node.last_pick_failure_reason
+        #     if right_failure not in ("no_ik", "q_pre"):
+        #         log.error("右臂抓取在非回退阶段失败，终止抓取流程")
+        #         log.info("按回车退出 …")
+        #         try:
+        #             input()
+        #         except EOFError:
+        #             pass
+        #         return finish(False, 0, 1)
 
-            reason_text = "无可用 IK/直线接近解" if right_failure == "no_ik" else "到 q_pre 失败"
-            log.warning(f"右臂{reason_text}，切换左臂抓取")
+        #     reason_text = "无可用 IK/直线接近解" if right_failure == "no_ik" else "到 q_pre 失败"
+        #     log.warning(f"右臂{reason_text}，切换左臂抓取")
 
-            left_ok = node.pick_and_return(
+        #     left_ok = node.pick_and_return(
+        #         target_pose=target_pose_left,
+        #         speed_scale=0.2,
+        #         group=left_group,
+        #         link=left_link,
+        #         plan_frame=left_frame,
+        #         joint_names=joint_names_for_group(left_group),
+        #         place_joints=PLACE_JOINTS[left_group],
+        #         place_speed_scale=0.2,
+        #         cutoff_joint_names=joint_names,
+        #         first_return_mode=first_return_mode,
+        #     )
+        #     if not left_ok:
+        #         log.error("左臂抓取仍然失败，退出抓取流程")
+        #         log.info("按回车退出 …")
+        #         try:
+        #             input()
+        #         except EOFError:
+        #             pass
+        #         return finish(False, 0, 1)
+        left_ok = node.pick_and_return(
                 target_pose=target_pose_left,
-                speed_scale=0.7,
+                speed_scale=0.2,
                 group=left_group,
                 link=left_link,
                 plan_frame=left_frame,
                 joint_names=joint_names_for_group(left_group),
                 place_joints=PLACE_JOINTS[left_group],
-                place_speed_scale=0.7,
+                place_speed_scale=0.2,
                 cutoff_joint_names=joint_names,
-                first_return_mode=1,
+                first_return_mode=first_return_mode,
             )
-            if not left_ok:
-                log.error("左臂抓取仍然失败，退出抓取流程")
-                log.info("按回车退出 …")
-                try:
-                    input()
-                except EOFError:
-                    pass
-                return finish(False, 0, 1)
-
+        if not left_ok:
+            log.error("左臂抓取仍然失败，退出抓取流程")
+            log.info("按回车退出 …")
+            try:
+                input()
+            except EOFError:
+                pass
+            return finish(False, 0, 1)
         finish(True, 1, 0)
 
         # log.info("按回车继续，输入 q 回车退出并移除深框 …")
