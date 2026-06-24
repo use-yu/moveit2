@@ -246,7 +246,7 @@ CYLINDER_DIAMETER = 0.15   # 直径 [m]
 CYLINDER_HEIGHT = 0.06     # 高度 [m]（沿位姿局部 z 轴）
 CYLINDER_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.45)
 GRASP_OBJECT_COLLISION_ID = "待抓取物体"
-GRASP_OBJECT_COLLISION_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.0)
+GRASP_OBJECT_COLLISION_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
 Z_AXIS_MARKER_ID = "ee_pose_z_axis"
 Z_AXIS_LENGTH = CYLINDER_HEIGHT / 2.0  # 从圆柱中心到局部 +z 端面，不超出物体
 Z_AXIS_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
@@ -2719,7 +2719,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         # --- 3. 根据物体在 SJ 下的 z 位置决定双臂尝试顺序 ---
-        side_value = t_sj_object[2][3] + 0.094
+        side_value = t_sj_object[2][3]
         arm_options = {
             "left": ("左臂", "left_arm", "l_tool", "l_base_link", target_pose_left),
             "right": ("右臂", "right_arm", "r_tool", "r_base_link", target_pose_right),
@@ -2730,7 +2730,7 @@ def main(argv: list[str] | None = None) -> int:
 
         log.info(
             f"物体 @ SJ: z={t_sj_object[2][3]:.6f} m，"
-            f"z+0.094={side_value:.6f} m → 尝试顺序 {first_label} → {second_label}"
+            f"尝试顺序 {first_label} → {second_label}"
         )
         node.show_cylinder_at_pose(first_target, frame_id=first_frame)
         node.show_z_axis_at_pose(first_target, frame_id=first_frame)
