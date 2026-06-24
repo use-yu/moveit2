@@ -557,6 +557,37 @@ def matrix_to_xyz_rpy(matrix: list[list[float]]) -> tuple[float, float, float, f
     )
 
 
+def xyz_rpy_to_pose(values: Sequence[float], position_scale: float = 1.0) -> Pose:
+    """xyz+rpy 转 Pose；position_scale 可用于将毫米转换成米。"""
+    x, y, z, roll, pitch, yaw = [float(value) for value in values]
+    return make_pose(
+        x * position_scale,
+        y * position_scale,
+        z * position_scale,
+        roll,
+        pitch,
+        yaw,
+    )
+
+
+def pose_to_matrix(pose: Pose) -> list[list[float]]:
+    """geometry_msgs/Pose 转 4×4 齐次变换矩阵，平移单位为米。"""
+    q = pose.orientation
+    rot = quat_wxyz_to_rot(q.w, q.x, q.y, q.z)
+    p = pose.position
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], p.x],
+        [rot[1][0], rot[1][1], rot[1][2], p.y],
+        [rot[2][0], rot[2][1], rot[2][2], p.z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def pose_to_xyz_rpy(pose: Pose) -> tuple[float, float, float, float, float, float]:
+    """geometry_msgs/Pose 转 xyz+rpy。"""
+    return matrix_to_xyz_rpy(pose_to_matrix(pose))
+
+
 def transform_vision_pose(
     pose: Sequence[float],
     transform_mm: list[list[float]],
@@ -2623,147 +2654,90 @@ def main(argv: list[str] | None = None) -> int:
             print(message)
             return finish(False, 0, 1)
 
-        def ee_pose_from_xyz_rpy_mm(values: Sequence[float]) -> dict[str, float]:
-            x_mm, y_mm, z_mm, roll, pitch, yaw = values
-            return dict(
-                x=x_mm / 1000.0,
-                y=y_mm / 1000.0,
-                z=z_mm / 1000.0,
-                roll=roll,
-                pitch=pitch,
-                yaw=yaw,
-            )
+        # 标定输出的位置为毫米，统一在这里转换为米制 Pose。
+        target_pose_right = xyz_rpy_to_pose(right_xyz_rpy, position_scale=0.001)
+        target_pose_left = xyz_rpy_to_pose(left_xyz_rpy, position_scale=0.001)
+        print(f"物体 @ r_base_link [m, rad]: {pose_to_xyz_rpy(target_pose_right)}")
+        print(f"物体 @ l_base_link [m, rad]: {pose_to_xyz_rpy(target_pose_left)}")
 
-        EE_POSE_RIGHT = ee_pose_from_xyz_rpy_mm(right_xyz_rpy)
-        EE_POSE_LEFT = ee_pose_from_xyz_rpy_mm(left_xyz_rpy)
-        print(f"viewer pose transformed (right): {EE_POSE_RIGHT}")
-        print(f"viewer pose transformed (left):  {EE_POSE_LEFT}")
-        #sim
-        # EE_POSE_RIGHT = dict(
-        #     x=-0.5838529295608973,
-        #     y=0.47421900873192807,
-        #     z=0.024792295551118827,
-        #     roll = -1.5516086668226448,
-        #     pitch=0.8213446404921059,
-        #     yaw=0.529204741098486
-        # )
-        # EE_POSE_RIGHT = dict(
-        #     x=-0.5838529295608973,
-        #     y=0.47421900873192807,
-        #     z=10.024792295551118827,
-        #     roll = -1.5516086668226448,
-        #     pitch=0.8213446404921059,
-        #     yaw=0.529204741098486
-        # )
-        # EE_POSE_LEFT = dict(
-        #     x=0.776093,
-        #     y=0.409232,
-        #     z=0.035247,
-        #     roll = -1.228403,
-        #     pitch=-0.888468,
-        #     yaw=-0.870621
-        # )
-
-        target_pose_right = make_pose(
-            EE_POSE_RIGHT["x"], EE_POSE_RIGHT["y"], EE_POSE_RIGHT["z"],
-            EE_POSE_RIGHT["roll"], EE_POSE_RIGHT["pitch"], EE_POSE_RIGHT["yaw"],
-        )
-        target_pose_left = make_pose(
-            EE_POSE_LEFT["x"], EE_POSE_LEFT["y"], EE_POSE_LEFT["z"],
-            EE_POSE_LEFT["roll"], EE_POSE_LEFT["pitch"], EE_POSE_LEFT["yaw"],
+        # 读取实际腰部角度；FK 返回 T_SJ_r_base_link，再与物体位姿相乘。
+        body_joints = node._get_joints(["body_joint2"], wait_new=True)
+        if body_joints is None:
+            log.error("读取实际腰部关节失败，无法转换到 SJ")
+            return finish(False, 0, 1)
+        print(
+            f"实际腰部角度: body_joint2={body_joints['body_joint2']:.6f} rad"
         )
 
-        # --- 3. 抓取流程：优先右臂；仅在无可用 IK 或到 q_pre 失败时改用左臂 ---
-        right_group = "right_arm"
-        right_link = "r_tool"
-        right_frame = "r_base_link"
-        left_group = "left_arm"
-        left_link = "l_tool"
-        left_frame = "l_base_link"
+        r_base_in_sj = node._get_link_pose_fk(
+            "r_base_link",
+            joints=body_joints,
+            plan_frame="SJ",
+        )
+        if r_base_in_sj is None:
+            log.error("计算 r_base_link → SJ 变换失败")
+            return finish(False, 0, 1)
 
-        node.show_cylinder_at_pose(EE_POSE_RIGHT, frame_id=right_frame)
-        node.show_z_axis_at_pose(EE_POSE_RIGHT, frame_id=right_frame)
-        log.info("抓取优先尝试右臂，按回车继续 …")
+        t_sj_r_base = pose_to_matrix(r_base_in_sj)
+        t_sj_object = matmul4(t_sj_r_base, pose_to_matrix(target_pose_right))
+        print("T_SJ_r_base_link:")
+        for row in t_sj_r_base:
+            print("  " + " ".join(f"{value: .6f}" for value in row))
+        print(
+            "物体 @ SJ [m, rad]: "
+            f"{matrix_to_xyz_rpy(t_sj_object)}"
+        )
+
+        # --- 3. 根据物体在 SJ 下的 z 位置选择抓取臂 ---
+        side_value = t_sj_object[2][3] + 0.094
+        if side_value > 0.0:
+            pick_label = "左臂"
+            pick_group = "left_arm"
+            pick_link = "l_tool"
+            pick_frame = "l_base_link"
+            target_pose = target_pose_left
+        else:
+            pick_label = "右臂"
+            pick_group = "right_arm"
+            pick_link = "r_tool"
+            pick_frame = "r_base_link"
+            target_pose = target_pose_right
+
+        log.info(
+            f"物体 @ SJ: z={t_sj_object[2][3]:.6f} m，"
+            f"z+0.094={side_value:.6f} m → {pick_label}抓取"
+        )
+        node.show_cylinder_at_pose(target_pose, frame_id=pick_frame)
+        node.show_z_axis_at_pose(target_pose, frame_id=pick_frame)
+        log.info(f"{pick_label}抓取，按回车继续 …")
         try:
             input()
         except EOFError:
             pass
 
-        # right_ok = node.pick_and_return(
-        #     target_pose=target_pose_right,
-        #     speed_scale=0.2,
-        #     group=right_group,
-        #     link=right_link,
-        #     plan_frame=right_frame,
-        #     joint_names=joint_names_for_group(right_group),
-        #     place_joints=PLACE_JOINTS[right_group],
-        #     place_speed_scale=0.2,
-        #     cutoff_joint_names=joint_names,
-        #     first_return_mode=first_return_mode,
-        # )
-
-        # if not right_ok:
-        #     right_failure = node.last_pick_failure_reason
-        #     if right_failure not in ("no_ik", "q_pre"):
-        #         log.error("右臂抓取在非回退阶段失败，终止抓取流程")
-        #         log.info("按回车退出 …")
-        #         try:
-        #             input()
-        #         except EOFError:
-        #             pass
-        #         return finish(False, 0, 1)
-
-        #     reason_text = "无可用 IK/直线接近解" if right_failure == "no_ik" else "到 q_pre 失败"
-        #     log.warning(f"右臂{reason_text}，切换左臂抓取")
-
-        #     left_ok = node.pick_and_return(
-        #         target_pose=target_pose_left,
-        #         speed_scale=0.2,
-        #         group=left_group,
-        #         link=left_link,
-        #         plan_frame=left_frame,
-        #         joint_names=joint_names_for_group(left_group),
-        #         place_joints=PLACE_JOINTS[left_group],
-        #         place_speed_scale=0.2,
-        #         cutoff_joint_names=joint_names,
-        #         first_return_mode=first_return_mode,
-        #     )
-        #     if not left_ok:
-        #         log.error("左臂抓取仍然失败，退出抓取流程")
-        #         log.info("按回车退出 …")
-        #         try:
-        #             input()
-        #         except EOFError:
-        #             pass
-        #         return finish(False, 0, 1)
-        left_ok = node.pick_and_return(
-                target_pose=target_pose_left,
-                speed_scale=0.2,
-                group=left_group,
-                link=left_link,
-                plan_frame=left_frame,
-                joint_names=joint_names_for_group(left_group),
-                place_joints=PLACE_JOINTS[left_group],
-                place_speed_scale=0.2,
-                cutoff_joint_names=joint_names,
-                first_return_mode=first_return_mode,
-            )
-        if not left_ok:
-            log.error("左臂抓取仍然失败，退出抓取流程")
+        pick_ok = node.pick_and_return(
+            target_pose=target_pose,
+            speed_scale=0.2,
+            group=pick_group,
+            link=pick_link,
+            plan_frame=pick_frame,
+            joint_names=joint_names_for_group(pick_group),
+            place_joints=PLACE_JOINTS[pick_group],
+            place_speed_scale=0.2,
+            cutoff_joint_names=joint_names,
+            first_return_mode=first_return_mode,
+        )
+        if not pick_ok:
+            log.error(f"{pick_label}抓取失败，退出抓取流程")
             log.info("按回车退出 …")
             try:
                 input()
             except EOFError:
                 pass
             return finish(False, 0, 1)
+
         finish(True, 1, 0)
 
-        # log.info("按回车继续，输入 q 回车退出并移除深框 …")
-        # try:
-        #     if input().strip().lower() == "q":
-        #         return 0
-        # except EOFError:
-        #     pass
         code = 0
 
     finally:
