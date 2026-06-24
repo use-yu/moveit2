@@ -2688,46 +2688,56 @@ def main(argv: list[str] | None = None) -> int:
             f"{matrix_to_xyz_rpy(t_sj_object)}"
         )
 
-        # --- 3. 根据物体在 SJ 下的 z 位置选择抓取臂 ---
+        # --- 3. 根据物体在 SJ 下的 z 位置决定双臂尝试顺序 ---
         side_value = t_sj_object[2][3] + 0.094
-        if side_value > 0.0:
-            pick_label = "左臂"
-            pick_group = "left_arm"
-            pick_link = "l_tool"
-            pick_frame = "l_base_link"
-            target_pose = target_pose_left
-        else:
-            pick_label = "右臂"
-            pick_group = "right_arm"
-            pick_link = "r_tool"
-            pick_frame = "r_base_link"
-            target_pose = target_pose_right
+        arm_options = {
+            "left": ("左臂", "left_arm", "l_tool", "l_base_link", target_pose_left),
+            "right": ("右臂", "right_arm", "r_tool", "r_base_link", target_pose_right),
+        }
+        pick_order = ("left", "right") if side_value > 0.0 else ("right", "left")
+        first_label, _, _, first_frame, first_target = arm_options[pick_order[0]]
+        second_label = arm_options[pick_order[1]][0]
 
         log.info(
             f"物体 @ SJ: z={t_sj_object[2][3]:.6f} m，"
-            f"z+0.094={side_value:.6f} m → {pick_label}抓取"
+            f"z+0.094={side_value:.6f} m → 尝试顺序 {first_label} → {second_label}"
         )
-        node.show_cylinder_at_pose(target_pose, frame_id=pick_frame)
-        node.show_z_axis_at_pose(target_pose, frame_id=pick_frame)
-        log.info(f"{pick_label}抓取，按回车继续 …")
+        node.show_cylinder_at_pose(first_target, frame_id=first_frame)
+        node.show_z_axis_at_pose(first_target, frame_id=first_frame)
+        log.info(f"先尝试{first_label}抓取，按回车继续 …")
         try:
             input()
         except EOFError:
             pass
 
-        pick_ok = node.pick_and_return(
-            target_pose=target_pose,
-            speed_scale=0.2,
-            group=pick_group,
-            link=pick_link,
-            plan_frame=pick_frame,
-            joint_names=joint_names_for_group(pick_group),
-            place_joints=PLACE_JOINTS[pick_group],
-            place_speed_scale=0.2,
-            cutoff_joint_names=joint_names,
-            first_return_mode=first_return_mode,
-        )
-        if not pick_ok:
+        pick_ok = False
+        for attempt_index, side in enumerate(pick_order):
+            pick_label, pick_group, pick_link, pick_frame, target_pose = arm_options[side]
+            if attempt_index == 1:
+                log.info(f"开始尝试{pick_label}抓取")
+
+            pick_ok = node.pick_and_return(
+                target_pose=target_pose,
+                speed_scale=0.2,
+                group=pick_group,
+                link=pick_link,
+                plan_frame=pick_frame,
+                joint_names=joint_names_for_group(pick_group),
+                place_joints=PLACE_JOINTS[pick_group],
+                place_speed_scale=0.2,
+                cutoff_joint_names=joint_names,
+                first_return_mode=first_return_mode,
+            )
+            if pick_ok:
+                break
+
+            failure = node.last_pick_failure_reason
+            can_try_other_arm = attempt_index == 0 and failure in ("no_ik", "q_pre")
+            if can_try_other_arm:
+                reason = "无可用 IK/直线接近解" if failure == "no_ik" else "到 q_pre 失败"
+                log.warning(f"{pick_label}{reason}，改用{second_label}")
+                continue
+
             log.error(f"{pick_label}抓取失败，退出抓取流程")
             log.info("按回车退出 …")
             try:
