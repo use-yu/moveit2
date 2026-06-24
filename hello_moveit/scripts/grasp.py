@@ -324,12 +324,16 @@ EXCHANGE_Q1 = [
     -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
     1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
 ]
-EXCHANGE_Q2 = [
-    # 0.070556798, -1.414919441, -1.053385853, -0.663103266, 0.585734181, -0.010876821,
-    0.113298828, -1.437132878, -0.988730233, -0.706701256, 0.628914758, -0.009681208,
-    -1.894577193, -1.514854650, -0.775937512, -0.852444980, 0.728284757, 0.001667991
-    
-]
+EXCHANGE_Q2 = {
+    "right": [
+        0.113298828, -1.437132878, -0.988730233, -0.706701256, 0.628914758, -0.009681208,
+        -1.894577193, -1.514854650, -0.775937512, -0.852444980, 0.728284757, 0.001667991,
+    ],
+    "left": [
+        1.894577193, 1.514854650, 0.775937512, 0.852444980, -0.728284757, -0.001667991,
+        -0.113298828, 1.437132878, 0.988730233, 0.706701256, -0.628914758, 0.009681208,
+    ],
+}
 
 # 视觉 TCP 配置
 VISION_IP = "192.168.5.110"
@@ -2324,17 +2328,27 @@ class G01Demo(Node):
             if not self.dual_arm_exchange(
                 EXCHANGE_Q1,
                 EXCHANGE_Q2,
+                source_link=link,
                 dual_speed=place_speed_scale,
                 cartesian_speed=speed_scale,
             ):
                 return False
 
+            if tool_side == "right":
+                place_group = "left_arm"
+                place_link = "l_tool"
+                place_frame = "l_base_link"
+            else:
+                place_group = "right_arm"
+                place_link = "r_tool"
+                place_frame = "r_base_link"
+
             if not self._place_and_return(
                 place_speed_scale,
-                place_joints=PLACE_JOINTS["left_arm"],
-                group="left_arm",
-                link="l_tool",
-                plan_frame="l_base_link",
+                place_joints=PLACE_JOINTS[place_group],
+                group=place_group,
+                link=place_link,
+                plan_frame=place_frame,
                 line_speed=speed_scale,
             ):
                 return False
@@ -2366,23 +2380,41 @@ class G01Demo(Node):
     def dual_arm_exchange(
         self,
         q1: Sequence[float],
-        q2: Sequence[float],
+        q2_by_side: dict[str, Sequence[float]],
         *,
+        source_link: str,
         dual_speed: float = 0.2,
         cartesian_speed: float = 0.2,
         z_down_distance: float = -0.1095,
     ) -> bool:
-        """双臂交换流程：dual_arm 到 q2，右臂沿 z 向下，再原直线返回，最后 dual_arm 到 q1。"""
+        """双臂交换：根据持物末端选择 Q2、运动臂和相反侧接物工具。"""
         log = self.get_logger()
         dual_group = "dual_arm_y"
-        right_group = "right_arm"
-        right_link = "r_tool"
-        right_plan_frame = "r_base_link"
         dual_joint_names = joint_names_for_group(dual_group)
-        right_joint_names = joint_names_for_group(right_group)
 
-        if not self.set_tool_power("left", 0):
-            log.error("[exchange] 左臂工具下电失败")
+        source_side = tool_side_for_link(source_link)
+        if source_side is None:
+            log.error(f"[exchange] source_link={source_link} 不是 l_tool 或 r_tool")
+            return False
+        receiver_side = "left" if source_side == "right" else "right"
+        source_label = "右臂" if source_side == "right" else "左臂"
+        receiver_label = "左臂" if receiver_side == "left" else "右臂"
+
+        if source_side == "right":
+            source_group = "right_arm"
+            source_plan_frame = "r_base_link"
+        else:
+            source_group = "left_arm"
+            source_plan_frame = "l_base_link"
+        source_joint_names = joint_names_for_group(source_group)
+
+        if source_side not in q2_by_side:
+            log.error(f"[exchange] EXCHANGE_Q2 未配置 {source_side}")
+            return False
+        q2 = q2_by_side[source_side]
+
+        if not self.set_tool_power(receiver_side, 0):
+            log.error(f"[exchange] {receiver_label}工具下电失败")
             return False
 
         if len(q1) != len(dual_joint_names):
@@ -2398,7 +2430,7 @@ class G01Demo(Node):
             return False
 
         log.info(
-            f"[exchange] 2/4  right_arm 沿 {right_link} 末端坐标系 -z 轴直线移动 "
+            f"[exchange] 2/4  {source_group} 沿 {source_link} 末端坐标系 -z 轴直线移动 "
             f"{z_down_distance:.3f} m"
         )
 
@@ -2408,36 +2440,36 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        current = self._get_joints(right_joint_names, wait_new=True)
+        current = self._get_joints(source_joint_names, wait_new=True)
         if current is None:
-            log.error("[exchange] 读取 right_arm 当前关节失败")
+            log.error(f"[exchange] 读取 {source_group} 当前关节失败")
             return False
 
         ee_pose = self._get_link_pose_fk(
-            right_link,
+            source_link,
             current,
-            joint_names=right_joint_names,
-            plan_frame=right_plan_frame,
+            joint_names=source_joint_names,
+            plan_frame=source_plan_frame,
         )
         if ee_pose is None:
-            log.error("[exchange] FK 读取 right_arm 当前末端位姿失败")
+            log.error(f"[exchange] FK 读取 {source_group} 当前末端位姿失败")
             return False
 
         down_pose = pose_offset_local_z(ee_pose, abs(z_down_distance))
         down_traj = self._cartesian_plan(
-            right_group,
-            right_link,
+            source_group,
+            source_link,
             down_pose,
             speed_scale=cartesian_speed,
             avoid_collisions=False,
-            joint_names=right_joint_names,
-            plan_frame=right_plan_frame,
+            joint_names=source_joint_names,
+            plan_frame=source_plan_frame,
         )
         if down_traj is None or not down_traj.joint_trajectory.points:
-            log.error("[exchange] right_arm z 向下直线规划失败")
+            log.error(f"[exchange] {source_group} z 向下直线规划失败")
             return False
         if not self._execute_traj(down_traj):
-            log.error("[exchange] right_arm z 向下直线执行失败")
+            log.error(f"[exchange] {source_group} z 向下直线执行失败")
             return False
 
         log.info("按回车继续 …")
@@ -2446,21 +2478,21 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        if not self.set_tool_power("right", 0):
-            log.error("[exchange] 右臂工具下电失败")
+        if not self.set_tool_power(source_side, 0):
+            log.error(f"[exchange] {source_label}工具下电失败")
             return False
-        if not self.set_tool_power("left", 1):
-            log.error("[exchange] 左臂工具上电失败")
+        if not self.set_tool_power(receiver_side, 1):
+            log.error(f"[exchange] {receiver_label}工具上电失败")
             return False
-        print("\033[32m右臂下电、左臂上电成功\033[0m")
+        print(f"\033[32m{source_label}下电、{receiver_label}上电成功\033[0m")
 
 
         log.info(
-            f"[exchange] 3/4  right_arm 沿刚才直线返回 "
+            f"[exchange] 3/4  {source_group} 沿刚才直线返回 "
             f"（{len(down_traj.joint_trajectory.points)} 点）"
         )
         if not self._execute_traj(self._reverse_trajectory(down_traj)):
-            log.error("[exchange] right_arm 反向直线返回失败")
+            log.error(f"[exchange] {source_group} 反向直线返回失败")
             return False
 
         log.info("[exchange] 4/4  dual_arm 规划执行到 q1")
@@ -2669,7 +2701,7 @@ def main(argv: list[str] | None = None) -> int:
                 place_joints=PLACE_JOINTS[left_group],
                 place_speed_scale=0.7,
                 cutoff_joint_names=joint_names,
-                first_return_mode=0,
+                first_return_mode=1,
             )
             if not left_ok:
                 log.error("左臂抓取仍然失败，退出抓取流程")
