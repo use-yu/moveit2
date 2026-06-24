@@ -238,13 +238,15 @@ FRAME_CUTOFF_ID = "深框隔离面"
 FRAME_CUTOFF_THICKNESS = 0.01  # 薄隔离面厚度 [m]，沿深框局部 z 轴；在 SCENE_FRAME 中等价于 y 方向厚度
 FRAME_CUTOFF_COLOR = ColorRGBA(r=1.0, g=0.25, b=0.1, a=1.0)
 
-# 位姿标记圆柱（仅 RViz Marker 显示，不进入规划场景碰撞）
+# 位姿标记圆柱（Marker 保持仅显示；q_pre OMPL 阶段另建同尺寸临时碰撞体）
 CYLINDER_MARKER_ID = "ee_pose_cylinder"
 CYLINDER_MARKER_NS = "g01_pose_cylinder"
 CYLINDER_MARKER_TOPIC = "g01_pose_cylinder"
 CYLINDER_DIAMETER = 0.15   # 直径 [m]
 CYLINDER_HEIGHT = 0.06     # 高度 [m]（沿位姿局部 z 轴）
 CYLINDER_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.45)
+GRASP_OBJECT_COLLISION_ID = "待抓取物体"
+GRASP_OBJECT_COLLISION_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.0)
 Z_AXIS_MARKER_ID = "ee_pose_z_axis"
 Z_AXIS_LENGTH = CYLINDER_HEIGHT / 2.0  # 从圆柱中心到局部 +z 端面，不超出物体
 Z_AXIS_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
@@ -749,6 +751,32 @@ def make_deep_frame_cutoff(scene_y: float) -> CollisionObject:
     return obj
 
 
+def make_grasp_object_collision(pose: Pose) -> CollisionObject:
+    """创建与 RViz 圆柱 Marker 同尺寸、同位姿的 MoveIt 碰撞体。"""
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = GRASP_OBJECT_COLLISION_ID
+    obj.operation = CollisionObject.ADD
+
+    prim = SolidPrimitive()
+    prim.type = SolidPrimitive.CYLINDER
+    prim.dimensions = [CYLINDER_HEIGHT, CYLINDER_DIAMETER / 2.0]
+    obj.primitives.append(prim)
+    obj.primitive_poses.append(copy.deepcopy(pose))
+    return obj
+
+
+def cylinder_half_extent_y(pose: Pose) -> float:
+    """圆柱按当前姿态投影到 Y 轴后的半尺寸，用于让隔板与圆柱刚好相切。"""
+    q = pose.orientation
+    _, axis_y, _ = rotate_xyz_by_quat(0.0, 0.0, 1.0, q.x, q.y, q.z, q.w)
+    axis_y = max(-1.0, min(1.0, axis_y))
+    radius = CYLINDER_DIAMETER / 2.0
+    half_height = CYLINDER_HEIGHT / 2.0
+    radial_projection = math.sqrt(max(0.0, 1.0 - axis_y * axis_y))
+    return abs(axis_y) * half_height + radial_projection * radius
+
+
 def pose_from_dict(ep: dict) -> Pose:
     """EE_POSE2 风格字典 → geometry_msgs/Pose（位置 + roll/pitch/yaw）。"""
     return make_pose(
@@ -1195,17 +1223,17 @@ class G01Demo(Node):
             f"orientation={math.degrees(ori_err):.3f} deg{RESET}"
         )
 
-    def _pose_position_in_frame(
+    def _pose_in_frame(
         self,
         pose: Pose | dict,
         source_frame: str,
         target_frame: str,
         joint_names: Sequence[str] | None = None,
-    ) -> tuple[float, float, float] | None:
-        """把 pose 原点从 source_frame 转到 target_frame，只返回位置。"""
+    ) -> Pose | None:
+        """把完整 pose（位置和姿态）从 source_frame 转到 target_frame。"""
         p = pose if isinstance(pose, Pose) else pose_from_dict(pose)
         if source_frame == target_frame:
-            return (p.position.x, p.position.y, p.position.z)
+            return copy.deepcopy(p)
 
         joints = None
         if joint_names is not None:
@@ -1222,20 +1250,11 @@ class G01Demo(Node):
         if source_pose is None:
             return None
 
-        qx, qy, qz, qw = (
-            source_pose.orientation.x,
-            source_pose.orientation.y,
-            source_pose.orientation.z,
-            source_pose.orientation.w,
+        transformed = matmul4(
+            pose_to_matrix(source_pose),
+            pose_to_matrix(p),
         )
-        rx, ry, rz = rotate_xyz_by_quat(
-            p.position.x, p.position.y, p.position.z, qx, qy, qz, qw
-        )
-        return (
-            source_pose.position.x + rx,
-            source_pose.position.y + ry,
-            source_pose.position.z + rz,
-        )
+        return xyz_rpy_to_pose(matrix_to_xyz_rpy(transformed))
 
     def set_tool_power(self, side: str, status: int, timeout: float = 10.0) -> bool:
         """调用左右工具电源服务，要求返回 res=0。"""
@@ -1302,29 +1321,40 @@ class G01Demo(Node):
         target_frame: str = SCENE_FRAME,
         joint_names: Sequence[str] | None = None,
     ) -> bool:
-        """按目标 pose 在 SCENE_FRAME 下的 y 高度添加深框隔离面。"""
-        pos = self._pose_position_in_frame(
+        """添加与目标圆柱相切的隔板，并把目标圆柱作为临时碰撞体加入场景。"""
+        scene_pose = self._pose_in_frame(
             pose,
             source_frame=source_frame,
             target_frame=target_frame,
             joint_names=joint_names,
         )
-        if pos is None:
+        if scene_pose is None:
             self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
             return False
 
-        scene_y = pos[1]
-        color = ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR)
+        half_extent_y = cylinder_half_extent_y(scene_pose)
+        scene_y = scene_pose.position.y - half_extent_y
+        colors = [
+            ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR),
+            ObjectColor(id=GRASP_OBJECT_COLLISION_ID, color=GRASP_OBJECT_COLLISION_COLOR),
+        ]
         self.get_logger().info(
-            f"添加碰撞体「{FRAME_CUTOFF_ID}」到 {target_frame}: "
-            f"目标 y={scene_y:.3f} m, 厚度={FRAME_CUTOFF_THICKNESS:.3f} m"
+            f"添加碰撞体「{FRAME_CUTOFF_ID}」+「{GRASP_OBJECT_COLLISION_ID}」到 {target_frame}: "
+            f"物体中心 y={scene_pose.position.y:.3f} m, Y 半尺寸={half_extent_y:.3f} m, "
+            f"隔板表面 y={scene_y:.3f} m"
         )
-        return self._apply_scene([make_deep_frame_cutoff(scene_y)], [color])
+        return self._apply_scene(
+            [make_deep_frame_cutoff(scene_y), make_grasp_object_collision(scene_pose)],
+            colors,
+        )
 
     def remove_frame_cutoff(self) -> bool:
-        """从场景中删除深框隔离面。"""
-        rm = CollisionObject(id=FRAME_CUTOFF_ID, operation=CollisionObject.REMOVE)
-        return self._apply_scene([rm])
+        """从场景中同时删除深框隔离面和临时抓取物体。"""
+        removals = [
+            CollisionObject(id=FRAME_CUTOFF_ID, operation=CollisionObject.REMOVE),
+            CollisionObject(id=GRASP_OBJECT_COLLISION_ID, operation=CollisionObject.REMOVE),
+        ]
+        return self._apply_scene(removals)
 
     def _cylinder_marker_numeric_id(self, object_id: str) -> int:
         if object_id not in self._cylinder_marker_ids:
