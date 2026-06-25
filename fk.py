@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""CR7 forward kinematics from the URDF model.
+"""URDF forward kinematics helper.
 
-By default command-line angles are degrees. Use --radians for ROS/MoveIt
-joint-state values.
+可以计算 URDF 中任意两个 link 之间的 FK。例如：
+
+    python3 fk.py SJ r_tool --radians 0 0 0 0 0 0 0
+
+默认命令行角度单位是 degree；ROS/MoveIt 的 joint-state 值请加 --radians。
 """
 
 from __future__ import annotations
@@ -10,17 +13,42 @@ from __future__ import annotations
 import argparse
 import math
 import subprocess
-import tempfile
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Iterable, Sequence
 
 
-DEFAULT_URDF = (
+DEFAULT_G01_URDF = (
+    Path(__file__).resolve().parent
+    / "moveit_resources/g01_description/urdf/G01-URDF888.urdf"
+)
+DEFAULT_CR7_URDF = (
     Path(__file__).resolve().parent
     / "DOBOT_6Axis_ROS2/dobot_rviz/urdf/cr7_robot.urdf"
 )
+DEFAULT_URDF = DEFAULT_G01_URDF
+
+# 这里改默认 FK 起点/终点。
+# 直接运行 python3 fk.py 时，等价于计算 DEFAULT_BASE_LINK -> DEFAULT_TARGET_LINK。
+DEFAULT_BASE_LINK = "SJ"
+DEFAULT_TARGET_LINK = "r_tool"
+DEFAULT_JOINT_VALUES = [
+    30.1,  # body_joint2
+    -38,  # r_arm_joint1
+    65,  # r_arm_joint2
+    87,  # r_arm_joint3
+    27,  # r_arm_joint4
+    142,  # r_arm_joint5
+    0.0,  # r_arm_joint6
+]
+
+# 下面三个只用于兼容旧 CR7 参数 --tool / --link6 / fk6。
+DEFAULT_LEGACY_BASE_LINK = "base_link"
+DEFAULT_TOOL_LINK = "tool"
+DEFAULT_LINK6_LINK = "Link6"
+
+MOVABLE_JOINT_TYPES = {"revolute", "continuous", "prismatic"}
 
 def _matmul(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> list[list[float]]:
     return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
@@ -67,6 +95,36 @@ def _axis_rotation(axis: Sequence[float], angle: float) -> list[list[float]]:
     ]
 
 
+def _axis_translation(axis: Sequence[float], distance: float) -> list[list[float]]:
+    x, y, z = axis
+    norm = math.sqrt(x * x + y * y + z * z)
+    if norm <= 1e-12:
+        raise ValueError(f"invalid joint axis: {axis}")
+
+    x, y, z = x / norm, y / norm, z / norm
+    return [
+        [1.0, 0.0, 0.0, x * distance],
+        [0.0, 1.0, 0.0, y * distance],
+        [0.0, 0.0, 1.0, z * distance],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _inverse_transform(matrix: Sequence[Sequence[float]]) -> list[list[float]]:
+    rotation_t = [[matrix[j][i] for j in range(3)] for i in range(3)]
+    translation = [matrix[i][3] for i in range(3)]
+    inverse_translation = [
+        -sum(rotation_t[i][j] * translation[j] for j in range(3))
+        for i in range(3)
+    ]
+    return [
+        [rotation_t[0][0], rotation_t[0][1], rotation_t[0][2], inverse_translation[0]],
+        [rotation_t[1][0], rotation_t[1][1], rotation_t[1][2], inverse_translation[1]],
+        [rotation_t[2][0], rotation_t[2][1], rotation_t[2][2], inverse_translation[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
 def _rpy_from_matrix(matrix: Sequence[Sequence[float]]) -> tuple[float, float, float]:
     pitch = math.atan2(-matrix[2][0], math.hypot(matrix[0][0], matrix[1][0]))
     if abs(math.cos(pitch)) < 1e-9:
@@ -87,49 +145,21 @@ def _numbers(value: str | None, default: Sequence[float]) -> list[float]:
 def _load_urdf_root(urdf_path: str | Path = DEFAULT_URDF) -> ET.Element:
     urdf_path = Path(urdf_path).resolve()
     text = urdf_path.read_text(encoding="utf-8")
-    if "xacro:" not in text:
+    if "xacro:" not in text and urdf_path.suffix != ".xacro":
         return ET.fromstring(text)
 
-    wrapper = f"""<?xml version="1.0"?>
-<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="cr7_fk">
-  <xacro:include filename="{urdf_path}" />
-  <link name="world" />
-  <xacro:cr7_robot
-    prefix=""
-    link_prefix="Link"
-    joint_prefix="joint"
-    parent="world"
-    xyz="0 0 0"
-    rpy="0 0 0" />
-</robot>
-"""
-    wrapper_file = tempfile.NamedTemporaryFile(
-        prefix=".cr7_fk_",
-        suffix=".urdf.xacro",
-        dir=urdf_path.parent,
-        mode="w",
-        encoding="utf-8",
-        delete=False,
-    )
-    wrapper_path = Path(wrapper_file.name)
     try:
-        wrapper_file.write(wrapper)
-        wrapper_file.close()
-        try:
-            result = subprocess.run(
-                ["xacro", str(wrapper_path)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError("xacro command not found; source your ROS environment first") from exc
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(exc.stderr.strip() or exc.stdout.strip()) from exc
-    finally:
-        if not wrapper_file.closed:
-            wrapper_file.close()
-        wrapper_path.unlink(missing_ok=True)
+        result = subprocess.run(
+            ["xacro", str(urdf_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(urdf_path.parent),
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("xacro command not found; source your ROS environment first") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(exc.stderr.strip() or exc.stdout.strip()) from exc
     return ET.fromstring(result.stdout)
 
 
@@ -152,63 +182,151 @@ def _joint_info(elem: ET.Element) -> dict[str, object]:
     }
 
 
+def _is_movable_joint(joint: dict[str, object]) -> bool:
+    return str(joint["type"]) in MOVABLE_JOINT_TYPES
+
+
+def _joint_transform(joint: dict[str, object], value: float) -> list[list[float]]:
+    transform = _origin_matrix(joint["xyz"], joint["rpy"])
+    joint_type = str(joint["type"])
+
+    if joint_type == "fixed":
+        return transform
+    if joint_type in {"revolute", "continuous"}:
+        return _matmul(transform, _axis_rotation(joint["axis"], value))
+    if joint_type == "prismatic":
+        return _matmul(transform, _axis_translation(joint["axis"], value))
+    raise ValueError(f"unsupported joint type {joint_type!r} for joint {joint['name']!r}")
+
+
+def _find_joint_path(
+    root: ET.Element,
+    base_link: str,
+    target_link: str,
+) -> list[tuple[dict[str, object], int]]:
+    link_names = {elem.attrib["name"] for elem in root.iter("link") if "name" in elem.attrib}
+    missing_links = [name for name in (base_link, target_link) if name not in link_names]
+    if missing_links:
+        available = ", ".join(sorted(link_names)[:20])
+        raise ValueError(
+            f"link not found: {', '.join(missing_links)}. "
+            f"available examples: {available}"
+        )
+
+    if base_link == target_link:
+        return []
+
+    graph: dict[str, list[tuple[str, dict[str, object], int]]] = defaultdict(list)
+    for elem in root.iter("joint"):
+        joint = _joint_info(elem)
+        parent = str(joint["parent"])
+        child = str(joint["child"])
+        graph[parent].append((child, joint, 1))
+        graph[child].append((parent, joint, -1))
+
+    queue: deque[tuple[str, list[tuple[dict[str, object], int]]]] = deque()
+    queue.append((base_link, []))
+    visited = {base_link}
+
+    while queue:
+        current_link, path = queue.popleft()
+        for next_link, joint, direction in graph[current_link]:
+            if next_link in visited:
+                continue
+            next_path = [*path, (joint, direction)]
+            if next_link == target_link:
+                return next_path
+            visited.add(next_link)
+            queue.append((next_link, next_path))
+
+    raise ValueError(f"no joint path found from {base_link!r} to {target_link!r}")
+
+
 def _load_chain(
     urdf_path: str | Path = DEFAULT_URDF,
     *,
-    include_tool: bool = False,
-) -> list[dict[str, object]]:
+    base_link: str = "base_link",
+    target_link: str = "r_tool",
+) -> list[tuple[dict[str, object], int]]:
     root = _load_urdf_root(urdf_path)
-    joints_by_parent: dict[str, list[dict[str, object]]] = defaultdict(list)
-    for elem in root.iter("joint"):
-        joint = _joint_info(elem)
-        joints_by_parent[str(joint["parent"])].append(joint)
-
-    target_link = "tool" if include_tool else "Link6"
-    link_names = {elem.attrib["name"] for elem in root.iter("link") if "name" in elem.attrib}
-    if target_link not in link_names:
-        raise ValueError(f"target link {target_link!r} not found in {urdf_path}")
-
-    current_link = "base_link"
-    chain: list[dict[str, object]] = []
-    while current_link != target_link:
-        candidates = joints_by_parent.get(current_link, [])
-        if len(candidates) != 1:
-            names = [str(joint["name"]) for joint in candidates]
-            raise ValueError(f"expected one child joint from {current_link}, got {names}")
-        joint = candidates[0]
-        chain.append(joint)
-        current_link = str(joint["child"])
-
-    return chain
+    return _find_joint_path(root, base_link, target_link)
 
 
-def fk(
+def _coerce_joint_values(
     joint_angles: Sequence[float] | Iterable[float] | float,
+    more_angles: Sequence[float],
+) -> list[float]:
+    if more_angles:
+        return [float(joint_angles), *[float(value) for value in more_angles]]
+    if isinstance(joint_angles, (int, float)):
+        return [float(joint_angles)]
+    return [float(value) for value in joint_angles]
+
+
+def fk_between(
+    base_link: str,
+    target_link: str,
+    joint_angles: Sequence[float] | Iterable[float] | float = (),
     *more_angles: float,
     urdf_path: str | Path = DEFAULT_URDF,
-    include_tool: bool = False,
     degrees: bool = True,
+    joint_names: Sequence[str] | None = None,
 ) -> dict[str, object]:
-    """Compute CR7 FK from base_link to Link6, or to tool with include_tool=True."""
-    if more_angles:
-        q = [float(joint_angles), *[float(value) for value in more_angles]]
-    elif isinstance(joint_angles, (int, float)):
-        q = [float(joint_angles)]
+    """Compute FK from ``base_link`` to ``target_link``.
+
+    如果没有传 ``joint_names``，关节角会按 URDF 中 base->target 路径上的
+    活动关节顺序匹配。revolute/continuous 关节受 ``degrees`` 控制，
+    prismatic 关节始终按 URDF 单位（通常是 m）输入。
+    """
+    q = _coerce_joint_values(joint_angles, more_angles)
+
+    root = _load_urdf_root(urdf_path)
+    path = _find_joint_path(root, base_link, target_link)
+    active_joints = [str(joint["name"]) for joint, _ in path if _is_movable_joint(joint)]
+
+    if not q and base_link == DEFAULT_BASE_LINK and target_link == DEFAULT_TARGET_LINK:
+        q = list(DEFAULT_JOINT_VALUES)
+        if len(q) != len(active_joints):
+            raise ValueError(
+                "DEFAULT_JOINT_VALUES length does not match "
+                f"{base_link}->{target_link}: expected {len(active_joints)}, got {len(q)}. "
+                f"Path joints: {', '.join(active_joints)}"
+            )
+    elif not q:
+        q = [0.0] * len(active_joints)
+
+    if joint_names is None:
+        if len(q) != len(active_joints):
+            raise ValueError(
+                f"{base_link}->{target_link} needs {len(active_joints)} joint values, "
+                f"got {len(q)}. Path joints: {', '.join(active_joints)}"
+            )
+        q_by_joint = dict(zip(active_joints, q))
     else:
-        q = [float(value) for value in joint_angles]
+        names = [str(name) for name in joint_names]
+        if len(q) != len(names):
+            raise ValueError(f"joint_names has {len(names)} names, but got {len(q)} values")
+        q_by_joint = dict(zip(names, q))
+        missing = [name for name in active_joints if name not in q_by_joint]
+        if missing:
+            raise ValueError(f"missing values for path joints: {', '.join(missing)}")
 
-    if len(q) != 6:
-        raise ValueError(f"fk() needs 6 joint angles, got {len(q)}")
     if degrees:
-        q = [math.radians(value) for value in q]
+        joint_type_by_name = {str(joint["name"]): str(joint["type"]) for joint, _ in path}
+        q_by_joint = {
+            name: math.radians(value)
+            if joint_type_by_name.get(name) in {"revolute", "continuous"}
+            else value
+            for name, value in q_by_joint.items()
+        }
 
-    q_by_joint = {f"joint{i + 1}": q[i] for i in range(6)}
     transform = _identity()
-
-    for joint in _load_chain(urdf_path, include_tool=include_tool):
-        transform = _matmul(transform, _origin_matrix(joint["xyz"], joint["rpy"]))
-        if joint["type"] != "fixed":
-            transform = _matmul(transform, _axis_rotation(joint["axis"], q_by_joint[str(joint["name"])]))
+    for joint, direction in path:
+        value = q_by_joint[str(joint["name"])] if _is_movable_joint(joint) else 0.0
+        step = _joint_transform(joint, value)
+        if direction < 0:
+            step = _inverse_transform(step)
+        transform = _matmul(transform, step)
 
     xyz = (transform[0][3], transform[1][3], transform[2][3])
     rpy = _rpy_from_matrix(transform)
@@ -217,38 +335,148 @@ def fk(
         "xyz": xyz,
         "rpy": rpy,
         "rpy_deg": tuple(math.degrees(value) for value in rpy),
-        "end_link": "tool" if include_tool else "Link6",
+        "base_link": base_link,
+        "target_link": target_link,
+        "end_link": target_link,
+        "joint_names": active_joints,
+        "joint_values": tuple(q_by_joint[name] for name in active_joints),
     }
 
 
+def fk(
+    joint_angles: Sequence[float] | Iterable[float] | float,
+    *more_angles: float,
+    urdf_path: str | Path = DEFAULT_URDF,
+    include_tool: bool = False,
+    degrees: bool = True,
+    base_link: str = DEFAULT_LEGACY_BASE_LINK,
+    target_link: str | None = None,
+    joint_names: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Backward-compatible FK wrapper.
+
+    新代码建议直接用 ``fk_between(base_link, target_link, q...)``。
+    """
+    if target_link is None:
+        target_link = DEFAULT_TOOL_LINK if include_tool else DEFAULT_LINK6_LINK
+    return fk_between(
+        base_link,
+        target_link,
+        joint_angles,
+        *more_angles,
+        urdf_path=urdf_path,
+        degrees=degrees,
+        joint_names=joint_names,
+    )
+
+
 def fk6(q1: float, q2: float, q3: float, q4: float, q5: float, q6: float) -> dict[str, object]:
-    return fk(q1, q2, q3, q4, q5, q6)
+    return fk(
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+        q6,
+        urdf_path=DEFAULT_CR7_URDF,
+        base_link=DEFAULT_LEGACY_BASE_LINK,
+        target_link=DEFAULT_LINK6_LINK,
+    )
+
+
+def _parse_joint_names(value: str | None) -> list[str] | None:
+    if not value:
+        return None
+    return [part for part in value.replace(",", " ").split() if part]
+
+
+def _is_float_text(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _default_base_link(args: argparse.Namespace) -> str:
+    return DEFAULT_LEGACY_BASE_LINK if args.tool or args.link6 else DEFAULT_BASE_LINK
+
+
+def _default_target_link(args: argparse.Namespace) -> str:
+    if args.tool:
+        return DEFAULT_TOOL_LINK
+    if args.link6:
+        return DEFAULT_LINK6_LINK
+    return DEFAULT_TARGET_LINK
 
 
 def _main() -> int:
-    parser = argparse.ArgumentParser(description="Compute CR7 forward kinematics")
-    parser.add_argument("q", nargs="*", type=float, help="joint1..joint6 angles; default unit is degree")
+    parser = argparse.ArgumentParser(
+        description="Compute URDF forward kinematics",
+        epilog=(
+            "例子: python3 fk.py SJ r_tool --radians "
+            "0 0 0 0 0 0 0"
+        ),
+    )
+    parser.add_argument(
+        "items",
+        nargs="*",
+        help="可写成: base_link target_link q...；或配合 --base/--link 只写 q...",
+    )
+    parser.add_argument("--base", dest="base_link", help="起始 link，例如 SJ")
+    parser.add_argument("--link", "--target", dest="target_link", help="目标 link，例如 r_tool")
     parser.add_argument("--radians", action="store_true", help="input angles are radians")
-    parser.add_argument("--tool", action="store_true", help="return FK to tool if the URDF contains a tool link")
+    parser.add_argument("--joint-names", help="逗号或空格分隔的关节名；默认使用路径上的活动关节顺序")
+    parser.add_argument("--list-chain", action="store_true", help="只打印 base->target 路径关节顺序")
+    parser.add_argument("--tool", action="store_true", help="兼容旧用法：目标 link 使用 tool")
     parser.add_argument("--link6", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--urdf", default=str(DEFAULT_URDF), help="path to cr7_robot.urdf file")
-    args = parser.parse_args()
+    parser.add_argument("--urdf", default=str(DEFAULT_URDF), help="path to URDF/xacro file")
+    parse_args = getattr(parser, "parse_intermixed_args", parser.parse_args)
+    args = parse_args()
 
-    if args.q:
-        if len(args.q) != 6:
-            parser.error(f"需要输入 6 个关节角度，现在是 {len(args.q)} 个")
-        joint_angles = args.q
+    items = list(args.items)
+    if args.base_link or args.target_link:
+        base_link = args.base_link or _default_base_link(args)
+        target_link = args.target_link or _default_target_link(args)
+        q_text = items
+    elif len(items) >= 2 and not _is_float_text(items[0]) and not _is_float_text(items[1]):
+        base_link, target_link = items[0], items[1]
+        q_text = items[2:]
     else:
-        joint_angles = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        base_link = _default_base_link(args)
+        target_link = _default_target_link(args)
+        q_text = items
 
-    result = fk(
+    try:
+        joint_angles = [float(value) for value in q_text]
+    except ValueError as exc:
+        parser.error(f"关节角必须是数字: {exc}")
+
+    if args.list_chain:
+        path = _load_chain(args.urdf, base_link=base_link, target_link=target_link)
+        print(f"chain: {base_link} -> {target_link}")
+        for joint, direction in path:
+            arrow = "->" if direction > 0 else "<-"
+            moving = "active" if _is_movable_joint(joint) else "fixed"
+            print(
+                f"  {joint['parent']} {arrow} {joint['child']}  "
+                f"{joint['name']} ({joint['type']}, {moving})"
+            )
+        active = [str(joint["name"]) for joint, _ in path if _is_movable_joint(joint)]
+        print(f"active joints ({len(active)}): {', '.join(active)}")
+        return 0
+
+    result = fk_between(
+        base_link,
+        target_link,
         joint_angles,
         urdf_path=args.urdf,
-        include_tool=args.tool and not args.link6,
         degrees=not args.radians,
+        joint_names=_parse_joint_names(args.joint_names),
     )
 
-    print(f"transform: base_link -> {result['end_link']}")
+    print(f"transform: {result['base_link']} -> {result['target_link']}")
+    print(f"active joints: {', '.join(result['joint_names'])}")
     print("matrix:")
     for row in result["matrix"]:
         print("  " + " ".join(f"{value: .9f}" for value in row))

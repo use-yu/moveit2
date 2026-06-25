@@ -16,8 +16,8 @@ default_acceleration_scaling_factor: 0.1
 # 在节点启动时通过 scene_->getCollisionEnvNonConst()->setPadding(...) 一次性
 # Robot ↔ World 自碰撞不受影响
 # -----------------------------------------------------------------------------
-default_robot_padding: 0.01
-default_robot_scale: 1.0
+# default_robot_padding: 0.01
+# default_robot_scale: 1.0
 
 # Specific joint properties can be changed with the keys [max_position, min_position, max_velocity, max_acceleration]
 # Joint limits can be turned off with [has_velocity_limits, has_acceleration_limits]
@@ -25,80 +25,80 @@ joint_limits:
   base_joint1:
     has_velocity_limits: true
     max_velocity: 1.0
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 1.0
   base_joint2:
     has_velocity_limits: true
     max_velocity: 1.0
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 1.0
   body_joint1:
     has_velocity_limits: true
     max_velocity: 1.0
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 1.0
   body_joint2:
     has_velocity_limits: true
-    max_velocity: 0.1
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    max_velocity: 0.2
+    has_acceleration_limits: true
+    max_acceleration: 0.2
   l_arm_joint1:
     has_velocity_limits: true
     max_velocity: 3.14
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.14
   l_arm_joint2:
     has_velocity_limits: true
     max_velocity: 3.14
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.14
   l_arm_joint3:
     has_velocity_limits: true
     max_velocity: 3.14
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.14
   l_arm_joint4:
     has_velocity_limits: true
     max_velocity: 3.89
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.89
   l_arm_joint5:
     has_velocity_limits: true
     max_velocity: 3.89
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.89
   l_arm_joint6:
     has_velocity_limits: true
     max_velocity: 3.89
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.89
   r_arm_joint1:
     has_velocity_limits: true
     max_velocity: 3.14
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.14
   r_arm_joint2:
     has_velocity_limits: true
     max_velocity: 3.14
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.14
   r_arm_joint3:
     has_velocity_limits: true
     max_velocity: 3.14
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.14
   r_arm_joint4:
     has_velocity_limits: true
     max_velocity: 3.89
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.89
   r_arm_joint5:
     has_velocity_limits: true
     max_velocity: 3.89
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.89
   r_arm_joint6:
     has_velocity_limits: true
     max_velocity: 3.89
-    has_acceleration_limits: false
-    max_acceleration: 0.0
+    has_acceleration_limits: true
+    max_acceleration: 3.89
