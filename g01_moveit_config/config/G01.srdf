@@ -62,7 +62,7 @@
         <joint name="l_arm_joint6"/>
     </group>
     <group name="left_body">
-        <joint name="body_joint1"/>
+        <!-- <joint name="body_joint1"/> -->
         <joint name="body_joint2"/>
         <joint name="l_arm_joint1"/>
         <joint name="l_arm_joint2"/>
@@ -94,7 +94,7 @@
         <joint name="r_arm_joint6"/>
     </group>
     <group name="right_body">
-        <joint name="body_joint1"/>
+        <!-- <joint name="body_joint1"/> -->
         <joint name="body_joint2"/>
         <joint name="r_arm_joint1"/>
         <joint name="r_arm_joint2"/>

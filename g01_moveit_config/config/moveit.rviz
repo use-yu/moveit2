@@ -201,8 +201,8 @@ Visualization Manager:
         Goal State Color: 250; 128; 0
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
-        Planning Group: left_arm
-        Query Goal State: false
+        Planning Group: body
+        Query Goal State: true
         Query Start State: false
         Show Workspace: false
         Start State Alpha: 1
@@ -338,7 +338,7 @@ Visualization Manager:
       Velocity_Scaling_Factor: 0.1
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
-      Collision Enabled: true
+      Collision Enabled: false
       Description File: ""
       Description Source: Topic
       Description Topic:
@@ -554,7 +554,7 @@ Visualization Manager:
       Enabled: true
       Name: Pose Cylinder Marker
       Namespaces:
-        g01_pose_cylinder: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -599,7 +599,7 @@ Visualization Manager:
       Pitch: 0.07479681819677353
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 5.810196876525879
+      Yaw: 5.525196552276611
     Saved: ~
 Window Geometry:
   Displays:
@@ -617,5 +617,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1387
-  X: 340
-  Y: 132
+  X: 196
+  Y: 131

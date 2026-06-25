@@ -598,6 +598,82 @@ def transform_vision_pose(
     return matrix_to_xyz_rpy(matmul4(transform_mm, pose_mm_wxyz_to_matrix(pose)))
 
 
+def print_matrix(name: str, matrix: list[list[float]], digits: int = 6) -> None:
+    print(f"{name}:")
+    for row in matrix:
+        print("  " + " ".join(f"{value: .{digits}f}" for value in row))
+
+
+def read_vision_object_pose(node, log):
+    """视觉识别封装：返回模式码、左右抓取 Pose，以及 xyz_rpy/三个变换矩阵。"""
+    vision_sock = connect_vision(log)
+    if vision_sock is None:
+        return None
+
+    try:
+        vision_result = read_vision_pose(vision_sock, log)
+        if vision_result is None:
+            return None
+        first_return_mode, pose = vision_result
+        print(f"\033[32mviewer first_return_mode = {first_return_mode}, pose = {pose}\033[0m")
+
+        try:
+            right_xyz_rpy_mm = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
+            left_xyz_rpy_mm = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
+        except ValueError as exc:
+            message = f"viewer pose 解析失败：{exc}"
+            log.error(message)
+            print(message)
+            return None
+
+        # 标定输出的位置为毫米，统一转换成米制 Pose / 4x4 矩阵。
+        target_pose_right = xyz_rpy_to_pose(right_xyz_rpy_mm, position_scale=0.001)
+        target_pose_left = xyz_rpy_to_pose(left_xyz_rpy_mm, position_scale=0.001)
+        t_r_tool_object = pose_to_matrix(target_pose_right)
+        t_l_tool_object = pose_to_matrix(target_pose_left)
+
+        # 读取实际腰部角度；FK 返回 T_SJ_r_base_link，再左乘右侧物体位姿得到 T_SJ_object。
+        body_joints = node._get_joints(["body_joint2"], wait_new=True)
+        if body_joints is None:
+            log.error("读取实际腰部关节失败，无法转换到 SJ")
+            return None
+        print(f"实际腰部角度: body_joint2={body_joints['body_joint2']:.6f} rad")
+
+        r_base_in_sj = node._get_link_pose_fk(
+            "r_base_link",
+            joints=body_joints,
+            plan_frame="SJ",
+        )
+        if r_base_in_sj is None:
+            log.error("计算 r_base_link → SJ 变换失败")
+            return None
+
+        t_sj_r_base = pose_to_matrix(r_base_in_sj)
+        t_sj_object = matmul4(t_sj_r_base, t_r_tool_object)
+        xyz_rpy = {
+            "right": matrix_to_xyz_rpy(t_r_tool_object),
+            "left": matrix_to_xyz_rpy(t_l_tool_object),
+            "sj": matrix_to_xyz_rpy(t_sj_object),
+        }
+
+        print(f"xyz_rpy [m, rad]: {xyz_rpy}")
+        print_matrix("t_r_tool_object", t_r_tool_object)
+        print_matrix("t_l_tool_object", t_l_tool_object)
+        print_matrix("t_sj_object", t_sj_object)
+
+        return (
+            first_return_mode,
+            target_pose_right,
+            target_pose_left,
+            xyz_rpy,
+            t_r_tool_object,
+            t_l_tool_object,
+            t_sj_object,
+        )
+    finally:
+        close_vision(vision_sock, log)
+
+
 def quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
     """固定轴 XYZ：欧拉角 → 四元数 (x, y, z, w)。"""
     cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
@@ -2601,7 +2677,6 @@ def main(argv: list[str] | None = None) -> int:
     log = node.get_logger()
     code = 1
     frame_added = False
-    vision_sock = None
     result_published = False
 
     def finish(result: bool, success_grasp_number: int, exit_code: int) -> int:
@@ -2653,69 +2728,31 @@ def main(argv: list[str] | None = None) -> int:
         log.info("  " + ", ".join(joint_names))
         log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
-        # log.info("按回车继续，输入 q 回车退出")
-        # try:
-        #     if input().strip().lower() == "q":
-        #         return finish(False, 0, 0)
-        # except EOFError:
-        #     pass
-
         if not node.plan_execute_joint_waypoints("dual_arm", 0.2, joint_names, waypoints):
             log.error("关节规划/执行失败")
             return finish(False, 0, 1)
 
         time.sleep(1)
-        # 视觉识别
-        vision_sock = connect_vision(log)
-        if vision_sock is None:
-            return finish(False, 0, 1)
-        vision_result = read_vision_pose(vision_sock, log)
 
-        if vision_result is None:
+        vision_pose = read_vision_object_pose(node, log)
+        if vision_pose is None:
             return finish(False, 0, 1)
-        first_return_mode, pose = vision_result
-        print(f"\033[32mviewer first_return_mode = {first_return_mode}, pose = {pose}\033[0m")
-        try:
-            right_xyz_rpy = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
-            left_xyz_rpy = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
-        except ValueError as exc:
-            message = f"viewer pose 解析失败：{exc}"
-            log.error(message)
-            print(message)
-            return finish(False, 0, 1)
+        (
+            first_return_mode,
+            target_pose_right,
+            target_pose_left,
+            xyz_rpy,
+            t_r_tool_object,
+            t_l_tool_object,
+            t_sj_object,
+        ) = vision_pose
 
-        # 标定输出的位置为毫米，统一在这里转换为米制 Pose。
-        target_pose_right = xyz_rpy_to_pose(right_xyz_rpy, position_scale=0.001)
-        target_pose_left = xyz_rpy_to_pose(left_xyz_rpy, position_scale=0.001)
-        print(f"物体 @ r_base_link [m, rad]: {pose_to_xyz_rpy(target_pose_right)}")
-        print(f"物体 @ l_base_link [m, rad]: {pose_to_xyz_rpy(target_pose_left)}")
-
-        # 读取实际腰部角度；FK 返回 T_SJ_r_base_link，再与物体位姿相乘。
-        body_joints = node._get_joints(["body_joint2"], wait_new=True)
-        if body_joints is None:
-            log.error("读取实际腰部关节失败，无法转换到 SJ")
-            return finish(False, 0, 1)
-        print(
-            f"实际腰部角度: body_joint2={body_joints['body_joint2']:.6f} rad"
-        )
-
-        r_base_in_sj = node._get_link_pose_fk(
-            "r_base_link",
-            joints=body_joints,
-            plan_frame="SJ",
-        )
-        if r_base_in_sj is None:
-            log.error("计算 r_base_link → SJ 变换失败")
-            return finish(False, 0, 1)
-
-        t_sj_r_base = pose_to_matrix(r_base_in_sj)
-        t_sj_object = matmul4(t_sj_r_base, pose_to_matrix(target_pose_right))
-        print("T_SJ_r_base_link:")
-        for row in t_sj_r_base:
-            print("  " + " ".join(f"{value: .6f}" for value in row))
-        print(
-            "物体 @ SJ [m, rad]: "
-            f"{matrix_to_xyz_rpy(t_sj_object)}"
+        log.info(
+            "视觉输出完成: "
+            f"xyz_rpy={xyz_rpy}, "
+            f"t_r_tool_object[xyz]={matrix_to_xyz_rpy(t_r_tool_object)[:3]}, "
+            f"t_l_tool_object[xyz]={matrix_to_xyz_rpy(t_l_tool_object)[:3]}, "
+            f"t_sj_object[xyz]={matrix_to_xyz_rpy(t_sj_object)[:3]}"
         )
 
         # --- 3. 根据物体在 SJ 下的 z 位置决定双臂尝试顺序 ---
@@ -2734,7 +2771,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         node.show_cylinder_at_pose(first_target, frame_id=first_frame)
         node.show_z_axis_at_pose(first_target, frame_id=first_frame)
-        log.info(f"先尝试{first_label}抓取，按回车继续 …")
+        log.info(f"按回车继续 …")
         try:
             input()
         except EOFError:
@@ -2781,7 +2818,6 @@ def main(argv: list[str] | None = None) -> int:
         code = 0
 
     finally:
-        close_vision(vision_sock, log)
         node.remove_cylinder_at_pose()
         node.remove_cylinder_at_pose(object_id=Z_AXIS_MARKER_ID)
         if frame_added:
