@@ -271,7 +271,7 @@ _ORI_TOL = 1e-5
 CART_EEF_STEP = 0.005     # 服务端 IK 离散步长（m）
 CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截断）
 CART_JUMP_THRESHOLD = 2.0  # 相对关节跳变阈值；0 表示关闭，容易接受绕腕跳解
-CART_REVOLUTE_JUMP_THRESHOLD = 0.08  # 单步任一转动关节超过该值 [rad] 视为跳解
+CART_REVOLUTE_JUMP_THRESHOLD = 0.1  # 单步任一转动关节超过该值 [rad] 视为跳解
 CART_PRISMATIC_JUMP_THRESHOLD = 0.02  # 单步任一移动关节超过该值 [m] 视为跳解
 CART_JUMP_STEP_FACTOR = 3.0  # 单步关节空间距离超过平均值该倍数，直接淘汰
 CART_MAX_POINT_FACTOR = 2.0  # 实际点数超过理论直线点数该倍数时，认为 IK 分支不稳
@@ -437,28 +437,47 @@ def connect_vision(log) -> socket.socket | None:
         return None
 
 
-def read_vision_pose(sock: socket.socket, log) -> tuple[int, list[float]] | None:
-    """解析 9 个数：第 1 个忽略，第 2–8 个为 xyz(mm)+quat(wxyz)，第 9 个为模式码。"""
+def read_vision_pose(sock: socket.socket, log) -> list[tuple[int, list[float]]] | None:
+    """解析视觉数据：第 1 个数忽略，后面每 8 个数为 xyz(mm)+quat(wxyz)+模式码。"""
     try:
         sock.sendall(VISION_TRIGGER_COMMAND.encode("utf-8"))
         raw_text = sock.recv(4096).decode("utf-8", errors="ignore").strip()
         numbers = [float(item) for item in NUMBER_PATTERN.findall(raw_text)]
         if len(numbers) < 9:
-            message = f"viewer 返回数字不足 9 个：{raw_text}"
+            message = f"viewer 返回数字不足 9 个，至少需要 1 + 8：{raw_text}"
             log.error(message)
             print(message)
             return None
-        payload = numbers[-9:]
-        pose = payload[1:8]
-        mode_value = payload[8]
-        if mode_value not in (1.0, 2.0):
-            mode_code = mode_value
-            message = f"viewer 返回模式码无效：{mode_code}，原始返回：{raw_text}"
+
+        payload = numbers[1:]
+        if len(payload) % 8 != 0:
+            message = (
+                f"viewer 返回格式错误：忽略第 1 个数后剩余 {len(payload)} 个，"
+                f"不是 8 的整数倍，原始返回：{raw_text}"
+            )
             log.error(message)
             print(message)
             return None
-        first_return_mode = int(mode_value)
-        return first_return_mode, pose
+
+        poses: list[tuple[int, list[float]]] = []
+        for index in range(0, len(payload), 8):
+            group = payload[index:index + 8]
+            pose = group[:7]
+            mode_value = group[7]
+            if mode_value not in (1.0, 2.0):
+                point_index = index // 8 + 1
+                message = (
+                    f"viewer 第 {point_index} 个点模式码无效：{mode_value}，"
+                    f"原始返回：{raw_text}"
+                )
+                log.error(message)
+                print(message)
+                return None
+            poses.append((int(mode_value), pose))
+
+        print(f"viewer 点个数: {len(poses)}")
+        log.info(f"viewer 点个数: {len(poses)}")
+        return poses
     except OSError as exc:
         message = f"viewer 获取 pose 失败：{exc}"
         log.error(message)
@@ -572,6 +591,18 @@ def xyz_rpy_to_pose(values: Sequence[float], position_scale: float = 1.0) -> Pos
     )
 
 
+def xyz_rpy_to_matrix(values: Sequence[float], position_scale: float = 1.0) -> list[list[float]]:
+    """xyz+rpy 转 4×4 矩阵；position_scale 可用于将毫米转换成米。"""
+    x, y, z, roll, pitch, yaw = [float(value) for value in values]
+    rot = rpy_to_rot(roll, pitch, yaw)
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x * position_scale],
+        [rot[1][0], rot[1][1], rot[1][2], y * position_scale],
+        [rot[2][0], rot[2][1], rot[2][2], z * position_scale],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
 def pose_to_matrix(pose: Pose) -> list[list[float]]:
     """geometry_msgs/Pose 转 4×4 齐次变换矩阵，平移单位为米。"""
     q = pose.orientation
@@ -598,39 +629,16 @@ def transform_vision_pose(
     return matrix_to_xyz_rpy(matmul4(transform_mm, pose_mm_wxyz_to_matrix(pose)))
 
 
-def print_matrix(name: str, matrix: list[list[float]], digits: int = 6) -> None:
-    print(f"{name}:")
-    for row in matrix:
-        print("  " + " ".join(f"{value: .{digits}f}" for value in row))
-
-
 def read_vision_object_pose(node, log):
-    """视觉识别封装：返回模式码、左右抓取 Pose，以及 xyz_rpy/三个变换矩阵。"""
+    """视觉识别封装：返回所有点的模式码和 xyz_rpy。"""
     vision_sock = connect_vision(log)
     if vision_sock is None:
         return None
 
     try:
-        vision_result = read_vision_pose(vision_sock, log)
-        if vision_result is None:
+        vision_results = read_vision_pose(vision_sock, log)
+        if vision_results is None:
             return None
-        first_return_mode, pose = vision_result
-        print(f"\033[32mviewer first_return_mode = {first_return_mode}, pose = {pose}\033[0m")
-
-        try:
-            right_xyz_rpy_mm = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
-            left_xyz_rpy_mm = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
-        except ValueError as exc:
-            message = f"viewer pose 解析失败：{exc}"
-            log.error(message)
-            print(message)
-            return None
-
-        # 标定输出的位置为毫米，统一转换成米制 Pose / 4x4 矩阵。
-        target_pose_right = xyz_rpy_to_pose(right_xyz_rpy_mm, position_scale=0.001)
-        target_pose_left = xyz_rpy_to_pose(left_xyz_rpy_mm, position_scale=0.001)
-        t_r_tool_object = pose_to_matrix(target_pose_right)
-        t_l_tool_object = pose_to_matrix(target_pose_left)
 
         # 读取实际腰部角度；FK 返回 T_SJ_r_base_link，再左乘右侧物体位姿得到 T_SJ_object。
         body_joints = node._get_joints(["body_joint2"], wait_new=True)
@@ -647,29 +655,53 @@ def read_vision_object_pose(node, log):
         if r_base_in_sj is None:
             log.error("计算 r_base_link → SJ 变换失败")
             return None
+        l_base_in_sj = node._get_link_pose_fk(
+            "l_base_link",
+            joints=body_joints,
+            plan_frame="SJ",
+        )
+        if l_base_in_sj is None:
+            log.error("计算 l_base_link → SJ 变换失败")
+            return None
 
         t_sj_r_base = pose_to_matrix(r_base_in_sj)
-        t_sj_object = matmul4(t_sj_r_base, t_r_tool_object)
-        xyz_rpy = {
-            "right": matrix_to_xyz_rpy(t_r_tool_object),
-            "left": matrix_to_xyz_rpy(t_l_tool_object),
-            "sj": matrix_to_xyz_rpy(t_sj_object),
-        }
+        t_sj_l_base = pose_to_matrix(l_base_in_sj)
+        first_return_modes: list[int] = []
+        all_xyz_rpy: list[dict[str, tuple[float, float, float, float, float, float]]] = []
 
-        print(f"xyz_rpy [m, rad]: {xyz_rpy}")
-        print_matrix("t_r_tool_object", t_r_tool_object)
-        print_matrix("t_l_tool_object", t_l_tool_object)
-        print_matrix("t_sj_object", t_sj_object)
+        for point_index, (first_return_mode, pose) in enumerate(vision_results, start=1):
+            print(
+                f"\033[32mviewer point {point_index}: "
+                f"first_return_mode = {first_return_mode}, pose = {pose}\033[0m"
+            )
 
-        return (
-            first_return_mode,
-            target_pose_right,
-            target_pose_left,
-            xyz_rpy,
-            t_r_tool_object,
-            t_l_tool_object,
-            t_sj_object,
-        )
+            try:
+                right_xyz_rpy_mm = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
+                left_xyz_rpy_mm = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
+            except ValueError as exc:
+                message = f"viewer 第 {point_index} 个 pose 解析失败：{exc}"
+                log.error(message)
+                print(message)
+                return None
+
+            # 标定输出的位置为毫米，统一转换成米制 4x4 矩阵。
+            right_matrix = xyz_rpy_to_matrix(right_xyz_rpy_mm, position_scale=0.001)
+            left_matrix = xyz_rpy_to_matrix(left_xyz_rpy_mm, position_scale=0.001)
+            right_sj_matrix = matmul4(t_sj_r_base, right_matrix)
+            left_sj_matrix = matmul4(t_sj_l_base, left_matrix)
+            xyz_rpy = {
+                "right": matrix_to_xyz_rpy(right_matrix),
+                "left": matrix_to_xyz_rpy(left_matrix),
+                "right_sj": matrix_to_xyz_rpy(right_sj_matrix),
+                "left_sj": matrix_to_xyz_rpy(left_sj_matrix),
+                "sj": matrix_to_xyz_rpy(right_sj_matrix),
+            }
+
+            first_return_modes.append(first_return_mode)
+            all_xyz_rpy.append(xyz_rpy)
+            print(f"xyz_rpy[{point_index}] [m, rad]: {xyz_rpy}")
+
+        return first_return_modes, all_xyz_rpy
     finally:
         close_vision(vision_sock, log)
 
@@ -692,6 +724,122 @@ def joint_names_for_group(group: str) -> list[str]:
     if group not in JOINT_TARGETS:
         raise KeyError(f"未知 group={group}，JOINT_TARGETS 可选: {list(JOINT_TARGETS)}")
     return list(JOINT_TARGETS[group].keys())
+
+
+def _side_order_from_xyz_rpy(xyz_rpy: dict) -> tuple[str, str]:
+    """根据物体在 SJ 下的 z 值决定左右优先级。"""
+    return ("left", "right") if xyz_rpy["sj"][2] > 0.0 else ("right", "left")
+
+
+def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
+    """先只用手臂验证；两只手臂都不行，再验证手臂+腰部。"""
+    side_order = _side_order_from_xyz_rpy(xyz_rpy)
+    attempts: list[dict[str, str]] = []
+    for side in side_order:
+        attempts.append({
+            "side": side,
+            "group": f"{side}_arm",
+            "link": "l_tool" if side == "left" else "r_tool",
+            "plan_frame": "l_base_link" if side == "left" else "r_base_link",
+            "xyz_key": side,
+        })
+    for side in side_order:
+        attempts.append({
+            "side": side,
+            "group": f"{side}_body",
+            "link": "l_tool" if side == "left" else "r_tool",
+            "plan_frame": "SJ",
+            "xyz_key": f"{side}_sj",
+        })
+    return attempts
+
+
+def place_joints_for_group(group: str) -> dict[str, Sequence[float]]:
+    """获取 pick_and_return 使用的放置关节配置，body 组自动补 body_joint2。"""
+    place_joints = PLACE_JOINTS.get(group)
+    if isinstance(place_joints, dict):
+        return place_joints
+
+    if group == "left_body":
+        arm_group = "left_arm"
+    elif group == "right_body":
+        arm_group = "right_arm"
+    else:
+        raise KeyError(f"PLACE_JOINTS 中没有可用的 {group} 放置配置")
+
+    body_joint2 = JOINT_TARGETS[group]["body_joint2"]
+    arm_place = PLACE_JOINTS[arm_group]
+    return {
+        name: [body_joint2, *values]
+        for name, values in arm_place.items()
+    }
+
+# 按视觉点顺序遍历：
+#   点1 → 点2 → 点3 ...
+
+# 每个点内按 side_value = xyz_rpy["sj"][2] 判断左右顺序：
+
+# side_value > 0:
+#   left_arm → right_arm → left_body → right_body
+def validate_reachable_grasp(node, all_xyz_rpy: list[dict], speed_scale: float = 0.2):
+    """按点和候选 group 顺序验证 IK 可解 + cartesian approach 可行。"""
+    log = node.get_logger()
+    if not all_xyz_rpy:
+        log.error("[reach] 没有可验证的视觉点")
+        return None
+
+    for point_index, xyz_rpy in enumerate(all_xyz_rpy):
+        attempts = _reachability_attempts_for_point(xyz_rpy)
+        order_text = " → ".join(item["group"] for item in attempts)
+        log.info(
+            f"[reach] 点 {point_index + 1}/{len(all_xyz_rpy)}: "
+            f"SJ.z={xyz_rpy['sj'][2]:.6f}, 验证顺序 {order_text}"
+        )
+
+        for attempt in attempts:
+            pick_group = attempt["group"]
+            pick_link = attempt["link"]
+            pick_frame = attempt["plan_frame"]
+            xyz_key = attempt["xyz_key"]
+            if pick_group not in JOINT_TARGETS:
+                log.warning(f"[reach] 跳过未知 group={pick_group}")
+                continue
+            if xyz_key not in xyz_rpy:
+                log.warning(f"[reach] 点 {point_index + 1} 缺少 xyz_rpy[{xyz_key!r}]，跳过 {pick_group}")
+                continue
+
+            pick_joint_names = joint_names_for_group(pick_group)
+            pick_target_pose = xyz_rpy_to_pose(xyz_rpy[xyz_key])
+            pre_pose = pose_offset_local_z(pick_target_pose, PRE_GRASP_OFFSET)
+            log.info(
+                f"[reach] 验证点 {point_index + 1}: group={pick_group}, "
+                f"link={pick_link}, frame={pick_frame}, xyz_key={xyz_key}"
+            )
+            picked = node._select_feasible_grasp_pair(
+                pick_group,
+                pick_link,
+                pick_target_pose,
+                pre_pose,
+                joint_names=pick_joint_names,
+                speed_scale=speed_scale,
+                plan_frame=pick_frame,
+            )
+            if picked is None:
+                log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
+                continue
+
+            log.info(f"[reach] 点 {point_index + 1} / {pick_group}: 可达 ✓")
+            return {
+                "point_index": point_index,
+                "pick_group": pick_group,
+                "pick_link": pick_link,
+                "pick_frame": pick_frame,
+                "pick_joint_names": pick_joint_names,
+                "pick_target_pose": pick_target_pose,
+            }
+
+    log.error("[reach] 所有视觉点的所有候选 group 均不可达")
+    return None
 
 
 def tool_side_for_link(link: str) -> str | None:
@@ -2713,7 +2861,7 @@ def main(argv: list[str] | None = None) -> int:
         targets = JOINT_TARGETS["dual_arm"]
         joint_names = list(targets.keys())
         Q1 = [
-            0.0, 0.0, 0.0, 30 * math.pi / 180,
+            0.0, 0.0, 0.0, 45 * math.pi / 180,
             -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
             1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
         ]
@@ -2734,77 +2882,63 @@ def main(argv: list[str] | None = None) -> int:
 
         time.sleep(1)
 
+        # 视觉识别
         vision_pose = read_vision_object_pose(node, log)
         if vision_pose is None:
             return finish(False, 0, 1)
-        (
-            first_return_mode,
-            target_pose_right,
-            target_pose_left,
-            xyz_rpy,
-            t_r_tool_object,
-            t_l_tool_object,
-            t_sj_object,
-        ) = vision_pose
+        first_return_modes, all_xyz_rpy = vision_pose
 
-        log.info(
-            "视觉输出完成: "
-            f"xyz_rpy={xyz_rpy}, "
-            f"t_r_tool_object[xyz]={matrix_to_xyz_rpy(t_r_tool_object)[:3]}, "
-            f"t_l_tool_object[xyz]={matrix_to_xyz_rpy(t_l_tool_object)[:3]}, "
-            f"t_sj_object[xyz]={matrix_to_xyz_rpy(t_sj_object)[:3]}"
+        # 可达性验证：按视觉点顺序，先 left/right_arm，再 left/right_body。
+        reachable = validate_reachable_grasp(node, all_xyz_rpy, speed_scale=0.2)
+        if reachable is None:
+            log.error("没有找到 IK 可解 + cartesian approach 可行的视觉点")
+            return finish(False, 0, 1)
+
+        point_index = reachable["point_index"]
+        first_return_mode = first_return_modes[point_index]
+        pick_group = reachable["pick_group"]
+        pick_link = reachable["pick_link"]
+        pick_frame = reachable["pick_frame"]
+        pick_joint_names = reachable["pick_joint_names"]
+        pick_target_pose = reachable["pick_target_pose"]
+        pick_label = "左臂" if tool_side_for_link(pick_link) == "left" else "右臂"
+
+        selected_msg = (
+            f"可达性选中: 点 {point_index + 1}/{len(all_xyz_rpy)}, "
+            f"mode={first_return_mode}, group={pick_group}, "
+            f"link={pick_link}, frame={pick_frame}"
         )
+        log.info(selected_msg)
+        print(f"\033[32m{selected_msg}\033[0m")
 
-        # --- 3. 根据物体在 SJ 下的 z 位置决定双臂尝试顺序 ---
-        side_value = t_sj_object[2][3]
-        arm_options = {
-            "left": ("左臂", "left_arm", "l_tool", "l_base_link", target_pose_left),
-            "right": ("右臂", "right_arm", "r_tool", "r_base_link", target_pose_right),
-        }
-        pick_order = ("left", "right") if side_value > 0.0 else ("right", "left")
-        first_label, _, _, first_frame, first_target = arm_options[pick_order[0]]
-        second_label = arm_options[pick_order[1]][0]
+        node.show_cylinder_at_pose(pick_target_pose, frame_id=pick_frame)
+        node.show_z_axis_at_pose(pick_target_pose, frame_id=pick_frame)
+        log.info("按回车继续，输入 q 回车退出并移除深框 …")
+        try:
+            if input().strip().lower() == "q":
+                return 0
+        except EOFError:
+            pass
+        return 1
 
-        log.info(
-            f"物体 @ SJ: z={t_sj_object[2][3]:.6f} m，"
-            f"尝试顺序 {first_label} → {second_label}"
-        )
-        node.show_cylinder_at_pose(first_target, frame_id=first_frame)
-        node.show_z_axis_at_pose(first_target, frame_id=first_frame)
-        log.info(f"按回车继续 …")
         try:
             input()
         except EOFError:
             pass
 
-        pick_ok = False
-        for attempt_index, side in enumerate(pick_order):
-            pick_label, pick_group, pick_link, pick_frame, target_pose = arm_options[side]
-            if attempt_index == 1:
-                log.info(f"开始尝试{pick_label}抓取")
-
-            pick_ok = node.pick_and_return(
-                target_pose=target_pose,
-                speed_scale=0.2,
-                group=pick_group,
-                link=pick_link,
-                plan_frame=pick_frame,
-                joint_names=joint_names_for_group(pick_group),
-                place_joints=PLACE_JOINTS[pick_group],
-                place_speed_scale=0.2,
-                cutoff_joint_names=joint_names,
-                first_return_mode=first_return_mode,
-            )
-            if pick_ok:
-                break
-
-            failure = node.last_pick_failure_reason
-            can_try_other_arm = attempt_index == 0 and failure in ("no_ik", "q_pre")
-            if can_try_other_arm:
-                reason = "无可用 IK/直线接近解" if failure == "no_ik" else "到 q_pre 失败"
-                log.warning(f"{pick_label}{reason}，改用{second_label}")
-                continue
-
+        log.info(f"开始尝试{pick_label}抓取")
+        if not node.pick_and_return(
+            target_pose=pick_target_pose,
+            speed_scale=0.2,
+            group=pick_group,
+            link=pick_link,
+            plan_frame=pick_frame,
+            joint_names=pick_joint_names,
+            place_joints=place_joints_for_group(pick_group),
+            place_speed_scale=0.2,
+            cutoff_joint_names=joint_names,
+            first_return_mode=first_return_mode,
+        ):
             log.error(f"{pick_label}抓取失败，退出抓取流程")
             log.info("按回车退出 …")
             try:
