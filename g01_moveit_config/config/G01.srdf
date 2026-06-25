@@ -112,11 +112,11 @@
         <joint name="r_arm_joint6"/>
     </group>
     <group name="body">
-        <joint name="virtual_joint"/>
+        <!-- <joint name="virtual_joint"/>
         <joint name="world_to_base_footprint"/>
         <joint name="base_joint1"/>
         <joint name="base_joint2"/>
-        <joint name="body_joint1"/>
+        <joint name="body_joint1"/> -->
         <joint name="body_joint2"/>
     </group>
 

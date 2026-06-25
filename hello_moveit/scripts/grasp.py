@@ -72,7 +72,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import ColorRGBA, String
+from std_msgs.msg import ColorRGBA, Float32, String
 from visualization_msgs.msg import Marker
 from dobot_msgs_v4.srv import SetToolPower
 
@@ -260,6 +260,9 @@ LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 GRASP_CMD_TOPIC = "/grasp_cmd"
 GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
+WAIST_PICK_COMMAND_TOPIC = "/taihu_motor_control/positon"
+WAIST_PICK_SETTLE_SEC = 5.0
+WAIST_RESET_ANGLE_RAD = math.radians(30.0)
 ACT_MOVE_GROUP = "move_action"
 ACT_EXEC_TRAJ = "execute_trajectory"
 
@@ -335,7 +338,7 @@ PLACE_JOINTS = {
 }
 
 # 抓取流程默认参数
-PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
+PRE_GRASP_OFFSET = -0.08  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 FIRST_RETURN_MODE = 2       # 1: 只反向直线回到 q_pre；2: 直线+OMPL 回到 1/8 初始位置
 EXCHANGE_Q1 = [
@@ -828,14 +831,23 @@ def validate_reachable_grasp(node, all_xyz_rpy: list[dict], speed_scale: float =
                 log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
                 continue
 
+            q_pre, q_target, _approach_traj = picked
             log.info(f"[reach] 点 {point_index + 1} / {pick_group}: 可达 ✓")
+            log.info(
+                "[reach] 抓取点 q_target: "
+                + ", ".join(f"{n}={q_target[n]:.6f}" for n in pick_joint_names)
+            )
             return {
                 "point_index": point_index,
+                "pick_side": attempt["side"],
                 "pick_group": pick_group,
                 "pick_link": pick_link,
                 "pick_frame": pick_frame,
+                "pick_xyz_key": xyz_key,
                 "pick_joint_names": pick_joint_names,
                 "pick_target_pose": pick_target_pose,
+                "pick_q_pre": q_pre,
+                "pick_q_target": q_target,
             }
 
     log.error("[reach] 所有视觉点的所有候选 group 均不可达")
@@ -1273,6 +1285,7 @@ class G01Demo(Node):
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
         self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
+        self._waist_pick_pub = self.create_publisher(Float32, WAIST_PICK_COMMAND_TOPIC, 10)
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
@@ -1331,6 +1344,16 @@ class G01Demo(Node):
         msg.data = json.dumps(data, ensure_ascii=False)
         self._grasp_result_pub.publish(msg)
         self.get_logger().info(f"发布抓取结果 {GRASP_CMD_RESULT_TOPIC}: {msg.data}")
+
+    def publish_waist_pick_angle(self, angle_rad: float) -> None:
+        """发布腰部抓取角度。单位沿用 MoveIt joint_state：rad。"""
+        msg = Float32()
+        msg.data = float(angle_rad)
+        self._waist_pick_pub.publish(msg)
+        self.get_logger().info(
+            f"发布腰部抓取角度 {WAIST_PICK_COMMAND_TOPIC}: "
+            f"{angle_rad:.6f} rad ({math.degrees(angle_rad):.2f} deg)"
+        )
 
     def _on_js(self, msg: JointState):
         """每次收到 joint_states 更新缓存并递增计数（用于检测「新帧」）。"""
@@ -2468,6 +2491,8 @@ class G01Demo(Node):
         place_speed_scale: float = PLACE_SPEED_SCALE,
         cutoff_joint_names: Sequence[str] | None = None,
         first_return_mode: int = FIRST_RETURN_MODE,
+        waist_moved: bool = False,
+        waist_reset_angle: float = WAIST_RESET_ANGLE_RAD,
     ) -> bool:
         """抓取流程（IK 多解 + approach 预检 + 放置 + 原路返回）。
 
@@ -2482,6 +2507,8 @@ class G01Demo(Node):
             place_speed_scale : 放置段的速度缩放（0~1）
             cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
             first_return_mode : 1=使用 *_j 并交换；2=使用普通放置点；0 兼容旧普通模式
+            waist_moved       : 抓取前是否为了可达性移动过腰部；若移动过，放置/交换前先回 30°
+            waist_reset_angle : 腰部回正角度 [rad]
         """
         log = self.get_logger()
         self.last_pick_failure_reason = None
@@ -2618,6 +2645,16 @@ class G01Demo(Node):
         if not self._execute_traj(retreat_approach):
             log.error("[pick] 反向播放 approach 失败")
             return False
+
+        if waist_moved:
+            log.info(
+                f"[pick] 抓取前腰部运动过，交换/复位前先回腰到 "
+                f"{waist_reset_angle:.6f} rad ({math.degrees(waist_reset_angle):.2f} deg)"
+            )
+            self.publish_waist_pick_angle(waist_reset_angle)
+            log.info(f"[pick] 等待腰部回正稳定 {WAIST_PICK_SETTLE_SEC:.1f}s")
+            time.sleep(WAIST_PICK_SETTLE_SEC)
+
         if first_return_mode == 1:
             log.info(
                 "[pick] 第一段复位完成，已反向直线回到 q_pre: "
@@ -2902,6 +2939,51 @@ def main(argv: list[str] | None = None) -> int:
         pick_joint_names = reachable["pick_joint_names"]
         pick_target_pose = reachable["pick_target_pose"]
         pick_label = "左臂" if tool_side_for_link(pick_link) == "left" else "右臂"
+        pick_q_target = reachable.get("pick_q_target", {})
+        waist_pick_angle = (
+            pick_q_target.get("body_joint2") if isinstance(pick_q_target, dict) else None
+        )
+        waist_moved = False
+
+        if waist_pick_angle is not None and pick_group not in ("left_arm", "right_arm"):
+            pick_side = reachable["pick_side"]
+            log.info(
+                f"可达性选中 {pick_group}，先发布腰部抓取角度 "
+                f"body_joint2={waist_pick_angle:.6f} rad "
+                f"({math.degrees(waist_pick_angle):.2f} deg)"
+            )
+            node.publish_waist_pick_angle(waist_pick_angle)
+            waist_moved = True
+            log.info(f"等待腰部运动稳定 {WAIST_PICK_SETTLE_SEC:.1f}s 后重新视觉识别")
+            time.sleep(WAIST_PICK_SETTLE_SEC)
+
+            vision_pose = read_vision_object_pose(node, log)
+            if vision_pose is None:
+                return finish(False, 0, 1)
+            first_return_modes, all_xyz_rpy = vision_pose
+            if point_index >= len(all_xyz_rpy) or point_index >= len(first_return_modes):
+                log.error(
+                    f"重新视觉识别后点数量不足，无法继续使用原点 {point_index + 1}"
+                )
+                return finish(False, 0, 1)
+
+            xyz_key = pick_side
+            new_xyz_rpy = all_xyz_rpy[point_index]
+            if xyz_key not in new_xyz_rpy:
+                log.error(f"重新视觉识别结果缺少 {xyz_key!r} 位姿，无法改用纯臂规划")
+                return finish(False, 0, 1)
+
+            pick_group = f"{pick_side}_arm"
+            pick_link = "l_tool" if pick_side == "left" else "r_tool"
+            pick_frame = "l_base_link" if pick_side == "left" else "r_base_link"
+            pick_joint_names = joint_names_for_group(pick_group)
+            pick_target_pose = xyz_rpy_to_pose(new_xyz_rpy[xyz_key])
+            first_return_mode = first_return_modes[point_index]
+            pick_label = "左臂" if pick_side == "left" else "右臂"
+            log.info(
+                f"腰部到位后改用纯臂规划: 点 {point_index + 1}/{len(all_xyz_rpy)}, "
+                f"group={pick_group}, link={pick_link}, frame={pick_frame}"
+            )
 
         selected_msg = (
             f"可达性选中: 点 {point_index + 1}/{len(all_xyz_rpy)}, "
@@ -2919,12 +3001,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
         except EOFError:
             pass
-        return 1
-
-        try:
-            input()
-        except EOFError:
-            pass
+        # return 1
+        # 抓取
 
         log.info(f"开始尝试{pick_label}抓取")
         if not node.pick_and_return(
@@ -2938,6 +3016,7 @@ def main(argv: list[str] | None = None) -> int:
             place_speed_scale=0.2,
             cutoff_joint_names=joint_names,
             first_return_mode=first_return_mode,
+            waist_moved=waist_moved,
         ):
             log.error(f"{pick_label}抓取失败，退出抓取流程")
             log.info("按回车退出 …")
