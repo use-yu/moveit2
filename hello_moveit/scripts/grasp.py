@@ -72,7 +72,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import ColorRGBA, Float32, String
+from std_msgs.msg import ColorRGBA, String
 from visualization_msgs.msg import Marker
 from dobot_msgs_v4.srv import SetToolPower
 
@@ -123,9 +123,9 @@ EE_LINK = "r_tool"
 # 各组的关节目标 [rad]（键名须与 URDF/SRDF 一致）
 JOINT_TARGETS = {
     "body": {
-        "base_joint1": 1.0,
-        "base_joint2": 0.0,
-        "body_joint1": 0.0,
+        # "base_joint1": 1.0,
+        # "base_joint2": 0.0,
+        # "body_joint1": 0.0,
         "body_joint2": 0.0,
     },
     # 预备位：底盘略前伸、躯干抬起、双臂零位（与 hello_go1.cpp dual_arm 一致）
@@ -162,7 +162,7 @@ JOINT_TARGETS = {
         "r_arm_joint6": -0 * math.pi / 180,
     },
     "left_body": {
-        "body_joint1": 0.0,
+        # "body_joint1": 0.0,
         "body_joint2": 1.313,
         "l_arm_joint1": 1.8697,
         "l_arm_joint2": 0.2,
@@ -184,7 +184,7 @@ JOINT_TARGETS = {
         "l_arm_joint6": -1.5702,
     },
     "right_body": {
-        "body_joint1": 0.0,
+        # "body_joint1": 0.0,
         "body_joint2": -1.313,
         "r_arm_joint1": -1.8697,
         "r_arm_joint2": 0.2,
@@ -260,8 +260,8 @@ LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 GRASP_CMD_TOPIC = "/grasp_cmd"
 GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
-WAIST_PICK_COMMAND_TOPIC = "/taihu_motor_control/positon"
-WAIST_PICK_SETTLE_SEC = 5.0
+WAIST_BODY_GROUP = "body"
+WAIST_BODY_JOINT = "body_joint2"
 WAIST_RESET_ANGLE_RAD = math.radians(30.0)
 ACT_MOVE_GROUP = "move_action"
 ACT_EXEC_TRAJ = "execute_trajectory"
@@ -274,7 +274,7 @@ _ORI_TOL = 1e-5
 CART_EEF_STEP = 0.005     # 服务端 IK 离散步长（m）
 CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截断）
 CART_JUMP_THRESHOLD = 2.0  # 相对关节跳变阈值；0 表示关闭，容易接受绕腕跳解
-CART_REVOLUTE_JUMP_THRESHOLD = 0.1  # 单步任一转动关节超过该值 [rad] 视为跳解
+CART_REVOLUTE_JUMP_THRESHOLD = 0.15  # 单步任一转动关节超过该值 [rad] 视为跳解
 CART_PRISMATIC_JUMP_THRESHOLD = 0.02  # 单步任一移动关节超过该值 [m] 视为跳解
 CART_JUMP_STEP_FACTOR = 3.0  # 单步关节空间距离超过平均值该倍数，直接淘汰
 CART_MAX_POINT_FACTOR = 2.0  # 实际点数超过理论直线点数该倍数时，认为 IK 分支不稳
@@ -338,7 +338,7 @@ PLACE_JOINTS = {
 }
 
 # 抓取流程默认参数
-PRE_GRASP_OFFSET = -0.08  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
+PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
 PLACE_SPEED_SCALE = 0.5     # 5/8 OMPL 运动到放置位的速度缩放
 FIRST_RETURN_MODE = 2       # 1: 只反向直线回到 q_pre；2: 直线+OMPL 回到 1/8 初始位置
 EXCHANGE_Q1 = [
@@ -1285,7 +1285,6 @@ class G01Demo(Node):
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
         self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
-        self._waist_pick_pub = self.create_publisher(Float32, WAIST_PICK_COMMAND_TOPIC, 10)
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
@@ -1345,15 +1344,39 @@ class G01Demo(Node):
         self._grasp_result_pub.publish(msg)
         self.get_logger().info(f"发布抓取结果 {GRASP_CMD_RESULT_TOPIC}: {msg.data}")
 
-    def publish_waist_pick_angle(self, angle_rad: float) -> None:
-        """发布腰部抓取角度。单位沿用 MoveIt joint_state：rad。"""
-        msg = Float32()
-        msg.data = float(angle_rad)
-        self._waist_pick_pub.publish(msg)
-        self.get_logger().info(
-            f"发布腰部抓取角度 {WAIST_PICK_COMMAND_TOPIC}: "
-            f"{angle_rad:.6f} rad ({math.degrees(angle_rad):.2f} deg)"
+    def move_body_joint2(self, angle_rad: float, speed_scale: float = 0.2) -> bool:
+        """读取 body 组当前位置，只改变 body_joint2 后做关节空间规划执行。"""
+        log = self.get_logger()
+        if WAIST_BODY_GROUP not in JOINT_TARGETS:
+            log.error(f"未知腰部规划组 {WAIST_BODY_GROUP}")
+            return False
+
+        joint_names = joint_names_for_group(WAIST_BODY_GROUP)
+        if WAIST_BODY_JOINT not in joint_names:
+            log.error(f"{WAIST_BODY_GROUP} 组不包含 {WAIST_BODY_JOINT}")
+            return False
+
+        current = self._get_joints(joint_names, wait_new=True)
+        if current is None:
+            log.error(f"[waist] 读取 {WAIST_BODY_GROUP} 当前关节失败")
+            return False
+
+        target = dict(current)
+        target[WAIST_BODY_JOINT] = float(angle_rad)
+        log.info(
+            f"[waist] {WAIST_BODY_GROUP} 关节空间规划: "
+            f"{WAIST_BODY_JOINT} {current[WAIST_BODY_JOINT]:.6f} -> {angle_rad:.6f} rad "
+            f"({math.degrees(angle_rad):.2f} deg), speed_scale={_clamp01(speed_scale):.2f}"
         )
+        ok, used_ms, _ = self.move(
+            WAIST_BODY_GROUP,
+            [make_joint_constraints(WAIST_BODY_GROUP, target)],
+            start=current,
+            plan_only=False,
+            speed_scale=speed_scale,
+        )
+        log.info(f"[waist] move body_joint2: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        return ok
 
     def _on_js(self, msg: JointState):
         """每次收到 joint_states 更新缓存并递增计数（用于检测「新帧」）。"""
@@ -2651,9 +2674,9 @@ class G01Demo(Node):
                 f"[pick] 抓取前腰部运动过，交换/复位前先回腰到 "
                 f"{waist_reset_angle:.6f} rad ({math.degrees(waist_reset_angle):.2f} deg)"
             )
-            self.publish_waist_pick_angle(waist_reset_angle)
-            log.info(f"[pick] 等待腰部回正稳定 {WAIST_PICK_SETTLE_SEC:.1f}s")
-            time.sleep(WAIST_PICK_SETTLE_SEC)
+            if not self.move_body_joint2(waist_reset_angle, speed_scale=place_speed_scale):
+                log.error("[pick] 腰部回 30 度失败")
+                return False
 
         if first_return_mode == 1:
             log.info(
@@ -2898,7 +2921,7 @@ def main(argv: list[str] | None = None) -> int:
         targets = JOINT_TARGETS["dual_arm"]
         joint_names = list(targets.keys())
         Q1 = [
-            0.0, 0.0, 0.0, 45 * math.pi / 180,
+            0.0, 0.0, 0.0, 30 * math.pi / 180,
             -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
             1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
         ]
@@ -2948,14 +2971,15 @@ def main(argv: list[str] | None = None) -> int:
         if waist_pick_angle is not None and pick_group not in ("left_arm", "right_arm"):
             pick_side = reachable["pick_side"]
             log.info(
-                f"可达性选中 {pick_group}，先发布腰部抓取角度 "
+                f"可达性选中 {pick_group}，先用 body 组规划腰部抓取角度 "
                 f"body_joint2={waist_pick_angle:.6f} rad "
                 f"({math.degrees(waist_pick_angle):.2f} deg)"
             )
-            node.publish_waist_pick_angle(waist_pick_angle)
+            if not node.move_body_joint2(waist_pick_angle, speed_scale=0.2):
+                log.error("腰部运动到抓取角度失败")
+                return finish(False, 0, 1)
             waist_moved = True
-            log.info(f"等待腰部运动稳定 {WAIST_PICK_SETTLE_SEC:.1f}s 后重新视觉识别")
-            time.sleep(WAIST_PICK_SETTLE_SEC)
+            log.info("腰部运动完成，重新视觉识别")
 
             vision_pose = read_vision_object_pose(node, log)
             if vision_pose is None:
