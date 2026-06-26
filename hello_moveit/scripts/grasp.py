@@ -274,7 +274,7 @@ _ORI_TOL = 1e-5
 CART_EEF_STEP = 0.005     # 服务端 IK 离散步长（m）
 CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截断）
 CART_JUMP_THRESHOLD = 2.0  # 相对关节跳变阈值；0 表示关闭，容易接受绕腕跳解
-CART_REVOLUTE_JUMP_THRESHOLD = 0.15  # 单步任一转动关节超过该值 [rad] 视为跳解
+CART_REVOLUTE_JUMP_THRESHOLD = 0.2  # 单步任一转动关节超过该值 [rad] 视为跳解
 CART_PRISMATIC_JUMP_THRESHOLD = 0.02  # 单步任一移动关节超过该值 [m] 视为跳解
 CART_JUMP_STEP_FACTOR = 3.0  # 单步关节空间距离超过平均值该倍数，直接淘汰
 CART_MAX_POINT_FACTOR = 2.0  # 实际点数超过理论直线点数该倍数时，认为 IK 分支不稳
@@ -1344,7 +1344,7 @@ class G01Demo(Node):
         self._grasp_result_pub.publish(msg)
         self.get_logger().info(f"发布抓取结果 {GRASP_CMD_RESULT_TOPIC}: {msg.data}")
 
-    def move_body_joint2(self, angle_rad: float, speed_scale: float = 0.2) -> bool:
+    def move_body_joint2(self, angle_rad: float, speed_scale: float = 0.5) -> bool:
         """读取 body 组当前位置，只改变 body_joint2 后做关节空间规划执行。"""
         log = self.get_logger()
         if WAIST_BODY_GROUP not in JOINT_TARGETS:
@@ -2674,7 +2674,7 @@ class G01Demo(Node):
                 f"[pick] 抓取前腰部运动过，交换/复位前先回腰到 "
                 f"{waist_reset_angle:.6f} rad ({math.degrees(waist_reset_angle):.2f} deg)"
             )
-            if not self.move_body_joint2(waist_reset_angle, speed_scale=place_speed_scale):
+            if not self.move_body_joint2(waist_reset_angle, speed_scale=0.5):
                 log.error("[pick] 腰部回 30 度失败")
                 return False
 
@@ -2975,7 +2975,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"body_joint2={waist_pick_angle:.6f} rad "
                 f"({math.degrees(waist_pick_angle):.2f} deg)"
             )
-            if not node.move_body_joint2(waist_pick_angle, speed_scale=0.2):
+            if not node.move_body_joint2(waist_pick_angle, speed_scale=0.5):
                 log.error("腰部运动到抓取角度失败")
                 return finish(False, 0, 1)
             waist_moved = True
