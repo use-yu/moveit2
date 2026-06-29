@@ -866,6 +866,10 @@ def validate_reachable_grasp(node, all_xyz_rpy: list[dict], speed_scale: float =
 
             q_pre, q_target, _approach_traj = picked
             log.info(f"[reach] 点 {point_index + 1} / {pick_group}: 可达 ✓")
+            # log.info(
+            #     f"{GREEN}[reach] 可行点 xyz_rpy[{xyz_key}]: "
+            #     f"{xyz_rpy[xyz_key]}{RESET}"
+            # )
             log.info(
                 "[reach] 抓取点 q_target: "
                 + ", ".join(f"{n}={q_target[n]:.6f}" for n in pick_joint_names)
@@ -2542,6 +2546,10 @@ class G01Demo(Node):
                 f"可行 ✓ (轨迹 {point_count} 点, joint_motion={total_motion:.3f}, "
                 f"max_step={max_step:.3f}, score={score:.3f})"
             )
+            log.info(
+                f"{GREEN}[grasp-select-body] body IK {idx + 1}/{len(body_candidates)} "
+                f"可行 arm_target_pose: {arm_target_pose}{RESET}"
+            )
             if score < best_score:
                 best_score = score
                 best = (
@@ -3121,39 +3129,26 @@ def main(argv: list[str] | None = None) -> int:
     log = node.get_logger()
     code = 1
     frame_added = False
-    result_published = False
 
-    def finish(result: bool, success_grasp_number: int, exit_code: int) -> int:
-        nonlocal result_published
-        if not result_published:
-            node.publish_grasp_cmd_result(result, success_grasp_number)
-            result_published = True
-        return exit_code
+    def cleanup_grasp_display(remove_scene_objects: bool = True) -> None:
+        node.remove_cylinder_at_pose()
+        node.remove_cylinder_at_pose(object_id=Z_AXIS_MARKER_ID)
+        if remove_scene_objects and not node.remove_frame_cutoff():
+            log.warning(f"清理「{FRAME_CUTOFF_ID}」/「{GRASP_OBJECT_COLLISION_ID}」失败")
 
-    try:
-        if ACTIVE_GROUP not in JOINT_TARGETS:
-            log.error(f"未知 ACTIVE_GROUP={ACTIVE_GROUP}，可选: {list(JOINT_TARGETS)}")
-            return 1
-
-        # 上位机通信
-        # grasp_cmd = node.wait_for_grasp_start()
-        # if grasp_cmd is None:
-        #     return 1
-    
-        # --- 1. 添加深框 ---
-        log.info(f"添加碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
-        if not node.add_frame():
-            return finish(False, 0, 1)
-        frame_added = True
-        
-        log.info("按回车继续，输入 q 回车退出并移除深框 …")
+    def prompt_exit(message: str) -> bool:
+        log.info(message)
         try:
-            if input().strip().lower() == "q":
-                return 0
+            return input().strip().lower() == "q"
         except EOFError:
-            pass
-        # time.sleep(5)
-        # --- 2. 关节空间运动 ---   
+            return False
+
+    def publish_attempt_result(result: bool, success_grasp_number: int) -> None:
+        node.publish_grasp_cmd_result(result, success_grasp_number)
+
+    def run_one_grasp() -> bool | None:
+        """执行一轮抓取；True=成功，False=失败，None=用户选择退出。"""
+        # --- 2. 关节空间运动 ---
         targets = JOINT_TARGETS["dual_arm"]
         joint_names = list(targets.keys())
         Q1 = [
@@ -3167,28 +3162,28 @@ def main(argv: list[str] | None = None) -> int:
         current = node._get_joints(joint_names)
         if current is None:
             log.error("读取当前关节位置失败，无法规划")
-            return finish(False, 0, 1)
+            return False
         log.info("规划前当前关节位置 [rad]:")
         log.info("  " + ", ".join(joint_names))
         log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
         if not node.plan_execute_joint_waypoints("dual_arm", 0.2, joint_names, waypoints):
             log.error("关节规划/执行失败")
-            return finish(False, 0, 1)
+            return False
 
         time.sleep(1)
 
         # 视觉识别
         vision_pose = read_vision_object_pose(node, log)
         if vision_pose is None:
-            return finish(False, 0, 1)
+            return False
         first_return_modes, all_xyz_rpy = vision_pose
 
         # 可达性验证：按视觉点顺序，先 left/right_arm，再 left/right_body。
         reachable = validate_reachable_grasp(node, all_xyz_rpy, speed_scale=0.2)
         if reachable is None:
             log.error("没有找到 IK 可解 + cartesian approach 可行的视觉点")
-            return finish(False, 0, 1)
+            return False
 
         point_index = reachable["point_index"]
         first_return_mode = first_return_modes[point_index]
@@ -3213,25 +3208,25 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not node.move_body_joint2(waist_pick_angle, speed_scale=0.5):
                 log.error("腰部运动到抓取角度失败")
-                return finish(False, 0, 1)
+                return False
             waist_moved = True
             log.info("腰部运动完成，重新视觉识别")
 
             vision_pose = read_vision_object_pose(node, log)
             if vision_pose is None:
-                return finish(False, 0, 1)
+                return False
             first_return_modes, all_xyz_rpy = vision_pose
             if point_index >= len(all_xyz_rpy) or point_index >= len(first_return_modes):
                 log.error(
                     f"重新视觉识别后点数量不足，无法继续使用原点 {point_index + 1}"
                 )
-                return finish(False, 0, 1)
+                return False
 
             xyz_key = pick_side
             new_xyz_rpy = all_xyz_rpy[point_index]
             if xyz_key not in new_xyz_rpy:
                 log.error(f"重新视觉识别结果缺少 {xyz_key!r} 位姿，无法改用纯臂规划")
-                return finish(False, 0, 1)
+                return False
 
             pick_group = f"{pick_side}_arm"
             pick_link = "l_tool" if pick_side == "left" else "r_tool"
@@ -3255,14 +3250,8 @@ def main(argv: list[str] | None = None) -> int:
 
         node.show_cylinder_at_pose(pick_target_pose, frame_id=pick_frame)
         node.show_z_axis_at_pose(pick_target_pose, frame_id=pick_frame)
-        log.info("按回车继续，输入 q 回车退出并移除深框 …")
-        try:
-            if input().strip().lower() == "q":
-                return 0
-        except EOFError:
-            pass
-        # return 1
-        # 抓取
+        if prompt_exit("按回车继续，输入 q 回车退出并移除深框 …"):
+            return None
 
         log.info(f"开始尝试{pick_label}抓取")
         if not node.pick_and_return(
@@ -3278,21 +3267,51 @@ def main(argv: list[str] | None = None) -> int:
             first_return_mode=first_return_mode,
             waist_moved=waist_moved,
         ):
-            log.error(f"{pick_label}抓取失败，退出抓取流程")
-            log.info("按回车退出 …")
-            try:
-                input()
-            except EOFError:
-                pass
-            return finish(False, 0, 1)
+            log.error(f"{pick_label}抓取失败")
+            return False
 
-        finish(True, 1, 0)
+        return True
 
-        code = 0
+    try:
+        if ACTIVE_GROUP not in JOINT_TARGETS:
+            log.error(f"未知 ACTIVE_GROUP={ACTIVE_GROUP}，可选: {list(JOINT_TARGETS)}")
+            return 1
+
+        # 上位机通信
+        # grasp_cmd = node.wait_for_grasp_start()
+        # if grasp_cmd is None:
+        #     return 1
+    
+        # --- 1. 添加深框 ---
+        log.info(f"添加碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
+        if not node.add_frame():
+            publish_attempt_result(False, 0)
+            return 1
+        frame_added = True
+
+        if prompt_exit("按回车开始第一次抓取，输入 q 回车退出并移除深框 …"):
+            code = 0
+        else:
+            while True:
+                try:
+                    grasp_result = run_one_grasp()
+                finally:
+                    cleanup_grasp_display()
+
+                if grasp_result is None:
+                    code = 0
+                    break
+
+                publish_attempt_result(grasp_result, 1 if grasp_result else 0)
+                if grasp_result:
+                    code = 0
+
+                if prompt_exit("按回车继续下一次抓取，输入 q 回车退出 …"):
+                    code = 0
+                    break
 
     finally:
-        node.remove_cylinder_at_pose()
-        node.remove_cylinder_at_pose(object_id=Z_AXIS_MARKER_ID)
+        cleanup_grasp_display(remove_scene_objects=frame_added)
         if frame_added:
             log.info(f"移除「{FRAME_ID}」…")
             if not node.remove_frame():
