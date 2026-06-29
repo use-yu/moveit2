@@ -500,6 +500,19 @@ def matmul4(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
     return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
 
 
+def invert_transform4(t: list[list[float]]) -> list[list[float]]:
+    """刚体 4x4 齐次矩阵求逆。"""
+    rot_t = [[t[j][i] for j in range(3)] for i in range(3)]
+    trans = [t[i][3] for i in range(3)]
+    inv_trans = [-sum(rot_t[i][k] * trans[k] for k in range(3)) for i in range(3)]
+    return [
+        [rot_t[0][0], rot_t[0][1], rot_t[0][2], inv_trans[0]],
+        [rot_t[1][0], rot_t[1][1], rot_t[1][2], inv_trans[1]],
+        [rot_t[2][0], rot_t[2][1], rot_t[2][2], inv_trans[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
 def rpy_to_rot(roll: float, pitch: float, yaw: float) -> list[list[float]]:
     cr, sr = math.cos(roll), math.sin(roll)
     cp, sp = math.cos(pitch), math.sin(pitch)
@@ -757,6 +770,15 @@ def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
     return attempts
 
 
+def arm_context_for_body_group(group: str) -> tuple[str, str] | None:
+    """body 抓取组对应的纯臂组和纯臂规划坐标系。"""
+    if group == "left_body":
+        return "left_arm", "l_base_link"
+    if group == "right_body":
+        return "right_arm", "r_base_link"
+    return None
+
+
 def place_joints_for_group(group: str) -> dict[str, Sequence[float]]:
     """获取 pick_and_return 使用的放置关节配置，body 组自动补 body_joint2。"""
     place_joints = PLACE_JOINTS.get(group)
@@ -818,15 +840,26 @@ def validate_reachable_grasp(node, all_xyz_rpy: list[dict], speed_scale: float =
                 f"[reach] 验证点 {point_index + 1}: group={pick_group}, "
                 f"link={pick_link}, frame={pick_frame}, xyz_key={xyz_key}"
             )
-            picked = node._select_feasible_grasp_pair(
-                pick_group,
-                pick_link,
-                pick_target_pose,
-                pre_pose,
-                joint_names=pick_joint_names,
-                speed_scale=speed_scale,
-                plan_frame=pick_frame,
-            )
+            if arm_context_for_body_group(pick_group) is not None:
+                picked = node._select_feasible_grasp_pair_with_waist(
+                    pick_group,
+                    pick_link,
+                    pick_target_pose,
+                    pre_pose,
+                    joint_names=pick_joint_names,
+                    speed_scale=speed_scale,
+                    plan_frame=pick_frame,
+                )
+            else:
+                picked = node._select_feasible_grasp_pair(
+                    pick_group,
+                    pick_link,
+                    pick_target_pose,
+                    pre_pose,
+                    joint_names=pick_joint_names,
+                    speed_scale=speed_scale,
+                    plan_frame=pick_frame,
+                )
             if picked is None:
                 log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
                 continue
@@ -2240,6 +2273,67 @@ class G01Demo(Node):
                     )
         return solutions
 
+    def _solve_ik_from_seeds(
+        self,
+        group: str,
+        link: str,
+        pose: Pose,
+        joint_names: Sequence[str],
+        seeds: Sequence[dict[str, float]],
+        dedup_tol: float = 1e-2,
+        avoid_collisions: bool = True,
+        plan_frame: str = PLAN_FRAME,
+    ) -> list[dict]:
+        """只使用调用方给定的 seed 求 IK，不额外尝试当前关节或随机初始值。"""
+        log = self.get_logger()
+        joint_names = list(joint_names)
+        solutions: list[dict] = []
+        fail_codes: dict[int, int] = {}
+
+        def _is_dup(cand: dict) -> bool:
+            for s in solutions:
+                if all(abs(cand[n] - s[n]) < dedup_tol for n in joint_names if n in cand and n in s):
+                    return True
+            return False
+
+        for idx, raw_seed in enumerate(seeds):
+            missing_seed = [n for n in joint_names if n not in raw_seed]
+            if missing_seed:
+                log.warning(
+                    f"[ik-seed] seed {idx + 1}/{len(seeds)} 缺少关节 {missing_seed}，跳过"
+                )
+                continue
+
+            seed = {n: raw_seed[n] for n in joint_names}
+            sol, code = self._solve_ik(
+                group, link, pose, seed,
+                avoid_collisions=avoid_collisions, return_code=True, plan_frame=plan_frame,
+            )
+            if sol is None:
+                if code is not None:
+                    fail_codes[code] = fail_codes.get(code, 0) + 1
+                continue
+
+            sub = {n: sol[n] for n in joint_names if n in sol}
+            if len(sub) != len(joint_names):
+                log.warning(
+                    f"[ik-seed] seed {idx + 1}/{len(seeds)} 返回解缺少部分关节，跳过"
+                )
+                continue
+            if not _is_dup(sub):
+                solutions.append(sub)
+
+        log.info(
+            f"[ik-seed] {len(solutions)} 个不同 IK 解 / {len(seeds)} 个指定 seed "
+            f"(avoid_collisions={avoid_collisions})"
+        )
+        if fail_codes:
+            breakdown = ", ".join(
+                f"{_moveit_error_name(c)}={n}" for c, n in sorted(fail_codes.items())
+            )
+            log.info(f"[ik-seed] 失败原因分布: {breakdown}")
+        return solutions
+
     def _select_feasible_grasp_pair(
         self,
         group: str,
@@ -2250,17 +2344,24 @@ class G01Demo(Node):
         speed_scale: float,
         n_candidates: int = IK_N_CANDIDATES,
         plan_frame: str = PLAN_FRAME,
+        target_seeds: Sequence[dict[str, float]] | None = None,
     ):
         """从 target_pose 的多个 IK 解里挑「能直线退回 pre_pose」的一组。
 
+        target_seeds 不为 None 时，只用这些 seed 求 IK，不做当前关节/随机 seed 枚举。
         返回 (q_pre, q_target, approach_traj) 三元组；找不到返回 None。
         approach_traj = reverse( cartesian(start=q_target, end=pre_pose) )
             即真正用来「从 pre_pose 直线接近 target_pose」的轨迹。
         """
         log = self.get_logger()
-        candidates = self._solve_ik_multi(
-            group, link, target_pose, joint_names, n_candidates, plan_frame=plan_frame
-        )
+        if target_seeds is None:
+            candidates = self._solve_ik_multi(
+                group, link, target_pose, joint_names, n_candidates, plan_frame=plan_frame
+            )
+        else:
+            candidates = self._solve_ik_from_seeds(
+                group, link, target_pose, joint_names, target_seeds, plan_frame=plan_frame
+            )
         if not candidates:
             log.error("[grasp-select] target_pose 在该 group 上没有任何 IK 解")
             return None
@@ -2330,6 +2431,141 @@ class G01Demo(Node):
 
         log.error(
             f"[grasp-select] 共 {len(candidates)} 个候选 IK 解，没有一个能直线退回 pre_pose"
+        )
+        return None
+
+    def _select_feasible_grasp_pair_with_waist(
+        self,
+        group: str,
+        link: str,
+        target_pose: Pose,
+        pre_pose: Pose,
+        joint_names: Sequence[str],
+        speed_scale: float,
+        n_candidates: int = IK_N_CANDIDATES,
+        plan_frame: str = PLAN_FRAME,
+    ):
+        """带腰 group 的可达性选择。
+
+        先只在 body group 上求 target_pose IK；对每个 body IK 解，取其中腰部关节
+        计算 target/pre 在纯臂 base_link 下的位姿，再只用该 IK 解里的臂关节作为
+        seed 调纯臂 _select_feasible_grasp_pair 做 approach 预检。
+        """
+        log = self.get_logger()
+        arm_context = arm_context_for_body_group(group)
+        if arm_context is None:
+            log.error(f"[grasp-select-body] {group} 不是带腰抓取组")
+            return None
+        arm_group, arm_plan_frame = arm_context
+        arm_joint_names = joint_names_for_group(arm_group)
+        joint_names = list(joint_names)
+
+        body_candidates = self._solve_ik_multi(
+            group, link, target_pose, joint_names, n_candidates, plan_frame=plan_frame
+        )
+        if not body_candidates:
+            log.error("[grasp-select-body] target_pose 在带腰 group 上没有任何 IK 解")
+            return None
+
+        best = None
+        best_score = float("inf")
+
+        for idx, q_body in enumerate(body_candidates):
+            if WAIST_BODY_JOINT not in q_body:
+                log.warning(
+                    f"[grasp-select-body] body IK {idx + 1}/{len(body_candidates)} "
+                    f"缺少 {WAIST_BODY_JOINT}，跳过"
+                )
+                continue
+            missing_arm = [n for n in arm_joint_names if n not in q_body]
+            if missing_arm:
+                log.warning(
+                    f"[grasp-select-body] body IK {idx + 1}/{len(body_candidates)} "
+                    f"缺少臂关节 {missing_arm}，跳过"
+                )
+                continue
+
+            waist_angle = q_body[WAIST_BODY_JOINT]
+            waist_joints = {WAIST_BODY_JOINT: waist_angle}
+            arm_base_in_body_frame = self._get_link_pose_fk(
+                arm_plan_frame,
+                joints=waist_joints,
+                plan_frame=plan_frame,
+            )
+            if arm_base_in_body_frame is None:
+                log.warning(
+                    f"[grasp-select-body] body IK {idx + 1}/{len(body_candidates)}: "
+                    f"无法用 {WAIST_BODY_JOINT}={waist_angle:.6f} 计算 "
+                    f"{arm_plan_frame} @ {plan_frame}"
+                )
+                continue
+
+            t_arm_body = invert_transform4(pose_to_matrix(arm_base_in_body_frame))
+
+            def _to_arm_frame(pose: Pose) -> Pose:
+                return xyz_rpy_to_pose(matrix_to_xyz_rpy(matmul4(t_arm_body, pose_to_matrix(pose))))
+
+            arm_target_pose = _to_arm_frame(target_pose)
+            arm_pre_pose = _to_arm_frame(pre_pose)
+            arm_seed = {n: q_body[n] for n in arm_joint_names}
+            log.info(
+                f"[grasp-select-body] body IK {idx + 1}/{len(body_candidates)}: "
+                f"{WAIST_BODY_JOINT}={waist_angle:.6f} rad，"
+                f"转到 {arm_group} @ {arm_plan_frame} 后只用该臂关节 seed 验证"
+            )
+
+            picked = self._select_feasible_grasp_pair(
+                arm_group,
+                link,
+                arm_target_pose,
+                arm_pre_pose,
+                joint_names=arm_joint_names,
+                speed_scale=speed_scale,
+                plan_frame=arm_plan_frame,
+                target_seeds=[arm_seed],
+            )
+            if picked is None:
+                log.info(
+                    f"[grasp-select-body] body IK {idx + 1}/{len(body_candidates)}: "
+                    "纯臂 seeded approach 不可行"
+                )
+                continue
+
+            q_pre_arm, q_target_arm, approach_traj = picked
+            point_count = len(approach_traj.joint_trajectory.points)
+            total_motion, max_step = _trajectory_joint_stats(approach_traj)
+            score = total_motion + 0.01 * point_count
+            q_pre = {WAIST_BODY_JOINT: waist_angle, **q_pre_arm}
+            q_target = {WAIST_BODY_JOINT: waist_angle, **q_target_arm}
+            log.info(
+                f"[grasp-select-body] body IK {idx + 1}/{len(body_candidates)}: "
+                f"可行 ✓ (轨迹 {point_count} 点, joint_motion={total_motion:.3f}, "
+                f"max_step={max_step:.3f}, score={score:.3f})"
+            )
+            if score < best_score:
+                best_score = score
+                best = (
+                    q_pre,
+                    q_target,
+                    approach_traj,
+                    idx + 1,
+                    point_count,
+                    total_motion,
+                    max_step,
+                )
+
+        if best is not None:
+            q_pre, q_target, approach_traj, best_idx, point_count, total_motion, max_step = best
+            log.info(
+                f"[grasp-select-body] 选用 body IK {best_idx}/{len(body_candidates)}："
+                f"{WAIST_BODY_JOINT}={q_target[WAIST_BODY_JOINT]:.6f} rad, "
+                f"{point_count} 点, joint_motion={total_motion:.3f}, max_step={max_step:.3f}"
+            )
+            return q_pre, q_target, approach_traj
+
+        log.error(
+            f"[grasp-select-body] 共 {len(body_candidates)} 个带腰 IK 解，"
+            "没有一个能通过纯臂 seeded approach 预检"
         )
         return None
 
