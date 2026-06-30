@@ -345,6 +345,18 @@ EXCHANGE_Q1 = [
     -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
     1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
 ]
+EXCHANGE_Q3 = {
+    "right": [
+        -0.9828664660453796, 0.6264781951904297, 1.393784523010254,
+        1.1182692050933838, 2.6711831092834473, 0.891918420791626,
+        1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
+    ],
+    "left": [
+        -1.57, -0.15, -1.578090, 1.370549, 1.672852, 0.588477,
+        0.9902063012123108, -0.6606103777885437, -1.4372066259384155,
+        -1.0370503664016724, -2.6659367084503174, -2.29879448,
+    ],
+}
 EXCHANGE_Q2 = {
     "right": [
         0.113298830,-1.437132861,-0.988730272,-0.706701233,0.628914759,-0.533279984,
@@ -1771,16 +1783,18 @@ class G01Demo(Node):
         start: dict[str, float] | None,
         plan_only: bool,
         speed_scale: float | None,
+        num_attempts: int | None = None,
     ) -> tuple[bool, float, RobotTrajectory | None, int | None]:
         """单次 move_action 调用。返回 (ok, 耗时 ms, trajectory, error_code)。"""
         log = self.get_logger()
         t0 = time.monotonic()
         elapsed_ms = lambda: (time.monotonic() - t0) * 1000.0
+        planning_attempts = NUM_ATTEMPTS if num_attempts is None else max(1, int(num_attempts))
 
         g = MoveGroup.Goal()
         g.request.group_name = group
         g.request.planner_id = PLANNER_ID
-        g.request.num_planning_attempts = NUM_ATTEMPTS
+        g.request.num_planning_attempts = planning_attempts
         g.request.allowed_planning_time = PLAN_TIME_SEC
         g.request.goal_constraints = goal_constraints
         if speed_scale is not None:
@@ -1845,6 +1859,7 @@ class G01Demo(Node):
         plan_only: bool = False,
         speed_scale: float | None = None,
         max_retries: int | None = None,
+        num_attempts: int | None = None,
     ) -> tuple[bool, float, RobotTrajectory | None]:
         """
         调用 move_action：规划（plan_only=True）或规划并执行（False）。
@@ -1874,7 +1889,7 @@ class G01Demo(Node):
         last_code: int | None = None
         for attempt in range(1, retries + 1):
             ok, _, traj, code = self._move_once(
-                group, goal_constraints, start, plan_only, speed_scale
+                group, goal_constraints, start, plan_only, speed_scale, num_attempts
             )
             last_code = code
             if ok:
@@ -1907,6 +1922,7 @@ class G01Demo(Node):
         speed_scale: float,
         joint_names: Sequence[str],
         waypoints: Sequence[Sequence[float]],
+        num_attempts: int | None = None,
     ) -> bool:
         """
         关节空间多点规划（vector<vector>）：
@@ -1922,17 +1938,19 @@ class G01Demo(Node):
         start = self._get_joints(list(joint_names))
         if start is None:
             return False
+        planning_attempts = NUM_ATTEMPTS if num_attempts is None else max(1, int(num_attempts))
 
         log.info(
             f"[{group}] 关节多点路径: {len(waypoints)} waypoints, speed_scale={_clamp01(speed_scale):.2f}, "
-            f"planner={PLANNER_ID}, attempts={NUM_ATTEMPTS}, time={PLAN_TIME_SEC:.1f}s"
+            f"planner={PLANNER_ID}, attempts={planning_attempts}, time={PLAN_TIME_SEC:.1f}s"
         )
 
         for idx, q in enumerate(waypoints):
             goal = [make_joint_constraints_from_vector(group, joint_names, q)]
 
             ok, used_ms, _ = self.move(
-                group, goal, start=start, plan_only=False, speed_scale=speed_scale
+                group, goal, start=start, plan_only=False, speed_scale=speed_scale,
+                num_attempts=planning_attempts
             )
             log.info(
                 f"[{group}] segment {idx + 1}/{len(waypoints)} plan+exec: {used_ms:.3f} ms "
@@ -3001,9 +3019,13 @@ class G01Demo(Node):
             except EOFError:
                 pass
 
+            exchange_q3 = EXCHANGE_Q3.get(tool_side)
+            if exchange_q3 is None:
+                log.error(f"[pick] EXCHANGE_Q3 未配置 {tool_side}")
+                return False
 
             if not self.dual_arm_exchange(
-                EXCHANGE_Q1,
+                exchange_q3,
                 EXCHANGE_Q2,
                 source_link=link,
                 dual_speed=place_speed_scale,
@@ -3106,7 +3128,7 @@ class G01Demo(Node):
             return False
 
         log.info("[exchange] 1/4  dual_arm 规划执行到 q2")
-        if not self.plan_execute_joint_waypoints(dual_group, dual_speed, dual_joint_names, [q2]):
+        if not self.plan_execute_joint_waypoints(dual_group, dual_speed, dual_joint_names, [q2], num_attempts=60):
             log.error("[exchange] dual_arm 到 q2 失败")
             return False
 
