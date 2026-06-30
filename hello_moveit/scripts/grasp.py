@@ -729,6 +729,14 @@ def read_vision_object_pose(node, log):
             all_xyz_rpy.append(xyz_rpy)
             print(f"xyz_rpy[{point_index}] [m, rad]: {xyz_rpy}")
 
+        sorted_results = sorted(
+            zip(first_return_modes, all_xyz_rpy),
+            key=lambda item: item[1]["sj"][1],
+            reverse=True,
+        )
+        first_return_modes = [mode for mode, _ in sorted_results]
+        all_xyz_rpy = [xyz_rpy for _, xyz_rpy in sorted_results]
+
         return first_return_modes, all_xyz_rpy
     finally:
         close_vision(vision_sock, log)
@@ -3346,13 +3354,13 @@ def main(argv: list[str] | None = None) -> int:
         log.info(f"开始尝试{pick_label}抓取")
         if not node.pick_and_return(
             target_pose=pick_target_pose,
-            speed_scale=0.2,
+            speed_scale=0.4,
             group=pick_group,
             link=pick_link,
             plan_frame=pick_frame,
             joint_names=pick_joint_names,
             place_joints=place_joints_for_group(pick_group),
-            place_speed_scale=0.2,
+            place_speed_scale=0.4,
             cutoff_joint_names=joint_names,
             first_return_mode=first_return_mode,
             waist_moved=waist_moved,
