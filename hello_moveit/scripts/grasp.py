@@ -1655,6 +1655,36 @@ class G01Demo(Node):
             colors,
         )
 
+    def add_frame_cutoff_only_for_pose(
+        self,
+        pose: Pose | dict,
+        source_frame: str = PLAN_FRAME,
+        target_frame: str = SCENE_FRAME,
+        joint_names: Sequence[str] | None = None,
+    ) -> bool:
+        """只添加与目标圆柱相切的隔板，不添加临时抓取物体。"""
+        scene_pose = self._pose_in_frame(
+            pose,
+            source_frame=source_frame,
+            target_frame=target_frame,
+            joint_names=joint_names,
+        )
+        if scene_pose is None:
+            self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
+            return False
+
+        half_extent_y = cylinder_half_extent_y(scene_pose)
+        scene_y = scene_pose.position.y - half_extent_y
+        self.get_logger().info(
+            f"添加碰撞体「{FRAME_CUTOFF_ID}」到 {target_frame}: "
+            f"物体中心 y={scene_pose.position.y:.3f} m, Y 半尺寸={half_extent_y:.3f} m, "
+            f"隔板表面 y={scene_y:.3f} m"
+        )
+        return self._apply_scene(
+            [make_deep_frame_cutoff(scene_y)],
+            [ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR)],
+        )
+
     def remove_frame_cutoff(self) -> bool:
         """从场景中同时删除深框隔离面和临时抓取物体。"""
         removals = [
@@ -2733,16 +2763,44 @@ class G01Demo(Node):
             log.error("[pick] 7/8 反向播放 6/8 失败")
             return False
 
+        q1_count = len(place_joint_names)
+        if group == "left_arm":
+            q1_source = list(EXCHANGE_Q1[:6])
+            q1_joints = q1_source[:q1_count]
+            q1_slice_text = "前6"
+        elif group == "right_arm":
+            q1_source = list(EXCHANGE_Q1[-6:])
+            q1_joints = q1_source[-q1_count:]
+            q1_slice_text = "后6"
+        else:
+            log.error(f"[pick] 8/8 group={group} 不支持按 Q1 固定点返回")
+            return False
+        if len(q1_joints) != q1_count:
+            log.error(
+                f"[pick] 8/8 Q1 固定点长度错误：Q1={len(q1_joints)}, "
+                f"关节数={q1_count}"
+            )
+            return False
+
         log.info(
-            f"[pick] 8/8  原路返回 ②：反向播放 5/8 → 1/8 初始位置 "
-            f"（{len(to_yubei_traj.joint_trajectory.points)} 点）"
+            f"[pick] 8/8  从当前位置运动到 Q1 固定点 "
+            f"（{q1_slice_text} 个数，使用 {q1_count} 个关节）"
         )
-        if not self._execute_traj(self._reverse_trajectory(to_yubei_traj)):
-            log.error("[pick] 8/8 反向播放 5/8 失败")
+        current = self._get_joints(place_joint_names, wait_new=True)
+        if current is None:
+            log.error("[pick] 8/8 读取当前关节失败")
+            return False
+        goal = [make_joint_constraints_from_vector(group, place_joint_names, q1_joints)]
+        ok, used_ms, _to_q1_traj = self.move(
+            group, goal, start=current, plan_only=False, speed_scale=speed
+        )
+        log.info(f"[pick] OMPL → Q1 固定点: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        if not ok:
+            log.error("[pick] 8/8 运动到 Q1 固定点失败")
             return False
         log.info(
-            "[pick] 原路返回完成，当前应在放置前位置: "
-            + ", ".join(f"{n}={place_start_joints[n]:.3f}" for n in place_joint_names)
+            "[pick] Q1 固定点返回完成: "
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(place_joint_names, q1_joints))
         )
         return True
 
@@ -2912,6 +2970,15 @@ class G01Demo(Node):
         if not self._execute_traj(retreat_approach):
             log.error("[pick] 反向播放 approach 失败")
             return False
+        
+        if not self.add_frame_cutoff_only_for_pose(
+            target_pose,
+            source_frame=plan_frame,
+            target_frame=SCENE_FRAME,
+            joint_names=cutoff_joint_names,
+        ):
+            log.error("[pick] 第一段复位后添加隔板失败")
+            return False
 
         if waist_moved:
             log.info(
@@ -2966,14 +3033,14 @@ class G01Demo(Node):
 
             
         else:
-            retreat_to_start = self._reverse_trajectory(to_pre_traj)
-            if not self._execute_traj(retreat_to_start):
-                log.error("[pick] 反向播放 1/8 OMPL 回到初始位置失败")
-                return False
-            log.info(
-                "[pick] 第一段复位完成，已回到 1/8 初始位置: "
-                + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
-            )
+            # retreat_to_start = self._reverse_trajectory(to_pre_traj)
+            # if not self._execute_traj(retreat_to_start):
+            #     log.error("[pick] 反向播放 1/8 OMPL 回到初始位置失败")
+            #     return False
+            # log.info(
+            #     "[pick] 第一段复位完成，已回到 1/8 初始位置: "
+            #     + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
+            # )
         
             if not self._place_and_return(
                 place_speed_scale,
@@ -3256,13 +3323,13 @@ def main(argv: list[str] | None = None) -> int:
         log.info(f"开始尝试{pick_label}抓取")
         if not node.pick_and_return(
             target_pose=pick_target_pose,
-            speed_scale=0.2,
+            speed_scale=0.7,
             group=pick_group,
             link=pick_link,
             plan_frame=pick_frame,
             joint_names=pick_joint_names,
             place_joints=place_joints_for_group(pick_group),
-            place_speed_scale=0.2,
+            place_speed_scale=0.7,
             cutoff_joint_names=joint_names,
             first_return_mode=first_return_mode,
             waist_moved=waist_moved,
