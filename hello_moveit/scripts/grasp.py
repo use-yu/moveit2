@@ -3128,7 +3128,7 @@ class G01Demo(Node):
             return False
 
         log.info("[exchange] 1/4  dual_arm 规划执行到 q2")
-        if not self.plan_execute_joint_waypoints(dual_group, dual_speed, dual_joint_names, [q2], num_attempts=60):
+        if not self.plan_execute_joint_waypoints(dual_group, dual_speed, dual_joint_names, [q2], num_attempts=20):
             log.error("[exchange] dual_arm 到 q2 失败")
             return False
 
@@ -3345,13 +3345,13 @@ def main(argv: list[str] | None = None) -> int:
         log.info(f"开始尝试{pick_label}抓取")
         if not node.pick_and_return(
             target_pose=pick_target_pose,
-            speed_scale=0.7,
+            speed_scale=0.2,
             group=pick_group,
             link=pick_link,
             plan_frame=pick_frame,
             joint_names=pick_joint_names,
             place_joints=place_joints_for_group(pick_group),
-            place_speed_scale=0.7,
+            place_speed_scale=0.2,
             cutoff_joint_names=joint_names,
             first_return_mode=first_return_mode,
             waist_moved=waist_moved,

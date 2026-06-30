@@ -77,18 +77,18 @@
 
     <!-- 桌子 -->
     <visual>
-      <origin xyz="0.0 -0.023 0.0" rpy="0 0 0" />
+      <origin xyz="0.095 -0.023 0.0" rpy="0 0 0" />
       <geometry>
-          <box size="0.425 0.1 0.9" />
+          <box size="0.615 0.18 0.9" />
       </geometry>
       <material name="base_link_box_transparent">
         <color rgba="1 0 0 0.5" />
       </material>
     </visual>
     <collision>
-      <origin xyz="0.0 -0.023 0.0" rpy="0 0 0" />
+      <origin xyz="0.095 -0.023 0.0" rpy="0 0 0" />
       <geometry>
-          <box size="0.425 0.1 0.9" />
+          <box size="0.615 0.18 0.9" />
       </geometry>
     </collision>
 
