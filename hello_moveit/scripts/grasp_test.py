@@ -809,26 +809,6 @@ def arm_context_for_body_group(group: str) -> tuple[str, str] | None:
     return None
 
 
-def place_joints_for_group(group: str) -> dict[str, Sequence[float]]:
-    """获取 pick_and_return 使用的放置关节配置，body 组自动补 body_joint2。"""
-    place_joints = PLACE_JOINTS.get(group)
-    if isinstance(place_joints, dict):
-        return place_joints
-
-    if group == "left_body":
-        arm_group = "left_arm"
-    elif group == "right_body":
-        arm_group = "right_arm"
-    else:
-        raise KeyError(f"PLACE_JOINTS 中没有可用的 {group} 放置配置")
-
-    body_joint2 = JOINT_TARGETS[group]["body_joint2"]
-    arm_place = PLACE_JOINTS[arm_group]
-    return {
-        name: [body_joint2, *values]
-        for name, values in arm_place.items()
-    }
-
 # 按视觉点顺序遍历：
 #   点1 → 点2 → 点3 ...
 
@@ -2849,7 +2829,6 @@ class G01Demo(Node):
         link: str,
         plan_frame: str,
         joint_names: Sequence[str],
-        place_joints: dict[str, Sequence[float]],
         place_speed_scale: float = PLACE_SPEED_SCALE,
         cutoff_joint_names: Sequence[str] | None = None,
         first_return_mode: int = FIRST_RETURN_MODE,
@@ -2865,7 +2844,6 @@ class G01Demo(Node):
             link              : 末端连杆名（如 L6）
             plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 base_link、world）
             joint_names       : group 内关节名顺序（与 yubei/fang 数组一一对应）
-            place_joints      : 含 yubei、fang 的放置关节目标 [rad]
             place_speed_scale : 放置段的速度缩放（0~1）
             cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
             first_return_mode : 1=使用 *_j 并交换；2=使用普通放置点；0 兼容旧普通模式
@@ -2879,16 +2857,6 @@ class G01Demo(Node):
         first_return_mode = int(first_return_mode)
         if first_return_mode not in (0, 1, 2):
             log.error(f"[pick] first_return_mode 只能是 0、1 或 2，当前={first_return_mode}")
-            return False
-        yubei_key = "yubei_j" if first_return_mode == 1 else "yubei"
-        fang_key = "fang_j" if first_return_mode == 1 else "fang"
-        if not isinstance(place_joints, dict) or yubei_key not in place_joints or fang_key not in place_joints:
-            log.error(f"[pick] place_joints 必须包含 {yubei_key} 和 {fang_key}")
-            return False
-        if any(len(place_joints[name]) != len(joint_names) for name in (yubei_key, fang_key)):
-            log.error(
-                f"[pick] {yubei_key}/{fang_key} 的关节数必须等于 joint_names 长度 {len(joint_names)}"
-            )
             return False
 
         log.info(
@@ -3017,7 +2985,7 @@ class G01Demo(Node):
             log.error("[pick] 第一段复位后添加隔板失败")
             return False
 
-        if waist_moved:
+        if group in ("left_body", "right_body"):
             log.info(
                 f"[pick] 抓取前腰部运动过，交换/复位前先回腰到 "
                 f"{waist_reset_angle:.6f} rad ({math.degrees(waist_reset_angle):.2f} deg)"
@@ -3060,10 +3028,14 @@ class G01Demo(Node):
                 place_group = "right_arm"
                 place_link = "r_tool"
                 place_frame = "r_base_link"
+            place_joint_config = PLACE_JOINTS.get(place_group)
+            if not isinstance(place_joint_config, dict):
+                log.error(f"[pick] PLACE_JOINTS 未配置 {place_group}")
+                return False
 
             if not self._place_and_return(
                 place_speed_scale,
-                place_joints=PLACE_JOINTS[place_group],
+                place_joint_config,
                 group=place_group,
                 link=place_link,
                 plan_frame=place_frame,
@@ -3083,12 +3055,22 @@ class G01Demo(Node):
             #     + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
             # )
         
+            place_group = group
+            place_frame = plan_frame
+            arm_context = arm_context_for_body_group(group)
+            if arm_context is not None:
+                place_group, place_frame = arm_context
+            place_joint_config = PLACE_JOINTS.get(place_group)
+            if not isinstance(place_joint_config, dict):
+                log.error(f"[pick] PLACE_JOINTS 未配置 {place_group}")
+                return False
+
             if not self._place_and_return(
                 place_speed_scale,
-                place_joints,
-                group=group,
+                place_joint_config,
+                group=place_group,
                 link=link,
-                plan_frame=plan_frame,
+                plan_frame=place_frame,
                 first_return_mode=first_return_mode,
                 line_speed=speed_scale,
             ):
@@ -3308,44 +3290,11 @@ def main(argv: list[str] | None = None) -> int:
         waist_moved = False
 
         if waist_pick_angle is not None and pick_group not in ("left_arm", "right_arm"):
-            pick_side = reachable["pick_side"]
             log.info(
-                f"可达性选中 {pick_group}，先用 body 组规划腰部抓取角度 "
+                f"可达性选中 {pick_group}，后续直接使用该 body 组规划抓取，"
+                f"不再单独动腰和重新视觉识别；"
                 f"body_joint2={waist_pick_angle:.6f} rad "
                 f"({math.degrees(waist_pick_angle):.2f} deg)"
-            )
-            if not node.move_body_joint2(waist_pick_angle, speed_scale=0.5):
-                log.error("腰部运动到抓取角度失败")
-                return False
-            waist_moved = True
-            log.info("腰部运动完成，重新视觉识别")
-
-            vision_pose = read_vision_object_pose(node, log)
-            if vision_pose is None:
-                return False
-            first_return_modes, all_xyz_rpy = vision_pose
-            if point_index >= len(all_xyz_rpy) or point_index >= len(first_return_modes):
-                log.error(
-                    f"重新视觉识别后点数量不足，无法继续使用原点 {point_index + 1}"
-                )
-                return False
-
-            xyz_key = pick_side
-            new_xyz_rpy = all_xyz_rpy[point_index]
-            if xyz_key not in new_xyz_rpy:
-                log.error(f"重新视觉识别结果缺少 {xyz_key!r} 位姿，无法改用纯臂规划")
-                return False
-
-            pick_group = f"{pick_side}_arm"
-            pick_link = "l_tool" if pick_side == "left" else "r_tool"
-            pick_frame = "l_base_link" if pick_side == "left" else "r_base_link"
-            pick_joint_names = joint_names_for_group(pick_group)
-            pick_target_pose = xyz_rpy_to_pose(new_xyz_rpy[xyz_key])
-            first_return_mode = first_return_modes[point_index]
-            pick_label = "左臂" if pick_side == "left" else "右臂"
-            log.info(
-                f"腰部到位后改用纯臂规划: 点 {point_index + 1}/{len(all_xyz_rpy)}, "
-                f"group={pick_group}, link={pick_link}, frame={pick_frame}"
             )
 
         selected_msg = (
@@ -3369,7 +3318,6 @@ def main(argv: list[str] | None = None) -> int:
             link=pick_link,
             plan_frame=pick_frame,
             joint_names=pick_joint_names,
-            place_joints=place_joints_for_group(pick_group),
             place_speed_scale=0.4,
             cutoff_joint_names=joint_names,
             first_return_mode=first_return_mode,
