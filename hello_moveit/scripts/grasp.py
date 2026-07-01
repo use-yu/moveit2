@@ -1707,7 +1707,7 @@ class G01Demo(Node):
             return False
 
         half_extent_y = cylinder_half_extent_y(scene_pose)
-        scene_y = scene_pose.position.y + half_extent_y
+        scene_y = scene_pose.position.y - half_extent_y
         self.get_logger().info(
             f"添加碰撞体「{FRAME_CUTOFF_ID}」到 {target_frame}: "
             f"物体中心 y={scene_pose.position.y:.3f} m, Y 半尺寸={half_extent_y:.3f} m, "
@@ -3379,6 +3379,11 @@ def main(argv: list[str] | None = None) -> int:
             waist_moved=waist_moved,
         ):
             log.error(f"{pick_label}抓取失败")
+            log.info("按回车继续 …")
+            try:
+                input()
+            except EOFError:
+                pass
             return False
 
         return True

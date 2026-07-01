@@ -706,13 +706,9 @@ def read_vision_object_pose(node, log):
         t_sj_l_base = pose_to_matrix(l_base_in_sj)
         first_return_modes: list[int] = []
         all_xyz_rpy: list[dict[str, tuple[float, float, float, float, float, float]]] = []
+        raw_poses: list[list[float]] = []
 
         for point_index, (first_return_mode, pose) in enumerate(vision_results, start=1):
-            print(
-                f"\033[32mviewer point {point_index}: "
-                f"first_return_mode = {first_return_mode}, pose = {pose}\033[0m"
-            )
-
             try:
                 right_xyz_rpy_mm = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
                 left_xyz_rpy_mm = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
@@ -737,15 +733,22 @@ def read_vision_object_pose(node, log):
 
             first_return_modes.append(first_return_mode)
             all_xyz_rpy.append(xyz_rpy)
-            print(f"xyz_rpy[{point_index}] [m, rad]: {xyz_rpy}")
+            raw_poses.append(pose)
 
         sorted_results = sorted(
-            zip(first_return_modes, all_xyz_rpy),
+            zip(first_return_modes, all_xyz_rpy, raw_poses),
             key=lambda item: item[1]["sj"][1],
             reverse=True,
         )
-        first_return_modes = [mode for mode, _ in sorted_results]
-        all_xyz_rpy = [xyz_rpy for _, xyz_rpy in sorted_results]
+        first_return_modes = [mode for mode, _, _ in sorted_results]
+        all_xyz_rpy = [xyz_rpy for _, xyz_rpy, _ in sorted_results]
+
+        for point_index, (first_return_mode, xyz_rpy, pose) in enumerate(sorted_results, start=1):
+            print(
+                f"\033[32mviewer point {point_index}: "
+                f"first_return_mode = {first_return_mode}, pose = {pose}\033[0m"
+            )
+            print(f"xyz_rpy[{point_index}] [m, rad]: {xyz_rpy}")
 
         return first_return_modes, all_xyz_rpy
     finally:
@@ -1684,7 +1687,7 @@ class G01Demo(Node):
             return False
 
         half_extent_y = cylinder_half_extent_y(scene_pose)
-        scene_y = scene_pose.position.y + half_extent_y
+        scene_y = scene_pose.position.y - half_extent_y
         self.get_logger().info(
             f"添加碰撞体「{FRAME_CUTOFF_ID}」到 {target_frame}: "
             f"物体中心 y={scene_pose.position.y:.3f} m, Y 半尺寸={half_extent_y:.3f} m, "
