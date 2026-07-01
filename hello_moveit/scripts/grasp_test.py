@@ -383,10 +383,10 @@ NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
 # 下面会转成平移单位为毫米的 4x4 矩阵，与 viewer pose 的毫米单位保持一致。
 VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
-    -0.152770, -0.139391, -0.109405, 0.648141, -0.270300, -0.657271, -0.273580
+    -0.152739, -0.142554, -0.108776, 0.651190, -0.265437, -0.658722, -0.267545
 ]
 VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
-    0.154525, -0.138222, -0.190644, 0.654745, -0.277931, 0.647655, 0.273140
+    0.154349, -0.141012, -0.191157, 0.656399, -0.271619, 0.650814, 0.267963
 ]
 
 def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
@@ -1684,7 +1684,7 @@ class G01Demo(Node):
             return False
 
         half_extent_y = cylinder_half_extent_y(scene_pose)
-        scene_y = scene_pose.position.y - half_extent_y
+        scene_y = scene_pose.position.y + half_extent_y
         self.get_logger().info(
             f"添加碰撞体「{FRAME_CUTOFF_ID}」到 {target_frame}: "
             f"物体中心 y={scene_pose.position.y:.3f} m, Y 半尺寸={half_extent_y:.3f} m, "
