@@ -1673,7 +1673,7 @@ class G01Demo(Node):
             return False
 
         half_extent_y = cylinder_half_extent_y(scene_pose)
-        scene_y = scene_pose.position.y - half_extent_y
+        scene_y = scene_pose.position.y + half_extent_y
         colors = [
             ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR),
             ObjectColor(id=GRASP_OBJECT_COLLISION_ID, color=GRASP_OBJECT_COLLISION_COLOR),
