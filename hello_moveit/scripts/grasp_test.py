@@ -3128,10 +3128,18 @@ class G01Demo(Node):
             log.error("[pick] 1/8 未返回 OMPL 轨迹，无法原路退回初始位置")
             return False
 
+
+
         log.info(
             f"[pick] 2/8  执行已缓存的 approach 轨迹 → q_target "
             f"（{len(approach_traj.joint_trajectory.points)} 点，免重规划）"
         )
+
+        try:
+            input()
+        except EOFError:
+            pass
+
         if not self._execute_traj(approach_traj):
             log.error("[pick] 直线接近执行失败")
             return False
@@ -3164,6 +3172,11 @@ class G01Demo(Node):
         if not self._execute_traj(retreat_approach):
             log.error("[pick] 反向播放 approach 失败")
             return False
+
+        try:
+            input()
+        except EOFError:
+            pass
 
         if group in ("left_body", "right_body"):
             log.info(
