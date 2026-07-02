@@ -140,7 +140,9 @@ class fankuis():
             if hex((a['test_value'][0])) == '0x123456789abcdef':
                 tool_v = a['tool_vector_actual'][0]
                 tool_j = a['q_actual'][0]
-            return [tool_v, tool_j]
+                tool_i = a['i_actual'][0]
+                tcp_force = a['TCP_force'][0]
+            return [tool_v, tool_j, tool_i, tcp_force]
         except:
             return ["NG"]
             print("反馈接收解析失败")
@@ -151,6 +153,10 @@ class ArmRosBridge(Node):
         self.arm_clients = clients
         self.left_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/state", 10)
         self.right_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/state", 10)
+        self.left_i_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/i_actual", 10)
+        self.right_i_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/i_actual", 10)
+        self.left_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/TCP_force", 10)
+        self.right_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/TCP_force", 10)
         self.create_subscription(JointState, COMMAND_TOPIC, self._on_joint_commands, 10)
         self.create_service(SetToolPower, LEFT_TOOL_COMMAND_SERVICE, self._on_left_tool_command)
         self.create_service(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE, self._on_right_tool_command)
@@ -162,6 +168,22 @@ class ArmRosBridge(Node):
             self.left_pub.publish(msg)
         elif side == "right":
             self.right_pub.publish(msg)
+
+    def publish_arm_i_actual(self, side, i_actual):
+        msg = Float32MultiArray()
+        msg.data = [float(num) for num in i_actual]
+        if side == "left":
+            self.left_i_pub.publish(msg)
+        elif side == "right":
+            self.right_i_pub.publish(msg)
+
+    def publish_arm_tcp_force(self, side, tcp_force):
+        msg = Float32MultiArray()
+        msg.data = [float(num) for num in tcp_force]
+        if side == "left":
+            self.left_tcp_force_pub.publish(msg)
+        elif side == "right":
+            self.right_tcp_force_pub.publish(msg)
 
     def _extract_arm_command(self, name_to_pos, joints):
         out = []
@@ -213,15 +235,21 @@ class ArmRosBridge(Node):
 
 
 q_actual = {"left": [], "right": []}
+i_actual = {"left": [], "right": []}
+TCP_force = {"left": [], "right": []}
 def joint(ip, side, state_node):
-    global q_actual
+    global q_actual, i_actual, TCP_force
     feed_v = fankuis(ip, 30004)
     while stop:
         actual = feed_v.feed()
         #print(actual)
         if actual != ["NG"]:
            q_actual[side] = [round(num, 6) for num in actual[1]]
+           i_actual[side] = [round(num, 6) for num in actual[2]]
+           TCP_force[side] = [round(num, 6) for num in actual[3]]
            state_node.publish_arm_state(side, q_actual[side])
+           state_node.publish_arm_i_actual(side, i_actual[side])
+           state_node.publish_arm_tcp_force(side, TCP_force[side])
            #print(q_actual[side])  # 输出: [3.141593, 2.718282, 1.414214]
         time.sleep(0.01)
 
