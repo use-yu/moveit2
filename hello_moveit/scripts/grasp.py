@@ -49,8 +49,12 @@ import multiprocessing
 import random
 import re
 import socket
+import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
+from functools import lru_cache
+from pathlib import Path
 from typing import Iterable, Sequence
 
 import rclpy
@@ -283,6 +287,10 @@ CART_PRISMATIC_JUMP_THRESHOLD = 0.02  # 单步任一移动关节超过该值 [m]
 CART_JUMP_STEP_FACTOR = 3.0  # 单步关节空间距离超过平均值该倍数，直接淘汰
 CART_MAX_POINT_FACTOR = 2.0  # 实际点数超过理论直线点数该倍数时，认为 IK 分支不稳
 CART_MAX_POINT_EXTRA = 5
+DEFAULT_ROBOT_URDF = (
+    Path(__file__).resolve().parents[2]
+    / "moveit_resources/g01_description/urdf/G01-URDF888.urdf"
+)
 
 # 放置位关节目标 [rad]（数组顺序与 JOINT_TARGETS[group] 一致）。
 # 单臂使用 yubei → fang 两段式放置：先到预备位，再做末端笛卡尔直线到放置位。
@@ -1074,13 +1082,98 @@ def make_grasp_object_collision(pose: Pose) -> CollisionObject:
 
 def cylinder_half_extent_y(pose: Pose) -> float:
     """圆柱按当前姿态投影到 Y 轴后的半尺寸，用于让隔板与圆柱刚好相切。"""
+    return cylinder_half_extent_y_from_shape(pose, CYLINDER_DIAMETER / 2.0, CYLINDER_HEIGHT)
+
+
+def cylinder_half_extent_y_from_shape(pose: Pose, radius: float, length: float) -> float:
+    """指定半径/长度的圆柱按当前姿态投影到 Y 轴后的半尺寸。"""
     q = pose.orientation
     _, axis_y, _ = rotate_xyz_by_quat(0.0, 0.0, 1.0, q.x, q.y, q.z, q.w)
     axis_y = max(-1.0, min(1.0, axis_y))
-    radius = CYLINDER_DIAMETER / 2.0
-    half_height = CYLINDER_HEIGHT / 2.0
+    half_height = float(length) / 2.0
     radial_projection = math.sqrt(max(0.0, 1.0 - axis_y * axis_y))
-    return abs(axis_y) * half_height + radial_projection * radius
+    return abs(axis_y) * half_height + radial_projection * float(radius)
+
+
+def matrix_from_xyz_rpy(xyz: Sequence[float], rpy: Sequence[float]) -> list[list[float]]:
+    x, y, z = [float(value) for value in xyz]
+    rot = rpy_to_rot(*[float(value) for value in rpy])
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x],
+        [rot[1][0], rot[1][1], rot[1][2], y],
+        [rot[2][0], rot[2][1], rot[2][2], z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _xml_numbers(value: str | None, default: Sequence[float]) -> list[float]:
+    if not value:
+        return list(default)
+    return [float(part) for part in value.split()]
+
+
+@lru_cache(maxsize=1)
+def _expanded_robot_urdf_root(urdf_path: str = str(DEFAULT_ROBOT_URDF)) -> ET.Element:
+    path = Path(urdf_path).resolve()
+    try:
+        result = subprocess.run(
+            ["xacro", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(path.parent),
+        )
+        return ET.fromstring(result.stdout)
+    except FileNotFoundError as exc:
+        raise RuntimeError("xacro command not found; source ROS environment first") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(exc.stderr.strip() or exc.stdout.strip()) from exc
+
+
+@lru_cache(maxsize=1)
+def _urdf_collision_data(urdf_path: str = str(DEFAULT_ROBOT_URDF)):
+    root = _expanded_robot_urdf_root(urdf_path)
+    collisions_by_link: dict[str, list[dict[str, object]]] = {}
+    parent_by_child: dict[str, str] = {}
+
+    for joint in root.iter("joint"):
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if parent is not None and child is not None:
+            parent_by_child[child.attrib["link"]] = parent.attrib["link"]
+
+    for link in root.iter("link"):
+        link_name = link.attrib.get("name")
+        if not link_name:
+            continue
+        for collision in link.findall("collision"):
+            cylinder = collision.find("./geometry/cylinder")
+            if cylinder is None:
+                continue
+            origin = collision.find("origin")
+            xyz = _xml_numbers(origin.attrib.get("xyz") if origin is not None else None, (0.0, 0.0, 0.0))
+            rpy = _xml_numbers(origin.attrib.get("rpy") if origin is not None else None, (0.0, 0.0, 0.0))
+            spec = {
+                "radius": float(cylinder.attrib["radius"]),
+                "length": float(cylinder.attrib["length"]),
+                "origin_matrix": matrix_from_xyz_rpy(xyz, rpy),
+            }
+            collisions_by_link.setdefault(link_name, []).append(spec)
+
+    return collisions_by_link, parent_by_child
+
+
+def collision_link_for_link(link: str) -> str | None:
+    """若 link 本身无 collision，则向父 link 查找最近的圆柱 collision link。"""
+    collisions_by_link, parent_by_child = _urdf_collision_data()
+    current = link
+    visited: set[str] = set()
+    while current and current not in visited:
+        visited.add(current)
+        if collisions_by_link.get(current):
+            return current
+        current = parent_by_child.get(current)
+    return None
 
 
 def pose_from_dict(ep: dict) -> Pose:
@@ -1654,14 +1747,72 @@ class G01Demo(Node):
         rm = CollisionObject(id=FRAME_ID, operation=CollisionObject.REMOVE)
         return self._apply_scene([rm])
 
+    def _link_collision_min_y(
+        self,
+        link: str,
+        *,
+        target_frame: str = SCENE_FRAME,
+        joints: dict[str, float] | None = None,
+        joint_names: Sequence[str] | None = None,
+    ) -> tuple[float, str] | None:
+        """读取 URDF cylinder collision，返回 link 在 target_frame 下的最小 Y 切面。"""
+        log = self.get_logger()
+        try:
+            collision_link = collision_link_for_link(link)
+            collisions_by_link, _ = _urdf_collision_data()
+        except RuntimeError as exc:
+            log.error(f"读取 URDF collision 失败：{exc}")
+            return None
+
+        if collision_link is None:
+            log.error(f"未在 {link} 或其父 link 上找到 cylinder collision")
+            return None
+
+        fk_joints = joints
+        if joints is not None and joint_names is not None:
+            current = self._get_joints(list(joint_names), timeout=2.0)
+            if current is not None:
+                fk_joints = dict(current)
+                fk_joints.update(joints)
+
+        link_pose = self._get_link_pose_fk(
+            collision_link,
+            joints=fk_joints,
+            joint_names=joint_names,
+            plan_frame=target_frame,
+        )
+        if link_pose is None:
+            log.error(f"无法计算 {collision_link} 在 {target_frame} 下的 FK")
+            return None
+
+        t_target_link = pose_to_matrix(link_pose)
+        min_y: float | None = None
+        for spec in collisions_by_link.get(collision_link, []):
+            collision_matrix = matmul4(t_target_link, spec["origin_matrix"])
+            collision_pose = xyz_rpy_to_pose(matrix_to_xyz_rpy(collision_matrix))
+            half_extent_y = cylinder_half_extent_y_from_shape(
+                collision_pose,
+                radius=float(spec["radius"]),
+                length=float(spec["length"]),
+            )
+            surface_y = collision_pose.position.y - half_extent_y
+            min_y = surface_y if min_y is None else min(min_y, surface_y)
+
+        if min_y is None:
+            log.error(f"{collision_link} 没有可用 cylinder collision")
+            return None
+        return min_y, collision_link
+
     def add_frame_cutoff_for_pose(
         self,
         pose: Pose | dict,
         source_frame: str = PLAN_FRAME,
         target_frame: str = SCENE_FRAME,
         joint_names: Sequence[str] | None = None,
+        tangent_link: str | None = None,
+        tangent_joints: dict[str, float] | None = None,
     ) -> bool:
-        """添加与目标圆柱相切的隔板，并把目标圆柱作为临时碰撞体加入场景。"""
+        """添加隔板和临时抓取物体；传 tangent_link 时隔板与该 link 在 tangent_joints 下相切。"""
         scene_pose = self._pose_in_frame(
             pose,
             source_frame=source_frame,
@@ -1672,15 +1823,31 @@ class G01Demo(Node):
             self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
             return False
 
-        half_extent_y = cylinder_half_extent_y(scene_pose)
-        scene_y = scene_pose.position.y - half_extent_y
+        if tangent_link:
+            link_surface = self._link_collision_min_y(
+                tangent_link,
+                target_frame=target_frame,
+                joints=tangent_joints,
+                joint_names=joint_names,
+            )
+            if link_surface is None:
+                return False
+            scene_y, collision_link = link_surface
+            tangent_desc = f"q_pre 状态下末端 link {tangent_link} 的 collision link {collision_link}"
+        else:
+            half_extent_y = cylinder_half_extent_y(scene_pose)
+            scene_y = scene_pose.position.y - half_extent_y
+            tangent_desc = (
+                f"目标圆柱，物体中心 y={scene_pose.position.y:.3f} m, "
+                f"Y 半尺寸={half_extent_y:.3f} m"
+            )
         colors = [
             ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR),
             ObjectColor(id=GRASP_OBJECT_COLLISION_ID, color=GRASP_OBJECT_COLLISION_COLOR),
         ]
         self.get_logger().info(
             f"添加碰撞体「{FRAME_CUTOFF_ID}」+「{GRASP_OBJECT_COLLISION_ID}」到 {target_frame}: "
-            f"物体中心 y={scene_pose.position.y:.3f} m, Y 半尺寸={half_extent_y:.3f} m, "
+            f"隔板与{tangent_desc}相切, "
             f"隔板表面 y={scene_y:.3f} m"
         )
         return self._apply_scene(
@@ -1694,23 +1861,40 @@ class G01Demo(Node):
         source_frame: str = PLAN_FRAME,
         target_frame: str = SCENE_FRAME,
         joint_names: Sequence[str] | None = None,
+        tangent_link: str | None = None,
+        tangent_joints: dict[str, float] | None = None,
     ) -> bool:
-        """只添加与目标圆柱相切的隔板，不添加临时抓取物体。"""
-        scene_pose = self._pose_in_frame(
-            pose,
-            source_frame=source_frame,
-            target_frame=target_frame,
-            joint_names=joint_names,
-        )
-        if scene_pose is None:
-            self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
-            return False
-
-        half_extent_y = cylinder_half_extent_y(scene_pose)
-        scene_y = scene_pose.position.y - half_extent_y
+        """只添加隔板；传 tangent_link 时隔板与该 link 在 tangent_joints 下相切。"""
+        if tangent_link:
+            link_surface = self._link_collision_min_y(
+                tangent_link,
+                target_frame=target_frame,
+                joints=tangent_joints,
+                joint_names=joint_names,
+            )
+            if link_surface is None:
+                return False
+            scene_y, collision_link = link_surface
+            tangent_desc = f"q_pre 状态下末端 link {tangent_link} 的 collision link {collision_link}"
+        else:
+            scene_pose = self._pose_in_frame(
+                pose,
+                source_frame=source_frame,
+                target_frame=target_frame,
+                joint_names=joint_names,
+            )
+            if scene_pose is None:
+                self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
+                return False
+            half_extent_y = cylinder_half_extent_y(scene_pose)
+            scene_y = scene_pose.position.y - half_extent_y
+            tangent_desc = (
+                f"目标圆柱，物体中心 y={scene_pose.position.y:.3f} m, "
+                f"Y 半尺寸={half_extent_y:.3f} m"
+            )
         self.get_logger().info(
             f"添加碰撞体「{FRAME_CUTOFF_ID}」到 {target_frame}: "
-            f"物体中心 y={scene_pose.position.y:.3f} m, Y 半尺寸={half_extent_y:.3f} m, "
+            f"隔板与{tangent_desc}相切, "
             f"隔板表面 y={scene_y:.3f} m"
         )
         return self._apply_scene(
@@ -2950,6 +3134,8 @@ class G01Demo(Node):
                 source_frame=plan_frame,
                 target_frame=SCENE_FRAME,
                 joint_names=cutoff_joint_names,
+                tangent_link=link,
+                tangent_joints=q_pre,
             ):
                 log.error("[pick] 添加 q_pre OMPL 隔板失败")
                 return False
@@ -3016,6 +3202,8 @@ class G01Demo(Node):
             source_frame=plan_frame,
             target_frame=SCENE_FRAME,
             joint_names=cutoff_joint_names,
+            tangent_link=link,
+            tangent_joints=q_pre,
         ):
             log.error("[pick] 第一段复位后添加隔板失败")
             return False
