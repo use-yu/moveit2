@@ -398,6 +398,10 @@ VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
 VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
     0.154349, -0.141012, -0.191157, 0.656399, -0.271619, 0.650814, 0.267963
 ]
+SIM_VISION_RESULT = (
+    2,
+    [-195.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+)
 
 def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
     if len(transform) != 7:
@@ -677,16 +681,27 @@ def transform_vision_pose(
     return matrix_to_xyz_rpy(matmul4(transform_mm, pose_mm_wxyz_to_matrix(pose)))
 
 
-def read_vision_object_pose(node, log):
+def read_vision_object_pose(node, log, sim_mode: bool = False):
     """视觉识别封装：返回所有点的模式码和 xyz_rpy。"""
-    vision_sock = connect_vision(log)
-    if vision_sock is None:
-        return None
+    vision_sock = None
+    if sim_mode:
+        first_return_mode, pose = SIM_VISION_RESULT
+        vision_results = [(first_return_mode, list(pose))]
+        log.info(f"[sim] viewer 点个数: 1，使用固定 pose")
+        print(
+            f"{GREEN}[sim] viewer point 1: "
+            f"first_return_mode = {first_return_mode}, pose = {pose}{RESET}"
+        )
+    else:
+        vision_sock = connect_vision(log)
+        if vision_sock is None:
+            return None
 
     try:
-        vision_results = read_vision_pose(vision_sock, log)
-        if vision_results is None:
-            return None
+        if not sim_mode:
+            vision_results = read_vision_pose(vision_sock, log)
+            if vision_results is None:
+                return None
 
         # 读取实际腰部角度；FK 返回 T_SJ_r_base_link，再左乘右侧物体位姿得到 T_SJ_object。
         body_joints = node._get_joints(["body_joint2"], wait_new=True)
@@ -1411,8 +1426,9 @@ def make_pose_constraints(link: str, pose: Pose, frame_id: str = PLAN_FRAME) -> 
 class G01Demo(Node):
     """封装 apply_planning_scene 与 move_action，对外提供少量高层接口。"""
 
-    def __init__(self):
+    def __init__(self, sim_mode: bool = False):
         super().__init__("g01_demo")
+        self.sim_mode = bool(sim_mode)
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
         self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
         self._ik_cli = self.create_client(GetPositionIK, SVC_COMPUTE_IK)
@@ -1674,6 +1690,10 @@ class G01Demo(Node):
     def set_tool_power(self, side: str, status: int, timeout: float = 10.0) -> bool:
         """调用左右工具电源服务，要求返回 res=0。"""
         log = self.get_logger()
+        if self.sim_mode:
+            log.info(f"[sim] 跳过 {side} SetToolPower({status})")
+            return True
+
         if side == "left":
             cli = self._left_tool_cli
             service_name = LEFT_TOOL_COMMAND_SERVICE
@@ -3424,10 +3444,21 @@ class G01Demo(Node):
 # =============================================================================
 
 
+def split_sim_args(argv: list[str] | None = None) -> tuple[bool, list[str]]:
+    """取出脚本自己的 --sim，其余参数继续交给 rclpy。"""
+    raw_args = list(sys.argv if argv is None else argv)
+    sim_mode = "--sim" in raw_args
+    ros_args = [arg for arg in raw_args if arg != "--sim"]
+    return sim_mode, ros_args
+
+
 def main(argv: list[str] | None = None) -> int:
-    rclpy.init(args=argv)
-    node = G01Demo()
+    sim_mode, ros_args = split_sim_args(argv)
+    rclpy.init(args=ros_args)
+    node = G01Demo(sim_mode=sim_mode)
     log = node.get_logger()
+    if sim_mode:
+        log.info("[sim] 仿真模式：跳过工具电源服务，视觉使用固定 viewer pose")
     code = 1
     frame_added = False
 
@@ -3475,7 +3506,7 @@ def main(argv: list[str] | None = None) -> int:
         time.sleep(1)
 
         # 视觉识别
-        vision_pose = read_vision_object_pose(node, log)
+        vision_pose = read_vision_object_pose(node, log, sim_mode=sim_mode)
         if vision_pose is None:
             return False
         first_return_modes, all_xyz_rpy = vision_pose
