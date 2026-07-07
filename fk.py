@@ -34,13 +34,8 @@ DEFAULT_URDF = DEFAULT_G01_URDF
 DEFAULT_BASE_LINK = "SJ"
 DEFAULT_TARGET_LINK = "r_tool"
 DEFAULT_JOINT_VALUES = [
-    30.1,  # body_joint2
-    -38,  # r_arm_joint1
-    65,  # r_arm_joint2
-    87,  # r_arm_joint3
-    27,  # r_arm_joint4
-    142,  # r_arm_joint5
-    0.0,  # r_arm_joint6
+    30,  # body_joint2
+    -108.551080, -86.793308, -44.458005, -48.840345, 41.727653, 0.095568
 ]
 
 # 下面三个只用于兼容旧 CR7 参数 --tool / --link6 / fk6。

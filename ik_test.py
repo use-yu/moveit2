@@ -29,7 +29,7 @@ URDF_XACRO = Path(__file__).parent / "moveit_resources/g01_description/urdf/G01-
 
 # 基坐标系和末端坐标系 link 名。右臂可改成 BASE_LINK="r_base_link", EE_LINK="r_tool"。
 BASE_LINK = "SJ"
-EE_LINK = "l_tool"
+EE_LINK = "r_tool"
 
 # 目标末端位姿，表达在 BASE_LINK 坐标系下，单位：m / rad。
 # 右臂放
