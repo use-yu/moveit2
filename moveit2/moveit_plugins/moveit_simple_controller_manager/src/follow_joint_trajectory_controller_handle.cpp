@@ -37,10 +37,117 @@
 
 #include <moveit_simple_controller_manager/follow_joint_trajectory_controller_handle.h>
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
 using namespace std::placeholders;
 
 namespace moveit_simple_controller_manager
 {
+namespace
+{
+constexpr char G01_HARDWARE_PLUGIN[] = "g01_topic_hardware/G01TopicSystem";
+constexpr char MOTOR_COMMAND_TOPIC[] = "/g01/motor_commands";
+constexpr char WAIST_CSP_PATH_TOPIC[] = "/waist_motor_control/csp_path";
+constexpr char LIFT_CSP_PATH_TOPIC[] = "/lift_motor_control/csp_path";
+constexpr char WAIST_JOINT[] = "body_joint2";
+constexpr char LIFT_JOINT[] = "body_joint1";
+constexpr double WAIST_POSITION_SCALE = 1.0;    // rad -> rad
+constexpr double LIFT_POSITION_SCALE = 1000.0;  // m -> mm
+constexpr auto CSP_PRELOAD_DELAY = std::chrono::milliseconds(100);
+}  // namespace
+
+FollowJointTrajectoryControllerHandle::FollowJointTrajectoryControllerHandle(const rclcpp::Node::SharedPtr& node,
+                                                                             const std::string& name,
+                                                                             const std::string& action_ns)
+  : ActionBasedControllerHandle<control_msgs::action::FollowJointTrajectory>(
+        node, name, action_ns, "moveit.simple_controller_manager.follow_joint_trajectory_controller_handle")
+{
+  // G01 的仿真和真机共用 moveit_controllers.yaml。只在 robot_description 明确使用
+  // 真机硬件插件时启用 CSP 完整轨迹预下发，避免仿真启动时触发电机话题。
+  std::string robot_description;
+  if (!node->get_parameter("robot_description", robot_description) ||
+      robot_description.find(G01_HARDWARE_PLUGIN) == std::string::npos)
+  {
+    return;
+  }
+
+  g01_csp_preload_enabled_ = true;
+  motor_command_pub_ = node->create_publisher<std_msgs::msg::UInt8>(MOTOR_COMMAND_TOPIC, rclcpp::QoS(5));
+  waist_csp_path_pub_ = node->create_publisher<std_msgs::msg::Float32MultiArray>(WAIST_CSP_PATH_TOPIC, rclcpp::QoS(5));
+  lift_csp_path_pub_ = node->create_publisher<std_msgs::msg::Float32MultiArray>(LIFT_CSP_PATH_TOPIC, rclcpp::QoS(5));
+
+  RCLCPP_INFO_STREAM(LOGGER, "G01 CSP trajectory preload enabled for " << name_);
+}
+
+bool FollowJointTrajectoryControllerHandle::appendJointPath(const trajectory_msgs::msg::JointTrajectory& trajectory,
+                                                            const std::string& joint_name, const double position_scale,
+                                                            std_msgs::msg::Float32MultiArray& path) const
+{
+  const auto joint_it = std::find(trajectory.joint_names.begin(), trajectory.joint_names.end(), joint_name);
+  if (joint_it == trajectory.joint_names.end())
+    return false;
+
+  const auto joint_index = static_cast<std::size_t>(std::distance(trajectory.joint_names.begin(), joint_it));
+  path.data.reserve(trajectory.points.size());
+  for (const auto& point : trajectory.points)
+  {
+    if (joint_index >= point.positions.size())
+    {
+      RCLCPP_ERROR_STREAM(LOGGER, "Cannot preload " << joint_name << " CSP path: trajectory point has "
+                                                    << point.positions.size() << " positions, but joint index is "
+                                                    << joint_index);
+      path.data.clear();
+      return false;
+    }
+    path.data.push_back(static_cast<float>(point.positions[joint_index] * position_scale));
+  }
+
+  std_msgs::msg::MultiArrayDimension dimension;
+  dimension.label = joint_name;
+  dimension.size = static_cast<uint32_t>(path.data.size());
+  dimension.stride = dimension.size;
+  path.layout.dim.push_back(std::move(dimension));
+  return true;
+}
+
+void FollowJointTrajectoryControllerHandle::publishG01CspPaths(const trajectory_msgs::msg::JointTrajectory& trajectory)
+{
+  if (!g01_csp_preload_enabled_ || trajectory.points.empty())
+    return;
+
+  std_msgs::msg::Float32MultiArray waist_path;
+  std_msgs::msg::Float32MultiArray lift_path;
+  const bool has_waist = appendJointPath(trajectory, WAIST_JOINT, WAIST_POSITION_SCALE, waist_path);
+  const bool has_lift = appendJointPath(trajectory, LIFT_JOINT, LIFT_POSITION_SCALE, lift_path);
+  if (!has_waist && !has_lift)
+    return;
+
+  // 发布顺序是协议的一部分：先给电机控制节点发 1，再发送完整 CSP 轨迹，
+  // 最后才把 FollowJointTrajectory goal 交给控制器。真机硬件插件只有在 goal
+  // 进入 EXECUTING 后才会开始发布 /g01/joint_commands。
+  std_msgs::msg::UInt8 motor_command;
+  motor_command.data = 1;
+  motor_command_pub_->publish(motor_command);
+
+  // 先让电机控制节点处理停止/切换命令，再发送新的 CSP 完整轨迹。
+  std::this_thread::sleep_for(CSP_PRELOAD_DELAY);
+
+  if (has_waist)
+    waist_csp_path_pub_->publish(std::move(waist_path));
+  if (has_lift)
+    lift_csp_path_pub_->publish(std::move(lift_path));
+
+  // 给电机控制节点留出 0.1 秒接收和处理完整 CSP 数组，然后才发送 action goal。
+  std::this_thread::sleep_for(CSP_PRELOAD_DELAY);
+
+  RCLCPP_INFO_STREAM(LOGGER, "Preloaded G01 CSP trajectory with two "
+                                 << CSP_PRELOAD_DELAY.count() << " ms delays before " << name_
+                                 << " execution: " << (has_waist ? "waist " : "") << (has_lift ? "lift " : "") << "("
+                                 << trajectory.points.size() << " points)");
+}
+
 bool FollowJointTrajectoryControllerHandle::sendTrajectory(const moveit_msgs::msg::RobotTrajectory& trajectory)
 {
   RCLCPP_DEBUG_STREAM(LOGGER, "new trajectory to " << name_);
@@ -62,6 +169,8 @@ bool FollowJointTrajectoryControllerHandle::sendTrajectory(const moveit_msgs::ms
   control_msgs::action::FollowJointTrajectory::Goal goal = goal_template_;
   goal.trajectory = trajectory.joint_trajectory;
   goal.multi_dof_trajectory = trajectory.multi_dof_joint_trajectory;
+
+  publishG01CspPaths(goal.trajectory);
 
   rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SendGoalOptions send_goal_options;
   // Active callback

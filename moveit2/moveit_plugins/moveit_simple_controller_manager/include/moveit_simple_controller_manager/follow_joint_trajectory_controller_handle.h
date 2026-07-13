@@ -40,6 +40,8 @@
 #include <moveit_simple_controller_manager/action_based_controller_handle.h>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <control_msgs/msg/joint_tolerance.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/u_int8.hpp>
 #include <functional>
 
 namespace moveit_simple_controller_manager
@@ -53,11 +55,7 @@ class FollowJointTrajectoryControllerHandle
 {
 public:
   FollowJointTrajectoryControllerHandle(const rclcpp::Node::SharedPtr& node, const std::string& name,
-                                        const std::string& action_ns)
-    : ActionBasedControllerHandle<control_msgs::action::FollowJointTrajectory>(
-          node, name, action_ns, "moveit.simple_controller_manager.follow_joint_trajectory_controller_handle")
-  {
-  }
+                                        const std::string& action_ns);
 
   bool sendTrajectory(const moveit_msgs::msg::RobotTrajectory& trajectory) override;
 
@@ -73,6 +71,16 @@ protected:
       override;
 
   control_msgs::action::FollowJointTrajectory::Goal goal_template_;
+
+private:
+  void publishG01CspPaths(const trajectory_msgs::msg::JointTrajectory& trajectory);
+  bool appendJointPath(const trajectory_msgs::msg::JointTrajectory& trajectory, const std::string& joint_name,
+                       double position_scale, std_msgs::msg::Float32MultiArray& path) const;
+
+  bool g01_csp_preload_enabled_{ false };
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr motor_command_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr waist_csp_path_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr lift_csp_path_pub_;
 };
 
 }  // end namespace moveit_simple_controller_manager
