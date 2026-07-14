@@ -4,8 +4,21 @@
 # sleep(3)
 # rclpy.spin(state_node) 等待 /g01/joint_commands
 # 控制和臂位置是角度
-# tcp读取状态100hz,发布指令33hz
+# tcp读取状态100hz，/g01/joint_commands 200hz；每30ms取最新完整6关节值发送一次ServoJ
+# 只有完整左臂6关节
+# → 只更新左臂最新目标
+# → 30 ms定时器只向左臂发送 ServoJ
 
+# 只有完整右臂6关节
+# → 只更新右臂最新目标
+# → 只向右臂发送 ServoJ
+
+# 同时有左右臂完整关节
+# → 分别更新左右臂最新目标
+# → 左右臂各发送一次 ServoJ
+
+# 没有手臂关节或关节不完整
+# → 不发送 ServoJ
 import socket
 from time import sleep
 import time
@@ -110,6 +123,8 @@ JOINT_ORDER = [
 ]
 LEFT_JOINTS = JOINT_ORDER[4:10]
 RIGHT_JOINTS = JOINT_ORDER[10:16]
+ARM_COMMAND_SIZE = 6
+SERVOJ_SEND_PERIOD_SEC = 0.03
 COMMAND_TOPIC = "/g01/joint_commands"
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
@@ -157,7 +172,12 @@ class ArmRosBridge(Node):
         self.right_i_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/i_actual", 10)
         self.left_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/TCP_force", 10)
         self.right_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/TCP_force", 10)
-        self.create_subscription(JointState, COMMAND_TOPIC, self._on_joint_commands, 10)
+        # 200Hz输入只保留最新一条，30ms定时器按固定频率下发最新完整目标。
+        self._latest_arm_commands = {"left": None, "right": None}
+        self._new_arm_commands = {"left": False, "right": False}
+        self._arm_command_lock = threading.Lock()
+        self.create_subscription(JointState, COMMAND_TOPIC, self._on_joint_commands, 1)
+        self.create_timer(SERVOJ_SEND_PERIOD_SEC, self._send_latest_joint_commands)
         self.create_service(SetToolPower, LEFT_TOOL_COMMAND_SERVICE, self._on_left_tool_command)
         self.create_service(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE, self._on_right_tool_command)
 
@@ -191,22 +211,40 @@ class ArmRosBridge(Node):
             if joint not in name_to_pos:
                 return None
             out.append(float(name_to_pos[joint]))
-        return out
+        return out if len(out) == ARM_COMMAND_SIZE else None
 
     def _on_joint_commands(self, msg):
         name_to_pos = {}
         for i, name in enumerate(msg.name):
             if i < len(msg.position):
                 name_to_pos[str(name)] = float(msg.position[i])
-    
+
         left_cmd = self._extract_arm_command(name_to_pos, LEFT_JOINTS)
         right_cmd = self._extract_arm_command(name_to_pos, RIGHT_JOINTS)
 
-        # 把数据写入内核发送缓冲区，没 recv(200)
-        if left_cmd is not None:
-            ServoJ(self.arm_clients[0], [math.degrees(value) for value in left_cmd])
-        if right_cmd is not None:
-            ServoJ(self.arm_clients[1], [math.degrees(value) for value in right_cmd])
+        # 高频回调只覆盖缓存，不直接发送；同一个30ms周期内的旧目标会被新目标替换。
+        with self._arm_command_lock:
+            if left_cmd is not None:
+                self._latest_arm_commands["left"] = left_cmd
+                self._new_arm_commands["left"] = True
+            if right_cmd is not None:
+                self._latest_arm_commands["right"] = right_cmd
+                self._new_arm_commands["right"] = True
+
+    def _send_latest_joint_commands(self):
+        pending_commands = []
+        with self._arm_command_lock:
+            for side, client_index in (("left", 0), ("right", 1)):
+                command = self._latest_arm_commands[side]
+                if not self._new_arm_commands[side] or command is None:
+                    continue
+                pending_commands.append((self.arm_clients[client_index], list(command)))
+                self._new_arm_commands[side] = False
+
+        # 每30ms最多向每侧发送一次；这段时间没有新目标则不重复发送旧目标。
+        # 把数据写入内核发送缓冲区，没 recv(200)。
+        for client, command in pending_commands:
+            ServoJ(client, [math.degrees(value) for value in command])
 
     def _on_tool_command(self, request, response, side, client):
         status = int(request.status)
