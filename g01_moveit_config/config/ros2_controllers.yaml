@@ -55,6 +55,9 @@ body_controller:
       - body_joint2
     # left_body/right_body 执行时轨迹只含 body_joint1/2，不含底盘关节；必须为 true
     allow_partial_joints_goal: true
+    # 躯干 action goal 已预先离散为 5 ms 点，禁止控制器再次样条插值，
+    # 保证 /g01/joint_commands 和预下发 CSP 使用同一组点。
+    interpolation_method: none
     command_interfaces:
       - position
     state_interfaces:

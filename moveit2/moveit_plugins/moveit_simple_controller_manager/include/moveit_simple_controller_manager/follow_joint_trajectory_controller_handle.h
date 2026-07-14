@@ -73,10 +73,12 @@ protected:
   control_msgs::action::FollowJointTrajectory::Goal goal_template_;
 
 private:
+  bool synchronizeG01BodyTrajectory(trajectory_msgs::msg::JointTrajectory& trajectory) const;
   void publishG01CspPaths(const trajectory_msgs::msg::JointTrajectory& trajectory);
   bool appendJointPath(const trajectory_msgs::msg::JointTrajectory& trajectory, const std::string& joint_name,
                        double position_scale, std_msgs::msg::Float32MultiArray& path) const;
 
+  bool g01_body_trajectory_sync_enabled_{ false };
   bool g01_csp_preload_enabled_{ false };
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr motor_command_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr waist_csp_path_pub_;

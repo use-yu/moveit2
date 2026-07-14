@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 using namespace std::placeholders;
@@ -55,6 +56,8 @@ constexpr char WAIST_JOINT[] = "body_joint2";
 constexpr char LIFT_JOINT[] = "body_joint1";
 constexpr double WAIST_POSITION_SCALE = 1.0;    // rad -> rad
 constexpr double LIFT_POSITION_SCALE = 1000.0;  // m -> mm
+constexpr double CSP_PATH_FREQUENCY_HZ = 200.0;
+constexpr double CSP_PATH_PERIOD_SEC = 1.0 / CSP_PATH_FREQUENCY_HZ;
 constexpr auto CSP_PRELOAD_DELAY = std::chrono::milliseconds(100);
 }  // namespace
 
@@ -67,11 +70,17 @@ FollowJointTrajectoryControllerHandle::FollowJointTrajectoryControllerHandle(con
   // G01 的仿真和真机共用 moveit_controllers.yaml。只在 robot_description 明确使用
   // 真机硬件插件时启用 CSP 完整轨迹预下发，避免仿真启动时触发电机话题。
   std::string robot_description;
-  if (!node->get_parameter("robot_description", robot_description) ||
-      robot_description.find(G01_HARDWARE_PLUGIN) == std::string::npos)
+  if (!node->get_parameter("robot_description", robot_description))
   {
     return;
   }
+
+  // 真机和仿真的 body_controller 共用 interpolation_method=none。两者都要先把
+  // 躯干轨迹离散为 5 ms 点；只有真机会把同一份点数组预发给 CSP。
+  g01_body_trajectory_sync_enabled_ = robot_description.find(WAIST_JOINT) != std::string::npos &&
+                                      robot_description.find(LIFT_JOINT) != std::string::npos;
+  if (!g01_body_trajectory_sync_enabled_ || robot_description.find(G01_HARDWARE_PLUGIN) == std::string::npos)
+    return;
 
   g01_csp_preload_enabled_ = true;
   motor_command_pub_ = node->create_publisher<std_msgs::msg::UInt8>(MOTOR_COMMAND_TOPIC, rclcpp::QoS(5));
@@ -79,6 +88,104 @@ FollowJointTrajectoryControllerHandle::FollowJointTrajectoryControllerHandle(con
   lift_csp_path_pub_ = node->create_publisher<std_msgs::msg::Float32MultiArray>(LIFT_CSP_PATH_TOPIC, rclcpp::QoS(5));
 
   RCLCPP_INFO_STREAM(LOGGER, "G01 CSP trajectory preload enabled for " << name_);
+}
+
+bool FollowJointTrajectoryControllerHandle::synchronizeG01BodyTrajectory(
+    trajectory_msgs::msg::JointTrajectory& trajectory) const
+{
+  if (!g01_body_trajectory_sync_enabled_ || trajectory.points.empty())
+    return true;
+
+  const auto waist_it = std::find(trajectory.joint_names.begin(), trajectory.joint_names.end(), WAIST_JOINT);
+  const auto lift_it = std::find(trajectory.joint_names.begin(), trajectory.joint_names.end(), LIFT_JOINT);
+  if (waist_it == trajectory.joint_names.end() && lift_it == trajectory.joint_names.end())
+    return true;
+
+  const std::size_t joint_count = trajectory.joint_names.size();
+  std::vector<double> point_times;
+  point_times.reserve(trajectory.points.size());
+  for (std::size_t i = 0; i < trajectory.points.size(); ++i)
+  {
+    const auto& point = trajectory.points[i];
+    if (point.positions.size() != joint_count)
+    {
+      RCLCPP_ERROR_STREAM(LOGGER, "Cannot synchronize G01 body trajectory: point "
+                                      << i << " has " << point.positions.size() << " positions for " << joint_count
+                                      << " joints");
+      return false;
+    }
+
+    const double point_time = rclcpp::Duration(point.time_from_start).seconds();
+    if (i > 0 && point_time <= point_times.back())
+    {
+      RCLCPP_ERROR_STREAM(LOGGER, "Cannot synchronize G01 body trajectory: time_from_start is not strictly "
+                                  "increasing at point "
+                                      << i);
+      return false;
+    }
+    point_times.push_back(point_time);
+  }
+
+  const auto source_points = trajectory.points;
+  const double start_time = point_times.front();
+  const double end_time = point_times.back();
+  const double duration = end_time - start_time;
+  const std::size_t sample_intervals =
+      source_points.size() == 1 ? 0 : static_cast<std::size_t>(std::ceil(duration / CSP_PATH_PERIOD_SEC));
+
+  std::vector<trajectory_msgs::msg::JointTrajectoryPoint> synchronized_points;
+  synchronized_points.reserve(sample_intervals + 1);
+  std::size_t segment = 0;
+  for (std::size_t sample = 0; sample <= sample_intervals; ++sample)
+  {
+    // 末点时间向上对齐到 5 ms，保证控制器的最后一个 200 Hz 周期也能取到终点。
+    const double synchronized_time = start_time + sample * CSP_PATH_PERIOD_SEC;
+    const double source_time = std::min(synchronized_time, end_time);
+    while (segment + 1 < point_times.size() - 1 && source_time > point_times[segment + 1])
+      ++segment;
+
+    trajectory_msgs::msg::JointTrajectoryPoint point;
+    point.positions.resize(joint_count);
+    if (source_points.size() == 1 || source_time >= end_time)
+    {
+      point.positions = source_points.back().positions;
+    }
+    else
+    {
+      const double segment_duration = point_times[segment + 1] - point_times[segment];
+      const double ratio = (source_time - point_times[segment]) / segment_duration;
+      for (std::size_t joint = 0; joint < joint_count; ++joint)
+      {
+        point.positions[joint] =
+            source_points[segment].positions[joint] +
+            ratio * (source_points[segment + 1].positions[joint] - source_points[segment].positions[joint]);
+      }
+    }
+
+    // CSP 消息是 Float32。先把 action goal 中的躯干点同步到同样的精度，
+    // 避免 /g01/joint_commands(double) 和 CSP(float) 只因精度不同而出现尾数差异。
+    if (waist_it != trajectory.joint_names.end())
+    {
+      const auto waist_index = static_cast<std::size_t>(std::distance(trajectory.joint_names.begin(), waist_it));
+      point.positions[waist_index] = static_cast<double>(static_cast<float>(point.positions[waist_index]));
+    }
+    if (lift_it != trajectory.joint_names.end())
+    {
+      const auto lift_index = static_cast<std::size_t>(std::distance(trajectory.joint_names.begin(), lift_it));
+      const float lift_mm = static_cast<float>(point.positions[lift_index] * LIFT_POSITION_SCALE);
+      point.positions[lift_index] = static_cast<double>(lift_mm) / LIFT_POSITION_SCALE;
+    }
+
+    point.time_from_start = rclcpp::Duration::from_seconds(synchronized_time);
+    synchronized_points.push_back(std::move(point));
+  }
+
+  const std::size_t original_point_count = trajectory.points.size();
+  trajectory.points = std::move(synchronized_points);
+  RCLCPP_INFO_STREAM(LOGGER, "Synchronized G01 body action trajectory: " << original_point_count << " MoveIt points -> "
+                                                                         << trajectory.points.size() << " shared "
+                                                                         << CSP_PATH_FREQUENCY_HZ << " Hz points");
+  return true;
 }
 
 bool FollowJointTrajectoryControllerHandle::appendJointPath(const trajectory_msgs::msg::JointTrajectory& trajectory,
@@ -124,6 +231,9 @@ void FollowJointTrajectoryControllerHandle::publishG01CspPaths(const trajectory_
   if (!has_waist && !has_lift)
     return;
 
+  const std::size_t waist_sample_count = waist_path.data.size();
+  const std::size_t lift_sample_count = lift_path.data.size();
+
   // 发布顺序是协议的一部分：先给电机控制节点发 1，再发送完整 CSP 轨迹，
   // 最后才把 FollowJointTrajectory goal 交给控制器。真机硬件插件只有在 goal
   // 进入 EXECUTING 后才会开始发布 /g01/joint_commands。
@@ -145,7 +255,9 @@ void FollowJointTrajectoryControllerHandle::publishG01CspPaths(const trajectory_
   RCLCPP_INFO_STREAM(LOGGER, "Preloaded G01 CSP trajectory with two "
                                  << CSP_PRELOAD_DELAY.count() << " ms delays before " << name_
                                  << " execution: " << (has_waist ? "waist " : "") << (has_lift ? "lift " : "") << "("
-                                 << trajectory.points.size() << " points)");
+                                 << trajectory.points.size() << " shared points -> waist " << waist_sample_count
+                                 << "/lift " << lift_sample_count << " CSP samples at " << CSP_PATH_FREQUENCY_HZ
+                                 << " Hz)");
 }
 
 bool FollowJointTrajectoryControllerHandle::sendTrajectory(const moveit_msgs::msg::RobotTrajectory& trajectory)
@@ -169,6 +281,9 @@ bool FollowJointTrajectoryControllerHandle::sendTrajectory(const moveit_msgs::ms
   control_msgs::action::FollowJointTrajectory::Goal goal = goal_template_;
   goal.trajectory = trajectory.joint_trajectory;
   goal.multi_dof_trajectory = trajectory.multi_dof_joint_trajectory;
+
+  if (!synchronizeG01BodyTrajectory(goal.trajectory))
+    return false;
 
   publishG01CspPaths(goal.trajectory);
 
