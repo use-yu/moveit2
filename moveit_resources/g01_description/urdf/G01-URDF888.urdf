@@ -277,10 +277,10 @@
     <child
       link="SJ" />
     <axis
-      xyz="0 -1 0" />
+      xyz="0 1 0" />
     <limit
-      lower="-0.25"
-      upper="0"
+      lower="0.0"
+      upper="0.25"
       effort="100"
       velocity="1" />
   </joint>
