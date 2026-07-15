@@ -164,6 +164,37 @@ JOINT_TARGETS = {
         "r_arm_joint5": -0 * math.pi,
         "r_arm_joint6": -0 * math.pi / 180,
     },
+    "dual_arm_body": {
+        "body_joint1": 0.0,
+        "body_joint2": 1.313,
+        "l_arm_joint1": -20 * math.pi / 180,
+        "l_arm_joint2": -102 * math.pi / 180,
+        "l_arm_joint3": -92 * math.pi / 180,
+        "l_arm_joint4": 137 * math.pi / 180,
+        "l_arm_joint5": -0 * math.pi,
+        "l_arm_joint6": -0 * math.pi / 180,
+        "r_arm_joint1": 80 * math.pi / 180,
+        "r_arm_joint2": -102 * math.pi / 180,
+        "r_arm_joint3": -92 * math.pi / 180,
+        "r_arm_joint4": 137 * math.pi / 180,
+        "r_arm_joint5": -0 * math.pi,
+        "r_arm_joint6": -0 * math.pi / 180,
+    },
+    "dual_arm_waist": {
+        "body_joint2": 1.313,
+        "l_arm_joint1": -20 * math.pi / 180,
+        "l_arm_joint2": -102 * math.pi / 180,
+        "l_arm_joint3": -92 * math.pi / 180,
+        "l_arm_joint4": 137 * math.pi / 180,
+        "l_arm_joint5": -0 * math.pi,
+        "l_arm_joint6": -0 * math.pi / 180,
+        "r_arm_joint1": 80 * math.pi / 180,
+        "r_arm_joint2": -102 * math.pi / 180,
+        "r_arm_joint3": -92 * math.pi / 180,
+        "r_arm_joint4": 137 * math.pi / 180,
+        "r_arm_joint5": -0 * math.pi,
+        "r_arm_joint6": -0 * math.pi / 180,
+    },
     "left_body": {
         "body_joint1": 0.0,
         "body_joint2": 1.313,
@@ -339,6 +370,7 @@ PLACE_JOINTS = {
     ],
     "right_arm": {
         "yubei_j": [
+            0.0, 30*math.pi/180,
             0.9902063012123108, -0.6606103777885437, -1.4372066259384155,
             -1.0370503664016724, -2.6659367084503174, -2.29879448,
         ],
@@ -347,6 +379,7 @@ PLACE_JOINTS = {
             -1.1022419929504395, -2.5003864765167236, -2.29879448,
         ],
         "yubei": [
+            0.0, 30*math.pi/180,
             0.9875547289848328, -0.6653450727462769, -1.4346156120300293,
             -1.0350865125656128, -2.6696741580963135, -2.2988312244415283,
         ],
@@ -357,6 +390,7 @@ PLACE_JOINTS = {
     },
     "left_arm": {
         "yubei_j": [
+            0.0, 30*math.pi/180,
             -0.9828664660453796, 0.6264781951904297, 1.393784523010254,
             1.1182692050933838, 2.6711831092834473, 0.891918420791626,
         ],
@@ -365,6 +399,7 @@ PLACE_JOINTS = {
             1.1796667575836182, 2.5052123069763184, 0.893162727355957,
         ],
         "yubei": [
+            0.0, 30*math.pi/180,
             -0.9856565594673157, 0.6248205900192261, 1.403222680091858,
             1.110521912574768, 2.6683006286621094, 0.7956140637397766,
         ],
@@ -399,10 +434,12 @@ EXCHANGE_Q3 = {
 # 交换
 EXCHANGE_Q2 = {
     "right": [
+        0.0, 30*math.pi/180,
         0.113298830,-1.437132861,-0.988730272,-0.706701233,0.628914759,-0.533279984,
         -1.894577193, -1.514854650, -0.775937512, -0.852444980, 0.728284757, 0.001667991,
     ],
     "left": [
+        0.0, 30*math.pi/180,
         1.894577193, 1.514854650, 0.775937512, 0.852444980, -0.728284757, -0.001667991,
         -0.113298828, 1.437132878, 0.988730233, 0.706701256, -0.628914758, -0.533279984,
     ],
@@ -880,11 +917,11 @@ def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
     return attempts
 
 
-def arm_context_for_body_group(group: str) -> tuple[str, str] | None:
-    """body 抓取组对应的纯臂组和纯臂规划坐标系。"""
-    if group == "left_body":
+def arm_context_for_group(group: str) -> tuple[str, str] | None:
+    """抓取 group 对应的纯臂 group 和纯臂规划坐标系。"""
+    if group in ("left_arm", "left_waist", "left_body"):
         return "left_arm", "l_base_link"
-    if group == "right_body":
+    if group in ("right_arm", "right_waist", "right_body"):
         return "right_arm", "r_base_link"
     return None
 
@@ -2774,7 +2811,6 @@ class G01Demo(Node):
         *,
         group: str,
         link: str,
-        plan_frame: str,
         first_return_mode: int,
         line_speed: float | None = None,
     ) -> bool:
@@ -2783,28 +2819,36 @@ class G01Demo(Node):
         参数：
             speed        : 5/8 OMPL 到 yubei 的速度缩放（0~1）。
             place_joints : 包含 yubei/fang 和 yubei_j/fang_j 的关节目标。
-            group        : SRDF 规划组，如 right_arm。
+            group        : yubei 使用的实际抓取 group。
             link         : 做笛卡尔直线运动的末端 link。
-            plan_frame   : FK 与笛卡尔路径使用的规划坐标系。
             first_return_mode: 1 选择 *_j；0/2 选择普通 yubei/fang。
             line_speed   : 6/8 yubei → fang 笛卡尔直线速度；None 时复用 speed。
         """
         log = self.get_logger()
         place_joint_names = joint_names_for_group(group)
+        arm_context = arm_context_for_group(group)
+        if arm_context is None:
+            log.error(f"[pick] group={group} 无法确定 fang 使用的纯臂 group")
+            return False
+        line_group, line_plan_frame = arm_context
+        line_joint_names = joint_names_for_group(line_group)
         line_speed = speed if line_speed is None else line_speed
         yubei_key = "yubei_j" if first_return_mode == 1 else "yubei"
         fang_key = "fang_j" if first_return_mode == 1 else "fang"
         if not isinstance(place_joints, dict) or yubei_key not in place_joints or fang_key not in place_joints:
             log.error(f"[pick] group={group} 的放置配置必须包含 {yubei_key} 和 {fang_key}")
             return False
-        yubei_joints = list(place_joints[yubei_key])
+        yubei_source = list(place_joints[yubei_key])
         fang_joints = list(place_joints[fang_key])
-        if len(yubei_joints) != len(place_joint_names) or len(fang_joints) != len(place_joint_names):
+        body_group = "left_body" if line_group == "left_arm" else "right_body"
+        full_yubei_count = len(joint_names_for_group(body_group))
+        if len(yubei_source) != full_yubei_count or len(fang_joints) != len(line_joint_names):
             log.error(
-                f"[pick] group={group} 放置配置长度错误：{yubei_key}={len(yubei_joints)}, "
-                f"{fang_key}={len(fang_joints)}, 关节数={len(place_joint_names)}"
+                f"[pick] group={group} 放置配置长度错误：{yubei_key}={len(yubei_source)}, "
+                f"{fang_key}={len(fang_joints)}, 期望={full_yubei_count}/{len(line_joint_names)}"
             )
             return False
+        yubei_joints = yubei_source[-len(place_joint_names):]
 
         log.info(f"[pick] 5/8  OMPL → {yubei_key} 放置预备位")
         current = self._get_joints(place_joint_names, wait_new=True)
@@ -2834,29 +2878,29 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        log.info(f"[pick] 6/8  末端笛卡尔直线 {yubei_key} → {fang_key}")
-        current = self._get_joints(place_joint_names, wait_new=True)
-        if current is None:
-            log.error("[pick] 读取当前关节失败")
+        log.info(f"[pick] 6/8  {line_group} 末端笛卡尔直线 {yubei_key} → {fang_key}")
+        line_current = self._get_joints(line_joint_names, wait_new=True)
+        if line_current is None:
+            log.error("[pick] 读取当前手臂关节失败")
             return False
-        fang_state = dict(zip(place_joint_names, fang_joints))
+        fang_state = dict(zip(line_joint_names, fang_joints))
         fang_pose = self._get_link_pose_fk(
             link,
             joints=fang_state,
-            plan_frame=plan_frame,
+            plan_frame=line_plan_frame,
         )
         if fang_pose is None:
             log.error(f"[pick] 无法由 {fang_key} 关节角计算目标末端位姿")
             return False
         yubei_to_fang_traj = self._cartesian_plan(
-            group,
+            line_group,
             link,
             fang_pose,
             speed_scale=line_speed,
             avoid_collisions=False,
-            start_joints=current,
-            joint_names=place_joint_names,
-            plan_frame=plan_frame,
+            start_joints=line_current,
+            joint_names=line_joint_names,
+            plan_frame=line_plan_frame,
         )
         if yubei_to_fang_traj is None:
             log.error(f"[pick] {yubei_key} → {fang_key} 笛卡尔直线规划失败")
@@ -2866,7 +2910,7 @@ class G01Demo(Node):
             return False
         log.info(
             f"[pick] {fang_key} 目标关节（用于 FK 生成直线终点）: "
-            + ", ".join(f"{n}={v:.3f}" for n, v in zip(place_joint_names, fang_joints))
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(line_joint_names, fang_joints))
         )
 
         log.info("按回车继续 …")
@@ -2893,17 +2937,17 @@ class G01Demo(Node):
             log.error("[pick] 7/8 反向播放 6/8 失败")
             return False
 
-        q1_count = len(place_joint_names)
-        if group == "left_arm":
+        q1_count = len(line_joint_names)
+        if line_group == "left_arm":
             q1_source = list(EXCHANGE_Q1[:6])
             q1_joints = q1_source[:q1_count]
             q1_slice_text = "前6"
-        elif group == "right_arm":
+        elif line_group == "right_arm":
             q1_source = list(EXCHANGE_Q1[-6:])
             q1_joints = q1_source[-q1_count:]
             q1_slice_text = "后6"
         else:
-            log.error(f"[pick] 8/8 group={group} 不支持按 Q1 固定点返回")
+            log.error(f"[pick] 8/8 group={line_group} 不支持按 Q1 固定点返回")
             return False
         if len(q1_joints) != q1_count:
             log.error(
@@ -2916,13 +2960,13 @@ class G01Demo(Node):
             f"[pick] 8/8  从当前位置运动到 Q1 固定点 "
             f"（{q1_slice_text} 个数，使用 {q1_count} 个关节）"
         )
-        current = self._get_joints(place_joint_names, wait_new=True)
-        if current is None:
+        line_current = self._get_joints(line_joint_names, wait_new=True)
+        if line_current is None:
             log.error("[pick] 8/8 读取当前关节失败")
             return False
-        goal = [make_joint_constraints_from_vector(group, place_joint_names, q1_joints)]
+        goal = [make_joint_constraints_from_vector(line_group, line_joint_names, q1_joints)]
         ok, used_ms, _to_q1_traj = self.move(
-            group, goal, start=current, plan_only=False, speed_scale=speed
+            line_group, goal, start=line_current, plan_only=False, speed_scale=speed
         )
         log.info(f"[pick] OMPL → Q1 固定点: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not ok:
@@ -2930,7 +2974,7 @@ class G01Demo(Node):
             return False
         log.info(
             "[pick] Q1 固定点返回完成: "
-            + ", ".join(f"{n}={v:.3f}" for n, v in zip(place_joint_names, q1_joints))
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(line_joint_names, q1_joints))
         )
         return True
 
@@ -3054,8 +3098,6 @@ class G01Demo(Node):
             log.error("[pick] 1/8 未返回 OMPL 轨迹，无法原路退回初始位置")
             return False
 
-
-
         log.info(
             f"[pick] 2/8  执行已缓存的 approach 轨迹 → q_target "
             f"（{len(approach_traj.joint_trajectory.points)} 点，免重规划）"
@@ -3104,14 +3146,6 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        if group in ("left_body", "right_body"):
-            log.info(
-                f"[pick] 抓取前腰部运动过，交换/复位前先回腰到 "
-                f"{waist_reset_angle:.6f} rad ({math.degrees(waist_reset_angle):.2f} deg)"
-            )
-            if not self.move_body_joint2(waist_reset_angle, speed_scale=0.5):
-                log.error("[pick] 腰部回 30 度失败")
-                return False
 
         cutoff_tangent_joints = q_pre
         if group in ("left_body", "right_body"):
@@ -3150,6 +3184,7 @@ class G01Demo(Node):
                 exchange_q3,
                 EXCHANGE_Q2,
                 source_link=link,
+                pick_group=group,
                 dual_speed=place_speed_scale,
                 cartesian_speed=speed_scale,
             ):
@@ -3158,11 +3193,9 @@ class G01Demo(Node):
             if tool_side == "right":
                 place_group = "left_arm"
                 place_link = "l_tool"
-                place_frame = "l_base_link"
             else:
                 place_group = "right_arm"
                 place_link = "r_tool"
-                place_frame = "r_base_link"
             place_joint_config = PLACE_JOINTS.get(place_group)
             if not isinstance(place_joint_config, dict):
                 log.error(f"[pick] PLACE_JOINTS 未配置 {place_group}")
@@ -3173,7 +3206,6 @@ class G01Demo(Node):
                 place_joint_config,
                 group=place_group,
                 link=place_link,
-                plan_frame=place_frame,
                 first_return_mode=first_return_mode,
                 line_speed=speed_scale,
             ):
@@ -3190,22 +3222,21 @@ class G01Demo(Node):
             #     + ", ".join(f"{n}={pick_start_joints[n]:.3f}" for n in joint_names)
             # )
         
-            place_group = group
-            place_frame = plan_frame
-            arm_context = arm_context_for_body_group(group)
-            if arm_context is not None:
-                place_group, place_frame = arm_context
-            place_joint_config = PLACE_JOINTS.get(place_group)
+            arm_context = arm_context_for_group(group)
+            if arm_context is None:
+                log.error(f"[pick] group={group} 无法确定放置所用的纯臂 group")
+                return False
+            place_arm_group, _ = arm_context
+            place_joint_config = PLACE_JOINTS.get(place_arm_group)
             if not isinstance(place_joint_config, dict):
-                log.error(f"[pick] PLACE_JOINTS 未配置 {place_group}")
+                log.error(f"[pick] PLACE_JOINTS 未配置 {place_arm_group}")
                 return False
 
             if not self._place_and_return(
                 place_speed_scale,
                 place_joint_config,
-                group=place_group,
+                group=group,
                 link=link,
-                plan_frame=place_frame,
                 first_return_mode=first_return_mode,
                 line_speed=speed_scale,
             ):
@@ -3220,14 +3251,31 @@ class G01Demo(Node):
         q2_by_side: dict[str, Sequence[float]],
         *,
         source_link: str,
+        pick_group: str,
         dual_speed: float = 0.2,
         cartesian_speed: float = 0.2,
         z_down_distance: float | None = None,
     ) -> bool:
-        """双臂交换：根据持物末端选择 Q2、运动臂和相反侧接物工具。"""
+        """双臂交换：Q2 根据抓取 group 选择双臂/+腰/+升降规划组。"""
         log = self.get_logger()
-        dual_group = "dual_arm_y"
-        dual_joint_names = joint_names_for_group(dual_group)
+        arm_dual_group = "dual_arm"
+        arm_dual_joint_names = joint_names_for_group(arm_dual_group)
+
+        if pick_group in ("left_arm", "right_arm"):
+            exchange_group = "dual_arm"
+            exchange_joint_names = arm_dual_joint_names
+            q2_slice_text = "后12个"
+        elif pick_group in ("left_waist", "right_waist"):
+            exchange_group = "dual_arm_waist"
+            exchange_joint_names = ["body_joint2", *arm_dual_joint_names]
+            q2_slice_text = "后13个"
+        elif pick_group in ("left_body", "right_body"):
+            exchange_group = "dual_arm_body"
+            exchange_joint_names = ["body_joint1", "body_joint2", *arm_dual_joint_names]
+            q2_slice_text = "全部14个"
+        else:
+            log.error(f"[exchange] 不支持 pick_group={pick_group}")
+            return False
 
         source_side = tool_side_for_link(source_link)
         if source_side is None:
@@ -3250,22 +3298,35 @@ class G01Demo(Node):
         if source_side not in q2_by_side:
             log.error(f"[exchange] EXCHANGE_Q2 未配置 {source_side}")
             return False
-        q2 = q2_by_side[source_side]
+        q2_source = list(q2_by_side[source_side])
+        if len(q2_source) != 14:
+            log.error(f"[exchange] EXCHANGE_Q2[{source_side!r}] 长度错误: {len(q2_source)} != 14")
+            return False
+        q2 = q2_source[-len(exchange_joint_names):]
 
         if not self.set_tool_power(receiver_side, 0):
             log.error(f"[exchange] {receiver_label}工具下电失败")
             return False
 
-        if len(q1) != len(dual_joint_names):
-            log.error(f"[exchange] q1 长度错误: {len(q1)} != {len(dual_joint_names)}")
+        if len(q1) != len(arm_dual_joint_names):
+            log.error(f"[exchange] q1 长度错误: {len(q1)} != {len(arm_dual_joint_names)}")
             return False
-        if len(q2) != len(dual_joint_names):
-            log.error(f"[exchange] q2 长度错误: {len(q2)} != {len(dual_joint_names)}")
+        if len(q2) != len(exchange_joint_names):
+            log.error(f"[exchange] q2 长度错误: {len(q2)} != {len(exchange_joint_names)}")
             return False
 
-        log.info("[exchange] 1/4  dual_arm 规划执行到 q2")
-        if not self.plan_execute_joint_waypoints(dual_group, dual_speed, dual_joint_names, [q2], num_attempts=20):
-            log.error("[exchange] dual_arm 到 q2 失败")
+        log.info(
+            f"[exchange] 1/4  {exchange_group} 使用 EXCHANGE_Q2 {q2_slice_text} "
+            f"规划执行到 q2"
+        )
+        if not self.plan_execute_joint_waypoints(
+            exchange_group,
+            dual_speed,
+            exchange_joint_names,
+            [q2],
+            num_attempts=20,
+        ):
+            log.error(f"[exchange] {exchange_group} 到 q2 失败")
             return False
 
         log.info(
@@ -3334,9 +3395,14 @@ class G01Demo(Node):
             log.error(f"[exchange] {source_group} 反向直线返回失败")
             return False
 
-        log.info("[exchange] 4/4  dual_arm 规划执行到 q1")
-        if not self.plan_execute_joint_waypoints(dual_group, dual_speed, dual_joint_names, [q1]):
-            log.error("[exchange] dual_arm 到 q1 失败")
+        log.info(f"[exchange] 4/4  {arm_dual_group} 规划执行到 q1")
+        if not self.plan_execute_joint_waypoints(
+            arm_dual_group,
+            dual_speed,
+            arm_dual_joint_names,
+            [q1],
+        ):
+            log.error(f"[exchange] {arm_dual_group} 到 q1 失败")
             return False
 
         log.info("[exchange] 双臂交换流程完成")
