@@ -17,6 +17,7 @@ g01实际部署：
 ros2 topic pub -r 50 /driver_report/taihu_motor_info pkg_msg_define/msg/MotorRuntimeInfo "{state: 0, error_code: 0, reserved: 0, position: 0.523598, speed: 0.0}"
 
 启动moveit：
+    export DISPLAY=:0
     ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true
     
 ros2 service call /g01/right/tool_commands dobot_msgs_v4/srv/SetToolPower "{status: 0}"

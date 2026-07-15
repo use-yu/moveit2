@@ -130,14 +130,9 @@ EE_LINK = "r_tool"
 # )
 # 各组的关节目标 [rad]（键名须与 URDF/SRDF 一致）
 JOINT_TARGETS = {
-    "body": {
-        # "base_joint1": 1.0,
-        # "base_joint2": 0.0,
-        # "body_joint1": 0.0,
-        "body_joint2": 0.0,
-    },
+
     # 预备位：底盘略前伸、躯干抬起、双臂零位（与 hello_go1.cpp dual_arm 一致）
-    "dual_arm": {
+    "robot": {
         "base_joint1": 1.25,
         "base_joint2": 0.0,
         "body_joint1": -0.25,
@@ -155,7 +150,7 @@ JOINT_TARGETS = {
         "r_arm_joint5": -0 * math.pi,
         "r_arm_joint6": -0 * math.pi / 180,
     },
-    "dual_arm_y": {
+    "dual_arm": {
         "l_arm_joint1": -20 * math.pi / 180,
         "l_arm_joint2": -102 * math.pi / 180,
         "l_arm_joint3": -92 * math.pi / 180,
@@ -170,7 +165,16 @@ JOINT_TARGETS = {
         "r_arm_joint6": -0 * math.pi / 180,
     },
     "left_body": {
-        # "body_joint1": 0.0,
+        "body_joint1": 0.0,
+        "body_joint2": 1.313,
+        "l_arm_joint1": 1.8697,
+        "l_arm_joint2": 0.2,
+        "l_arm_joint3": 0.135997,
+        "l_arm_joint4": 1.23459,
+        "l_arm_joint5": 2.1201,
+        "l_arm_joint6": -1.5702,
+    },
+    "left_waist": {
         "body_joint2": 1.313,
         "l_arm_joint1": 1.8697,
         "l_arm_joint2": 0.2,
@@ -191,8 +195,37 @@ JOINT_TARGETS = {
         "l_arm_joint5": 2.1201,
         "l_arm_joint6": -1.5702,
     },
+    "left_arm": {
+        "l_arm_joint1": 1.8697,
+        "l_arm_joint2": 0.2,
+        "l_arm_joint3": 0.135997,
+        "l_arm_joint4": 1.23459,
+        "l_arm_joint5": 2.1201,
+        "l_arm_joint6": -1.5702,
+    },
+    "right": {
+        "base_joint1": 1.25,
+        "base_joint2": 0.0,
+        "body_joint1": 0.0,
+        "body_joint2": 1.313,
+        "r_arm_joint1": -1.8697,
+        "r_arm_joint2": 0.2,
+        "r_arm_joint3": 0.135997,
+        "r_arm_joint4": 1.23459,
+        "r_arm_joint5": 2.1201,
+        "r_arm_joint6": -1.5702,
+    },
     "right_body": {
-        # "body_joint1": 0.0,
+        "body_joint1": 0.0,
+        "body_joint2": -1.313,
+        "r_arm_joint1": -1.8697,
+        "r_arm_joint2": 0.2,
+        "r_arm_joint3": 0.135997,
+        "r_arm_joint4": 1.23459,
+        "r_arm_joint5": 2.1201,
+        "r_arm_joint6": -1.5702,
+    },
+    "right_waist": {
         "body_joint2": -1.313,
         "r_arm_joint1": -1.8697,
         "r_arm_joint2": 0.2,
@@ -209,14 +242,7 @@ JOINT_TARGETS = {
         "r_arm_joint5": 2.1201,
         "r_arm_joint6": -1.5702,
     },
-    "left_arm": {
-        "l_arm_joint1": 1.8697,
-        "l_arm_joint2": 0.2,
-        "l_arm_joint3": 0.135997,
-        "l_arm_joint4": 1.23459,
-        "l_arm_joint5": 2.1201,
-        "l_arm_joint6": -1.5702,
-    },
+    
 }
 
 # 位姿规划时作为起始状态的关节（不含底盘，与 left_body 组一致）

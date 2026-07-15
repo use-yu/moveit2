@@ -621,7 +621,7 @@ def send_dashboard_once(ip, port, command):
         sock.close()
 
 stop = True
-SERVER_ADDRESSES = ['192.168.5.1', '192.168.5.2']
+SERVER_ADDRESSES = ['192.168.1.1', '192.168.1.2']
 SERVER_PORT = 29999
 
 def create_client_socket(ip, port):
