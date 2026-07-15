@@ -90,7 +90,7 @@ from dobot_msgs_v4.srv import SetToolPower
 GREEN = '\033[32m'
 RESET = '\033[0m'
 # 第一步：关节空间规划使用哪个 SRDF 组
-ACTIVE_GROUP = "dual_arm_y"
+
 
 # 第二步：末端位姿规划组与目标（连杆 L6，坐标系 base_link）
 POSE_GROUP = "right_arm"
@@ -832,7 +832,7 @@ def _side_order_from_xyz_rpy(xyz_rpy: dict) -> tuple[str, str]:
 
 
 def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
-    """先只用手臂验证；两只手臂都不行，再验证手臂+腰部。"""
+    """依次验证纯臂、腰+臂、身体+臂，每层均按物体侧向决定左右顺序。"""
     side_order = _side_order_from_xyz_rpy(xyz_rpy)
     attempts: list[dict[str, str]] = []
     for side in side_order:
@@ -842,6 +842,14 @@ def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
             "link": "l_tool" if side == "left" else "r_tool",
             "plan_frame": "l_base_link" if side == "left" else "r_base_link",
             "xyz_key": side,
+        })
+    for side in side_order:
+        attempts.append({
+            "side": side,
+            "group": f"{side}_waist",
+            "link": "l_tool" if side == "left" else "r_tool",
+            "plan_frame": "SJ",
+            "xyz_key": f"{side}_sj",
         })
     for side in side_order:
         attempts.append({
@@ -869,7 +877,9 @@ def arm_context_for_body_group(group: str) -> tuple[str, str] | None:
 # 每个点内按 side_value = xyz_rpy["sj"][2] 判断左右顺序：
 
 # side_value > 0:
-#   left_arm → right_arm → left_body → right_body
+#   left_arm → right_arm → left_waist → right_waist → left_body → right_body
+# side_value <= 0:
+#   right_arm → left_arm → right_waist → left_waist → right_body → left_body
 def validate_reachable_grasp(node, all_xyz_rpy: list[dict], speed_scale: float = 0.2):
     """按点和候选 group 顺序验证 IK 可解 + cartesian approach 可行。"""
     log = node.get_logger()
@@ -3510,7 +3520,7 @@ def main(argv: list[str] | None = None) -> int:
         targets = JOINT_TARGETS["dual_arm"]
         joint_names = list(targets.keys())
         Q1 = [
-            0.0, 0.0, 0.0, 30 * math.pi / 180,
+            0.0, 30 * math.pi / 180,
             -1.57, -0.15, -1.578090, -1.370549, -1.672852, -0.588477,
             1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
         ]
@@ -3537,7 +3547,7 @@ def main(argv: list[str] | None = None) -> int:
             return False
         first_return_modes, all_xyz_rpy = vision_pose
 
-        # 可达性验证：按视觉点顺序，先 left/right_arm，再 left/right_body。
+        # 可达性验证：按视觉点顺序，依次验证 arm、waist、body。
         reachable = validate_reachable_grasp(node, all_xyz_rpy, speed_scale=0.2)
         if reachable is None:
             log.error("没有找到 IK 可解 + cartesian approach 可行的视觉点")
@@ -3597,9 +3607,6 @@ def main(argv: list[str] | None = None) -> int:
         return True
 
     try:
-        if ACTIVE_GROUP not in JOINT_TARGETS:
-            log.error(f"未知 ACTIVE_GROUP={ACTIVE_GROUP}，可选: {list(JOINT_TARGETS)}")
-            return 1
 
         # 上位机通信
         # grasp_cmd = node.wait_for_grasp_start()
