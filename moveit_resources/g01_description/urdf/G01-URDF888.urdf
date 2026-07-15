@@ -321,12 +321,12 @@
       </geometry>
     </collision>
     <!-- 头部 -->
-    <collision>
+    <!-- <collision>
       <origin xyz="-0.15 0.28 -0.094" rpy="0 0 0" />
       <geometry>
         <box size="0.22 0.15 0.13" />
       </geometry>
-    </collision>
+    </collision> -->
     <!-- <collision>
       <origin
         xyz="0 0 0"

@@ -5,10 +5,18 @@
 G01 MoveIt 演示脚本
 
 功能（按顺序执行）：
-  1. 向规划场景添加半透明「深框」碰撞体（底板 + 四面墙，顶部敞开）
-  2. 对 ACTIVE_GROUP 做关节空间规划并执行（例如 dual_arm）
-  3. 对 left_body 组做末端位姿（L6）规划并执行
-  4. 程序退出时在 finally 中自动移除深框
+机器人先到初始位
+→ 读取视觉点
+→ 生成左臂、右臂、SJ、base_link 下的目标位姿
+→ 按视觉点和 group 顺序做可达性验证
+→ 选中第一个“有 IK + 直线 approach 可行”的候选
+→ OMPL 到 q_pre
+→ Cartesian approach 到抓取点
+→ 工具上电抓取
+→ 反向 Cartesian 回 q_pre
+→ 根据 first_return_mode：
+   ├─ mode=1：双臂交换 → 接物臂放置
+   └─ mode=0/2：抓取臂直接放置
 
 前提：
   - 已启动 move_group： ros2 launch g01_moveit_config demo.launch.py
@@ -3146,19 +3154,13 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-
-        cutoff_tangent_joints = q_pre
-        if group in ("left_body", "right_body"):
-            cutoff_tangent_joints = dict(q_pre)
-            cutoff_tangent_joints[WAIST_BODY_JOINT] = waist_reset_angle
-
         if not self.add_frame_cutoff_only_for_pose(
             target_pose,
             source_frame=plan_frame,
             target_frame=SCENE_FRAME,
             joint_names=cutoff_joint_names,
             tangent_link=link,
-            tangent_joints=cutoff_tangent_joints,
+            tangent_joints=q_pre,
         ):
             log.error("[pick] 第一段复位后添加隔板失败")
             return False
@@ -3454,7 +3456,6 @@ def main(argv: list[str] | None = None) -> int:
         targets = JOINT_TARGETS["dual_arm"]
         joint_names = list(targets.keys())
         Q1 = [
-            0.0, 30 * math.pi / 180,
             -1.57, -0.15, -1.578090, -1.370549, -1.672852, -0.588477,
             1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
         ]
