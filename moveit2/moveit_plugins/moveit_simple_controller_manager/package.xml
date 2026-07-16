@@ -25,6 +25,7 @@
   <depend version_gte="1.11.2">pluginlib</depend>
   <depend>control_msgs</depend>
   <depend>rclcpp_action</depend>
+  <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>trajectory_msgs</depend>
 

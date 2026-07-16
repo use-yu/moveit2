@@ -40,6 +40,7 @@
 #include <moveit_simple_controller_manager/action_based_controller_handle.h>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <control_msgs/msg/joint_tolerance.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 #include <functional>
@@ -57,6 +58,12 @@ public:
   FollowJointTrajectoryControllerHandle(const rclcpp::Node::SharedPtr& node, const std::string& name,
                                         const std::string& action_ns);
 
+  bool prepareTrajectory(moveit_msgs::msg::RobotTrajectory& trajectory) override;
+  bool coordinatesTrajectoryExecution() const override;
+  bool prepareTrajectoryExecution(const std::vector<moveit_msgs::msg::RobotTrajectory>& trajectories) override;
+  rclcpp::Duration getTrajectoryStartDelay() const override;
+  bool publishTrajectoryExecutionSchedule(const rclcpp::Time& start_time,
+                                          const std::vector<std::string>& joint_names) override;
   bool sendTrajectory(const moveit_msgs::msg::RobotTrajectory& trajectory) override;
 
   // TODO(JafarAbdi): Revise parameter lookup
@@ -74,7 +81,7 @@ protected:
 
 private:
   bool synchronizeG01BodyTrajectory(trajectory_msgs::msg::JointTrajectory& trajectory) const;
-  void publishG01CspPaths(const trajectory_msgs::msg::JointTrajectory& trajectory);
+  bool publishG01CspPaths(const std::vector<moveit_msgs::msg::RobotTrajectory>& trajectories);
   bool appendJointPath(const trajectory_msgs::msg::JointTrajectory& trajectory, const std::string& joint_name,
                        double position_scale, std_msgs::msg::Float32MultiArray& path) const;
 
@@ -83,6 +90,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr motor_command_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr waist_csp_path_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr lift_csp_path_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr execution_schedule_pub_;
+  bool trajectory_prepared_{ false };
 };
 
 }  // end namespace moveit_simple_controller_manager

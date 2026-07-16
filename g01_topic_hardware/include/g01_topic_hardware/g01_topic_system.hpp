@@ -36,6 +36,8 @@ public:
 
 private:
   void on_joint_state(const sensor_msgs::msg::JointState & msg);
+  void on_execution_schedule(const sensor_msgs::msg::JointState & msg);
+  void clear_execution_schedule();
   void setup_trajectory_action_watchers();
   std::vector<size_t> joint_indices_for_controller(const std::string & controller) const;
   bool is_trajectory_executing() const;
@@ -48,10 +50,12 @@ private:
   std::atomic<bool> state_received_{false};
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr state_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr execution_schedule_sub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr command_pub_;
 
   std::string state_topic_;
   std::string command_topic_;
+  std::string execution_schedule_topic_{"/g01/trajectory_execution_schedule"};
 
   std::vector<std::string> joint_names_;
   std::unordered_map<std::string, size_t> joint_index_;
@@ -68,6 +72,12 @@ private:
   std::vector<std::vector<size_t>> controller_joint_indices_;
   std::vector<std::shared_ptr<std::atomic<bool>>> controller_executing_;
   std::vector<rclcpp::SubscriptionBase::SharedPtr> action_status_subs_;
+
+  std::mutex execution_schedule_mutex_;
+  std::vector<size_t> scheduled_joint_indices_;
+  std::vector<bool> scheduled_controller_mask_;
+  int64_t scheduled_start_ns_{0};
+  bool scheduled_execution_started_{false};
 };
 
 }  // namespace g01_topic_hardware

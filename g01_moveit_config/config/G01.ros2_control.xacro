@@ -10,7 +10,8 @@
                 <xacro:if value="${hardware_plugin == 'g01_topic_hardware/G01TopicSystem'}">
                     <param name="state_topic">${state_topic}</param>
                     <param name="command_topic">${command_topic}</param>
-                    <param name="trajectory_controllers">left_arm_controller,right_arm_controller,body_controller</param>
+                    <param name="execution_schedule_topic">/g01/trajectory_execution_schedule</param>
+                    <param name="trajectory_controllers">left_arm_controller,right_arm_controller,base_controller,lift_controller,waist_controller</param>
                     <param name="state_timeout_sec">0.5</param>
                 </xacro:if>
             </hardware>

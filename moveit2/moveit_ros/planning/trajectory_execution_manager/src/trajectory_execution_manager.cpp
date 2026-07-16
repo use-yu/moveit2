@@ -512,7 +512,15 @@ void TrajectoryExecutionManager::continuousExecutionThread()
           break;
         }
 
-        // push all trajectories to all controllers simultaneously
+        // Complete all external trajectory preparation before sending the first controller goal.
+        if (!handles.empty() && !prepareAndScheduleTrajectories(handles, context->trajectory_parts_))
+        {
+          RCLCPP_ERROR(LOGGER, "Failed to prepare synchronized controller trajectories");
+          last_execution_status_ = moveit_controller_manager::ExecutionStatus::ABORTED;
+          handles.clear();
+        }
+
+        // All goals carry the same future start stamp, so these sequential service calls start synchronously.
         if (!handles.empty())
           for (std::size_t i = 0; i < context->trajectory_parts_.size(); ++i)
           {
@@ -999,6 +1007,84 @@ bool TrajectoryExecutionManager::distributeTrajectory(const moveit_msgs::msg::Ro
   return true;
 }
 
+bool TrajectoryExecutionManager::prepareAndScheduleTrajectories(
+    const std::vector<moveit_controller_manager::MoveItControllerHandlePtr>& handles,
+    std::vector<moveit_msgs::msg::RobotTrajectory>& parts)
+{
+  if (handles.size() != parts.size())
+  {
+    RCLCPP_ERROR(LOGGER, "Cannot prepare trajectories: %zu controller handles for %zu trajectory parts", handles.size(),
+                 parts.size());
+    return false;
+  }
+
+  moveit_controller_manager::MoveItControllerHandlePtr coordinator;
+  for (std::size_t i = 0; i < handles.size(); ++i)
+  {
+    if (!handles[i]->prepareTrajectory(parts[i]))
+    {
+      RCLCPP_ERROR(LOGGER, "Controller %s failed to prepare its trajectory", handles[i]->getName().c_str());
+      return false;
+    }
+    if (!coordinator && handles[i]->coordinatesTrajectoryExecution())
+      coordinator = handles[i];
+  }
+
+  if (!coordinator)
+    return true;
+
+  // External paths (G01 waist/lift CSP) must be completely preloaded before any action goal is sent.
+  if (!coordinator->prepareTrajectoryExecution(parts))
+  {
+    RCLCPP_ERROR(LOGGER, "Controller %s failed to prepare the synchronized trajectory batch",
+                 coordinator->getName().c_str());
+    return false;
+  }
+
+  rclcpp::Duration start_delay = rclcpp::Duration::from_seconds(0.0);
+  for (const auto& handle : handles)
+    start_delay = std::max(start_delay, handle->getTrajectoryStartDelay());
+
+  rclcpp::Time start_time = node_->now() + start_delay;
+  for (const auto& part : parts)
+  {
+    const rclcpp::Time joint_start(part.joint_trajectory.header.stamp);
+    const rclcpp::Time multi_dof_start(part.multi_dof_joint_trajectory.header.stamp);
+    if (joint_start > start_time)
+      start_time = joint_start;
+    if (multi_dof_start > start_time)
+      start_time = multi_dof_start;
+  }
+
+  std::set<std::string> seen_joints;
+  std::vector<std::string> scheduled_joints;
+  for (auto& part : parts)
+  {
+    if (!part.joint_trajectory.points.empty())
+      part.joint_trajectory.header.stamp = start_time;
+    if (!part.multi_dof_joint_trajectory.points.empty())
+      part.multi_dof_joint_trajectory.header.stamp = start_time;
+
+    for (const auto& name : part.joint_trajectory.joint_names)
+      if (seen_joints.insert(name).second)
+        scheduled_joints.push_back(name);
+    for (const auto& name : part.multi_dof_joint_trajectory.joint_names)
+      if (seen_joints.insert(name).second)
+        scheduled_joints.push_back(name);
+  }
+
+  if (!coordinator->publishTrajectoryExecutionSchedule(start_time, scheduled_joints))
+  {
+    RCLCPP_ERROR(LOGGER, "Controller %s failed to publish the synchronized execution schedule",
+                 coordinator->getName().c_str());
+    return false;
+  }
+
+  RCLCPP_INFO(LOGGER, "Prepared %zu synchronized controller trajectories to start at %.9f", parts.size(),
+              start_time.seconds());
+  return true;
+}
+
 bool TrajectoryExecutionManager::validate(const TrajectoryExecutionContext& context) const
 {
   if (allowed_start_tolerance_ == 0)  // skip validation on this magic number
@@ -1437,6 +1523,14 @@ bool TrajectoryExecutionManager::executePart(std::size_t part_index)
           active_handles_[i] = h;
         }
         handles = active_handles_;  // keep a copy for later, to avoid thread safety issues
+        if (!prepareAndScheduleTrajectories(active_handles_, context.trajectory_parts_))
+        {
+          active_handles_.clear();
+          current_context_ = -1;
+          last_execution_status_ = moveit_controller_manager::ExecutionStatus::ABORTED;
+          RCLCPP_ERROR(LOGGER, "Failed to prepare synchronized controller trajectories");
+          return false;
+        }
         for (std::size_t i = 0; i < context.trajectory_parts_.size(); ++i)
         {
           bool ok = false;

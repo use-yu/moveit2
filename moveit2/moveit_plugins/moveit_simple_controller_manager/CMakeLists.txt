@@ -11,6 +11,7 @@ find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(rclcpp_action REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 
@@ -21,6 +22,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   control_msgs
   rclcpp
   rclcpp_action
+  sensor_msgs
   std_msgs
   trajectory_msgs
   moveit_core

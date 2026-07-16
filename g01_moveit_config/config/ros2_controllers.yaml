@@ -11,7 +11,15 @@ controller_manager:
       type: joint_trajectory_controller/JointTrajectoryController
 
 
-    body_controller:
+    base_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+
+    lift_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+
+    waist_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
 
@@ -46,15 +54,31 @@ right_arm_controller:
     state_interfaces:
       - position
       - velocity
-body_controller:
+base_controller:
   ros__parameters:
     joints:
       - base_joint1
       - base_joint2
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+lift_controller:
+  ros__parameters:
+    joints:
       - body_joint1
+    # 躯干 action goal 已预先离散为 5 ms 点，禁止控制器再次样条插值。
+    interpolation_method: none
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+waist_controller:
+  ros__parameters:
+    joints:
       - body_joint2
-    # left_body/right_body 执行时轨迹只含 body_joint1/2，不含底盘关节；必须为 true
-    allow_partial_joints_goal: true
     # 躯干 action goal 已预先离散为 5 ms 点，禁止控制器再次样条插值，
     # 保证 /g01/joint_commands 和预下发 CSP 使用同一组点。
     interpolation_method: none

@@ -127,6 +127,46 @@ public:
    * Return false when the controller cannot accept the trajectory. */
   virtual bool sendTrajectory(const moveit_msgs::msg::RobotTrajectory& trajectory) = 0;
 
+  /** \brief Prepare one controller-specific trajectory before any controller in the batch is started.
+   *
+   * The default implementation is a no-op. Implementations may resample or otherwise update the
+   * trajectory in place. */
+  virtual bool prepareTrajectory(moveit_msgs::msg::RobotTrajectory& /*trajectory*/)
+  {
+    return true;
+  }
+
+  /** \brief Whether this handle coordinates preparation for the complete multi-controller batch. */
+  virtual bool coordinatesTrajectoryExecution() const
+  {
+    return false;
+  }
+
+  /** \brief Prepare external hardware for all trajectories in one execution batch.
+   *
+   * This hook runs after every per-controller prepareTrajectory() call and before any action goal is sent.
+   * Only the first handle returning true from coordinatesTrajectoryExecution() is called. */
+  virtual bool prepareTrajectoryExecution(
+      const std::vector<moveit_msgs::msg::RobotTrajectory>& /*trajectories*/)
+  {
+    return true;
+  }
+
+  /** \brief Minimum delay between preparation and the shared trajectory start time. */
+  virtual rclcpp::Duration getTrajectoryStartDelay() const
+  {
+    return rclcpp::Duration::from_seconds(0.0);
+  }
+
+  /** \brief Publish an optional execution schedule for a synchronized controller batch.
+   *
+   * Return true when the schedule was handled. */
+  virtual bool publishTrajectoryExecutionSchedule(
+      const rclcpp::Time& /*start_time*/, const std::vector<std::string>& /*joint_names*/)
+  {
+    return false;
+  }
+
   /** \brief Cancel the execution of any motion using this controller.
    *
    * Report false if canceling is not possible.

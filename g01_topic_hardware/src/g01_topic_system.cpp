@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 
 #include <action_msgs/msg/goal_status_array.hpp>
@@ -73,6 +74,10 @@ hardware_interface::CallbackReturn G01TopicSystem::on_init(const hardware_interf
   if (it_cmd != info_.hardware_parameters.end()) {
     command_topic_ = it_cmd->second;
   }
+  auto it_schedule = info_.hardware_parameters.find("execution_schedule_topic");
+  if (it_schedule != info_.hardware_parameters.end()) {
+    execution_schedule_topic_ = it_schedule->second;
+  }
 
   if (state_topic_.empty() || command_topic_.empty()) {
     RCLCPP_ERROR(
@@ -95,13 +100,21 @@ hardware_interface::CallbackReturn G01TopicSystem::on_init(const hardware_interf
     [this](sensor_msgs::msg::JointState::SharedPtr msg) { this->on_joint_state(*msg); });
 
   setup_trajectory_action_watchers();
+  execution_schedule_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
+    execution_schedule_topic_, rclcpp::QoS(10),
+    [this](sensor_msgs::msg::JointState::SharedPtr msg) { this->on_execution_schedule(*msg); });
+
+  RCLCPP_INFO(
+    rclcpp::get_logger("g01_topic_hardware"),
+    "Synchronized execution schedule: %s", execution_schedule_topic_.c_str());
 
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 void G01TopicSystem::setup_trajectory_action_watchers()
 {
-  std::string controllers_csv = "left_arm_controller,right_arm_controller,body_controller";
+  std::string controllers_csv =
+    "left_arm_controller,right_arm_controller,base_controller,lift_controller,waist_controller";
   auto it_ctrl = info_.hardware_parameters.find("trajectory_controllers");
   if (it_ctrl != info_.hardware_parameters.end()) {
     controllers_csv = it_ctrl->second;
@@ -150,8 +163,12 @@ std::vector<size_t> G01TopicSystem::joint_indices_for_controller(const std::stri
     names = {
       "r_arm_joint1", "r_arm_joint2", "r_arm_joint3",
       "r_arm_joint4", "r_arm_joint5", "r_arm_joint6"};
-  } else if (controller == "body_controller") {
-    names = {"base_joint1", "base_joint2", "body_joint1", "body_joint2"};
+  } else if (controller == "base_controller") {
+    names = {"base_joint1", "base_joint2"};
+  } else if (controller == "lift_controller") {
+    names = {"body_joint1"};
+  } else if (controller == "waist_controller") {
+    names = {"body_joint2"};
   } else {
     RCLCPP_WARN(
       rclcpp::get_logger("g01_topic_hardware"),
@@ -168,6 +185,57 @@ std::vector<size_t> G01TopicSystem::joint_indices_for_controller(const std::stri
     }
   }
   return indices;
+}
+
+void G01TopicSystem::clear_execution_schedule()
+{
+  scheduled_joint_indices_.clear();
+  scheduled_controller_mask_.clear();
+  scheduled_start_ns_ = 0;
+  scheduled_execution_started_ = false;
+}
+
+void G01TopicSystem::on_execution_schedule(const sensor_msgs::msg::JointState & msg)
+{
+  std::vector<size_t> joint_indices;
+  std::unordered_set<size_t> unique_indices;
+  joint_indices.reserve(msg.name.size());
+  for (const auto & name : msg.name) {
+    const auto it = joint_index_.find(name);
+    if (it == joint_index_.end()) {
+      RCLCPP_WARN(
+        rclcpp::get_logger("g01_topic_hardware"),
+        "Ignoring unknown joint '%s' in execution schedule", name.c_str());
+      continue;
+    }
+    if (unique_indices.insert(it->second).second) {
+      joint_indices.push_back(it->second);
+    }
+  }
+
+  std::vector<bool> controller_mask(controller_joint_indices_.size(), false);
+  for (size_t controller = 0; controller < controller_joint_indices_.size(); ++controller) {
+    for (const auto index : controller_joint_indices_[controller]) {
+      if (unique_indices.find(index) != unique_indices.end()) {
+        controller_mask[controller] = true;
+        break;
+      }
+    }
+  }
+
+  std::scoped_lock lk(execution_schedule_mutex_);
+  clear_execution_schedule();
+  if (joint_indices.empty()) {
+    return;
+  }
+  scheduled_joint_indices_ = std::move(joint_indices);
+  scheduled_controller_mask_ = std::move(controller_mask);
+  scheduled_start_ns_ = rclcpp::Time(msg.header.stamp).nanoseconds();
+
+  RCLCPP_INFO(
+    rclcpp::get_logger("g01_topic_hardware"),
+    "Received synchronized execution schedule: %zu joints, start=%.9f",
+    scheduled_joint_indices_.size(), static_cast<double>(scheduled_start_ns_) / 1e9);
 }
 
 bool G01TopicSystem::is_trajectory_executing() const
@@ -254,6 +322,10 @@ hardware_interface::CallbackReturn G01TopicSystem::on_deactivate(
       flag->store(false);
     }
   }
+  {
+    std::scoped_lock lk(execution_schedule_mutex_);
+    clear_execution_schedule();
+  }
   running_.store(false);
   if (spin_thread_.joinable()) {
     spin_thread_.join();
@@ -284,10 +356,51 @@ hardware_interface::return_type G01TopicSystem::write(
     return hardware_interface::return_type::OK;
   }
 
-  const bool executing = is_trajectory_executing();
+  std::vector<size_t> scheduled_indices;
+  {
+    std::scoped_lock lk(execution_schedule_mutex_);
+    if (!scheduled_joint_indices_.empty()) {
+      bool has_expected_controller = false;
+      bool all_expected_executing = true;
+      bool any_expected_executing = false;
+      for (size_t i = 0; i < scheduled_controller_mask_.size(); ++i) {
+        if (!scheduled_controller_mask_[i]) {
+          continue;
+        }
+        has_expected_controller = true;
+        const bool controller_is_executing =
+          i < controller_executing_.size() && controller_executing_[i] &&
+          controller_executing_[i]->load();
+        all_expected_executing = all_expected_executing && controller_is_executing;
+        any_expected_executing = any_expected_executing || controller_is_executing;
+      }
 
-  // 仅 MoveIt 点 Execute、FollowJointTrajectory 进入 EXECUTING 后才发 command_topic
-  if (!executing) {
+      const int64_t now_ns = node_->get_clock()->now().nanoseconds();
+      if (!scheduled_execution_started_) {
+        // Do not expose a partial command set: wait for the shared start time and every scheduled controller.
+        if (!has_expected_controller || now_ns < scheduled_start_ns_ || !all_expected_executing) {
+          if (now_ns > scheduled_start_ns_ + static_cast<int64_t>(1e9) && !any_expected_executing) {
+            RCLCPP_ERROR(
+              rclcpp::get_logger("g01_topic_hardware"),
+              "Synchronized execution did not start within 1 s; dropping schedule");
+            clear_execution_schedule();
+          }
+          return hardware_interface::return_type::OK;
+        }
+        scheduled_execution_started_ = true;
+      }
+
+      // Keep the complete planned joint set until the final controller leaves EXECUTING.
+      if (!any_expected_executing) {
+        clear_execution_schedule();
+        return hardware_interface::return_type::OK;
+      }
+      scheduled_indices = scheduled_joint_indices_;
+    }
+  }
+
+  // Backward-compatible path for direct controller goals that do not provide an execution schedule.
+  if (scheduled_indices.empty() && !is_trajectory_executing()) {
     return hardware_interface::return_type::OK;
   }
 
@@ -295,15 +408,24 @@ hardware_interface::return_type G01TopicSystem::write(
   msg.header.stamp = node_->get_clock()->now();
   {
     std::scoped_lock lk(state_mutex_);
-    for (size_t i = 0; i < controller_executing_.size(); ++i) {
-      const auto & flag = controller_executing_[i];
-      if (!flag || !flag->load() || i >= controller_joint_indices_.size()) {
-        continue;
-      }
-      for (const auto idx : controller_joint_indices_[i]) {
+    if (!scheduled_indices.empty()) {
+      for (const auto idx : scheduled_indices) {
         if (idx < joint_names_.size() && idx < pos_cmd_.size()) {
           msg.name.push_back(joint_names_[idx]);
           msg.position.push_back(pos_cmd_[idx]);
+        }
+      }
+    } else {
+      for (size_t i = 0; i < controller_executing_.size(); ++i) {
+        const auto & flag = controller_executing_[i];
+        if (!flag || !flag->load() || i >= controller_joint_indices_.size()) {
+          continue;
+        }
+        for (const auto idx : controller_joint_indices_[i]) {
+          if (idx < joint_names_.size() && idx < pos_cmd_.size()) {
+            msg.name.push_back(joint_names_[idx]);
+            msg.position.push_back(pos_cmd_[idx]);
+          }
         }
       }
     }

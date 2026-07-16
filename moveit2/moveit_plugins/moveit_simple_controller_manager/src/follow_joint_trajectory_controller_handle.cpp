@@ -52,12 +52,14 @@ constexpr char G01_HARDWARE_PLUGIN[] = "g01_topic_hardware/G01TopicSystem";
 constexpr char MOTOR_COMMAND_TOPIC[] = "/g01/motor_commands";
 constexpr char WAIST_CSP_PATH_TOPIC[] = "/waist_motor_control/csp_path";
 constexpr char LIFT_CSP_PATH_TOPIC[] = "/lift_motor_control/csp_path";
+constexpr char EXECUTION_SCHEDULE_TOPIC[] = "/g01/trajectory_execution_schedule";
 constexpr char WAIST_JOINT[] = "body_joint2";
 constexpr char LIFT_JOINT[] = "body_joint1";
 constexpr double WAIST_POSITION_SCALE = 1.0;    // rad -> rad
 constexpr double LIFT_POSITION_SCALE = 1000.0;  // m -> mm
 constexpr double CSP_PATH_FREQUENCY_HZ = 200.0;
 constexpr double CSP_PATH_PERIOD_SEC = 1.0 / CSP_PATH_FREQUENCY_HZ;
+constexpr double SYNCHRONIZED_START_DELAY_SEC = 0.1;
 constexpr auto CSP_PRELOAD_DELAY = std::chrono::milliseconds(100);
 }  // namespace
 
@@ -86,6 +88,8 @@ FollowJointTrajectoryControllerHandle::FollowJointTrajectoryControllerHandle(con
   motor_command_pub_ = node->create_publisher<std_msgs::msg::UInt8>(MOTOR_COMMAND_TOPIC, rclcpp::QoS(5));
   waist_csp_path_pub_ = node->create_publisher<std_msgs::msg::Float32MultiArray>(WAIST_CSP_PATH_TOPIC, rclcpp::QoS(5));
   lift_csp_path_pub_ = node->create_publisher<std_msgs::msg::Float32MultiArray>(LIFT_CSP_PATH_TOPIC, rclcpp::QoS(5));
+  execution_schedule_pub_ =
+      node->create_publisher<sensor_msgs::msg::JointState>(EXECUTION_SCHEDULE_TOPIC, rclcpp::QoS(5));
 
   RCLCPP_INFO_STREAM(LOGGER, "G01 CSP trajectory preload enabled for " << name_);
 }
@@ -188,6 +192,46 @@ bool FollowJointTrajectoryControllerHandle::synchronizeG01BodyTrajectory(
   return true;
 }
 
+bool FollowJointTrajectoryControllerHandle::prepareTrajectory(moveit_msgs::msg::RobotTrajectory& trajectory)
+{
+  trajectory_prepared_ = false;
+  if (!synchronizeG01BodyTrajectory(trajectory.joint_trajectory))
+    return false;
+  trajectory_prepared_ = true;
+  return true;
+}
+
+bool FollowJointTrajectoryControllerHandle::coordinatesTrajectoryExecution() const
+{
+  return g01_csp_preload_enabled_;
+}
+
+bool FollowJointTrajectoryControllerHandle::prepareTrajectoryExecution(
+    const std::vector<moveit_msgs::msg::RobotTrajectory>& trajectories)
+{
+  return publishG01CspPaths(trajectories);
+}
+
+rclcpp::Duration FollowJointTrajectoryControllerHandle::getTrajectoryStartDelay() const
+{
+  return rclcpp::Duration::from_seconds(g01_csp_preload_enabled_ ? SYNCHRONIZED_START_DELAY_SEC : 0.0);
+}
+
+bool FollowJointTrajectoryControllerHandle::publishTrajectoryExecutionSchedule(
+    const rclcpp::Time& start_time, const std::vector<std::string>& joint_names)
+{
+  if (!execution_schedule_pub_)
+    return false;
+
+  sensor_msgs::msg::JointState schedule;
+  schedule.header.stamp = start_time;
+  schedule.name = joint_names;
+  execution_schedule_pub_->publish(std::move(schedule));
+  RCLCPP_INFO_STREAM(LOGGER, "Scheduled synchronized G01 execution at " << start_time.seconds() << " with "
+                                                                         << joint_names.size() << " joints");
+  return true;
+}
+
 bool FollowJointTrajectoryControllerHandle::appendJointPath(const trajectory_msgs::msg::JointTrajectory& trajectory,
                                                             const std::string& joint_name, const double position_scale,
                                                             std_msgs::msg::Float32MultiArray& path) const
@@ -219,17 +263,28 @@ bool FollowJointTrajectoryControllerHandle::appendJointPath(const trajectory_msg
   return true;
 }
 
-void FollowJointTrajectoryControllerHandle::publishG01CspPaths(const trajectory_msgs::msg::JointTrajectory& trajectory)
+bool FollowJointTrajectoryControllerHandle::publishG01CspPaths(
+    const std::vector<moveit_msgs::msg::RobotTrajectory>& trajectories)
 {
-  if (!g01_csp_preload_enabled_ || trajectory.points.empty())
-    return;
+  if (!g01_csp_preload_enabled_)
+    return true;
 
   std_msgs::msg::Float32MultiArray waist_path;
   std_msgs::msg::Float32MultiArray lift_path;
-  const bool has_waist = appendJointPath(trajectory, WAIST_JOINT, WAIST_POSITION_SCALE, waist_path);
-  const bool has_lift = appendJointPath(trajectory, LIFT_JOINT, LIFT_POSITION_SCALE, lift_path);
+  bool has_waist = false;
+  bool has_lift = false;
+  for (const auto& robot_trajectory : trajectories)
+  {
+    const auto& trajectory = robot_trajectory.joint_trajectory;
+    if (trajectory.points.empty())
+      continue;
+    if (!has_waist)
+      has_waist = appendJointPath(trajectory, WAIST_JOINT, WAIST_POSITION_SCALE, waist_path);
+    if (!has_lift)
+      has_lift = appendJointPath(trajectory, LIFT_JOINT, LIFT_POSITION_SCALE, lift_path);
+  }
   if (!has_waist && !has_lift)
-    return;
+    return true;
 
   const std::size_t waist_sample_count = waist_path.data.size();
   const std::size_t lift_sample_count = lift_path.data.size();
@@ -254,10 +309,10 @@ void FollowJointTrajectoryControllerHandle::publishG01CspPaths(const trajectory_
 
   RCLCPP_INFO_STREAM(LOGGER, "Preloaded G01 CSP trajectory with two "
                                  << CSP_PRELOAD_DELAY.count() << " ms delays before " << name_
-                                 << " execution: " << (has_waist ? "waist " : "") << (has_lift ? "lift " : "") << "("
-                                 << trajectory.points.size() << " shared points -> waist " << waist_sample_count
-                                 << "/lift " << lift_sample_count << " CSP samples at " << CSP_PATH_FREQUENCY_HZ
-                                 << " Hz)");
+                                 << " execution: " << (has_waist ? "waist " : "") << (has_lift ? "lift " : "")
+                                 << "(waist " << waist_sample_count << "/lift " << lift_sample_count
+                                 << " CSP samples at " << CSP_PATH_FREQUENCY_HZ << " Hz)");
+  return true;
 }
 
 bool FollowJointTrajectoryControllerHandle::sendTrajectory(const moveit_msgs::msg::RobotTrajectory& trajectory)
@@ -278,14 +333,21 @@ bool FollowJointTrajectoryControllerHandle::sendTrajectory(const moveit_msgs::ms
   else
     RCLCPP_INFO_STREAM(LOGGER, "sending continuation for the currently executed trajectory to " << name_);
 
+  moveit_msgs::msg::RobotTrajectory prepared_trajectory;
+  const moveit_msgs::msg::RobotTrajectory* trajectory_to_send = &trajectory;
+  if (!trajectory_prepared_)
+  {
+    prepared_trajectory = trajectory;
+    if (!prepareTrajectory(prepared_trajectory) ||
+        !prepareTrajectoryExecution(std::vector<moveit_msgs::msg::RobotTrajectory>{ prepared_trajectory }))
+      return false;
+    trajectory_to_send = &prepared_trajectory;
+  }
+  trajectory_prepared_ = false;
+
   control_msgs::action::FollowJointTrajectory::Goal goal = goal_template_;
-  goal.trajectory = trajectory.joint_trajectory;
-  goal.multi_dof_trajectory = trajectory.multi_dof_joint_trajectory;
-
-  if (!synchronizeG01BodyTrajectory(goal.trajectory))
-    return false;
-
-  publishG01CspPaths(goal.trajectory);
+  goal.trajectory = trajectory_to_send->joint_trajectory;
+  goal.multi_dof_trajectory = trajectory_to_send->multi_dof_joint_trajectory;
 
   rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SendGoalOptions send_goal_options;
   // Active callback

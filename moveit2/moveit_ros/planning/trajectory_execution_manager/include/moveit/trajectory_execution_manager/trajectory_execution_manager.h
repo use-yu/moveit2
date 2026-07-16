@@ -281,6 +281,9 @@ private:
   bool distributeTrajectory(const moveit_msgs::msg::RobotTrajectory& trajectory,
                             const std::vector<std::string>& controllers,
                             std::vector<moveit_msgs::msg::RobotTrajectory>& parts);
+  bool prepareAndScheduleTrajectories(
+      const std::vector<moveit_controller_manager::MoveItControllerHandlePtr>& handles,
+      std::vector<moveit_msgs::msg::RobotTrajectory>& parts);
 
   bool findControllers(const std::set<std::string>& actuated_joints, std::size_t controller_count,
                        const std::vector<std::string>& available_controllers,

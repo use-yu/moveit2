@@ -11,7 +11,7 @@ Panels:
         - /TF1
         - /TF1/Frames1
       Splitter Ratio: 0.5
-    Tree Height: 229
+    Tree Height: 344
   - Class: rviz_common/Help
     Name: Help
   - Class: rviz_common/Views
@@ -151,6 +151,11 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          base_sj:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
           base_x_link:
             Alpha: 1
             Show Axes: false
@@ -201,8 +206,8 @@ Visualization Manager:
         Goal State Color: 250; 128; 0
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
-        Planning Group: body
-        Query Goal State: false
+        Planning Group: dual_arm
+        Query Goal State: true
         Query Start State: false
         Show Workspace: false
         Start State Alpha: 1
@@ -304,6 +309,11 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          base_sj:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
           base_x_link:
             Alpha: 1
             Show Axes: false
@@ -338,7 +348,7 @@ Visualization Manager:
       Velocity_Scaling_Factor: 0.1
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
-      Collision Enabled: false
+      Collision Enabled: true
       Description File: ""
       Description Source: Topic
       Description Topic:
@@ -434,6 +444,11 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
+        base_sj:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
         base_x_link:
           Alpha: 1
           Show Axes: false
@@ -506,6 +521,8 @@ Visualization Manager:
           Value: false
         base_link:
           Value: true
+        base_sj:
+          Value: true
         base_x_link:
           Value: false
         l_base_link:
@@ -528,26 +545,27 @@ Visualization Manager:
           base_footprint:
             base_x_link:
               base_link:
-                SJ:
-                  YB:
-                    l_base_link:
-                      L1:
-                        L2:
-                          L3:
-                            L4:
-                              L5:
-                                L6:
-                                  l_tool:
-                                    {}
-                    r_base_link:
-                      R1:
-                        R2:
-                          R3:
-                            R4:
-                              R5:
-                                R6:
-                                  r_tool:
-                                    {}
+                base_sj:
+                  SJ:
+                    YB:
+                      l_base_link:
+                        L1:
+                          L2:
+                            L3:
+                              L4:
+                                L5:
+                                  L6:
+                                    l_tool:
+                                      {}
+                      r_base_link:
+                        R1:
+                          R2:
+                            R3:
+                              R4:
+                                R5:
+                                  R6:
+                                    r_tool:
+                                      {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Marker
@@ -581,30 +599,30 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 4.722651481628418
+      Distance: 6.2331414222717285
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.15173490345478058
-        Y: 0.14356398582458496
-        Z: 0.7051620483398438
+        X: -0.20027543604373932
+        Y: 0.3418879508972168
+        Z: 1.0678622722625732
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.099796824157238
+      Pitch: 0.12479683011770248
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 5.625197410583496
+      Yaw: 5.815206527709961
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 752
+  Height: 1016
   Help:
     collapsed: false
   Hide Left Dock: false
@@ -613,9 +631,9 @@ Window Geometry:
     collapsed: false
   MotionPlanning - Trajectory Slider:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000002b40000029afc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb000000100044006900730070006c006100790073010000003b00000120000000c700fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e00670100000161000001740000016900fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000043c00000109000000a000ffffff000002b10000029a00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000002b4000003a2fc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb000000100044006900730070006c006100790073010000003b00000193000000c700fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e006701000001d4000002090000016900fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000043c00000109000000a000ffffff00000480000003a200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 1387
-  X: -54
-  Y: 104
+  Width: 1850
+  X: 70
+  Y: 27
