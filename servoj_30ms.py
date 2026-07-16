@@ -128,8 +128,10 @@ SERVOJ_SEND_PERIOD_SEC = 0.03
 COMMAND_TOPIC = "/g01/joint_commands"
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
-DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 45.0)
-TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 87.0)
+# DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 45.0)
+# TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 87.0)
+DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 82.0)
+TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 124.0)
 
 
 class fankuis():

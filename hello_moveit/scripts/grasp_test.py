@@ -302,10 +302,10 @@ DEFAULT_SPEED_SCALE = 0.5
 # 深框障碍物（相对于 base_link 发布）
 SCENE_FRAME = "base_link"
 FRAME_ID = "深框"
-FRAME_SIZE = (1.18, 1.18, 0.58)  # 深框整体外尺寸：长×宽×高 [m]
-WALL_T = 0.09  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
-FRAME_CENTER = (-0.81 - 0.005, -0.35, -0.08)  # 深框整体外轮廓中心，相对于 base_link [m]
-FRAME_RPY_DEG = (90.0, -0.0, 180.0)  # 深框整体姿态，相对于 base_link [degree]
+FRAME_SIZE = (0.795, 0.795, 0.505)  # 深框整体外尺寸：长×宽×高 [m]
+WALL_T = 0.031  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
+FRAME_CENTER = (0.8, 0.0, 0.4545)  # 深框整体外轮廓中心，相对于 base_link [m]
+FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 FRAME_CUTOFF_ID = "深框隔离面"
 FRAME_CUTOFF_THICKNESS = 0.01  # 薄隔离面厚度 [m]，沿深框局部 z 轴；在 SCENE_FRAME 中等价于 y 方向厚度
@@ -464,10 +464,10 @@ NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
 # 下面会转成平移单位为毫米的 4x4 矩阵，与 viewer pose 的毫米单位保持一致。
 VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
-    -0.152739, -0.142554, -0.108776, 0.651190, -0.265437, -0.658722, -0.267545
+    -0.152664, -0.143763, -0.135330, 0.650330, -0.265305, -0.658682, -0.269858
 ]
 VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
-    0.154349, -0.141012, -0.191157, 0.656399, -0.271619, 0.650814, 0.267963
+    0.155022, -0.142564, -0.216301, 0.656542, -0.274923, 0.649464, 0.267520
 ]
 SIM_VISION_RESULT = (
     1,
