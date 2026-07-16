@@ -143,8 +143,6 @@
       link="base_link" />
     <child
       link="base_sj" />
-    <axis
-      xyz="0 0 0" />
   </joint>
   <link
     name="SJ">

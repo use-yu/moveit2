@@ -32,10 +32,10 @@ DEFAULT_URDF = DEFAULT_G01_URDF
 # 这里改默认 FK 起点/终点。
 # 直接运行 python3 fk.py 时，等价于计算 DEFAULT_BASE_LINK -> DEFAULT_TARGET_LINK。
 DEFAULT_BASE_LINK = "SJ"
-DEFAULT_TARGET_LINK = "r_tool"
+DEFAULT_TARGET_LINK = "l_tool"
 DEFAULT_JOINT_VALUES = [
-    30,  # body_joint2
-    -108.551080, -86.793308, -44.458005, -48.840345, 41.727653, 0.095568
+    30*math.pi/180,  # body_joint2
+    0.113298830,-1.437132861,-0.988730272,-0.706701233,0.628914759,-0.533279984,
 ]
 
 # 下面三个只用于兼容旧 CR7 参数 --tool / --link6 / fk6。
