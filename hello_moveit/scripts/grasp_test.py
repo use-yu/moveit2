@@ -308,7 +308,7 @@ FRAME_CENTER = (0.8, 0.0, 0.4545)  # 深框整体外轮廓中心，相对于 bas
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 FRAME_CUTOFF_ID = "深框隔离面"
-FRAME_CUTOFF_THICKNESS = 0.01  # 薄隔离面厚度 [m]，沿深框局部 z 轴；在 SCENE_FRAME 中等价于 y 方向厚度
+FRAME_CUTOFF_THICKNESS = 0.01  # 水平隔离面厚度 [m]，沿深框局部 z 轴
 FRAME_CUTOFF_COLOR = ColorRGBA(r=1.0, g=0.25, b=0.1, a=1.0)
 
 # 位姿标记圆柱（Marker 保持仅显示；q_pre OMPL 阶段另建同尺寸临时碰撞体）
@@ -1123,11 +1123,11 @@ def make_deep_frame() -> CollisionObject:
     return obj
 
 
-def make_deep_frame_cutoff(scene_y: float) -> CollisionObject:
-    """在深框内生成一张薄隔离面，顶面位于 SCENE_FRAME 的 scene_y。"""
+def make_deep_frame_cutoff(scene_z: float) -> CollisionObject:
+    """在深框内生成水平隔离面，其上表面位于 SCENE_FRAME 的 scene_z。"""
     L, W, _ = FRAME_SIZE
     t = WALL_T
-    bx, _, bz = FRAME_CENTER
+    bx, by, _ = FRAME_CENTER
     roll, pitch, yaw = (math.radians(v) for v in FRAME_RPY_DEG)
     qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
 
@@ -1143,11 +1143,13 @@ def make_deep_frame_cutoff(scene_y: float) -> CollisionObject:
         max(0.0, W - 2.0 * t),
         FRAME_CUTOFF_THICKNESS,
     ]
+    # 隔离面沿深框局部 X/Y 铺满内腔，局部 Z 为厚度方向。
+    # scene_z 是与末端最低点相切的上表面，实体中心向下偏半个厚度。
     ox, oy, oz = rotate_xyz_by_quat(
         0.0, 0.0, -FRAME_CUTOFF_THICKNESS / 2.0, qx, qy, qz, qw
     )
     obj.primitives.append(prim)
-    obj.primitive_poses.append(make_pose(bx + ox, scene_y + oy, bz + oz, roll, pitch, yaw))
+    obj.primitive_poses.append(make_pose(bx + ox, by + oy, scene_z + oz, roll, pitch, yaw))
     return obj
 
 
@@ -1166,19 +1168,19 @@ def make_grasp_object_collision(pose: Pose) -> CollisionObject:
     return obj
 
 
-def cylinder_half_extent_y(pose: Pose) -> float:
-    """圆柱按当前姿态投影到 Y 轴后的半尺寸，用于让隔板与圆柱刚好相切。"""
-    return cylinder_half_extent_y_from_shape(pose, CYLINDER_DIAMETER / 2.0, CYLINDER_HEIGHT)
+def cylinder_half_extent_z(pose: Pose) -> float:
+    """圆柱按当前姿态投影到 Z 轴后的半尺寸，用于让水平隔板与圆柱相切。"""
+    return cylinder_half_extent_z_from_shape(pose, CYLINDER_DIAMETER / 2.0, CYLINDER_HEIGHT)
 
 
-def cylinder_half_extent_y_from_shape(pose: Pose, radius: float, length: float) -> float:
-    """指定半径/长度的圆柱按当前姿态投影到 Y 轴后的半尺寸。"""
+def cylinder_half_extent_z_from_shape(pose: Pose, radius: float, length: float) -> float:
+    """指定半径/长度的圆柱按当前姿态投影到 Z 轴后的半尺寸。"""
     q = pose.orientation
-    _, axis_y, _ = rotate_xyz_by_quat(0.0, 0.0, 1.0, q.x, q.y, q.z, q.w)
-    axis_y = max(-1.0, min(1.0, axis_y))
+    _, _, axis_z = rotate_xyz_by_quat(0.0, 0.0, 1.0, q.x, q.y, q.z, q.w)
+    axis_z = max(-1.0, min(1.0, axis_z))
     half_height = float(length) / 2.0
-    radial_projection = math.sqrt(max(0.0, 1.0 - axis_y * axis_y))
-    return abs(axis_y) * half_height + radial_projection * float(radius)
+    radial_projection = math.sqrt(max(0.0, 1.0 - axis_z * axis_z))
+    return abs(axis_z) * half_height + radial_projection * float(radius)
 
 
 def matrix_from_xyz_rpy(xyz: Sequence[float], rpy: Sequence[float]) -> list[list[float]]:
@@ -1859,7 +1861,7 @@ class G01Demo(Node):
             return False
 
         if tangent_link:
-            link_surface = self._link_collision_min_y(
+            link_surface = self._link_collision_min_z(
                 tangent_link,
                 target_frame=target_frame,
                 joints=tangent_joints,
@@ -1867,14 +1869,14 @@ class G01Demo(Node):
             )
             if link_surface is None:
                 return False
-            scene_y, collision_link = link_surface
+            scene_z, collision_link = link_surface
             tangent_desc = f"q_pre 状态下末端 link {tangent_link} 的 collision link {collision_link}"
         else:
-            half_extent_y = cylinder_half_extent_y(scene_pose)
-            scene_y = scene_pose.position.y - half_extent_y
+            half_extent_z = cylinder_half_extent_z(scene_pose)
+            scene_z = scene_pose.position.z - half_extent_z
             tangent_desc = (
-                f"目标圆柱，物体中心 y={scene_pose.position.y:.3f} m, "
-                f"Y 半尺寸={half_extent_y:.3f} m"
+                f"目标圆柱，物体中心 z={scene_pose.position.z:.3f} m, "
+                f"Z 半尺寸={half_extent_z:.3f} m"
             )
         colors = [
             ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR),
@@ -1883,14 +1885,14 @@ class G01Demo(Node):
         self.get_logger().info(
             f"添加碰撞体「{FRAME_CUTOFF_ID}」+「{GRASP_OBJECT_COLLISION_ID}」到 {target_frame}: "
             f"隔板与{tangent_desc}相切, "
-            f"隔板表面 y={scene_y:.3f} m"
+            f"隔板上表面 z={scene_z:.3f} m"
         )
         return self._apply_scene(
-            [make_deep_frame_cutoff(scene_y), make_grasp_object_collision(scene_pose)],
+            [make_deep_frame_cutoff(scene_z), make_grasp_object_collision(scene_pose)],
             colors,
         )
 
-    def _link_collision_min_y(
+    def _link_collision_min_z(
         self,
         link: str,
         *,
@@ -1898,7 +1900,7 @@ class G01Demo(Node):
         joints: dict[str, float] | None = None,
         joint_names: Sequence[str] | None = None,
     ) -> tuple[float, str] | None:
-        """读取 URDF cylinder collision，返回 link 在 target_frame 下的最小 Y 切面。"""
+        """读取 URDF cylinder collision，返回 link 在 target_frame 下的最低 Z 表面。"""
         log = self.get_logger()
         try:
             collision_link = collision_link_for_link(link)
@@ -1929,22 +1931,22 @@ class G01Demo(Node):
             return None
 
         t_target_link = pose_to_matrix(link_pose)
-        min_y: float | None = None
+        min_z: float | None = None
         for spec in collisions_by_link.get(collision_link, []):
             collision_matrix = matmul4(t_target_link, spec["origin_matrix"])
             collision_pose = xyz_rpy_to_pose(matrix_to_xyz_rpy(collision_matrix))
-            half_extent_y = cylinder_half_extent_y_from_shape(
+            half_extent_z = cylinder_half_extent_z_from_shape(
                 collision_pose,
                 radius=float(spec["radius"]),
                 length=float(spec["length"]),
             )
-            surface_y = collision_pose.position.y - half_extent_y
-            min_y = surface_y if min_y is None else min(min_y, surface_y)
+            surface_z = collision_pose.position.z - half_extent_z
+            min_z = surface_z if min_z is None else min(min_z, surface_z)
 
-        if min_y is None:
+        if min_z is None:
             log.error(f"{collision_link} 没有可用 cylinder collision")
             return None
-        return min_y, collision_link
+        return min_z, collision_link
 
     def add_frame_cutoff_only_for_pose(
         self,
@@ -1957,7 +1959,7 @@ class G01Demo(Node):
     ) -> bool:
         """只添加隔板；传 tangent_link 时隔板与该 link 在 tangent_joints 下相切。"""
         if tangent_link:
-            link_surface = self._link_collision_min_y(
+            link_surface = self._link_collision_min_z(
                 tangent_link,
                 target_frame=target_frame,
                 joints=tangent_joints,
@@ -1965,7 +1967,7 @@ class G01Demo(Node):
             )
             if link_surface is None:
                 return False
-            scene_y, collision_link = link_surface
+            scene_z, collision_link = link_surface
             tangent_desc = f"q_pre 状态下末端 link {tangent_link} 的 collision link {collision_link}"
         else:
             scene_pose = self._pose_in_frame(
@@ -1977,19 +1979,19 @@ class G01Demo(Node):
             if scene_pose is None:
                 self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
                 return False
-            half_extent_y = cylinder_half_extent_y(scene_pose)
-            scene_y = scene_pose.position.y - half_extent_y - 0.01
+            half_extent_z = cylinder_half_extent_z(scene_pose)
+            scene_z = scene_pose.position.z - half_extent_z
             tangent_desc = (
-                f"目标圆柱，物体中心 y={scene_pose.position.y:.3f} m, "
-                f"Y 半尺寸={half_extent_y:.3f} m"
+                f"目标圆柱，物体中心 z={scene_pose.position.z:.3f} m, "
+                f"Z 半尺寸={half_extent_z:.3f} m"
             )
         self.get_logger().info(
             f"添加碰撞体「{FRAME_CUTOFF_ID}」到 {target_frame}: "
             f"隔板与{tangent_desc}相切, "
-            f"隔板表面 y={scene_y:.3f} m"
+            f"隔板上表面 z={scene_z:.3f} m"
         )
         return self._apply_scene(
-            [make_deep_frame_cutoff(scene_y)],
+            [make_deep_frame_cutoff(scene_z)],
             [ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR)],
         )
 
