@@ -381,15 +381,15 @@
       </material>
     </visual>
     <collision>
-      <origin xyz="0.001 -0.001 0.0878" rpy="0 0 0" />
+      <origin xyz="0.00 -0.00 0.13" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="${arm_collision_scale * 0.085}" length="${arm_collision_scale * 0.10}" />
+        <cylinder radius="${arm_collision_scale * 0.086}" length="${arm_collision_scale * 0.12}" />
       </geometry>
     </collision>
     <collision>
-      <origin xyz="-0.000 0.000 -0.0012" rpy="0 0 0" />
+      <origin xyz="-0.000 0.000 0.035" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="${arm_collision_scale * 0.045}" length="${arm_collision_scale * 0.07}" />
+        <cylinder radius="${arm_collision_scale * 0.04}" length="${arm_collision_scale * 0.07}" />
       </geometry>
     </collision>
     <!-- <collision>
