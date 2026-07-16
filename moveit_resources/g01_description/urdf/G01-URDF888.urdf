@@ -14,7 +14,7 @@
   <joint name="world_to_base_footprint" type="fixed">
         <parent link="world" />
         <child link="base_footprint"/>
-        <origin xyz="0 0 0.6" rpy="1.5708 0 3.1415926"/>
+        <origin xyz="0 0 0.0" rpy="0.0 0.0 0.0"/>
   </joint>
 
   <link name="base_footprint">
@@ -40,7 +40,7 @@
 
     <origin xyz="0 0 0" rpy="0 0 0" />
 
-    <axis xyz="-1 0 0" />
+    <axis xyz="1 0 0" />
     <limit lower="-1.0" upper="1.0" effort="100.0" velocity="1.0" />
   </joint>
 
@@ -48,17 +48,17 @@
     name="base_link">
     <inertial>
       <origin
-        xyz="0.0485314645833506 -0.258032769237847 -0.00363036886449786"
+        xyz="-0.0833751232270759 -0.00157919453986541 0.24033544244362"
         rpy="0 0 0" />
       <mass
-        value="24.9214864900972" />
+        value="34.9231249877199" />
       <inertia
-        ixx="0.363673642126909"
-        ixy="-3.23019832572223E-05"
-        ixz="-1.45773753881236E-05"
-        iyy="0.189656629145211"
-        iyz="-7.78157617995762E-06"
-        izz="0.353485095381884" />
+        ixx="0.361785347136397"
+        ixy="-0.00841267665406299"
+        ixz="0.0027601796793283"
+        iyy="0.196337105587228"
+        iyz="-0.000784095863847305"
+        izz="0.5057472611945" />
     </inertial>
     <visual>
       <origin
@@ -74,56 +74,7 @@
           rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
       </material>
     </visual>
-
-    <!-- 桌子 -->
-    <!-- <visual>
-      <origin xyz="0.095 -0.023 0.0" rpy="0 0 0" />
-      <geometry>
-          <box size="0.615 0.18 0.9" />
-      </geometry>
-      <material name="base_link_box_transparent">
-        <color rgba="1 0 0 0.5" />
-      </material>
-    </visual>
     <collision>
-      <origin xyz="0.095 -0.023 0.0" rpy="0 0 0" />
-      <geometry>
-          <box size="0.615 0.18 0.9" />
-      </geometry>
-    </collision> -->
-
-    <!-- 底盘 -->
-    <!-- <visual>
-      <origin xyz="0.13 -0.52 0.0" rpy="0 0 0" />
-      <geometry>
-        <box size="0.78 0.19 0.65" />
-      </geometry>
-      <material name="base_link_box_transparent">
-        <color rgba="1 0 0 0.5" />
-      </material>
-    </visual> -->
-    <collision>
-      <origin xyz="0.13 -0.52 0.0" rpy="0 0 0" />
-      <geometry>
-          <box size="0.785 0.19 0.65" />
-      </geometry>
-    </collision>
-    <!-- 后舱/电池仓 -->
-    <collision>
-      <origin xyz="0.26 -0.255 0.0" rpy="0 0 0" />
-      <geometry>
-          <box size="0.34 0.35 0.51" />
-      </geometry>
-    </collision>
-    <!-- 髋部前方 -->
-    <collision>
-      <origin xyz="0.0 -0.21 0.0" rpy="0 0 0" />
-      <geometry>
-        <box size="0.19 0.42 0.19" />
-      </geometry>
-    </collision>
-
-    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
@@ -131,86 +82,32 @@
         <mesh
           filename="package://moveit_resources_g01_description/meshes/base_link.STL" />
       </geometry>
-    </collision> -->
+    </collision>
   </link>
-
-  <!-- <link name="base_link_box">
-      <visual>
-        <origin xyz="0.13 -0.52 0.0" rpy="0 0 0" />
-        <geometry>
-          <box size="0.78 0.19 0.65" />
-        </geometry>
-        <material name="base_link_box_transparent">
-          <color rgba="1 0 0 0.5" />
-        </material>
-      </visual>
-      <visual>
-        <origin xyz="0.26 -0.255 0.0" rpy="0 0 0" />
-        <geometry>
-          <box size="0.34 0.35 0.51" />
-        </geometry>
-        <material name="base_link_box_transparent">
-          <color rgba="1 0 0 0.5" />
-        </material>
-      </visual>
-      <visual>
-        <origin xyz="0.0 -0.21 0.0" rpy="0 0 0" />
-        <geometry>
-          <box size="0.19 0.42 0.19" />
-        </geometry>
-        <material name="base_link_box_transparent">
-          <color rgba="1 0 0 0.5" />
-        </material>
-      </visual>
-
-      <collision>
-        <origin xyz="0.13 -0.52 0.0" rpy="0 0 0" />
-        <geometry>
-           <box size="0.78 0.19 0.65" />
-        </geometry>
-      </collision>
-      <collision>
-        <origin xyz="0.26 -0.255 0.0" rpy="0 0 0" />
-        <geometry>
-           <box size="0.34 0.35 0.51" />
-        </geometry>
-      </collision>
-      <collision>
-        <origin xyz="0.0 -0.21 0.0" rpy="0 0 0" />
-        <geometry>
-          <box size="0.19 0.42 0.19" />
-        </geometry>
-      </collision>
-  </link>
-  <joint name="base_link_box_to_base_link" type="fixed">
-        <parent link="base_link" />
-        <child link="base_link_box"/>
-        <origin xyz="0 0 0" rpy="0 0 0"/>
-  </joint> -->
 
    <joint name="base_joint2" type="revolute">
       <parent link="base_x_link" />
       <child link="base_link"/>
       <origin xyz="0 0 0" rpy="0 0 0"/>
-      <axis xyz="0 1 0" />
+      <axis xyz="0 0 1" />
       <limit lower="-3.14" upper="3.14" effort="100.0" velocity="1.0" />      
   </joint>
 
   <link
-    name="SJ">
+    name="base_sj">
     <inertial>
       <origin
-        xyz="0.00360111710978206 -0.213711773237388 -0.000685628135359106"
+        xyz="0.00644601798435016 -1.53865218459097E-05 0.229438010554376"
         rpy="0 0 0" />
       <mass
-        value="15.5120061335875" />
+        value="19.7724725085068" />
       <inertia
-        ixx="0.304331232615233"
-        ixy="-0.00016788310284059"
-        ixz="-2.20087277999054E-05"
-        iyy="0.0685117073660919"
-        iyz="-1.40947850707228E-05"
-        izz="0.303622962734325" />
+        ixx="0.322657286178053"
+        ixy="-6.18791171035489E-07"
+        ixz="2.9377362500673E-05"
+        iyy="0.327130614474479"
+        iyz="1.0661862891089E-07"
+        izz="0.123816976255545" />
     </inertial>
     <visual>
       <origin
@@ -218,7 +115,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/SJ.STL" />
+          filename="package://moveit_resources_g01_description/meshes/1.STL" />
       </geometry>
       <material
         name="">
@@ -227,78 +124,101 @@
       </material>
     </visual>
     <collision>
-      <origin xyz="0.03 -0.11548 0.0" rpy="0 0 0" />
-      <geometry>
-        <box size="0.23 0.36 0.18" />
-      </geometry>
-    </collision>
-    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/SJ.STL" />
+          filename="package://moveit_resources_g01_description/meshes/1.STL" />
       </geometry>
-    </collision> -->
+    </collision>
   </link>
-
-  <!-- <link name="base_link_sj">
-      <visual>
-        <origin xyz="0.03 -0.11548 0.0" rpy="0 0 0" />
-        <geometry>
-          <box size="0.23 0.36 0.18" />
-        </geometry>
-        <material name="base_link_box_transparent">
-          <color rgba="1 0 0 0.5" />
-        </material>
-      </visual>
-      <collision>
-        <origin xyz="0.03 -0.11548 0.0" rpy="0 0 0" />
-        <geometry>
-          <box size="0.23 0.36 0.18" />
-        </geometry>
-      </collision>
-  </link>
-  <joint name="base_link_sj_to_base_link" type="fixed">
-        <parent link="SJ" />
-        <child link="base_link_sj"/>
-        <origin xyz="0 0 0" rpy="0 0 0"/>
-  </joint> -->
-
   <joint
-    name="body_joint1"
-    type="prismatic">
+    name="base_sj_joint"
+    type="fixed">
     <origin
-      xyz="0 0.04548 0"
+      xyz="0.127 0 0.1355"
       rpy="0 0 0" />
     <parent
       link="base_link" />
     <child
+      link="base_sj" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link
+    name="SJ">
+    <inertial>
+      <origin
+        xyz="-0.00345119031577348 0.000266161209262043 0.320314377129165"
+        rpy="0 0 0" />
+      <mass
+        value="17.1115281100298" />
+      <inertia
+        ixx="0.311824052364632"
+        ixy="5.73874861281675E-08"
+        ixz="1.88262796966466E-05"
+        iyy="0.313883784661324"
+        iyz="-0.000418652057797895"
+        izz="0.0815253338496027" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://moveit_resources_g01_description/meshes/2.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://moveit_resources_g01_description/meshes/2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="body_joint1"
+    type="prismatic">
+    <origin
+      xyz="0 0 0.043"
+      rpy="0 0 0" />
+    <parent
+      link="base_sj" />
+    <child
       link="SJ" />
     <axis
-      xyz="0 1 0" />
+      xyz="0 0 1" />
     <limit
-      lower="0.0"
+      lower="0"
       upper="0.24"
       effort="100"
-      velocity="1" />
+      velocity="0" />
   </joint>
   <link
     name="YB">
     <inertial>
       <origin
-        xyz="-0.0088172919048608 0.319689875724926 -0.0939168502437249"
+        xyz="-0.0199130782635125 0.278892660913785 -0.108205878200632"
         rpy="0 0 0" />
       <mass
-        value="5.03869108075918" />
+        value="5.10087522591895" />
       <inertia
-        ixx="0.0227295903029523"
-        ixy="-1.86442270167271E-05"
-        ixz="-3.49178529155489E-07"
-        iyy="0.0166272110804989"
-        iyz="5.56940206925635E-06"
-        izz="0.0212333253825738" />
+        ixx="0.0183533743406918"
+        ixy="1.31383736713042E-05"
+        ixz="3.90891873836747E-06"
+        iyy="0.0175943058268704"
+        iyz="3.73919329188091E-05"
+        izz="0.0136641235432857" />
     </inertial>
     <visual>
       <origin
@@ -306,7 +226,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/YB.STL" />
+          filename="package://moveit_resources_g01_description/meshes/3.STL" />
       </geometry>
       <material
         name="">
@@ -315,58 +235,21 @@
       </material>
     </visual>
     <collision>
-      <origin xyz="-0.02 0.19752 -0.094" rpy="0 0 0" />
-      <geometry>
-        <box size="0.23 0.51 0.32" />
-      </geometry>
-    </collision>
-    <!-- 头部 -->
-    <!-- <collision>
-      <origin xyz="-0.15 0.28 -0.094" rpy="0 0 0" />
-      <geometry>
-        <box size="0.22 0.15 0.13" />
-      </geometry>
-    </collision> -->
-    <!-- <collision>
       <origin
         xyz="0 0 0"
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/YB.STL" />
+          filename="package://moveit_resources_g01_description/meshes/3.STL" />
       </geometry>
-    </collision> -->
+    </collision>
   </link>
-
-  <!-- <link name="base_link_yb">
-      <visual>
-        <origin xyz="-0.02 0.19752 -0.094" rpy="0 0 0" />
-        <geometry>
-          <box size="0.23 0.51 0.32" />
-        </geometry>
-        <material name="base_link_box_transparent">
-          <color rgba="1 0 0 0.5" />
-        </material>
-      </visual>
-      <collision>
-        <origin xyz="-0.02 0.19752 -0.094" rpy="0 0 0" />
-        <geometry>
-          <box size="0.23 0.51 0.32" />
-        </geometry>
-      </collision>
-  </link>
-  <joint name="base_link_yb_to_base_link" type="fixed">
-        <parent link="YB" />
-        <child link="base_link_yb"/>
-        <origin xyz="0 0 0" rpy="0 0 0"/>
-  </joint> -->
-
   <joint
     name="body_joint2"
     type="revolute">
     <origin
-      xyz="0 0.117000000000034 0.0940000000000007"
-      rpy="0 0 0" />
+      xyz="0 0.1175 0.654"
+      rpy="1.5708 0 -3.1416" />
     <parent
       link="SJ" />
     <child
@@ -375,9 +258,9 @@
       xyz="0 0 1" />
     <limit
       lower="0"
-      upper="0.785"
+      upper="1.4"
       effort="100"
-      velocity="0.26" />
+      velocity="100" />
   </joint>
 
 
@@ -387,7 +270,7 @@
     link_prefix="L"
     joint_prefix="l_arm_joint"
     parent="YB"
-    xyz="0.000 0.378 0.0565"
+    xyz="0.000 0.418 0.059"
     rpy="0 0 -3.1415926"
     dh_id="'1079'" />
 
@@ -396,7 +279,7 @@
     link_prefix="R"
     joint_prefix="r_arm_joint"
     parent="YB"
-    xyz="-0.000 0.378 -0.2445"
+    xyz="-0.000 0.418 -0.294"
     rpy="-3.1415926 0 0"
     dh_id="'1084'" />
 

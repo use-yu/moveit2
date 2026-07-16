@@ -470,7 +470,7 @@ VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
     0.154349, -0.141012, -0.191157, 0.656399, -0.271619, 0.650814, 0.267963
 ]
 SIM_VISION_RESULT = (
-    2,
+    1,
     [-195.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
 )
 
@@ -3453,9 +3453,10 @@ def main(argv: list[str] | None = None) -> int:
     def run_one_grasp() -> bool | None:
         """执行一轮抓取；True=成功，False=失败，None=用户选择退出。"""
         # --- 2. 关节空间运动 ---
-        targets = JOINT_TARGETS["dual_arm"]
+        targets = JOINT_TARGETS["dual_arm_body"]
         joint_names = list(targets.keys())
         Q1 = [
+            0.0, 30*math.pi/180,
             -1.57, -0.15, -1.578090, -1.370549, -1.672852, -0.588477,
             1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
         ]
@@ -3470,7 +3471,7 @@ def main(argv: list[str] | None = None) -> int:
         log.info("  " + ", ".join(joint_names))
         log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
-        if not node.plan_execute_joint_waypoints("dual_arm", 0.2, joint_names, waypoints):
+        if not node.plan_execute_joint_waypoints("dual_arm_body", 0.2, joint_names, waypoints):
             log.error("关节规划/执行失败")
             return False
 
