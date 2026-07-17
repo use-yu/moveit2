@@ -311,7 +311,7 @@ FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 # 与深框同时添加/移除的长方体障碍物（位置为中心点，相对于 base_link）
 BOX_OBSTACLE_ID = "长方体障碍物"
 BOX_OBSTACLE_SIZE = (0.9, 1.5, 0.965)  # X × Y × Z [m]
-BOX_OBSTACLE_CENTER = (0.8, 1.35, 0.4825)  # 中心位置 [m]
+BOX_OBSTACLE_CENTER = (0.8, 1.35, 0.3825)  # 中心位置 [m]
 BOX_OBSTACLE_RPY_DEG = (0.0, 0.0, 0.0)
 BOX_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=1.0)
 
@@ -429,24 +429,26 @@ PLACE_JOINTS = {
         "yubei": {
             "sw1": [
                 0.0, 0*math.pi/180,
-                68.9251*math.pi/180, -60.9748*math.pi/180, -117.8150*math.pi/180,
-                -1.0258*math.pi/180, -109.6629*math.pi/180, -131.6794*math.pi/180,
+            -46.7142*math.pi/180, 66.5207*math.pi/180, 83.8969*math.pi/180,
+            30.0653*math.pi/180, 134.2708*math.pi/180, 40.2519*math.pi/180,
             ],
             "sw4": [
                 0.0, 0*math.pi/180,
-                48.7655*math.pi/180, -66.3739*math.pi/180, -88.0575*math.pi/180,
-                -25.3303*math.pi/180, -129.8943*math.pi/180, -131.4315*math.pi/180,
+            -65.7217*math.pi/180, 60.1817*math.pi/180, 115.2330*math.pi/180,
+            5.0116*math.pi/180, 115.1466*math.pi/180, 40.2956*math.pi/180,
             ],
+            
         },
         "fang": {
             "sw1": [
-                73.5589*math.pi/180, -62.9583*math.pi/180, -101.1115*math.pi/180,
-                -15.7038*math.pi/180, -105.0561*math.pi/180, -131.6008*math.pi/180,
+                -53.9239*math.pi/180, 71.7167*math.pi/180, 68.3340*math.pi/180,
+            40.3193*math.pi/180, 127.1579*math.pi/180, 40.1034*math.pi/180,
             ],
             "sw4": [
-                55.5322*math.pi/180, -71.4185*math.pi/180, -71.7264*math.pi/180,
-                -36.5876*math.pi/180, -123.2005*math.pi/180, -131.4034*math.pi/180,
+                -71.4429*math.pi/180, 62.6876*math.pi/180, 99.3166*math.pi/180,
+            18.3334*math.pi/180, 109.4691*math.pi/180, 40.1390*math.pi/180,
             ],
+            
         },
     },
 }
@@ -503,14 +505,16 @@ VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
 VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
     0.155022, -0.142564, -0.216301, 0.656542, -0.274923, 0.649464, 0.267520
 ]
-# SIM_VISION_RESULT = (
-#     1,
-#     [-195.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
-# )
+# 左臂抓
 SIM_VISION_RESULT = (
     0,
-    [-230.0305, 43.2781, 860.8122, -0.481, 0.0739, -0.1165, -0.8658],
+    [-195.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
 )
+# 右臂抓
+# SIM_VISION_RESULT = (
+#     0,
+#     [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+# )
 
 def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
     if len(transform) != 7:
@@ -1203,7 +1207,7 @@ def make_deep_frame_cutoff(scene_z: float) -> CollisionObject:
         0.0, 0.0, -FRAME_CUTOFF_THICKNESS / 2.0, qx, qy, qz, qw
     )
     obj.primitives.append(prim)
-    obj.primitive_poses.append(make_pose(bx + ox, by + oy, scene_z + oz, roll, pitch, yaw))
+    obj.primitive_poses.append(make_pose(bx + ox, by + oy, scene_z + oz - 0.0, roll, pitch, yaw))
     return obj
 
 
@@ -1950,6 +1954,7 @@ class G01Demo(Node):
         )
         return self._apply_scene(
             [make_deep_frame_cutoff(scene_z), make_grasp_object_collision(scene_pose)],
+            # [make_deep_frame_cutoff(scene_z)],
             colors,
         )
 
@@ -2908,7 +2913,7 @@ class G01Demo(Node):
         if arm_context is None:
             log.error(f"[pick] group={group} 无法确定放置使用的纯臂 group")
             return False
-        arm_group, _ = arm_context
+        arm_group, arm_plan_frame = arm_context
         arm_joint_names = joint_names_for_group(arm_group)
         body_group = "left_body" if arm_group == "left_arm" else "right_body"
         body_joint_names = joint_names_for_group(body_group)
@@ -2979,21 +2984,34 @@ class G01Demo(Node):
             log.error(f"[pick] 运动到 {yubei_name} 失败")
             return False
 
-        log.info(f"[pick] 6/9  {arm_group} OMPL → {place_name}")
+        log.info(f"[pick] 6/9  {arm_group} 笛卡尔直线 → {place_name}（不考虑碰撞）")
         current = self._get_joints(arm_joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前手臂关节失败")
             return False
-        goal = [make_joint_constraints_from_vector(arm_group, arm_joint_names, fang_joints)]
-        ok, used_ms, to_fang_traj = self.move(
-            arm_group, goal, start=current, plan_only=False, speed_scale=speed
+        fang_pose = self._get_link_pose_fk(
+            link,
+            joints=dict(zip(arm_joint_names, fang_joints)),
+            plan_frame=arm_plan_frame,
         )
-        log.info(f"[pick] OMPL → {place_name}: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
-        if not ok:
-            log.error(f"[pick] 运动到 {place_name} 失败")
+        if fang_pose is None:
+            log.error(f"[pick] 无法由 {place_name} 关节角计算末端位姿")
             return False
-        if to_fang_traj is None or not to_fang_traj.joint_trajectory.points:
-            log.error(f"[pick] 6/9 未返回到 {place_name} 的轨迹，无法原路返回")
+        to_fang_traj = self._cartesian_plan(
+            arm_group,
+            link,
+            fang_pose,
+            speed_scale=speed,
+            avoid_collisions=False,
+            start_joints=current,
+            joint_names=arm_joint_names,
+            plan_frame=arm_plan_frame,
+        )
+        if to_fang_traj is None:
+            log.error(f"[pick] 直线运动到 {place_name} 规划失败")
+            return False
+        if not self._execute_traj(to_fang_traj):
+            log.error(f"[pick] 直线运动到 {place_name} 执行失败")
             return False
         log.info(
             f"[pick] {place_name} 关节: "
