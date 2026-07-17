@@ -307,6 +307,14 @@ WALL_T = 0.031  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
 FRAME_CENTER = (0.8, 0.0, 0.4545)  # 深框整体外轮廓中心，相对于 base_link [m]
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
+
+# 与深框同时添加/移除的长方体障碍物（位置为中心点，相对于 base_link）
+BOX_OBSTACLE_ID = "长方体障碍物"
+BOX_OBSTACLE_SIZE = (0.9, 1.5, 0.965)  # X × Y × Z [m]
+BOX_OBSTACLE_CENTER = (0.8, 1.35, 0.4825)  # 中心位置 [m]
+BOX_OBSTACLE_RPY_DEG = (0.0, 0.0, 0.0)
+BOX_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=1.0)
+
 FRAME_CUTOFF_ID = "深框隔离面"
 FRAME_CUTOFF_THICKNESS = 0.01  # 水平隔离面厚度 [m]，沿深框局部 z 轴
 FRAME_CUTOFF_COLOR = ColorRGBA(r=1.0, g=0.25, b=0.1, a=1.0)
@@ -470,9 +478,13 @@ VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
 VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
     0.155022, -0.142564, -0.216301, 0.656542, -0.274923, 0.649464, 0.267520
 ]
+# SIM_VISION_RESULT = (
+#     1,
+#     [-195.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+# )
 SIM_VISION_RESULT = (
-    1,
-    [-195.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+    0,
+    [-230.0305, 43.2781, 860.8122, -0.481, 0.0739, -0.1165, -0.8658],
 )
 
 def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
@@ -1120,6 +1132,23 @@ def make_deep_frame() -> CollisionObject:
     add_box(t, W, wall_h, -(L / 2 - t / 2), 0, wall_z)        # -X 侧墙
     add_box(L - 2 * t, t, wall_h, 0, W / 2 - t / 2, wall_z)   # +Y 侧墙
     add_box(L - 2 * t, t, wall_h, 0, -(W / 2 - t / 2), wall_z)  # -Y 侧墙
+    return obj
+
+
+def make_box_obstacle() -> CollisionObject:
+    """创建与深框同时管理的长方体障碍物。"""
+    roll, pitch, yaw = (math.radians(v) for v in BOX_OBSTACLE_RPY_DEG)
+
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = BOX_OBSTACLE_ID
+    obj.operation = CollisionObject.ADD
+
+    prim = SolidPrimitive()
+    prim.type = SolidPrimitive.BOX
+    prim.dimensions = list(BOX_OBSTACLE_SIZE)
+    obj.primitives.append(prim)
+    obj.primitive_poses.append(make_pose(*BOX_OBSTACLE_CENTER, roll, pitch, yaw))
     return obj
 
 
@@ -1831,14 +1860,20 @@ class G01Demo(Node):
         return True
 
     def add_frame(self) -> bool:
-        """添加深框并设置 RViz 显示颜色。"""
-        color = ObjectColor(id=FRAME_ID, color=FRAME_COLOR)
-        return self._apply_scene([make_deep_frame()], [color])
+        """同时添加深框和长方体障碍物，并设置 RViz 显示颜色。"""
+        colors = [
+            ObjectColor(id=FRAME_ID, color=FRAME_COLOR),
+            ObjectColor(id=BOX_OBSTACLE_ID, color=BOX_OBSTACLE_COLOR),
+        ]
+        return self._apply_scene([make_deep_frame(), make_box_obstacle()], colors)
 
     def remove_frame(self) -> bool:
-        """从场景中删除深框。"""
-        rm = CollisionObject(id=FRAME_ID, operation=CollisionObject.REMOVE)
-        return self._apply_scene([rm])
+        """同时从场景中删除深框和长方体障碍物。"""
+        objects = [
+            CollisionObject(id=FRAME_ID, operation=CollisionObject.REMOVE),
+            CollisionObject(id=BOX_OBSTACLE_ID, operation=CollisionObject.REMOVE),
+        ]
+        return self._apply_scene(objects)
 
     def add_frame_cutoff_for_pose(
         self,
