@@ -864,7 +864,7 @@ def read_vision_object_pose(node, log, sim_mode: bool = False):
 
         sorted_results = sorted(
             zip(first_return_modes, all_xyz_rpy, raw_poses),
-            key=lambda item: item[1]["sj"][1],
+            key=lambda item: item[1]["sj"][2],
             reverse=True,
         )
         first_return_modes = [mode for mode, _, _ in sorted_results]
@@ -903,8 +903,8 @@ def joint_names_for_group(group: str) -> list[str]:
 
 
 def _side_order_from_xyz_rpy(xyz_rpy: dict) -> tuple[str, str]:
-    """根据物体在 SJ 下的 z 值决定左右优先级。"""
-    return ("left", "right") if xyz_rpy["sj"][2] > 0.0 else ("right", "left")
+    """根据物体在 SJ 下的 y 值决定左右优先级：y > 0 时左臂优先。"""
+    return ("left", "right") if xyz_rpy["sj"][1] > 0.0 else ("right", "left")
 
 
 def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
@@ -950,7 +950,7 @@ def arm_context_for_group(group: str) -> tuple[str, str] | None:
 # 按视觉点顺序遍历：
 #   点1 → 点2 → 点3 ...
 
-# 每个点内按 side_value = xyz_rpy["sj"][2] 判断左右顺序：
+# 每个点内按 side_value = xyz_rpy["sj"][1] 判断左右顺序：
 
 # side_value > 0:
 #   left_arm → right_arm → left_waist → right_waist → left_body → right_body
@@ -968,7 +968,7 @@ def validate_reachable_grasp(node, all_xyz_rpy: list[dict], speed_scale: float =
         order_text = " → ".join(item["group"] for item in attempts)
         log.info(
             f"[reach] 点 {point_index + 1}/{len(all_xyz_rpy)}: "
-            f"SJ.z={xyz_rpy['sj'][2]:.6f}, 验证顺序 {order_text}"
+            f"SJ.y={xyz_rpy['sj'][1]:.6f}, 验证顺序 {order_text}"
         )
 
         for attempt in attempts:
