@@ -188,7 +188,7 @@
     name="body_joint1"
     type="prismatic">
     <origin
-      xyz="0 0 0.043"
+      xyz="0 0 0.048"
       rpy="0 0 0" />
     <parent
       link="base_sj" />
@@ -198,7 +198,7 @@
       xyz="0 0 1" />
     <limit
       lower="0"
-      upper="0.24"
+      upper="0.19"
       effort="100"
       velocity="0" />
   </joint>
