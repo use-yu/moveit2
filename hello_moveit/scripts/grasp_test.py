@@ -304,14 +304,14 @@ SCENE_FRAME = "base_link"
 FRAME_ID = "深框"
 FRAME_SIZE = (0.795, 0.795, 0.505)  # 深框整体外尺寸：长×宽×高 [m]
 WALL_T = 0.035  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
-FRAME_CENTER = (0.8, 0.0, 0.4545)  # 深框整体外轮廓中心，相对于 base_link [m]
+FRAME_CENTER = (0.92, 0.01, 0.4545)  # 深框整体外轮廓中心，相对于 base_link [m]
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 
 # 与深框同时添加/移除的长方体障碍物（位置为中心点，相对于 base_link）
 BOX_OBSTACLE_ID = "长方体障碍物"
 BOX_OBSTACLE_SIZE = (0.9, 1.5, 0.965)  # X × Y × Z [m]
-BOX_OBSTACLE_CENTER = (0.8, 1.35, 0.3825)  # 中心位置 [m]
+BOX_OBSTACLE_CENTER = (0.8, 2.35, 0.3825)  # 中心位置 [m]
 BOX_OBSTACLE_RPY_DEG = (0.0, 0.0, 0.0)
 BOX_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=1.0)
 
@@ -583,11 +583,16 @@ def connect_vision(log) -> socket.socket | None:
         return None
 
 
-def read_vision_pose(sock: socket.socket, log) -> list[tuple[int, list[float]]] | None:
+def read_vision_pose(
+    sock: socket.socket,
+    log,
+    trigger_command: str = VISION_TRIGGER_COMMAND,
+) -> list[tuple[int, list[float]]] | None:
     """解析视觉数据：第 1 个数忽略，后面每 8 个数为 xyz(mm)+quat(wxyz)+模式码。"""
     try:
         t0 = time.monotonic()
-        sock.sendall(VISION_TRIGGER_COMMAND.encode("utf-8"))
+        sock.sendall(trigger_command.encode("utf-8"))
+        log.info(f"viewer 已发送触发命令: {trigger_command}")
         raw_text = sock.recv(4096).decode("utf-8", errors="ignore").strip()
         used_ms = (time.monotonic() - t0) * 1000.0
         message = f"viewer 发送命令到接收到数字耗时: {used_ms:.3f} ms"
@@ -794,7 +799,12 @@ def transform_vision_pose(
     return matrix_to_xyz_rpy(matmul4(transform_mm, pose_mm_wxyz_to_matrix(pose)))
 
 
-def read_vision_object_pose(node, log, sim_mode: bool = False):
+def read_vision_object_pose(
+    node,
+    log,
+    sim_mode: bool = False,
+    trigger_command: str = VISION_TRIGGER_COMMAND,
+):
     """视觉识别封装：返回所有点的模式码和 xyz_rpy。"""
     vision_sock = None
     if sim_mode:
@@ -812,7 +822,11 @@ def read_vision_object_pose(node, log, sim_mode: bool = False):
 
     try:
         if not sim_mode:
-            vision_results = read_vision_pose(vision_sock, log)
+            vision_results = read_vision_pose(
+                vision_sock,
+                log,
+                trigger_command=trigger_command,
+            )
             if vision_results is None:
                 return None
 

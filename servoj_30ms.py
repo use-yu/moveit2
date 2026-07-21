@@ -132,6 +132,7 @@ RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 # TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 87.0)
 DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 82.0)
 TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 124.0)
+FT_SENSOR_ONLINE_TIMEOUT_SEC = 5.0
 
 
 class fankuis():
@@ -149,7 +150,7 @@ class fankuis():
 
     def feed(self):
         try:
-            self.socket_feedback.setblocking(True)  # 需要先设置为非阻塞, 使用select超时机制清空
+            self.socket_feedback.settimeout(1.0)
             self.all = self.socket_feedback.recv(10240)
             data = self.all[0:1440]
             # print(data)
@@ -159,7 +160,9 @@ class fankuis():
                 tool_j = a['q_actual'][0]
                 tool_i = a['i_actual'][0]
                 tcp_force = a['TCP_force'][0]
-            return [tool_v, tool_j, tool_i, tcp_force]
+                ft_sensor = a['six_force_value'][0]
+                ft_sensor_online = int(a['six_force_online'][0])
+            return [tool_v, tool_j, tool_i, tcp_force, ft_sensor, ft_sensor_online]
         except:
             return ["NG"]
             print("反馈接收解析失败")
@@ -174,6 +177,8 @@ class ArmRosBridge(Node):
         self.right_i_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/i_actual", 10)
         self.left_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/TCP_force", 10)
         self.right_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/TCP_force", 10)
+        self.left_ft_sensor_pub = self.create_publisher(Float32MultiArray, "/g01/left/FTSensor", 10)
+        self.right_ft_sensor_pub = self.create_publisher(Float32MultiArray, "/g01/right/FTSensor", 10)
         # 200Hz输入只保留最新一条，30ms定时器按固定频率下发最新完整目标。
         self._latest_arm_commands = {"left": None, "right": None}
         self._new_arm_commands = {"left": False, "right": False}
@@ -206,6 +211,14 @@ class ArmRosBridge(Node):
             self.left_tcp_force_pub.publish(msg)
         elif side == "right":
             self.right_tcp_force_pub.publish(msg)
+
+    def publish_ft_sensor(self, side, force):
+        msg = Float32MultiArray()
+        msg.data = [float(num) for num in force]
+        if side == "left":
+            self.left_ft_sensor_pub.publish(msg)
+        elif side == "right":
+            self.right_ft_sensor_pub.publish(msg)
 
     def _extract_arm_command(self, name_to_pos, joints):
         out = []
@@ -277,9 +290,9 @@ class ArmRosBridge(Node):
 q_actual = {"left": [], "right": []}
 i_actual = {"left": [], "right": []}
 TCP_force = {"left": [], "right": []}
-def joint(ip, side, state_node):
-    global q_actual, i_actual, TCP_force
-    feed_v = fankuis(ip, 30004)
+FT_sensor = {"left": [], "right": []}
+def joint(feed_v, side, state_node):
+    global q_actual, i_actual, TCP_force, FT_sensor
     while stop:
         actual = feed_v.feed()
         #print(actual)
@@ -287,11 +300,33 @@ def joint(ip, side, state_node):
            q_actual[side] = [round(num, 6) for num in actual[1]]
            i_actual[side] = [round(num, 6) for num in actual[2]]
            TCP_force[side] = [round(num, 6) for num in actual[3]]
+           FT_sensor[side] = [round(num, 6) for num in actual[4]]
            state_node.publish_arm_state(side, q_actual[side])
            state_node.publish_arm_i_actual(side, i_actual[side])
            state_node.publish_arm_tcp_force(side, TCP_force[side])
+           state_node.publish_ft_sensor(side, FT_sensor[side])
            #print(q_actual[side])  # 输出: [3.141593, 2.718282, 1.414214]
         time.sleep(0.01)
+
+def wait_ft_sensor_online(feed_v, name, timeout=FT_SENSOR_ONLINE_TIMEOUT_SEC):
+    deadline = time.monotonic() + timeout
+    last_status = None
+    while time.monotonic() < deadline:
+        actual = feed_v.feed()
+        if actual == ["NG"]:
+            time.sleep(0.05)
+            continue
+        last_status = int(actual[5])
+        if last_status == 1:
+            print(f"{name} 力传感器已在线：six_force_online=1")
+            return
+        if last_status == 2:
+            raise RuntimeError(f"{name} 力传感器异常：six_force_online=2")
+        time.sleep(0.05)
+    raise RuntimeError(
+        f"{name} 力传感器未在线："
+        f"six_force_online={last_status}, 等待 {timeout:.1f}s 超时"
+    )
 
 def setup_logger(log_file='app.log'):
     # 创建日志记录器
@@ -670,17 +705,28 @@ state_node = None
 try:
     rclpy.init()
     state_node = ArmRosBridge(client_sockets)
-    for ip, side in zip(SERVER_ADDRESSES, ["left", "right"]):
-        feed_thread1 = threading.Thread(
-            target=joint,
-            args=(ip, side, state_node))  # 机器状态反馈线程
-        feed_thread1.daemon = True
-        feed_thread1.start()
     for index, client_socket in enumerate(client_sockets, start=1):
-        prepare_robot_for_servoj(client_socket, f'第{index}个机械臂')
+        arm_name = f'第{index}个机械臂'
+        prepare_robot_for_servoj(client_socket, arm_name)
         payload_result = send_set_payload(client_socket, *DEFAULT_PAYLOAD, wait_response=True)
         if payload_result != 0:
-            raise RuntimeError(f"第{index}个机械臂 SetPayload 失败，返回码：{payload_result}")
+            raise RuntimeError(f"{arm_name} SetPayload 失败，返回码：{payload_result}")
+        dashboard_command(client_socket, "EnableFTSensor(1)", name=arm_name, required=True)
+
+    feedback_connections = {}
+    for index, (ip, side) in enumerate(
+        zip(SERVER_ADDRESSES, ["left", "right"]), start=1
+    ):
+        feed_v = fankuis(ip, 30004)
+        # wait_ft_sensor_online(feed_v, f'第{index}个机械臂')
+        feedback_connections[side] = feed_v
+
+    for side in ["left", "right"]:
+        feed_thread1 = threading.Thread(
+            target=joint,
+            args=(feedback_connections[side], side, state_node))  # 机器状态反馈线程
+        feed_thread1.daemon = True
+        feed_thread1.start()
     for index, client_socket in enumerate(client_sockets, start=1):
         feed_thread = threading.Thread(
             target=worker,

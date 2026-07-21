@@ -28,14 +28,14 @@ from scipy.spatial.transform import Rotation
 URDF_XACRO = Path(__file__).parent / "moveit_resources/g01_description/urdf/G01-URDF888.urdf"
 
 # 基坐标系和末端坐标系 link 名。右臂可改成 BASE_LINK="r_base_link", EE_LINK="r_tool"。
-BASE_LINK = "SJ"
-EE_LINK = "l_tool"
+BASE_LINK = "base_sj"
+EE_LINK = "r_tool"
 
 # 目标末端位姿，表达在 BASE_LINK 坐标系下，单位：m / rad。
 # 右臂放
-# TARGET_XYZ = [0.318955+0.0005, 0.051979, -0.325236+0.001]
-# TARGET_RPY = [-90.0, -11.576622, -180.0]
-# SEED_JOINTS = [66.0, -42.0, -76.0, -60.0, -144.0, -100.0]
+TARGET_XYZ = [-0.256, 0.083, 0.522]
+TARGET_RPY = [-180, 0.0, 41.489]
+SEED_JOINTS = [66.0, -42.0, -76.0, -60.0, -144.0, -100.0]
 # 左臂放
 # TARGET_XYZ = [0.319742, 0.051979, 0.355548]
 # TARGET_RPY = [-90.0, -11.137174, 180.0]
@@ -45,15 +45,17 @@ EE_LINK = "l_tool"
 # TARGET_RPY = [-180.0, 0.0, -90.0]
 # SEED_JOINTS = [-108.0, -88.0, -48.0, -42.0, 43.0, 0.0]
 #交换左
-TARGET_XYZ = [0.757995453, -0.026005114, 0.981641356]
-TARGET_RPY = [0.0, 0.0, 60.0]
-SEED_JOINTS = [23, -87.0, -35.0, -60.0, 53.0, -2.0]
-# 固定腰部角度。BASE_LINK="SJ" 到 EE_LINK="r_tool" 的链上会经过 body_joint2。
+# TARGET_XYZ = [0.757995453, -0.026005114, 0.981641356]
+# TARGET_RPY = [0.0, 0.0, 60.0]
+# SEED_JOINTS = [23, -87.0, -35.0, -60.0, 53.0, -2.0]
+# BASE_LINK="base_sj" 到手臂末端的链会经过升降和腰部关节，二者都固定为 0。
+LIFT_JOINT = "body_joint1"
+LIFT_POSITION = 0.0  # m
 WAIST_JOINT = "body_joint2"
-WAIST_ANGLE = 30.0
+WAIST_ANGLE = 0.0
 WAIST_ANGLE_DEG = True
 
-# IK 迭代初始关节角。腰部已固定，这里只填右臂 6 个关节。
+# IK 迭代初始关节角。升降和腰部已固定，这里只填右臂 6 个关节。
 # 当前顺序: r_arm_joint1, r_arm_joint2, ..., r_arm_joint6。
 # SEED_JOINTS = [-108.0, -88.0, -48.0, -42.0, 43.0, 0.0]
 #l
@@ -225,11 +227,14 @@ def is_active_joint(joint: Joint) -> bool:
 def configured_fixed_joint_values(chain: Sequence[Joint]) -> dict[str, float]:
     values = {}
     for joint in chain:
-        if joint.name != WAIST_JOINT:
+        if joint.name == LIFT_JOINT:
+            value = LIFT_POSITION
+        elif joint.name == WAIST_JOINT:
+            value = WAIST_ANGLE
+            if WAIST_ANGLE_DEG and joint.type in ("revolute", "continuous"):
+                value = math.radians(value)
+        else:
             continue
-        value = WAIST_ANGLE
-        if WAIST_ANGLE_DEG and joint.type in ("revolute", "continuous"):
-            value = math.radians(value)
         values[joint.name] = float(value)
     return values
 

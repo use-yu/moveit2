@@ -20,8 +20,10 @@ ros2 topic pub -r 50 /driver_report/taihu_motor_info pkg_msg_define/msg/MotorRun
     export DISPLAY=:0
     ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true
     
+ros2 service call /dobot_right/dobot_bringup_ros2/srv/GetForce SetToolPower "{status: 0}"
+
 ros2 service call /g01/right/tool_commands dobot_msgs_v4/srv/SetToolPower "{status: 0}"
-ros2 service call /g01/left/tool_commands dobot_msgs_v4/srv/SetToolPower "{status: 0}"
+ros2 service call /g01/left/tool_commands dobot_msgs_v4/srv/GetForce "{status: 0}"
 官方 ros2 SDK：
     ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py
 

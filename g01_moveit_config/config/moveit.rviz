@@ -10,6 +10,8 @@ Panels:
         - /RobotModel1
         - /TF1
         - /TF1/Frames1
+        - /MarkerArray1
+        - /MarkerArray1/Topic1
       Splitter Ratio: 0.5
     Tree Height: 344
   - Class: rviz_common/Help
@@ -207,7 +209,7 @@ Visualization Manager:
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
         Planning Group: dual_arm
-        Query Goal State: true
+        Query Goal State: false
         Query Start State: false
         Show Workspace: false
         Start State Alpha: 1
@@ -489,32 +491,10 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
-        L1:
-          Value: false
-        L2:
-          Value: false
-        L3:
-          Value: false
-        L4:
-          Value: false
-        L5:
-          Value: false
         L6:
-          Value: false
-        R1:
-          Value: false
-        R2:
-          Value: false
-        R3:
-          Value: false
-        R4:
-          Value: false
-        R5:
           Value: false
         R6:
           Value: false
-        SJ:
-          Value: true
         YB:
           Value: false
         base_footprint:
@@ -523,8 +503,6 @@ Visualization Manager:
           Value: true
         base_sj:
           Value: true
-        base_x_link:
-          Value: false
         l_base_link:
           Value: true
         l_tool:
@@ -543,29 +521,7 @@ Visualization Manager:
       Tree:
         world:
           base_footprint:
-            base_x_link:
-              base_link:
-                base_sj:
-                  SJ:
-                    YB:
-                      l_base_link:
-                        L1:
-                          L2:
-                            L3:
-                              L4:
-                                L5:
-                                  L6:
-                                    l_tool:
-                                      {}
-                      r_base_link:
-                        R1:
-                          R2:
-                            R3:
-                              R4:
-                                R5:
-                                  R6:
-                                    r_tool:
-                                      {}
+            {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Marker
@@ -580,6 +536,18 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /g01_pose_cylinder
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /table_coordinate_system
       Value: true
   Enabled: true
   Global Options:
@@ -599,25 +567,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 6.2331414222717285
+      Distance: 5.716067314147949
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -0.20027543604373932
-        Y: 0.3418879508972168
-        Z: 1.0678622722625732
-      Focal Shape Fixed Size: true
+        X: 0.7432155609130859
+        Y: 1.06386399269104
+        Z: 0.3372155427932739
+      Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.12479683011770248
+      Pitch: 0.2647954225540161
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 5.815206527709961
+      Yaw: 4.848625183105469
     Saved: ~
 Window Geometry:
   Displays:
