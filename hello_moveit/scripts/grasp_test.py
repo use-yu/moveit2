@@ -88,7 +88,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import ColorRGBA, String
+from std_msgs.msg import ColorRGBA, String, UInt8
 from visualization_msgs.msg import Marker
 from dobot_msgs_v4.srv import SetToolPower
 
@@ -341,6 +341,21 @@ LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 GRASP_CMD_TOPIC = "/grasp_cmd"
 GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
+DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
+SIGNAL_SW1_MASK = 0x08
+SIGNAL_SW2_MASK = 0x10
+SIGNAL_SW3_MASK = 0x20
+SIGNAL_SW4_MASK = 0x40
+PLACE_SLOT_MASKS = {
+    "sw1": SIGNAL_SW1_MASK,
+    "sw2": SIGNAL_SW2_MASK,
+    "sw3": SIGNAL_SW3_MASK,
+    "sw4": SIGNAL_SW4_MASK,
+}
+ALL_PLACE_SLOTS_EMPTY_SIGNAL = (
+    SIGNAL_SW1_MASK | SIGNAL_SW2_MASK | SIGNAL_SW3_MASK | SIGNAL_SW4_MASK
+)
+DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 WAIST_BODY_GROUP = "body"
 WAIST_BODY_JOINT = "body_joint2"
 WAIST_RESET_ANGLE_RAD = math.radians(30.0)
@@ -394,36 +409,36 @@ PLACE_JOINTS = {
             -1.1022419929504395, -2.5003864765167236, -2.29879448,
         ],
         "yubei": {
-            "sw1": [
-                0.0, 0*math.pi/180,
-                3.556200637,1.060800540,2.044133396,0.051470581,0.424914406,-2.328834313
-            ],
-            "sw2": [
-                0.0, 0*math.pi/180,
-                3.554313605,1.538879001,1.722925524,-0.100794764,0.419769845,-2.333840873
-            ],
-            "sw3": [
-                0.0, 0*math.pi/180,
-                3.415033624,1.579144702,1.219744218,0.362175968,0.279827534,-2.332766090
-            ],
+            # "sw1": [
+            #     0.0, 0*math.pi/180,
+            #     3.556200637,1.060800540,2.044133396,0.051470581,0.424914406,-2.328834313
+            # ],
+            # "sw2": [
+            #     0.0, 0*math.pi/180,
+            #     3.554313605,1.538879001,1.722925524,-0.100794764,0.419769845,-2.333840873
+            # ],
+            # "sw3": [
+            #     0.0, 0*math.pi/180,
+            #     3.415033624,1.579144702,1.219744218,0.362175968,0.279827534,-2.332766090
+            # ],
             "sw4": [
                 0.0, 0*math.pi/180,
-                3.415484355,1.152638678,1.531571090,0.472062715,0.282902414,-2.327790246
+                3.415329490,1.155297318,1.529529274,0.471494600,0.282732286,-2.327840106
             ],            
             
         },
         "fang": {
-            "sw1": [
-                3.784054384,1.097705973,1.754978779,0.295541059,0.652224570,-2.321099244
-            ],
-            "sw2": [
-                3.783080058,1.541423677,1.450178525,0.158915519,0.648433513,-2.323951586
-            ],
-            "sw3": [
-                3.599673103,1.660221433,0.910718318,0.578949141,0.463169458,-2.321909191
-            ],
+            # "sw1": [
+            #     3.784054384,1.097705973,1.754978779,0.295541059,0.652224570,-2.321099244
+            # ],
+            # "sw2": [
+            #     3.783080058,1.541423677,1.450178525,0.158915519,0.648433513,-2.323951586
+            # ],
+            # "sw3": [
+            #     3.599673103,1.660221433,0.910718318,0.578949141,0.463169458,-2.321909191
+            # ],
             "sw4": [
-                3.599549154,1.239106766,1.255386134,0.653789105,0.465697974,-2.320114963
+                3.599330969,1.241679696,1.253256362,0.653366556,0.465464338,-2.320137010
             ],
         },
     },
@@ -1617,13 +1632,77 @@ class G01Demo(Node):
         self._latest_grasp_cmd: dict | None = None
         self._start_grasp_cmd: dict | None = None
         self.last_pick_failure_reason: str | None = None
-        self._used_place_slots: set[tuple[str, str]] = set()
+        # UInt8 会在回调中显式限制到 uint8 范围。真实模式在收到首帧前为未知，
+        # 未知状态按“没有安全空位”处理；仿真模式默认四个 SW 均为空。
+        self._driver_signal: int | None = (
+            ALL_PLACE_SLOTS_EMPTY_SIGNAL if self.sim_mode else None
+        )
+        # 放置完成后，传感器可能要到下一帧才变成 0。这里临时锁住刚放过的
+        # SW；收到该 SW=0 的硬件确认后解除本地锁，后续完全跟随硬件状态。
+        self._pending_occupied_place_slots: set[str] = set()
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
+        self.create_subscription(UInt8, DRIVER_SIGNAL_TOPIC, self._on_driver_signal, 10)
         self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
+
+    def _on_driver_signal(self, msg: UInt8):
+        """缓存驱动板 UInt8 信号；SW 位非 0=空，SW 位为 0=已有物体。"""
+        signal = int(msg.data) & 0xFF
+        changed = signal != self._driver_signal
+        self._driver_signal = signal
+
+        # 一旦硬件确认刚放置的槽位为“有物体”，本地防重复锁即可释放。
+        # 之后若物体被取走、硬件位重新变成 1，该槽位会自然恢复可用。
+        for slot_name in tuple(self._pending_occupied_place_slots):
+            mask = PLACE_SLOT_MASKS[slot_name]
+            if (signal & mask) == 0:
+                self._pending_occupied_place_slots.remove(slot_name)
+
+        if changed:
+            states = ", ".join(
+                f"{slot_name.upper()}={'空' if signal & mask else '有物体'}"
+                for slot_name, mask in PLACE_SLOT_MASKS.items()
+            )
+            self.get_logger().info(
+                f"收到 {DRIVER_SIGNAL_TOPIC}: uint8=0x{signal:02X}, {states}"
+            )
+
+    def _wait_for_driver_signal(
+        self, timeout_sec: float = DRIVER_SIGNAL_WAIT_TIMEOUT_SEC
+    ) -> bool:
+        """等待首帧放置位信号；没有可靠信号时禁止开始抓取。"""
+        if self._driver_signal is not None:
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while rclpy.ok() and self._driver_signal is None and time.monotonic() < deadline:
+            rclpy.spin_once(
+                self,
+                timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
+            )
+        if self._driver_signal is None:
+            self.get_logger().error(
+                f"[pick] {timeout_sec:.1f}s 内未收到 {DRIVER_SIGNAL_TOPIC}，"
+                "无法确认放置位，禁止抓取"
+            )
+            return False
+        return True
+
+    def _place_slot_is_empty(self, slot_name: str) -> bool:
+        """按 SW 掩码判断指定槽位是否为空；未知名称/未知信号均返回 False。"""
+        mask = PLACE_SLOT_MASKS.get(str(slot_name).lower())
+        if mask is None or self._driver_signal is None:
+            return False
+        normalized_name = str(slot_name).lower()
+        return (
+            (self._driver_signal & mask) != 0
+            and normalized_name not in self._pending_occupied_place_slots
+        )
+
+    def _has_any_empty_place_slot(self) -> bool:
+        return any(self._place_slot_is_empty(name) for name in PLACE_SLOT_MASKS)
 
     def _on_grasp_cmd(self, msg: String):
         """解析 /grasp_cmd 的 JSON 字符串，cmd_type=1 表示启动抓取。"""
@@ -2912,16 +2991,39 @@ class G01Demo(Node):
         place_joints: dict[str, object],
         first_return_mode: int,
     ) -> bool:
-        """检查当前放置配置是否还有可用目标。"""
+        """检查硬件信号所示的空位中，是否存在已配置的放置目标。"""
+        available, _ = self._select_available_place_target(
+            arm_group, place_joints, first_return_mode
+        )
+        return available
+
+    def _select_available_place_target(
+        self,
+        arm_group: str,
+        place_joints: dict[str, object],
+        first_return_mode: int,
+    ) -> tuple[bool, str | None]:
+        """返回 (是否可放, SW 名称)；字典配置会选择第一个真实空位。"""
         suffix = "_j" if first_return_mode == 1 else ""
         yubei_config = place_joints.get(f"yubei{suffix}")
         fang_config = place_joints.get(f"fang{suffix}")
         if isinstance(fang_config, dict):
-            return isinstance(yubei_config, dict) and any(
-                name in yubei_config and (arm_group, name) not in self._used_place_slots
-                for name in fang_config
+            if not isinstance(yubei_config, dict):
+                return False, None
+            slot_name = next(
+                (
+                    str(name).lower()
+                    for name in fang_config
+                    if name in yubei_config and self._place_slot_is_empty(str(name))
+                ),
+                None,
             )
-        return yubei_config is not None and fang_config is not None
+            return slot_name is not None, slot_name
+
+        # *_j 是没有 SW 名称的单一旧配置，无法把某个掩码映射到不同关节目标；
+        # 仍要求四个硬件检测位中至少存在一个空位，确保“无空位不抓取”。
+        configured = yubei_config is not None and fang_config is not None
+        return configured and self._has_any_empty_place_slot(), None
 
     def _place_and_return(
         self,
@@ -2931,6 +3033,7 @@ class G01Demo(Node):
         group: str,
         link: str,
         first_return_mode: int,
+        selected_slot_name: str | None = None,
     ) -> bool:
         """body+手臂到 yubei，再用纯臂放置、原路返回并运动到 Q1。"""
         log = self.get_logger()
@@ -2953,17 +3056,33 @@ class G01Demo(Node):
         fang_config = place_joints[fang_key]
         slot_name: str | None = None
         if isinstance(fang_config, dict):
-            available = next(
-                ((name, joints) for name, joints in fang_config.items()
-                 if (arm_group, name) not in self._used_place_slots
-                 and isinstance(yubei_config, dict) and name in yubei_config),
-                None,
-            )
-            if available is None:
-                log.error(f"[pick] {fang_key} 的所有放置位均已使用")
+            if not isinstance(yubei_config, dict):
+                log.error(f"[pick] {yubei_key} 不是按 SW 命名的放置配置")
                 return False
-            slot_name, fang_values = available
+            if (
+                selected_slot_name is not None
+                and selected_slot_name in fang_config
+                and selected_slot_name in yubei_config
+                and self._place_slot_is_empty(selected_slot_name)
+            ):
+                slot_name = selected_slot_name
+            else:
+                # 抓取过程中原目标可能被占用；放置动作开始前允许改选另一个空位。
+                available, slot_name = self._select_available_place_target(
+                    arm_group, place_joints, first_return_mode
+                )
+                if not available or slot_name is None:
+                    log.error(f"[pick] {fang_key} 没有硬件信号为“空”的可用放置位")
+                    return False
+                if selected_slot_name is not None and slot_name != selected_slot_name:
+                    log.warning(
+                        f"[pick] 原定放置位 {selected_slot_name} 已不可用，改用 {slot_name}"
+                    )
+            fang_values = fang_config[slot_name]
         else:
+            if not self._has_any_empty_place_slot():
+                log.error("[pick] SW1~SW4 均有物体，禁止执行放置")
+                return False
             fang_values = fang_config
 
         if isinstance(yubei_config, dict):
@@ -3060,13 +3179,30 @@ class G01Demo(Node):
             log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
             return False
         tool_label = "左臂" if tool_side == "left" else "右臂"
+        if slot_name is not None and not self._place_slot_is_empty(slot_name):
+            log.error(
+                f"[pick] 放置前复查发现 {slot_name} 已有物体，保持工具上电并中止放置"
+            )
+            return False
+        if slot_name is None and not self._has_any_empty_place_slot():
+            log.error("[pick] 放置前复查发现 SW1~SW4 均有物体，保持工具上电并中止放置")
+            return False
         log.info(f"[pick] 7/9  {tool_label}工具下电，放置到 {place_name}")
         if not self.set_tool_power(tool_side, 0):
             log.error(f"[pick] {tool_label}工具下电失败")
             return False
         if slot_name:
-            self._used_place_slots.add((arm_group, slot_name))
-            log.info(f"[pick] {arm_group} 放置位 {slot_name} 已使用")
+            mask = PLACE_SLOT_MASKS[slot_name]
+            if self._driver_signal is not None and (self._driver_signal & mask) == 0:
+                # set_tool_power() 等待服务返回时也会处理订阅回调；若此时已经
+                # 收到 SW=0，就不再增加本地锁，硬件状态本身已能阻止重复放置。
+                self._pending_occupied_place_slots.discard(slot_name)
+                log.info(f"[pick] {arm_group} 已放置到 {slot_name}，硬件已确认占用")
+            else:
+                self._pending_occupied_place_slots.add(slot_name)
+                log.info(
+                    f"[pick] {arm_group} 已放置到 {slot_name}，等待硬件信号确认占用"
+                )
         print(f"\033[32m{tool_label}下电成功\033[0m")
 
         log.info(
@@ -3178,11 +3314,29 @@ class G01Demo(Node):
         if not isinstance(place_joint_config, dict):
             log.error(f"[pick] PLACE_JOINTS 未配置 {place_arm_group}")
             return False
-        if not self._has_available_place_target(
-            place_arm_group, place_joint_config, first_return_mode
-        ):
-            log.error("[pick] 放置位已全部使用，取消本次抓取")
+        if not self._wait_for_driver_signal():
+            self.last_pick_failure_reason = "no_place_signal"
             return False
+        place_available, selected_place_slot = self._select_available_place_target(
+            place_arm_group, place_joint_config, first_return_mode
+        )
+        if not place_available:
+            signal_text = (
+                "unknown"
+                if self._driver_signal is None
+                else f"0x{self._driver_signal:02X}"
+            )
+            log.error(
+                f"[pick] 没有信号为“空”且已配置的放置位"
+                f"（driver_signal={signal_text}），取消本次抓取"
+            )
+            self.last_pick_failure_reason = "no_place"
+            return False
+        if selected_place_slot is not None:
+            log.info(
+                f"[pick] 抓取前确认放置位 {selected_place_slot.upper()} 为空，"
+                "本次抓取将使用该位置"
+            )
 
         if not self.set_tool_power(tool_side, 0):
             log.error(f"[pick] {tool_label}工具下电失败")
@@ -3349,6 +3503,7 @@ class G01Demo(Node):
                 group=place_arm_group,
                 link="l_tool" if place_arm_group == "left_arm" else "r_tool",
                 first_return_mode=first_return_mode,
+                selected_slot_name=selected_place_slot,
             ):
                 return False
 
@@ -3359,6 +3514,7 @@ class G01Demo(Node):
                 group=group,
                 link=link,
                 first_return_mode=first_return_mode,
+                selected_slot_name=selected_place_slot,
             ):
                 return False
 
