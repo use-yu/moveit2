@@ -409,18 +409,18 @@ PLACE_JOINTS = {
             -1.1022419929504395, -2.5003864765167236, -2.29879448,
         ],
         "yubei": {
-            # "sw1": [
-            #     0.0, 0*math.pi/180,
-            #     3.556200637,1.060800540,2.044133396,0.051470581,0.424914406,-2.328834313
-            # ],
-            # "sw2": [
-            #     0.0, 0*math.pi/180,
-            #     3.554313605,1.538879001,1.722925524,-0.100794764,0.419769845,-2.333840873
-            # ],
-            # "sw3": [
-            #     0.0, 0*math.pi/180,
-            #     3.415033624,1.579144702,1.219744218,0.362175968,0.279827534,-2.332766090
-            # ],
+            "sw1": [
+                0.0, 0*math.pi/180,
+                3.556200637,1.060800540,2.044133396,0.051470581,0.424914406,-2.328834313
+            ],
+            "sw2": [
+                0.0, 0*math.pi/180,
+                3.554313605,1.538879001,1.722925524,-0.100794764,0.419769845,-2.333840873
+            ],
+            "sw3": [
+                0.0, 0*math.pi/180,
+                3.415033624,1.579144702,1.219744218,0.362175968,0.279827534,-2.332766090
+            ],
             "sw4": [
                 0.0, 0*math.pi/180,
                 3.415329490,1.155297318,1.529529274,0.471494600,0.282732286,-2.327840106
@@ -428,15 +428,15 @@ PLACE_JOINTS = {
             
         },
         "fang": {
-            # "sw1": [
-            #     3.784054384,1.097705973,1.754978779,0.295541059,0.652224570,-2.321099244
-            # ],
-            # "sw2": [
-            #     3.783080058,1.541423677,1.450178525,0.158915519,0.648433513,-2.323951586
-            # ],
-            # "sw3": [
-            #     3.599673103,1.660221433,0.910718318,0.578949141,0.463169458,-2.321909191
-            # ],
+            "sw1": [
+                3.784054384,1.097705973,1.754978779,0.295541059,0.652224570,-2.321099244
+            ],
+            "sw2": [
+                3.783080058,1.541423677,1.450178525,0.158915519,0.648433513,-2.323951586
+            ],
+            "sw3": [
+                3.599673103,1.660221433,0.910718318,0.578949141,0.463169458,-2.321909191
+            ],
             "sw4": [
                 3.599330969,1.241679696,1.253256362,0.653366556,0.465464338,-2.320137010
             ],
@@ -1637,12 +1637,14 @@ class G01Demo(Node):
         self._driver_signal: int | None = (
             ALL_PLACE_SLOTS_EMPTY_SIGNAL if self.sim_mode else None
         )
+        self._driver_signal_count = 0
         # 放置完成后，传感器可能要到下一帧才变成 0。这里临时锁住刚放过的
         # SW；收到该 SW=0 的硬件确认后解除本地锁，后续完全跟随硬件状态。
         self._pending_occupied_place_slots: set[str] = set()
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
-        self.create_subscription(UInt8, DRIVER_SIGNAL_TOPIC, self._on_driver_signal, 10)
+        # 只保留最新一帧，避免循环间 input() 阻塞时积压旧的开关状态。
+        self.create_subscription(UInt8, DRIVER_SIGNAL_TOPIC, self._on_driver_signal, 1)
         self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
         self._cylinder_marker_ids: dict[str, int] = {}
@@ -1651,6 +1653,7 @@ class G01Demo(Node):
     def _on_driver_signal(self, msg: UInt8):
         """缓存驱动板 UInt8 信号；SW 位非 0=空，SW 位为 0=已有物体。"""
         signal = int(msg.data) & 0xFF
+        self._driver_signal_count += 1
         changed = signal != self._driver_signal
         self._driver_signal = signal
 
@@ -1671,20 +1674,32 @@ class G01Demo(Node):
             )
 
     def _wait_for_driver_signal(
-        self, timeout_sec: float = DRIVER_SIGNAL_WAIT_TIMEOUT_SEC
+        self,
+        timeout_sec: float = DRIVER_SIGNAL_WAIT_TIMEOUT_SEC,
+        require_new: bool = False,
     ) -> bool:
-        """等待首帧放置位信号；没有可靠信号时禁止开始抓取。"""
-        if self._driver_signal is not None:
+        """等待可靠的放置位信号；require_new=True 时必须收到调用后处理的新帧。"""
+        if self.sim_mode:
+            return True
+        signal_count_before_wait = self._driver_signal_count
+        if self._driver_signal is not None and not require_new:
             return True
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
-        while rclpy.ok() and self._driver_signal is None and time.monotonic() < deadline:
+        while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(
                 self,
                 timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
             )
-        if self._driver_signal is None:
+            if self._driver_signal is not None and (
+                not require_new or self._driver_signal_count > signal_count_before_wait
+            ):
+                return True
+        if self._driver_signal is None or (
+            require_new and self._driver_signal_count <= signal_count_before_wait
+        ):
+            wait_desc = "新一帧" if require_new else "首帧"
             self.get_logger().error(
-                f"[pick] {timeout_sec:.1f}s 内未收到 {DRIVER_SIGNAL_TOPIC}，"
+                f"[pick] {timeout_sec:.1f}s 内未收到 {DRIVER_SIGNAL_TOPIC} {wait_desc}，"
                 "无法确认放置位，禁止抓取"
             )
             return False
@@ -3726,6 +3741,22 @@ def main(argv: list[str] | None = None) -> int:
 
     def run_one_grasp() -> bool | None:
         """执行一轮抓取；True=成功，False=失败，None=用户选择退出。"""
+        # 在机器人运动和视觉识别之前先确认放置区，避免无空位时仍触发识别。
+        if not node._wait_for_driver_signal(require_new=True):
+            node.last_pick_failure_reason = "no_place_signal"
+            return False
+        empty_place_slots = [
+            slot_name.upper()
+            for slot_name in PLACE_SLOT_MASKS
+            if node._place_slot_is_empty(slot_name)
+        ]
+        empty_slots_text = ", ".join(empty_place_slots) if empty_place_slots else "无"
+        print(f"{GREEN}[pick] 当前空位: {empty_slots_text}{RESET}")
+        if not empty_place_slots:
+            node.last_pick_failure_reason = "no_place"
+            log.error("[pick] SW1~SW4 均有物体，取消本次抓取，不执行视觉识别")
+            return False
+
         # --- 2. 关节空间运动 ---
         targets = JOINT_TARGETS["dual_arm_body"]
         joint_names = list(targets.keys())
