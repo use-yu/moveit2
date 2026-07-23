@@ -33,9 +33,27 @@ EE_LINK = "r_tool"
 
 # 目标末端位姿，表达在 BASE_LINK 坐标系下，单位：m / rad。
 # 右臂放
-TARGET_XYZ = [-0.256, 0.083, 0.522]
-TARGET_RPY = [-180, 0.0, 41.489]
-SEED_JOINTS = [66.0, -42.0, -76.0, -60.0, -144.0, -100.0]
+
+# TARGET_XYZ = [-0.250734619, -0.086026246, 0.522690326]
+# TARGET_RPY = [-180, 0.0, 42.489536]
+# SEED_JOINTS = [216.8105,62.8939,100.5533,16.9322,37.3706,-132.9887]
+
+# 1
+# TARGET_XYZ = [-0.250734619, -0.086026246, 0.622690326]
+# TARGET_RPY = [-180, 0.0, 42.489536]
+# SEED_JOINTS = [216.8105,62.8939,100.5533,16.9322,37.3706,-132.9887]
+
+# TARGET_XYZ = [-0.250734619, 0.084, 0.622690326]
+# TARGET_RPY = [-180, 0.0, 42.489536]
+# SEED_JOINTS = [216.8105,62.8939,100.5533,16.9322,37.3706,-132.9887]
+
+# TARGET_XYZ = [-0.420734619, 0.084, 0.622690326]
+# TARGET_RPY = [-180, 0.0, 42.489536]
+# SEED_JOINTS = [216.8105,62.8939,100.5533,16.9322,37.3706,-132.9887]
+
+TARGET_XYZ = [-0.420734619, -0.086026246, 0.622690326]
+TARGET_RPY = [-180, 0.0, 42.489536]
+SEED_JOINTS = [216.8105,62.8939,100.5533,16.9322,37.3706,-132.9887]
 # 左臂放
 # TARGET_XYZ = [0.319742, 0.051979, 0.355548]
 # TARGET_RPY = [-90.0, -11.137174, 180.0]
@@ -414,13 +432,13 @@ def main() -> int:
     # print("target_xyz:", " ".join(f"{v:.9f}" for v in TARGET_XYZ))
     # print("target_rpy_rad:", " ".join(f"{v:.9f}" for v in target_rpy))
     # print("seed_rad:", format_named_values(active_names, seed))
-    if fixed_names:
-        print("fixed_joints_rad:", format_named_values(fixed_names, fixed_q))
-        print("fixed_joints_deg:", format_named_values(fixed_names, fixed_q, degrees=True))
+    # if fixed_names:
+    #     print("fixed_joints_rad:", format_named_values(fixed_names, fixed_q))
+    #     print("fixed_joints_deg:", format_named_values(fixed_names, fixed_q, degrees=True))
     print(",".join(f"{value:.9f}" for value in q))
     print("solution_deg:", format_named_values(active_names, q, degrees=True))
-    print("full_solution_rad:", format_named_values(full_names, full_q))
-    print("full_solution_deg:", format_named_values(full_names, full_q, degrees=True))
+    # print("full_solution_rad:", format_named_values(full_names, full_q))
+    # print("full_solution_deg:", format_named_values(full_names, full_q, degrees=True))
     # print(
     #     "fk_ee_xyz:",
     #     f"{fk[0, 3]:.9f}",
