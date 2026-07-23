@@ -382,32 +382,56 @@ DEFAULT_ROBOT_URDF = (
 
 # 放置位关节目标 [rad]。fang 字典的顺序就是放置顺序，槽位按左右臂分别记录。
 PLACE_JOINTS = {
-    "left_body": [
-        -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
-    ],
-    "left": [
-        1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
-    ],
-    "right_body": [
-        -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
-    ],
-    "right": [
-        1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
-    ],
-    "dual_arm": [
-        1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
-        ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
-    ],
+    # "left_body": [
+    #     -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    # ],
+    # "left": [
+    #     1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    # ],
+    # "right_body": [
+    #     -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    # ],
+    # "right": [
+    #     1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    # ],
+    # "dual_arm": [
+    #     1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    #     ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
+    # ],
     "right_arm": {
-        "yubei_j": [
-            0.0, 30*math.pi/180,
-            0.9902063012123108, -0.6606103777885437, -1.4372066259384155,
-            -1.0370503664016724, -2.6659367084503174, -2.29879448,
-        ],
-        "fang_j": [
-            1.15645432472229, -0.7307567596435547, -1.304102897644043,
-            -1.1022419929504395, -2.5003864765167236, -2.29879448,
-        ],
+        "yubei_j": {
+            "sw1": [
+                0.0, 0*math.pi/180,
+                3.556200637,1.060800540,2.044133396,0.051470581,0.424914406,-2.328834313
+            ],
+            "sw2": [
+                0.0, 0*math.pi/180,
+                3.554313605,1.538879001,1.722925524,-0.100794764,0.419769845,-2.333840873
+            ],
+            "sw3": [
+                0.0, 0*math.pi/180,
+                3.415033624,1.579144702,1.219744218,0.362175968,0.279827534,-2.332766090
+            ],
+            "sw4": [
+                0.0, 0*math.pi/180,
+                3.415329490,1.155297318,1.529529274,0.471494600,0.282732286,-2.327840106
+            ],
+
+        },
+        "fang_j": {
+            "sw1": [
+                3.784054384,1.097705973,1.754978779,0.295541059,0.652224570,-2.321099244
+            ],
+            "sw2": [
+                3.783080058,1.541423677,1.450178525,0.158915519,0.648433513,-2.323951586
+            ],
+            "sw3": [
+                3.599673103,1.660221433,0.910718318,0.578949141,0.463169458,-2.321909191
+            ],
+            "sw4": [
+                3.599330969,1.241679696,1.253256362,0.653366556,0.465464338,-2.320137010
+            ],
+        },
         "yubei": {
             "sw1": [
                 0.0, 0*math.pi/180,
@@ -424,8 +448,8 @@ PLACE_JOINTS = {
             "sw4": [
                 0.0, 0*math.pi/180,
                 3.415329490,1.155297318,1.529529274,0.471494600,0.282732286,-2.327840106
-            ],            
-            
+            ],
+
         },
         "fang": {
             "sw1": [
@@ -532,15 +556,15 @@ VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
     0.155022, -0.142564, -0.216301, 0.656542, -0.274923, 0.649464, 0.267520
 ]
 # 左臂抓
-# SIM_VISION_RESULT = (
-#     0,
-#     [-195.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
-# )
-# 右臂抓
 SIM_VISION_RESULT = (
-    0,
-    [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+    1,
+    [-195.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
 )
+# 右臂抓
+# SIM_VISION_RESULT = (
+#     1,
+#     [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+# )
 
 def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
     if len(transform) != 7:
@@ -1638,9 +1662,6 @@ class G01Demo(Node):
             ALL_PLACE_SLOTS_EMPTY_SIGNAL if self.sim_mode else None
         )
         self._driver_signal_count = 0
-        # 放置完成后，传感器可能要到下一帧才变成 0。这里临时锁住刚放过的
-        # SW；收到该 SW=0 的硬件确认后解除本地锁，后续完全跟随硬件状态。
-        self._pending_occupied_place_slots: set[str] = set()
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
         # 只保留最新一帧，避免循环间 input() 阻塞时积压旧的开关状态。
@@ -1656,13 +1677,6 @@ class G01Demo(Node):
         self._driver_signal_count += 1
         changed = signal != self._driver_signal
         self._driver_signal = signal
-
-        # 一旦硬件确认刚放置的槽位为“有物体”，本地防重复锁即可释放。
-        # 之后若物体被取走、硬件位重新变成 1，该槽位会自然恢复可用。
-        for slot_name in tuple(self._pending_occupied_place_slots):
-            mask = PLACE_SLOT_MASKS[slot_name]
-            if (signal & mask) == 0:
-                self._pending_occupied_place_slots.remove(slot_name)
 
         if changed:
             states = ", ".join(
@@ -1710,11 +1724,7 @@ class G01Demo(Node):
         mask = PLACE_SLOT_MASKS.get(str(slot_name).lower())
         if mask is None or self._driver_signal is None:
             return False
-        normalized_name = str(slot_name).lower()
-        return (
-            (self._driver_signal & mask) != 0
-            and normalized_name not in self._pending_occupied_place_slots
-        )
+        return (self._driver_signal & mask) != 0
 
     def _has_any_empty_place_slot(self) -> bool:
         return any(self._place_slot_is_empty(name) for name in PLACE_SLOT_MASKS)
@@ -3206,18 +3216,6 @@ class G01Demo(Node):
         if not self.set_tool_power(tool_side, 0):
             log.error(f"[pick] {tool_label}工具下电失败")
             return False
-        if slot_name:
-            mask = PLACE_SLOT_MASKS[slot_name]
-            if self._driver_signal is not None and (self._driver_signal & mask) == 0:
-                # set_tool_power() 等待服务返回时也会处理订阅回调；若此时已经
-                # 收到 SW=0，就不再增加本地锁，硬件状态本身已能阻止重复放置。
-                self._pending_occupied_place_slots.discard(slot_name)
-                log.info(f"[pick] {arm_group} 已放置到 {slot_name}，硬件已确认占用")
-            else:
-                self._pending_occupied_place_slots.add(slot_name)
-                log.info(
-                    f"[pick] {arm_group} 已放置到 {slot_name}，等待硬件信号确认占用"
-                )
         print(f"\033[32m{tool_label}下电成功\033[0m")
 
         log.info(
@@ -3686,15 +3684,15 @@ class G01Demo(Node):
             log.error(f"[exchange] {source_group} 反向直线返回失败")
             return False
 
-        log.info(f"[exchange] 4/4  {arm_dual_group} 规划执行到 q1")
-        if not self.plan_execute_joint_waypoints(
-            arm_dual_group,
-            dual_speed,
-            arm_dual_joint_names,
-            [q1],
-        ):
-            log.error(f"[exchange] {arm_dual_group} 到 q1 失败")
-            return False
+        # log.info(f"[exchange] 4/4  {arm_dual_group} 规划执行到 q1")
+        # if not self.plan_execute_joint_waypoints(
+        #     arm_dual_group,
+        #     dual_speed,
+        #     arm_dual_joint_names,
+        #     [q1],
+        # ):
+        #     log.error(f"[exchange] {arm_dual_group} 到 q1 失败")
+        #     return False
 
         log.info("[exchange] 双臂交换流程完成")
         return True
