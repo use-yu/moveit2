@@ -65,7 +65,7 @@ SIM_RECOGNITION_XYZ_RPY = (0.8, 0.0, 0.97, 0.0, 0.0, 0.0)
 # 识别点比桌面上方中心高 0.045 m，因此桌面中心沿识别局部 -Z 偏移。
 RECOGNITION_TO_TABLE_TOP_LOCAL_Z = 0.005
 # 桌子、左右目标和预抓点共同使用这些姿态修正。
-TABLE_LOCAL_Z_ROTATION =  math.pi / 2.0 * 0
+TABLE_LOCAL_Z_ROTATION =  math.pi / 2.0 
 TABLE_LOCAL_Y_ROTATION = math.pi
 
 # grasp_test 的视觉结果同时给出多个规划坐标系下的位姿。
@@ -751,6 +751,12 @@ def main(argv: list[str] | None = None) -> int:
             f"x={right_target.position.x:.4f}, y={right_target.position.y:.4f}, "
             f"z={right_target.position.z:.4f} m"
         )
+
+        try:
+            input("按回车: ")
+        except EOFError:
+            pass
+
         if not _confirm_execution(auto_confirm):
             log.info("用户取消执行")
             return 0

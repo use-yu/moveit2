@@ -681,7 +681,8 @@ def read_vision_pose(
         message = f"viewer 发送命令到接收到数字耗时: {used_ms:.3f} ms"
         log.info(message)
         print(f"{GREEN}{message}{RESET}")
-       
+        print(f"{GREEN}viewer 接收到的数据: {raw_text}{RESET}")
+
         numbers = [float(item) for item in NUMBER_PATTERN.findall(raw_text)]
         if len(numbers) < 9:
             message = f"viewer 返回数字不足 9 个，至少需要 1 + 8：{raw_text}"
