@@ -83,6 +83,15 @@
           filename="package://moveit_resources_g01_description/meshes/base_link.STL" />
       </geometry>
     </collision>
+    <collision>
+      <origin
+        xyz="-0.217 0 0.6445"
+        rpy="0 0 0" />
+      <geometry>
+        <box
+          size="0.34 0.34 0.03" />
+      </geometry>
+    </collision>
   </link>
 
    <joint name="base_joint2" type="revolute">
