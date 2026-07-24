@@ -77,7 +77,7 @@ from typing import Iterable, Sequence
 import rclpy
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration as DurationMsg
-from geometry_msgs.msg import Point, Pose, PoseStamped
+from geometry_msgs.msg import Point, Pose, PoseStamped, TransformStamped
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     BoundingVolume,
@@ -98,6 +98,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import ColorRGBA, String, UInt8
+from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker
 from dobot_msgs_v4.srv import SetToolPower
@@ -372,10 +373,13 @@ DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 # 下料流程：双臂成对取料，优先右 SW1 + 左 SW3，其次右 SW4 + 左 SW2。
 UNLOAD_TRIGGER_COMMAND = "p,2"
 UNLOAD_VISION_POSE_KEY = "right_body"
+UNLOAD_VISION_TF_FRAME = "material_table_vision"
+UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
 UNLOAD_SLOT_PAIRS = (("sw1", "sw3"), ("sw4", "sw2"))  # (右臂 SW, 左臂 SW)
 UNLOAD_TABLE_ID = "unload_table"
 UNLOAD_TABLE_SIZE = (0.6, 1.5, 1.0)
 UNLOAD_RECOGNITION_ABOVE_TABLE = 0.045
+UNLOAD_TABLE_LOCAL_RPY = (0.0, math.pi, math.pi / 2.0)  # 局部 Y=180°，Z=90°
 UNLOAD_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
 UNLOAD_OBSTACLE_ID = "unload_vision_y_obstacle"
 UNLOAD_OBSTACLE_SIZE = (1.5, 0.2, 3.0)
@@ -386,9 +390,18 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
     "sw1": 0.004,  # 右臂：多降 4 mm
     "sw2": 0.001,  # 左臂：多降 1 mm
     "sw3": 0.004,  # 左臂：多降 4 mm
-    "sw4": 0.008,  # 右臂：多降 5 mm
+    "sw4": 0.008,  # 右臂：多降 8 mm
 }
+# 物料台放置点：在 material_table_top 桌子坐标系下的 xyz 偏移 [m]。
+UNLOAD_PLACE_LOCAL_OFFSETS = {
+    1: (0.1, 0.325, -0.15),
+    2: (0.1, 0.125, -0.15),
+    3: (0.1, -0.125, -0.15),
+    4: (0.1, -0.325, -0.15),
+}
+UNLOAD_PLACE_SEQUENCE = ((1, 4), (2, 3))  # 每轮 (左臂点位, 右臂点位)
 UNLOAD_JOINT_SPEED = 0.2
+UNLOAD_PLACE_JOINT_SPEED = 0.2
 UNLOAD_CARTESIAN_SPEED = 0.2
 UNLOAD_CARTESIAN_AVOID_COLLISIONS = False
 UNLOAD_SYNC_SAMPLE_PERIOD = 0.005
@@ -636,6 +649,21 @@ SIM_VISION_RESULT = (
 #     1,
 #     [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
 # )
+# 物料台 p,2 仿真视觉数据：
+# 原始协议为 1,x,y,z,qw,qx,qy,qz,mode；首个 1 是点数量，末尾 1 是模式码。
+SIM_UNLOAD_VISION_RESULT = (
+    1,
+    [-47.2306, -52.774, 621.5524, 0.3712, 0.9282, 0.0238, -0.0043],
+)
+
+
+def sim_vision_result_for_trigger(
+    trigger_command: str,
+) -> tuple[int, list[float]]:
+    """p,2 使用物料台仿真数据，其他视觉命令继续使用普通抓取仿真数据。"""
+    if trigger_command == UNLOAD_TRIGGER_COMMAND:
+        return SIM_UNLOAD_VISION_RESULT
+    return SIM_VISION_RESULT
 
 def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
     if len(transform) != 7:
@@ -930,9 +958,14 @@ def read_vision_object_pose(
     """视觉识别封装：返回所有点的模式码和 xyz_rpy。"""
     vision_sock = None
     if sim_mode:
-        first_return_mode, pose = SIM_VISION_RESULT
+        first_return_mode, pose = sim_vision_result_for_trigger(trigger_command)
         vision_results = [(first_return_mode, list(pose))]
-        log.info(f"[sim] viewer 点个数: 1，使用固定 pose")
+        sim_source = (
+            "物料台 p,2"
+            if trigger_command == UNLOAD_TRIGGER_COMMAND
+            else "普通抓取"
+        )
+        log.info(f"[sim] viewer 点个数: 1，使用{sim_source}固定 pose")
         print(
             f"{GREEN}[sim] viewer point 1: "
             f"first_return_mode = {first_return_mode}, pose = {pose}{RESET}"
@@ -1273,31 +1306,56 @@ def rotate_xyz_by_quat(
     )
 
 
-def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
-    """沿 pose 自身坐标系 z 轴方向平移 dz 米，得到新位姿（姿态不变）。
-
-    用旋转矩阵第三列（= 局部 +z 在 base 系下的方向）做平移：
-        new_p = p + dz * R[:, 2]
-    其中 R 由 (qx, qy, qz, qw) 构造。
-    """
+def pose_offset_local(pose: Pose, dx: float, dy: float, dz: float) -> Pose:
+    """按 pose 自身坐标系平移 xyz，姿态保持不变。"""
     qx, qy, qz, qw = (
         pose.orientation.x,
         pose.orientation.y,
         pose.orientation.z,
         pose.orientation.w,
     )
-    zx = 2.0 * (qx * qz + qw * qy)
-    zy = 2.0 * (qy * qz - qw * qx)
-    zz = 1.0 - 2.0 * (qx * qx + qy * qy)
-    out = Pose()
-    out.position.x = pose.position.x + dz * zx
-    out.position.y = pose.position.y + dz * zy
-    out.position.z = pose.position.z + dz * zz
-    out.orientation.x = qx
-    out.orientation.y = qy
-    out.orientation.z = qz
-    out.orientation.w = qw
+    offset_x, offset_y, offset_z = rotate_xyz_by_quat(
+        dx, dy, dz, qx, qy, qz, qw
+    )
+    out = copy.deepcopy(pose)
+    out.position.x += offset_x
+    out.position.y += offset_y
+    out.position.z += offset_z
     return out
+
+
+def pose_rotate_local_rpy(
+    pose: Pose,
+    roll: float,
+    pitch: float,
+    yaw: float,
+) -> Pose:
+    """姿态右乘局部 RPY 旋转，位置保持不变。"""
+    ox, oy, oz, ow = quat_from_rpy(roll, pitch, yaw)
+    q = pose.orientation
+    out = copy.deepcopy(pose)
+    out.orientation.x = q.w * ox + q.x * ow + q.y * oz - q.z * oy
+    out.orientation.y = q.w * oy - q.x * oz + q.y * ow + q.z * ox
+    out.orientation.z = q.w * oz + q.x * oy - q.y * ox + q.z * ow
+    out.orientation.w = q.w * ow - q.x * ox - q.y * oy - q.z * oz
+    norm = math.sqrt(
+        out.orientation.x * out.orientation.x
+        + out.orientation.y * out.orientation.y
+        + out.orientation.z * out.orientation.z
+        + out.orientation.w * out.orientation.w
+    )
+    if norm <= 1e-12:
+        raise ValueError("局部旋转后的四元数长度为 0")
+    out.orientation.x /= norm
+    out.orientation.y /= norm
+    out.orientation.z /= norm
+    out.orientation.w /= norm
+    return out
+
+
+def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
+    """沿 pose 自身坐标系 z 轴平移 dz 米，姿态保持不变。"""
+    return pose_offset_local(pose, 0.0, 0.0, dz)
 
 
 def make_deep_frame() -> CollisionObject:
@@ -1353,15 +1411,21 @@ def make_box_obstacle() -> CollisionObject:
     return obj
 
 
-def make_unload_table(recognition_pose: Pose) -> CollisionObject:
-    """根据 p,2 识别点生成取料台；识别点位于台面中心上方 4.5 cm。"""
-    table_top_z = (
-        recognition_pose.position.z - UNLOAD_RECOGNITION_ABOVE_TABLE
+def make_unload_table_top_pose(recognition_pose: Pose) -> Pose:
+    """桌面中心沿视觉 -Z 偏移，姿态再相对视觉绕局部 Y=180°、Z=90°。"""
+    translated = pose_offset_local_z(
+        recognition_pose,
+        -UNLOAD_RECOGNITION_ABOVE_TABLE,
     )
-    center_pose = make_pose(
-        recognition_pose.position.x,
-        recognition_pose.position.y,
-        table_top_z - UNLOAD_TABLE_SIZE[2] / 2.0,
+    return pose_rotate_local_rpy(translated, *UNLOAD_TABLE_LOCAL_RPY)
+
+
+def make_unload_table(recognition_pose: Pose) -> CollisionObject:
+    """生成相对 p,2 视觉姿态绕局部 Y=180°、Z=90° 的取料台。"""
+    table_top_pose = make_unload_table_top_pose(recognition_pose)
+    center_pose = pose_offset_local_z(
+        table_top_pose,
+        UNLOAD_TABLE_SIZE[2] / 2.0,
     )
 
     primitive = SolidPrimitive()
@@ -1396,6 +1460,15 @@ def make_unload_obstacle(recognition_pose: Pose) -> CollisionObject:
     obj.primitives.append(primitive)
     obj.primitive_poses.append(center_pose)
     return obj
+
+
+def make_unload_place_poses(recognition_pose: Pose) -> dict[int, Pose]:
+    """以桌面中心坐标系为基准，按桌子局部偏移生成四个放置位姿。"""
+    table_top_pose = make_unload_table_top_pose(recognition_pose)
+    return {
+        point_index: pose_offset_local(table_top_pose, *local_offset)
+        for point_index, local_offset in UNLOAD_PLACE_LOCAL_OFFSETS.items()
+    }
 
 
 def make_deep_frame_cutoff(scene_z: float) -> CollisionObject:
@@ -1886,6 +1959,7 @@ class G01Demo(Node):
         self._right_tool_cli = self.create_client(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE)
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
         self._exec_cli = ActionClient(self, ExecuteTrajectory, ACT_EXEC_TRAJ)
+        self._unload_vision_tf_broadcaster = StaticTransformBroadcaster(self)
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
@@ -2290,6 +2364,42 @@ class G01Demo(Node):
                 make_unload_obstacle(recognition_pose),
             ],
             colors,
+        )
+
+    def publish_unload_vision_tf(self, recognition_pose: Pose) -> None:
+        """发布 base_link → 上料台视觉识别坐标系的固定 TF。"""
+        transform = TransformStamped()
+        transform.header.frame_id = SCENE_FRAME
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.child_frame_id = UNLOAD_VISION_TF_FRAME
+        transform.transform.translation.x = recognition_pose.position.x
+        transform.transform.translation.y = recognition_pose.position.y
+        transform.transform.translation.z = recognition_pose.position.z
+        transform.transform.rotation = copy.deepcopy(
+            recognition_pose.orientation
+        )
+        self._unload_vision_tf_broadcaster.sendTransform(transform)
+        self.get_logger().info(
+            f"[unload] 已发布视觉坐标系 TF: "
+            f"{SCENE_FRAME} → {UNLOAD_VISION_TF_FRAME}"
+        )
+
+    def publish_unload_table_top_tf(self, recognition_pose: Pose) -> None:
+        """发布相对视觉局部 Y=180°、Z=90° 的桌面中心固定 TF。"""
+        table_top_pose = make_unload_table_top_pose(recognition_pose)
+        transform = TransformStamped()
+        transform.header.frame_id = SCENE_FRAME
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.child_frame_id = UNLOAD_TABLE_TOP_TF_FRAME
+        transform.transform.translation.x = table_top_pose.position.x
+        transform.transform.translation.y = table_top_pose.position.y
+        transform.transform.translation.z = table_top_pose.position.z
+        transform.transform.rotation = copy.deepcopy(table_top_pose.orientation)
+        self._unload_vision_tf_broadcaster.sendTransform(transform)
+        mode_prefix = "[sim] " if self.sim_mode else ""
+        self.get_logger().info(
+            f"[unload] {mode_prefix}已发布上料桌上表面中心 TF: "
+            f"{SCENE_FRAME} → {UNLOAD_TABLE_TOP_TF_FRAME}"
         )
 
     def remove_unload_scene(self) -> bool:
@@ -4138,45 +4248,39 @@ def main(argv: list[str] | None = None) -> int:
 
         return True
 
-    def run_one_unload() -> bool:
-        """执行一轮双臂下料：按 SW1+SW3、SW2+SW4 的优先级取一对料。"""
-        log.info("[unload] 开始下料前先给左右末端下电")
-        if not node.set_tool_power("left", 0):
-            log.error("[unload] 左臂工具下电失败，禁止执行后续动作")
-            return False
-        if not node.set_tool_power("right", 0):
-            log.error("[unload] 右臂工具下电失败，禁止执行后续动作")
-            return False
-        print(f"{GREEN}[unload] 左右末端下电成功{RESET}")
-
-        if not node._wait_for_driver_signal(require_new=True):
-            return False
-
-        material_slots = [
-            slot_name.upper()
+    def unload_material_slots() -> list[str]:
+        """返回当前实时信号中有料的 SW 名称。"""
+        return [
+            slot_name
             for slot_name in PLACE_SLOT_MASKS
             if node._place_slot_has_material(slot_name)
         ]
-        material_text = ", ".join(material_slots) if material_slots else "无"
-        print(f"{GREEN}[unload] 当前有料位置: {material_text}{RESET}")
 
-        selected_pair: tuple[str, str] | None = None
-        for right_slot, left_slot in UNLOAD_SLOT_PAIRS:
+    def select_unload_pair(start_index: int = 0) -> tuple[int, str, str] | None:
+        """从指定优先级位置开始选择完整料对，返回 (索引, 右SW, 左SW)。"""
+        for pair_index in range(max(0, start_index), len(UNLOAD_SLOT_PAIRS)):
+            right_slot, left_slot = UNLOAD_SLOT_PAIRS[pair_index]
             if (
                 node._place_slot_has_material(right_slot)
                 and node._place_slot_has_material(left_slot)
             ):
-                selected_pair = right_slot, left_slot
-                break
+                return pair_index, right_slot, left_slot
+        return None
 
-        if selected_pair is None:
-            log.warning(
-                "[unload] 没有可供双臂成对取料的组合："
-                "需要 SW1+SW3 或 SW2+SW4 同时有料，本轮不取"
-            )
-            return True
+    def set_unload_tool_power(status: int, stage: str) -> bool:
+        """下料流程中依次设置左右末端电源。"""
+        action = "上电" if status else "下电"
+        if not node.set_tool_power("left", status):
+            log.error(f"[unload] {stage}：左臂工具{action}失败")
+            return False
+        if not node.set_tool_power("right", status):
+            log.error(f"[unload] {stage}：右臂工具{action}失败")
+            return False
+        print(f"{GREEN}[unload] {stage}：左右末端{action}成功{RESET}")
+        return True
 
-        right_slot, left_slot = selected_pair
+    def execute_unload_pick_pair(right_slot: str, left_slot: str) -> bool:
+        """从一对 SW 同步取料，并反向直线返回对应 yubei。"""
         pair_message = (
             f"[unload] 选择右臂 {right_slot.upper()} + "
             f"左臂 {left_slot.upper()}"
@@ -4184,7 +4288,282 @@ def main(argv: list[str] | None = None) -> int:
         log.info(pair_message)
         print(f"{GREEN}{pair_message}{RESET}")
 
-        # 先识别取料台，p,2 的识别点用于构造取料台和其后方墙状障碍物。
+        try:
+            dual_body_joint_names, yubei_target = (
+                make_unload_yubei_joint_target(right_slot, left_slot)
+            )
+        except (KeyError, ValueError) as exc:
+            log.error(f"[unload] 拼接双臂 yubei 目标失败: {exc}")
+            return False
+
+        log.info(
+            f"[unload] dual_arm_body → yubei："
+            f"body_joint1=0, body_joint2=0, "
+            f"右={right_slot.upper()}, 左={left_slot.upper()}"
+        )
+        if not node.plan_execute_joint_waypoints(
+            "dual_arm_body",
+            UNLOAD_JOINT_SPEED,
+            dual_body_joint_names,
+            [yubei_target],
+        ):
+            log.error("[unload] dual_arm_body 到 yubei 失败")
+            return False
+
+        left_joint_names = joint_names_for_group("left_arm")
+        right_joint_names = joint_names_for_group("right_arm")
+        dual_arm_joint_names = joint_names_for_group("dual_arm")
+        current = node._get_joints(dual_arm_joint_names, wait_new=True)
+        if current is None:
+            log.error("[unload] 读取 yubei 处双臂关节失败")
+            return False
+
+        left_pose = node._get_link_pose_fk(
+            "l_tool",
+            joints=current,
+            joint_names=left_joint_names,
+            plan_frame="l_base_link",
+        )
+        right_pose = node._get_link_pose_fk(
+            "r_tool",
+            joints=current,
+            joint_names=right_joint_names,
+            plan_frame="r_base_link",
+        )
+        if left_pose is None or right_pose is None:
+            log.error("[unload] 计算 yubei 处左右末端 FK 失败")
+            return False
+
+        left_approach_distance = (
+            UNLOAD_APPROACH_DISTANCE
+            + UNLOAD_EXTRA_APPROACH_BY_SLOT[left_slot]
+        )
+        right_approach_distance = (
+            UNLOAD_APPROACH_DISTANCE
+            + UNLOAD_EXTRA_APPROACH_BY_SLOT[right_slot]
+        )
+        left_target = pose_offset_local_z(left_pose, left_approach_distance)
+        right_target = pose_offset_local_z(right_pose, right_approach_distance)
+        log.info(
+            f"[unload] 直线下降距离：左臂 {left_slot.upper()}="
+            f"{left_approach_distance * 1000.0:.1f} mm，"
+            f"右臂 {right_slot.upper()}="
+            f"{right_approach_distance * 1000.0:.1f} mm"
+        )
+
+        left_seed = {name: current[name] for name in left_joint_names}
+        right_seed = {name: current[name] for name in right_joint_names}
+        left_ik = node._solve_ik(
+            "left_arm",
+            "l_tool",
+            left_target,
+            left_seed,
+            avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
+            plan_frame="l_base_link",
+        )
+        right_ik = node._solve_ik(
+            "right_arm",
+            "r_tool",
+            right_target,
+            right_seed,
+            avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
+            plan_frame="r_base_link",
+        )
+        if left_ik is None or right_ik is None:
+            log.error("[unload] 至少一只手臂的直线终点没有 IK")
+            return False
+        missing_left = [
+            name for name in left_joint_names if name not in left_ik
+        ]
+        missing_right = [
+            name for name in right_joint_names if name not in right_ik
+        ]
+        if missing_left or missing_right:
+            log.error(
+                f"[unload] IK 返回的关节不完整："
+                f"left_missing={missing_left}, right_missing={missing_right}"
+            )
+            return False
+        dual_arm_target = {
+            **{name: left_ik[name] for name in left_joint_names},
+            **{name: right_ik[name] for name in right_joint_names},
+        }
+        log.info(
+            "[unload] 左右终点 IK 已合成 dual_arm 目标: "
+            + ", ".join(
+                f"{name}={dual_arm_target[name]:.3f}"
+                for name in dual_arm_joint_names
+            )
+        )
+
+        left_trajectory = node._cartesian_plan(
+            "left_arm",
+            "l_tool",
+            left_target,
+            speed_scale=UNLOAD_CARTESIAN_SPEED,
+            avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
+            start_joints=current,
+            joint_names=left_joint_names,
+            plan_frame="l_base_link",
+        )
+        right_trajectory = node._cartesian_plan(
+            "right_arm",
+            "r_tool",
+            right_target,
+            speed_scale=UNLOAD_CARTESIAN_SPEED,
+            avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
+            start_joints=current,
+            joint_names=right_joint_names,
+            plan_frame="r_base_link",
+        )
+        if left_trajectory is None or right_trajectory is None:
+            log.error("[unload] 至少一只手臂的 Cartesian 规划失败")
+            return False
+
+        try:
+            approach = merge_dual_arm_cartesian_trajectories(
+                left_trajectory,
+                right_trajectory,
+            )
+        except ValueError as exc:
+            log.error(f"[unload] 合并双臂 Cartesian 轨迹失败: {exc}")
+            return False
+
+        try:
+            input("按回车执行双臂同步直线取料: ")
+        except EOFError:
+            pass
+
+        log.info(
+            f"[unload] 一次执行双臂沿末端 +Z 直线："
+            f"左臂 {left_approach_distance:.3f} m，"
+            f"右臂 {right_approach_distance:.3f} m（不考虑碰撞）"
+        )
+        if not node._execute_traj(approach):
+            log.error("[unload] 双臂同步直线取料失败")
+            return False
+
+        try:
+            input("按回车给左右末端上电: ")
+        except EOFError:
+            pass
+
+        if not set_unload_tool_power(1, "取料"):
+            return False
+        time.sleep(UNLOAD_TOOL_SETTLE_SEC)
+
+        log.info("[unload] 反向执行同一条双臂直线轨迹，原路复位到 yubei")
+        if not node._execute_traj(node._reverse_trajectory(approach)):
+            log.error("[unload] 双臂同步直线复位失败")
+            return False
+
+        log.info(
+            f"[unload] {right_slot.upper()} + {left_slot.upper()} "
+            "双臂取料并复位完成"
+        )
+        return True
+
+    def move_unload_pair_to_place(
+        place_poses: dict[int, Pose],
+        left_point: int,
+        right_point: int,
+    ) -> bool:
+        """左右分别求物料台点位 IK，合成一个 dual_arm 目标联合规划执行。"""
+        left_joint_names = joint_names_for_group("left_arm")
+        right_joint_names = joint_names_for_group("right_arm")
+        dual_arm_joint_names = joint_names_for_group("dual_arm")
+        current = node._get_joints(dual_arm_joint_names, wait_new=True)
+        if current is None:
+            log.error("[unload] 读取物料台放置规划起点失败")
+            return False
+
+        left_pose = place_poses[left_point]
+        right_pose = place_poses[right_point]
+        left_ik = node._solve_ik(
+            "left_arm",
+            "l_tool",
+            left_pose,
+            {name: current[name] for name in left_joint_names},
+            avoid_collisions=True,
+            plan_frame=SCENE_FRAME,
+        )
+        right_ik = node._solve_ik(
+            "right_arm",
+            "r_tool",
+            right_pose,
+            {name: current[name] for name in right_joint_names},
+            avoid_collisions=True,
+            plan_frame=SCENE_FRAME,
+        )
+        if left_ik is None or right_ik is None:
+            log.error(
+                f"[unload] 物料台点位 IK 失败：左点{left_point}，右点{right_point}"
+            )
+            return False
+        missing_left = [
+            name for name in left_joint_names if name not in left_ik
+        ]
+        missing_right = [
+            name for name in right_joint_names if name not in right_ik
+        ]
+        if missing_left or missing_right:
+            log.error(
+                f"[unload] 物料台 IK 返回关节不完整："
+                f"left_missing={missing_left}, right_missing={missing_right}"
+            )
+            return False
+
+        target = {
+            **{name: left_ik[name] for name in left_joint_names},
+            **{name: right_ik[name] for name in right_joint_names},
+        }
+        log.info(
+            f"[unload] dual_arm 联合运动到物料台："
+            f"左点{left_point} pos=({left_pose.position.x:.4f}, "
+            f"{left_pose.position.y:.4f}, {left_pose.position.z:.4f})，"
+            f"右点{right_point} pos=({right_pose.position.x:.4f}, "
+            f"{right_pose.position.y:.4f}, {right_pose.position.z:.4f})"
+        )
+        ok, used_ms, _ = node.move(
+            "dual_arm",
+            [make_joint_constraints("dual_arm", target)],
+            start=current,
+            plan_only=False,
+            speed_scale=UNLOAD_PLACE_JOINT_SPEED,
+        )
+        log.info(
+            f"[unload] dual_arm → 左点{left_point}/右点{right_point}: "
+            f"{used_ms:.1f} ms ({'success' if ok else 'failed'})"
+        )
+        return ok
+
+    def run_one_unload() -> bool:
+        """最多取两对料：首对放 1/4，实时复查后次对放 2/3。"""
+        log.info("[unload] 开始下料前先给左右末端下电")
+        if not set_unload_tool_power(0, "下料开始"):
+            log.error("[unload] 双臂未全部下电，禁止执行后续动作")
+            return False
+
+        if not node._wait_for_driver_signal(require_new=True):
+            return False
+        material_slots = unload_material_slots()
+        material_text = (
+            ", ".join(slot.upper() for slot in material_slots)
+            if material_slots
+            else "无"
+        )
+        print(f"{GREEN}[unload] 当前有料位置: {material_text}{RESET}")
+
+        selected = select_unload_pair()
+        if selected is None:
+            log.warning(
+                "[unload] 没有可供双臂成对取料的组合："
+                "需要 SW1+SW3 或 SW2+SW4 同时有料，本轮不取"
+            )
+            return True
+        pair_cursor, right_slot, left_slot = selected
+
+        # p,2 的识别姿态同时用于构造场景和四个物料台局部放置点。
         vision_result = read_vision_object_pose(
             node,
             log,
@@ -4201,12 +4580,22 @@ def main(argv: list[str] | None = None) -> int:
             return False
         recognition_values = all_xyz_rpy[0][UNLOAD_VISION_POSE_KEY]
         recognition_pose = make_pose(*recognition_values)
+        node.publish_unload_vision_tf(recognition_pose)
+        node.publish_unload_table_top_tf(recognition_pose)
+        place_poses = make_unload_place_poses(recognition_pose)
         log.info(
             f"[unload] p,2 识别点 @ {SCENE_FRAME}: "
             f"({recognition_pose.position.x:.4f}, "
             f"{recognition_pose.position.y:.4f}, "
             f"{recognition_pose.position.z:.4f})"
         )
+        for point_index, point_pose in place_poses.items():
+            local_offset = UNLOAD_PLACE_LOCAL_OFFSETS[point_index]
+            log.info(
+                f"[unload] 物料台点{point_index} table_local={local_offset}, "
+                f"base=({point_pose.position.x:.4f}, "
+                f"{point_pose.position.y:.4f}, {point_pose.position.z:.4f})"
+            )
 
         unload_scene_added = False
         try:
@@ -4214,196 +4603,74 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("[unload] 添加取料台/墙状障碍物失败")
                 return False
             unload_scene_added = True
-            table_top_z = (
-                recognition_pose.position.z
-                - UNLOAD_RECOGNITION_ABOVE_TABLE
-            )
+            table_top_pose = make_unload_table_top_pose(recognition_pose)
             log.info(
                 f"[unload] 已添加取料台 size={UNLOAD_TABLE_SIZE} m, "
-                f"top_center=({recognition_pose.position.x:.4f}, "
-                f"{recognition_pose.position.y:.4f}, {table_top_z:.4f}); "
+                f"top_center=({table_top_pose.position.x:.4f}, "
+                f"{table_top_pose.position.y:.4f}, "
+                f"{table_top_pose.position.z:.4f})，"
+                "姿态相对视觉绕局部 Y=180°、Z=90°；"
                 f"障碍物 size={UNLOAD_OBSTACLE_SIZE} m, "
                 f"center_y={recognition_pose.position.y + UNLOAD_OBSTACLE_Y_OFFSET:.4f}"
             )
 
-            try:
-                dual_body_joint_names, yubei_target = (
-                    make_unload_yubei_joint_target(right_slot, left_slot)
-                )
-            except (KeyError, ValueError) as exc:
-                log.error(f"[unload] 拼接双臂 yubei 目标失败: {exc}")
-                return False
-
-            log.info(
-                f"[unload] dual_arm_body → yubei："
-                f"body_joint1=0, body_joint2=0, "
-                f"右={right_slot.upper()}, 左={left_slot.upper()}"
-            )
-            if not node.plan_execute_joint_waypoints(
-                "dual_arm_body",
-                UNLOAD_JOINT_SPEED,
-                dual_body_joint_names,
-                [yubei_target],
+            for batch_index, (left_point, right_point) in enumerate(
+                UNLOAD_PLACE_SEQUENCE
             ):
-                log.error("[unload] dual_arm_body 到 yubei 失败")
-                return False
+                if batch_index > 0:
+                    if not node._wait_for_driver_signal(require_new=True):
+                        return False
+                    material_slots = unload_material_slots()
+                    material_text = (
+                        ", ".join(slot.upper() for slot in material_slots)
+                        if material_slots
+                        else "无"
+                    )
+                    print(
+                        f"{GREEN}[unload] 第一轮放置后仍有料位置: "
+                        f"{material_text}{RESET}"
+                    )
+                    selected = select_unload_pair(pair_cursor + 1)
+                    if selected is None:
+                        log.info(
+                            "[unload] 第一轮完成后没有下一组完整料对，"
+                            "不执行第二轮取料"
+                        )
+                        return True
+                    pair_cursor, right_slot, left_slot = selected
 
-            left_joint_names = joint_names_for_group("left_arm")
-            right_joint_names = joint_names_for_group("right_arm")
-            dual_arm_joint_names = joint_names_for_group("dual_arm")
-            current = node._get_joints(dual_arm_joint_names, wait_new=True)
-            if current is None:
-                log.error("[unload] 读取 yubei 处双臂关节失败")
-                return False
-
-            left_pose = node._get_link_pose_fk(
-                "l_tool",
-                joints=current,
-                joint_names=left_joint_names,
-                plan_frame="l_base_link",
-            )
-            right_pose = node._get_link_pose_fk(
-                "r_tool",
-                joints=current,
-                joint_names=right_joint_names,
-                plan_frame="r_base_link",
-            )
-            if left_pose is None or right_pose is None:
-                log.error("[unload] 计算 yubei 处左右末端 FK 失败")
-                return False
-
-            left_approach_distance = (
-                UNLOAD_APPROACH_DISTANCE
-                + UNLOAD_EXTRA_APPROACH_BY_SLOT[left_slot]
-            )
-            right_approach_distance = (
-                UNLOAD_APPROACH_DISTANCE
-                + UNLOAD_EXTRA_APPROACH_BY_SLOT[right_slot]
-            )
-            left_target = pose_offset_local_z(left_pose, left_approach_distance)
-            right_target = pose_offset_local_z(right_pose, right_approach_distance)
-            log.info(
-                f"[unload] 直线下降距离：左臂 {left_slot.upper()}="
-                f"{left_approach_distance * 1000.0:.1f} mm，"
-                f"右臂 {right_slot.upper()}="
-                f"{right_approach_distance * 1000.0:.1f} mm"
-            )
-
-            left_seed = {name: current[name] for name in left_joint_names}
-            right_seed = {name: current[name] for name in right_joint_names}
-            left_ik = node._solve_ik(
-                "left_arm",
-                "l_tool",
-                left_target,
-                left_seed,
-                avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
-                plan_frame="l_base_link",
-            )
-            right_ik = node._solve_ik(
-                "right_arm",
-                "r_tool",
-                right_target,
-                right_seed,
-                avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
-                plan_frame="r_base_link",
-            )
-            if left_ik is None or right_ik is None:
-                log.error("[unload] 至少一只手臂的 10 cm 直线终点没有 IK")
-                return False
-            missing_left = [
-                name for name in left_joint_names if name not in left_ik
-            ]
-            missing_right = [
-                name for name in right_joint_names if name not in right_ik
-            ]
-            if missing_left or missing_right:
-                log.error(
-                    f"[unload] IK 返回的关节不完整："
-                    f"left_missing={missing_left}, right_missing={missing_right}"
+                log.info(
+                    f"[unload] 第 {batch_index + 1} 轮："
+                    f"右臂 {right_slot.upper()}、左臂 {left_slot.upper()} → "
+                    f"物料台左点{left_point}/右点{right_point}"
                 )
-                return False
-            dual_arm_target = {
-                **{name: left_ik[name] for name in left_joint_names},
-                **{name: right_ik[name] for name in right_joint_names},
-            }
-            log.info(
-                "[unload] 左右终点 IK 已合成 dual_arm 目标: "
-                + ", ".join(
-                    f"{name}={dual_arm_target[name]:.3f}"
-                    for name in dual_arm_joint_names
+                if not execute_unload_pick_pair(right_slot, left_slot):
+                    return False
+
+                if not move_unload_pair_to_place(
+                    place_poses,
+                    left_point,
+                    right_point,
+                ):
+                    return False
+
+                try:
+                    input(
+                        f"已到物料台左点{left_point}/右点{right_point}，"
+                        "按回车给双臂下电放置: "
+                    )
+                except EOFError:
+                    pass
+                if not set_unload_tool_power(
+                    0,
+                    f"物料台左点{left_point}/右点{right_point}放置",
+                ):
+                    return False
+                log.info(
+                    f"[unload] 第 {batch_index + 1} 轮放置完成："
+                    f"左臂点{left_point}、右臂点{right_point}"
                 )
-            )
 
-            left_trajectory = node._cartesian_plan(
-                "left_arm",
-                "l_tool",
-                left_target,
-                speed_scale=UNLOAD_CARTESIAN_SPEED,
-                avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
-                start_joints=current,
-                joint_names=left_joint_names,
-                plan_frame="l_base_link",
-            )
-            right_trajectory = node._cartesian_plan(
-                "right_arm",
-                "r_tool",
-                right_target,
-                speed_scale=UNLOAD_CARTESIAN_SPEED,
-                avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
-                start_joints=current,
-                joint_names=right_joint_names,
-                plan_frame="r_base_link",
-            )
-            if left_trajectory is None or right_trajectory is None:
-                log.error("[unload] 至少一只手臂的 10 cm Cartesian 规划失败")
-                return False
-
-            try:
-                approach = merge_dual_arm_cartesian_trajectories(
-                    left_trajectory,
-                    right_trajectory,
-                )
-            except ValueError as exc:
-                log.error(f"[unload] 合并双臂 Cartesian 轨迹失败: {exc}")
-                return False
-
-            try:
-                input("按回车: ")
-            except EOFError:
-                pass
-
-            log.info(
-                f"[unload] 一次执行双臂沿末端 +Z 直线："
-                f"左臂 {left_approach_distance:.3f} m，"
-                f"右臂 {right_approach_distance:.3f} m（不考虑碰撞）"
-            )
-            if not node._execute_traj(approach):
-                log.error("[unload] 双臂同步直线取料失败")
-                return False
-
-            try:
-                input("按回车: ")
-            except EOFError:
-                pass
-
-            if not node.set_tool_power("left", 1):
-                log.error("[unload] 左臂工具上电失败")
-                return False
-            if not node.set_tool_power("right", 1):
-                log.error("[unload] 右臂工具上电失败")
-                return False
-            print(f"{GREEN}[unload] 左右末端上电成功{RESET}")
-            time.sleep(UNLOAD_TOOL_SETTLE_SEC)
-
-            log.info("[unload] 反向执行同一条双臂直线轨迹，原路复位到 yubei")
-            if not node._execute_traj(node._reverse_trajectory(approach)):
-                log.error("[unload] 双臂同步直线复位失败")
-                return False
-
-            log.info(
-                f"[unload] {right_slot.upper()} + {left_slot.upper()} "
-                "双臂取料完成"
-            )
             return True
         finally:
             if unload_scene_added and not node.remove_unload_scene():
