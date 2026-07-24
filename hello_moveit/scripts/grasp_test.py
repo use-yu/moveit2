@@ -313,7 +313,7 @@ DEFAULT_SPEED_SCALE = 0.5
 # 深框障碍物（相对于 base_link 发布）
 SCENE_FRAME = "base_link"
 FRAME_ID = "深框"
-FRAME_SIZE = (0.795, 0.795, 0.505)  # 深框整体外尺寸：长×宽×高 [m]
+FRAME_SIZE = (0.795, 0.795, 0.565)  # 深框整体外尺寸：长×宽×高 [m]
 WALL_T = 0.035  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 深框整体外轮廓中心，相对于 base_link [m]
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 深框整体姿态，相对于 base_link [degree]
