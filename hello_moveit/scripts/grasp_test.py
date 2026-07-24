@@ -394,14 +394,25 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
 }
 # 物料台放置点：在 material_table_top 桌子坐标系下的 xyz 偏移 [m]。
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    1: (0.1, 0.325, -0.15),
-    2: (0.1, 0.125, -0.15),
-    3: (0.1, -0.125, -0.15),
-    4: (0.1, -0.325, -0.15),
+    1: (0.1 + 0.005782, 0.325+0.338809-0.345293, -0.16 + 1.115998 - 1.070837+0.1),
+    2: (0.1, 0.125, -0.16),
+    3: (0.1, -0.125, -0.16),
+    4: (0.1 + 0.644717-0.649813, -0.325-0.310772+0.311753, -0.16+1.109917-1.074118+0.1),
 }
 UNLOAD_PLACE_SEQUENCE = ((1, 4), (2, 3))  # 每轮 (左臂点位, 右臂点位)
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
+UNLOAD_PLACE_ARM_IK_ATTEMPTS = 32
+UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS = 6
+UNLOAD_PLACE_BODY_IK_ATTEMPTS = 64
+UNLOAD_PLACE_BODY_IK_MAX_SOLUTIONS = 10
+UNLOAD_PLACE_RIGHT_IK_ATTEMPTS_PER_BODY = 24
+UNLOAD_PLACE_RIGHT_IK_MAX_SOLUTIONS_PER_BODY = 4
+UNLOAD_PLACE_MAX_PAIR_PLANS = 24
+UNLOAD_PLACE_IK_PERTURB = math.pi / 2.0
+UNLOAD_PLACE_IK_RANDOM_SEED = 20260724
+UNLOAD_BODY_JOINT1_LIMITS = (0.0, 0.19)
+UNLOAD_BODY_JOINT2_LIMITS = (0.0, 1.4)
 UNLOAD_CARTESIAN_SPEED = 0.2
 UNLOAD_CARTESIAN_AVOID_COLLISIONS = False
 UNLOAD_SYNC_SAMPLE_PERIOD = 0.005
@@ -1351,6 +1362,30 @@ def pose_rotate_local_rpy(
     out.orientation.z /= norm
     out.orientation.w /= norm
     return out
+
+
+def pose_relative_to_frame(
+    pose_in_reference: Pose,
+    frame_in_reference: Pose,
+) -> Pose:
+    """把 reference 下的目标位姿转换成指定 frame 下的表达。"""
+    relative_matrix = matmul4(
+        invert_transform4(pose_to_matrix(frame_in_reference)),
+        pose_to_matrix(pose_in_reference),
+    )
+    return xyz_rpy_to_pose(matrix_to_xyz_rpy(relative_matrix))
+
+
+def joint_distance_squared(
+    candidate: dict[str, float],
+    reference: dict[str, float],
+    joint_names: Sequence[str],
+) -> float:
+    """用于按接近当前构型的程度排序 IK 解。"""
+    return sum(
+        (candidate[name] - reference[name]) ** 2
+        for name in joint_names
+    )
 
 
 def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
@@ -3112,6 +3147,117 @@ class G01Demo(Node):
         sol = {n: p for n, p in zip(js.name, js.position)}
         return (sol, code) if return_code else sol
 
+    def _solve_ik_candidates_from_seed(
+        self,
+        group: str,
+        link: str,
+        pose: Pose,
+        joint_names: Sequence[str],
+        seed_state: dict[str, float],
+        *,
+        plan_frame: str,
+        n_attempts: int,
+        max_solutions: int,
+        random_seed: int,
+        perturb_joint_names: Sequence[str] | None = None,
+        avoid_collisions: bool = False,
+        perturb: float = UNLOAD_PLACE_IK_PERTURB,
+        dedup_tol: float = 1e-2,
+    ) -> list[dict[str, float]]:
+        """从显式完整种子枚举多组 IK；允许固定额外关节参与 RobotState。
+
+        joint_names 是需要从 IK 结果提取的规划组关节。seed_state 可以额外包含
+        body_joint1/2 和另一只手臂，使 IK 服务在指定身体构型下求解。
+        """
+        log = self.get_logger()
+        joint_names = list(joint_names)
+        perturb_joint_names = list(
+            joint_names if perturb_joint_names is None else perturb_joint_names
+        )
+        missing_seed = [name for name in joint_names if name not in seed_state]
+        if missing_seed:
+            log.error(
+                f"[unload-ik] group={group} 种子缺少关节: {missing_seed}"
+            )
+            return []
+
+        rng = random.Random(int(random_seed))
+        solutions: list[dict[str, float]] = []
+        failure_codes: dict[int, int] = {}
+
+        for attempt in range(max(1, int(n_attempts))):
+            seed = dict(seed_state)
+            if attempt > 0:
+                for name in perturb_joint_names:
+                    if name not in seed:
+                        continue
+                    if name == "body_joint1":
+                        seed[name] = rng.uniform(*UNLOAD_BODY_JOINT1_LIMITS)
+                    elif name == "body_joint2":
+                        seed[name] = rng.uniform(*UNLOAD_BODY_JOINT2_LIMITS)
+                    else:
+                        perturbed = seed[name] + rng.uniform(-perturb, perturb)
+                        seed[name] = math.atan2(
+                            math.sin(perturbed),
+                            math.cos(perturbed),
+                        )
+
+            solution, code = self._solve_ik(
+                group,
+                link,
+                pose,
+                seed,
+                avoid_collisions=avoid_collisions,
+                return_code=True,
+                plan_frame=plan_frame,
+            )
+            if solution is None:
+                if code is not None:
+                    failure_codes[int(code)] = (
+                        failure_codes.get(int(code), 0) + 1
+                    )
+                continue
+
+            candidate = {
+                name: solution[name]
+                for name in joint_names
+                if name in solution
+            }
+            if len(candidate) != len(joint_names):
+                continue
+            duplicate = any(
+                all(
+                    abs(candidate[name] - old[name]) < dedup_tol
+                    for name in joint_names
+                )
+                for old in solutions
+            )
+            if duplicate:
+                continue
+            solutions.append(candidate)
+            if len(solutions) >= max(1, int(max_solutions)):
+                break
+
+        solutions.sort(
+            key=lambda item: joint_distance_squared(
+                item,
+                seed_state,
+                joint_names,
+            )
+        )
+        failure_text = ""
+        if failure_codes:
+            failure_text = ", failures=" + ", ".join(
+                f"{_moveit_error_name(code)}:{count}"
+                for code, count in sorted(failure_codes.items())
+            )
+        log.info(
+            f"[unload-ik] group={group}, frame={plan_frame}, "
+            f"solutions={len(solutions)}/{n_attempts}, "
+            f"avoid_collisions={avoid_collisions}{failure_text}"
+        )
+        return solutions
+
     def _solve_ik_multi(
         self,
         group: str,
@@ -4468,74 +4614,289 @@ def main(argv: list[str] | None = None) -> int:
         left_point: int,
         right_point: int,
     ) -> bool:
-        """左右分别求物料台点位 IK，合成一个 dual_arm 目标联合规划执行。"""
+        """多构型求解物料台双臂目标；必要时联动升降和腰部。"""
         left_joint_names = joint_names_for_group("left_arm")
         right_joint_names = joint_names_for_group("right_arm")
         dual_arm_joint_names = joint_names_for_group("dual_arm")
-        current = node._get_joints(dual_arm_joint_names, wait_new=True)
-        if current is None:
+        left_body_joint_names = joint_names_for_group("left_body")
+        dual_body_joint_names = joint_names_for_group("dual_arm_body")
+        current_full = node._get_joints(
+            dual_body_joint_names,
+            wait_new=True,
+        )
+        if current_full is None:
             log.error("[unload] 读取物料台放置规划起点失败")
             return False
 
         left_pose = place_poses[left_point]
         right_pose = place_poses[right_point]
-        left_ik = node._solve_ik(
+        log.info(
+            f"[unload] 物料台目标 @ {SCENE_FRAME}："
+            f"左点{left_point}=({left_pose.position.x:.4f}, "
+            f"{left_pose.position.y:.4f}, {left_pose.position.z:.4f})，"
+            f"右点{right_point}=({right_pose.position.x:.4f}, "
+            f"{right_pose.position.y:.4f}, {right_pose.position.z:.4f})"
+        )
+
+        def try_plan_and_execute(
+            group: str,
+            target: dict[str, float],
+            start: dict[str, float],
+            label: str,
+        ) -> tuple[bool, bool]:
+            """返回 (是否规划成功, 是否执行成功)；只执行首条成功规划。"""
+            ok, used_ms, trajectory = node.move(
+                group,
+                [make_joint_constraints(group, target)],
+                start=start,
+                plan_only=True,
+                speed_scale=UNLOAD_PLACE_JOINT_SPEED,
+                max_retries=1,
+                num_attempts=3,
+            )
+            log.info(
+                f"[unload] {label}: {used_ms:.1f} ms "
+                f"({'planned' if ok else 'failed'})"
+            )
+            if not ok or trajectory is None:
+                return False, False
+            if not trajectory.joint_trajectory.points:
+                log.error(f"[unload] {label} 成功但没有返回轨迹")
+                return False, False
+            log.info(f"[unload] 执行已选中的 {group} 联合轨迹")
+            return True, node._execute_traj(trajectory)
+
+        # ------------------------------------------------------------------
+        # 第一级：身体保持当前位置，只求左右纯臂多组 IK。
+        # 目标原始表达在 base_link；纯臂 IK 必须分别转换到 l/r_base_link。
+        # ------------------------------------------------------------------
+        left_base_pose = node._get_link_pose_fk(
+            "l_base_link",
+            joints=current_full,
+            plan_frame=SCENE_FRAME,
+        )
+        right_base_pose = node._get_link_pose_fk(
+            "r_base_link",
+            joints=current_full,
+            plan_frame=SCENE_FRAME,
+        )
+        if left_base_pose is None or right_base_pose is None:
+            log.error("[unload] 计算当前左右纯臂基座位姿失败")
+            return False
+        left_pose_in_arm_base = pose_relative_to_frame(
+            left_pose,
+            left_base_pose,
+        )
+        right_pose_in_arm_base = pose_relative_to_frame(
+            right_pose,
+            right_base_pose,
+        )
+        log.info(
+            "[unload] 纯臂 IK 基座：左目标转换到 l_base_link，"
+            "右目标转换到 r_base_link"
+        )
+
+        left_arm_solutions = node._solve_ik_candidates_from_seed(
             "left_arm",
             "l_tool",
-            left_pose,
-            {name: current[name] for name in left_joint_names},
-            avoid_collisions=True,
-            plan_frame=SCENE_FRAME,
+            left_pose_in_arm_base,
+            left_joint_names,
+            current_full,
+            plan_frame="l_base_link",
+            n_attempts=UNLOAD_PLACE_ARM_IK_ATTEMPTS,
+            max_solutions=UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS,
+            random_seed=(
+                UNLOAD_PLACE_IK_RANDOM_SEED + left_point * 100 + 1
+            ),
+            perturb_joint_names=left_joint_names,
+            avoid_collisions=False,
         )
-        right_ik = node._solve_ik(
+        right_arm_solutions = node._solve_ik_candidates_from_seed(
             "right_arm",
             "r_tool",
-            right_pose,
-            {name: current[name] for name in right_joint_names},
-            avoid_collisions=True,
-            plan_frame=SCENE_FRAME,
+            right_pose_in_arm_base,
+            right_joint_names,
+            current_full,
+            plan_frame="r_base_link",
+            n_attempts=UNLOAD_PLACE_ARM_IK_ATTEMPTS,
+            max_solutions=UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS,
+            random_seed=(
+                UNLOAD_PLACE_IK_RANDOM_SEED + right_point * 100 + 2
+            ),
+            perturb_joint_names=right_joint_names,
+            avoid_collisions=False,
         )
-        if left_ik is None or right_ik is None:
-            log.error(
-                f"[unload] 物料台点位 IK 失败：左点{left_point}，右点{right_point}"
+        log.info(
+            f"[unload] 纯臂多构型：左点{left_point}="
+            f"{len(left_arm_solutions)} 解，右点{right_point}="
+            f"{len(right_arm_solutions)} 解"
+        )
+
+        pure_pairs = [
+            (left_solution, right_solution)
+            for left_solution in left_arm_solutions
+            for right_solution in right_arm_solutions
+        ]
+        pure_pairs.sort(
+            key=lambda pair: (
+                joint_distance_squared(
+                    pair[0],
+                    current_full,
+                    left_joint_names,
+                )
+                + joint_distance_squared(
+                    pair[1],
+                    current_full,
+                    right_joint_names,
+                )
             )
-            return False
-        missing_left = [
-            name for name in left_joint_names if name not in left_ik
-        ]
-        missing_right = [
-            name for name in right_joint_names if name not in right_ik
-        ]
-        if missing_left or missing_right:
+        )
+        pure_start = {
+            name: current_full[name]
+            for name in dual_arm_joint_names
+        }
+        for pair_index, (left_solution, right_solution) in enumerate(
+            pure_pairs[:UNLOAD_PLACE_MAX_PAIR_PLANS],
+            start=1,
+        ):
+            target = {
+                **left_solution,
+                **right_solution,
+            }
+            planned, executed = try_plan_and_execute(
+                "dual_arm",
+                target,
+                pure_start,
+                (
+                    f"dual_arm 纯臂构型 {pair_index}/"
+                    f"{min(len(pure_pairs), UNLOAD_PLACE_MAX_PAIR_PLANS)}"
+                ),
+            )
+            if planned:
+                return executed
+
+        log.warning(
+            "[unload] 当前腰部/升降位置下没有可执行的纯臂组合，"
+            "开始枚举 left_body 构型"
+        )
+
+        # ------------------------------------------------------------------
+        # 第二级：左臂先用 left_body 枚举升降+腰部+左臂解。
+        # 对每个左侧解固定 body_joint1/2，重新计算 r_base_link，再求右纯臂。
+        # 最终目标包含 body+两臂，因此改用 dual_arm_body 联合规划。
+        # ------------------------------------------------------------------
+        left_body_solutions = node._solve_ik_candidates_from_seed(
+            "left_body",
+            "l_tool",
+            left_pose,
+            left_body_joint_names,
+            current_full,
+            plan_frame=SCENE_FRAME,
+            n_attempts=UNLOAD_PLACE_BODY_IK_ATTEMPTS,
+            max_solutions=UNLOAD_PLACE_BODY_IK_MAX_SOLUTIONS,
+            random_seed=(
+                UNLOAD_PLACE_IK_RANDOM_SEED + left_point * 1000 + 3
+            ),
+            perturb_joint_names=left_body_joint_names,
+            avoid_collisions=False,
+        )
+        if not left_body_solutions:
             log.error(
-                f"[unload] 物料台 IK 返回关节不完整："
-                f"left_missing={missing_left}, right_missing={missing_right}"
+                f"[unload] 左点{left_point} 即使加入腰部和升降仍无 IK"
             )
             return False
 
-        target = {
-            **{name: left_ik[name] for name in left_joint_names},
-            **{name: right_ik[name] for name in right_joint_names},
-        }
-        log.info(
-            f"[unload] dual_arm 联合运动到物料台："
-            f"左点{left_point} pos=({left_pose.position.x:.4f}, "
-            f"{left_pose.position.y:.4f}, {left_pose.position.z:.4f})，"
-            f"右点{right_point} pos=({right_pose.position.x:.4f}, "
-            f"{right_pose.position.y:.4f}, {right_pose.position.z:.4f})"
+        body_plan_count = 0
+        for body_index, left_body_solution in enumerate(
+            left_body_solutions,
+            start=1,
+        ):
+            candidate_state = dict(current_full)
+            candidate_state.update(left_body_solution)
+            lift = left_body_solution["body_joint1"]
+            waist = left_body_solution["body_joint2"]
+            log.info(
+                f"[unload] 左侧 body 构型 {body_index}/"
+                f"{len(left_body_solutions)}："
+                f"body_joint1={lift:.4f} m，"
+                f"body_joint2={waist:.4f} rad"
+            )
+
+            candidate_right_base_pose = node._get_link_pose_fk(
+                "r_base_link",
+                joints=candidate_state,
+                plan_frame=SCENE_FRAME,
+            )
+            if candidate_right_base_pose is None:
+                log.warning(
+                    f"[unload] body 构型 {body_index} 无法计算 r_base_link，"
+                    "尝试下一构型"
+                )
+                continue
+            right_pose_for_body = pose_relative_to_frame(
+                right_pose,
+                candidate_right_base_pose,
+            )
+            right_solutions = node._solve_ik_candidates_from_seed(
+                "right_arm",
+                "r_tool",
+                right_pose_for_body,
+                right_joint_names,
+                candidate_state,
+                plan_frame="r_base_link",
+                n_attempts=UNLOAD_PLACE_RIGHT_IK_ATTEMPTS_PER_BODY,
+                max_solutions=UNLOAD_PLACE_RIGHT_IK_MAX_SOLUTIONS_PER_BODY,
+                random_seed=(
+                    UNLOAD_PLACE_IK_RANDOM_SEED
+                    + right_point * 1000
+                    + body_index
+                    + 100
+                ),
+                perturb_joint_names=right_joint_names,
+                avoid_collisions=False,
+            )
+            if not right_solutions:
+                log.info(
+                    f"[unload] body 构型 {body_index} 下右点{right_point}"
+                    "无纯臂 IK，切换下一组腰部/升降"
+                )
+                continue
+
+            for right_index, right_solution in enumerate(
+                right_solutions,
+                start=1,
+            ):
+                if body_plan_count >= UNLOAD_PLACE_MAX_PAIR_PLANS:
+                    break
+                body_plan_count += 1
+                target = {
+                    name: (
+                        right_solution[name]
+                        if name in right_solution
+                        else left_body_solution[name]
+                    )
+                    for name in dual_body_joint_names
+                }
+                planned, executed = try_plan_and_execute(
+                    "dual_arm_body",
+                    target,
+                    current_full,
+                    (
+                        f"dual_arm_body 左body构型{body_index}/"
+                        f"{len(left_body_solutions)}，"
+                        f"右解{right_index}/{len(right_solutions)}"
+                    ),
+                )
+                if planned:
+                    return executed
+            if body_plan_count >= UNLOAD_PLACE_MAX_PAIR_PLANS:
+                break
+
+        log.error(
+            f"[unload] 左点{left_point}/右点{right_point} 的纯臂及 "
+            "dual_arm_body 多构型全部失败"
         )
-        ok, used_ms, _ = node.move(
-            "dual_arm",
-            [make_joint_constraints("dual_arm", target)],
-            start=current,
-            plan_only=False,
-            speed_scale=UNLOAD_PLACE_JOINT_SPEED,
-        )
-        log.info(
-            f"[unload] dual_arm → 左点{left_point}/右点{right_point}: "
-            f"{used_ms:.1f} ms ({'success' if ok else 'failed'})"
-        )
-        return ok
+        return False
 
     def run_one_unload() -> bool:
         """最多取两对料：首对放 1/4，实时复查后次对放 2/3。"""
