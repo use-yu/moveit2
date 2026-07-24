@@ -377,10 +377,22 @@ UNLOAD_VISION_TF_FRAME = "material_table_vision"
 UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
 UNLOAD_SLOT_PAIRS = (("sw1", "sw3"), ("sw4", "sw2"))  # (右臂 SW, 左臂 SW)
 UNLOAD_TABLE_ID = "unload_table"
-UNLOAD_TABLE_SIZE = (0.6, 1.5, 1.0)
+UNLOAD_TABLE_SIZE = (0.6, 1.7, 1.0)
 UNLOAD_RECOGNITION_ABOVE_TABLE = -0.045
 UNLOAD_TABLE_LOCAL_RPY = (0.0, math.pi, math.pi / 2.0)  # 局部 Y=180°，Z=90°
 UNLOAD_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
+UNLOAD_TABLE_TOP_BOX_ID = "unload_table_top_box"
+UNLOAD_TABLE_TOP_BOX_SIZE = (
+    UNLOAD_TABLE_SIZE[0],
+    UNLOAD_TABLE_SIZE[1],
+    0.035,
+)
+UNLOAD_TABLE_TOP_BOX_COLOR = ColorRGBA(
+    r=0.72,
+    g=0.52,
+    b=0.20,
+    a=0.90,
+)
 UNLOAD_OBSTACLE_ID = "unload_vision_y_obstacle"
 UNLOAD_OBSTACLE_SIZE = (1.5, 0.2, 3.0)
 UNLOAD_OBSTACLE_Y_OFFSET = 1.2
@@ -397,24 +409,32 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
 UNLOAD_PLACE_LOCAL_YAW = math.radians(204.5)
 UNLOAD_PLACE_LOCAL_OFFSETS = {
     1: (0.1 + 0.005782, 0.325-0.338809+0.345293, -0.16 + 1.115998 - 1.070837-0.01),
-    2: (0.1 + 0.653630-0.656605, 0.125-0.138855+0.146165, -0.16+1.206160-1.071223-0.1),
-    3: (0.1 + 0.643439-0.655317, -0.125+0.110927-0.111151, -0.16+1.203874-1.073237-0.1),
+    2: (0.1 + 0.653630-0.656605+0.005, 0.125-0.138855+0.146165-0.001, -0.16+1.206160-1.071223-0.1),
+    3: (0.1 + 0.643439-0.655317+0.008, -0.125+0.110927-0.111151-0.001, -0.16+1.203874-1.073237-0.1),
     4: (0.1 + 0.644717-0.649813, -0.325+0.310772-0.311753, -0.16+1.109917-1.074118-0.01),
 }
 UNLOAD_PLACE_SEQUENCE = ((1, 4), (2, 3))  # 每轮 (左臂点位, 右臂点位)
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
-UNLOAD_PLACE_ARM_IK_ATTEMPTS = 32
-UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS = 6
-UNLOAD_PLACE_BODY_IK_ATTEMPTS = 64
-UNLOAD_PLACE_BODY_IK_MAX_SOLUTIONS = 10
-UNLOAD_PLACE_RIGHT_IK_ATTEMPTS_PER_BODY = 24
-UNLOAD_PLACE_RIGHT_IK_MAX_SOLUTIONS_PER_BODY = 4
-UNLOAD_PLACE_MAX_PAIR_PLANS = 24
-UNLOAD_PLACE_IK_PERTURB = math.pi / 2.0
+UNLOAD_PLACE_ARM_IK_ATTEMPTS = 200
+UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS = 20
+UNLOAD_PLACE_BODY_IK_ATTEMPTS = 200
+UNLOAD_PLACE_BODY_IK_MAX_SOLUTIONS = 20
+UNLOAD_PLACE_RIGHT_IK_ATTEMPTS_PER_BODY = 40
+UNLOAD_PLACE_RIGHT_IK_MAX_SOLUTIONS_PER_BODY = 10
+UNLOAD_PLACE_MAX_PAIR_PLANS = 200
+UNLOAD_PLACE_IK_PERTURB = math.pi
 UNLOAD_PLACE_IK_RANDOM_SEED = 20260724
 UNLOAD_BODY_JOINT1_LIMITS = (0.0, 0.19)
-UNLOAD_BODY_JOINT2_LIMITS = (0.0, 1.4)
+UNLOAD_BODY_JOINT2_LIMITS = (0.0, 1.0)
+UNLOAD_ARM_JOINT_LIMITS_BY_INDEX = {
+    1: (-3.14, 3.8),
+    2: (-3.14, 3.14),
+    3: (-2.79, 2.79),
+    4: (-3.14, 3.14),
+    5: (-3.14, 3.14),
+    6: (-3.14, 3.14),
+}
 UNLOAD_CARTESIAN_SPEED = 0.2
 UNLOAD_CARTESIAN_AVOID_COLLISIONS = False
 UNLOAD_SYNC_SAMPLE_PERIOD = 0.005
@@ -1390,6 +1410,26 @@ def joint_distance_squared(
     )
 
 
+def spread_sorted_candidates(
+    candidates: Sequence,
+    max_count: int,
+) -> list:
+    """从已排序候选中均匀取样，兼顾近、中、远构型。"""
+    candidates = list(candidates)
+    max_count = max(0, int(max_count))
+    if max_count == 0:
+        return []
+    if len(candidates) <= max_count:
+        return candidates
+    if max_count == 1:
+        return [candidates[0]]
+    last_index = len(candidates) - 1
+    return [
+        candidates[round(index * last_index / (max_count - 1))]
+        for index in range(max_count)
+    ]
+
+
 def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
     """沿 pose 自身坐标系 z 轴平移 dz 米，姿态保持不变。"""
     return pose_offset_local(pose, 0.0, 0.0, dz)
@@ -1472,6 +1512,30 @@ def make_unload_table(recognition_pose: Pose) -> CollisionObject:
     obj = CollisionObject()
     obj.header.frame_id = SCENE_FRAME
     obj.id = UNLOAD_TABLE_ID
+    obj.operation = CollisionObject.ADD
+    obj.primitives.append(primitive)
+    obj.primitive_poses.append(center_pose)
+    return obj
+
+
+def make_unload_table_top_box(recognition_pose: Pose) -> CollisionObject:
+    """生成薄长方体；下表面中心与视觉识别位置重合，姿态与料台一致。"""
+    bottom_pose = pose_rotate_local_rpy(
+        recognition_pose,
+        *UNLOAD_TABLE_LOCAL_RPY,
+    )
+    center_pose = pose_offset_local_z(
+        bottom_pose,
+        -UNLOAD_TABLE_TOP_BOX_SIZE[2] / 2.0,
+    )
+
+    primitive = SolidPrimitive()
+    primitive.type = SolidPrimitive.BOX
+    primitive.dimensions = list(UNLOAD_TABLE_TOP_BOX_SIZE)
+
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = UNLOAD_TABLE_TOP_BOX_ID
     obj.operation = CollisionObject.ADD
     obj.primitives.append(primitive)
     obj.primitive_poses.append(center_pose)
@@ -2395,14 +2459,19 @@ class G01Demo(Node):
         return self._apply_scene(objects)
 
     def add_unload_scene(self, recognition_pose: Pose) -> bool:
-        """添加 p,2 识别得到的取料台及其 +Y 方向墙状障碍物。"""
+        """添加 p,2 识别得到的料台、台面薄长方体及墙状障碍物。"""
         colors = [
             ObjectColor(id=UNLOAD_TABLE_ID, color=UNLOAD_TABLE_COLOR),
+            ObjectColor(
+                id=UNLOAD_TABLE_TOP_BOX_ID,
+                color=UNLOAD_TABLE_TOP_BOX_COLOR,
+            ),
             ObjectColor(id=UNLOAD_OBSTACLE_ID, color=UNLOAD_OBSTACLE_COLOR),
         ]
         return self._apply_scene(
             [
                 make_unload_table(recognition_pose),
+                make_unload_table_top_box(recognition_pose),
                 make_unload_obstacle(recognition_pose),
             ],
             colors,
@@ -2445,10 +2514,14 @@ class G01Demo(Node):
         )
 
     def remove_unload_scene(self) -> bool:
-        """移除下料流程使用的取料台和墙状障碍物。"""
+        """移除下料流程使用的料台、台面薄长方体和墙状障碍物。"""
         objects = [
             CollisionObject(
                 id=UNLOAD_TABLE_ID,
+                operation=CollisionObject.REMOVE,
+            ),
+            CollisionObject(
+                id=UNLOAD_TABLE_TOP_BOX_ID,
                 operation=CollisionObject.REMOVE,
             ),
             CollisionObject(
@@ -3174,7 +3247,8 @@ class G01Demo(Node):
         """从显式完整种子枚举多组 IK；允许固定额外关节参与 RobotState。
 
         joint_names 是需要从 IK 结果提取的规划组关节。seed_state 可以额外包含
-        body_joint1/2 和另一只手臂，使 IK 服务在指定身体构型下求解。
+        body_joint1/2 和另一只手臂，使 IK 服务在指定身体构型下求解。已知的
+        双臂、升降和腰部关节按 URDF 完整限位采样，其他关节使用 perturb 扰动。
         """
         log = self.get_logger()
         joint_names = list(joint_names)
@@ -3203,11 +3277,23 @@ class G01Demo(Node):
                     elif name == "body_joint2":
                         seed[name] = rng.uniform(*UNLOAD_BODY_JOINT2_LIMITS)
                     else:
-                        perturbed = seed[name] + rng.uniform(-perturb, perturb)
-                        seed[name] = math.atan2(
-                            math.sin(perturbed),
-                            math.cos(perturbed),
+                        arm_match = re.fullmatch(
+                            r"[lr]_arm_joint([1-6])",
+                            name,
                         )
+                        if arm_match:
+                            joint_index = int(arm_match.group(1))
+                            seed[name] = rng.uniform(
+                                *UNLOAD_ARM_JOINT_LIMITS_BY_INDEX[joint_index]
+                            )
+                        else:
+                            perturbed = (
+                                seed[name] + rng.uniform(-perturb, perturb)
+                            )
+                            seed[name] = math.atan2(
+                                math.sin(perturbed),
+                                math.cos(perturbed),
+                            )
 
             solution, code = self._solve_ik(
                 group,
@@ -4896,12 +4982,20 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         )
+        pure_pairs_to_validate = spread_sorted_candidates(
+            pure_pairs,
+            UNLOAD_PLACE_MAX_PAIR_PLANS,
+        )
+        log.info(
+            f"[unload] 纯臂共生成 {len(pure_pairs)} 个左右组合，"
+            f"按关节距离全范围分布验证 {len(pure_pairs_to_validate)} 组"
+        )
         pure_start = {
             name: current_full[name]
             for name in dual_arm_joint_names
         }
         for pair_index, (left_solution, right_solution) in enumerate(
-            pure_pairs[:UNLOAD_PLACE_MAX_PAIR_PLANS],
+            pure_pairs_to_validate,
             start=1,
         ):
             target = {
@@ -4914,7 +5008,7 @@ def main(argv: list[str] | None = None) -> int:
                 pure_start,
                 (
                     f"dual_arm 纯臂构型 {pair_index}/"
-                    f"{min(len(pure_pairs), UNLOAD_PLACE_MAX_PAIR_PLANS)}"
+                    f"{len(pure_pairs_to_validate)}"
                 ),
             )
             if result is not None:
@@ -5106,7 +5200,7 @@ def main(argv: list[str] | None = None) -> int:
         unload_scene_added = False
         try:
             if not node.add_unload_scene(recognition_pose):
-                log.error("[unload] 添加取料台/墙状障碍物失败")
+                log.error("[unload] 添加料台/台面薄长方体/墙状障碍物失败")
                 return False
             unload_scene_added = True
             table_top_pose = make_unload_table_top_pose(recognition_pose)
@@ -5116,6 +5210,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"{table_top_pose.position.y:.4f}, "
                 f"{table_top_pose.position.z:.4f})，"
                 "姿态相对视觉绕局部 Y=180°、Z=90°；"
+                f"台面薄长方体 size={UNLOAD_TABLE_TOP_BOX_SIZE} m，"
+                "下表面中心=视觉识别位置；"
                 f"障碍物 size={UNLOAD_OBSTACLE_SIZE} m, "
                 f"center_y={recognition_pose.position.y + UNLOAD_OBSTACLE_Y_OFFSET:.4f}"
             )
@@ -5169,7 +5265,7 @@ def main(argv: list[str] | None = None) -> int:
             return True
         finally:
             if unload_scene_added and not node.remove_unload_scene():
-                log.error("[unload] 移除取料台/墙状障碍物失败")
+                log.error("[unload] 移除料台/台面薄长方体/墙状障碍物失败")
 
     try:
 
