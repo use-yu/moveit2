@@ -10,7 +10,7 @@ G01 MoveIt 演示脚本
     → 读取视觉点
     → 生成左臂、右臂、SJ、base_link 下的目标位姿
     → 按视觉点和 group 顺序做可达性验证
-    → 选中第一个“有 IK + 直线 approach 可行”的候选
+    → 选中“有 IK + 直线 approach 可行 + 加入临时碰撞体后 q_pre 无碰撞”的候选
     → OMPL 到 q_pre
     → Cartesian approach 到抓取点
     → 工具上电抓取
@@ -92,7 +92,13 @@ from moveit_msgs.msg import (
     RobotState,
     RobotTrajectory,
 )
-from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetPositionFK, GetPositionIK
+from moveit_msgs.srv import (
+    ApplyPlanningScene,
+    GetCartesianPath,
+    GetPositionFK,
+    GetPositionIK,
+    GetStateValidity,
+)
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -349,6 +355,7 @@ SVC_APPLY_SCENE = "apply_planning_scene"
 SVC_CARTESIAN_PATH = "compute_cartesian_path"
 SVC_COMPUTE_IK = "compute_ik"
 SVC_COMPUTE_FK = "compute_fk"
+SVC_CHECK_STATE_VALIDITY = "check_state_validity"
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 GRASP_CMD_TOPIC = "/grasp_cmd"
@@ -1237,8 +1244,13 @@ def arm_context_for_group(group: str) -> tuple[str, str] | None:
 #   left_arm → right_arm → left_waist → right_waist → left_body → right_body
 # side_value <= 0:
 #   right_arm → left_arm → right_waist → left_waist → right_body → left_body
-def validate_reachable_grasp(node, all_xyz_rpy: list[dict], speed_scale: float = 0.2):
-    """按点和候选 group 顺序验证 IK 可解 + cartesian approach 可行。"""
+def validate_reachable_grasp(
+    node,
+    all_xyz_rpy: list[dict],
+    speed_scale: float = 0.2,
+    cutoff_joint_names: Sequence[str] | None = None,
+):
+    """验证 IK、Cartesian approach 以及加入两个临时碰撞体后的 q_pre。"""
     log = node.get_logger()
     if not all_xyz_rpy:
         log.error("[reach] 没有可验证的视觉点")
@@ -1279,6 +1291,7 @@ def validate_reachable_grasp(node, all_xyz_rpy: list[dict], speed_scale: float =
                 joint_names=pick_joint_names,
                 speed_scale=speed_scale,
                 plan_frame=pick_frame,
+                cutoff_joint_names=cutoff_joint_names,
             )
             if picked is None:
                 log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
@@ -2075,6 +2088,9 @@ class G01Demo(Node):
         self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
         self._ik_cli = self.create_client(GetPositionIK, SVC_COMPUTE_IK)
         self._fk_cli = self.create_client(GetPositionFK, SVC_COMPUTE_FK)
+        self._state_validity_cli = self.create_client(
+            GetStateValidity, SVC_CHECK_STATE_VALIDITY
+        )
         self._left_tool_cli = self.create_client(SetToolPower, LEFT_TOOL_COMMAND_SERVICE)
         self._right_tool_cli = self.create_client(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE)
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
@@ -2718,6 +2734,87 @@ class G01Demo(Node):
             CollisionObject(id=GRASP_OBJECT_COLLISION_ID, operation=CollisionObject.REMOVE),
         ]
         return self._apply_scene(removals)
+
+    def _check_state_collision_free(
+        self,
+        group: str,
+        joints: dict[str, float],
+        state_joint_names: Sequence[str],
+    ) -> bool:
+        """用当前完整状态补齐 joints，并检查该 group 是否无碰撞。"""
+        log = self.get_logger()
+        state_joint_names = list(state_joint_names)
+        current = self._get_joints(state_joint_names, wait_new=True)
+        if current is None:
+            log.error("[q-pre-collision] 读取完整机器人状态失败")
+            return False
+
+        state = dict(current)
+        state.update(joints)
+        if not self._state_validity_cli.wait_for_service(timeout_sec=10.0):
+            log.error(f"服务 {SVC_CHECK_STATE_VALIDITY} 不可用")
+            return False
+
+        req = GetStateValidity.Request()
+        req.group_name = group
+        req.robot_state.is_diff = True
+        req.robot_state.joint_state.name = list(state.keys())
+        req.robot_state.joint_state.position = list(state.values())
+        fut = self._state_validity_cli.call_async(req)
+        if not self._spin_until(fut, 10.0):
+            log.error(f"服务 {SVC_CHECK_STATE_VALIDITY} 调用超时")
+            return False
+
+        res = fut.result()
+        if res.valid:
+            return True
+
+        contact_pairs = []
+        for contact in res.contacts[:6]:
+            body_1 = getattr(contact, "contact_body_1", "")
+            body_2 = getattr(contact, "contact_body_2", "")
+            pair = f"{body_1}<->{body_2}" if body_1 or body_2 else "未知碰撞对"
+            if pair not in contact_pairs:
+                contact_pairs.append(pair)
+        contacts_text = ", ".join(contact_pairs) if contact_pairs else "服务未返回碰撞对"
+        log.info(f"[q-pre-collision] q_pre 有碰撞：{contacts_text}")
+        return False
+
+    def _q_pre_valid_with_temporary_collisions(
+        self,
+        group: str,
+        link: str,
+        target_pose: Pose,
+        plan_frame: str,
+        q_pre: dict[str, float],
+        state_joint_names: Sequence[str],
+    ) -> bool:
+        """临时加入隔离面和待抓物体，仅检查 q_pre 状态，然后恢复场景。"""
+        log = self.get_logger()
+        if not self.add_frame_cutoff_for_pose(
+            target_pose,
+            source_frame=plan_frame,
+            target_frame=SCENE_FRAME,
+            joint_names=state_joint_names,
+            tangent_link=link,
+            tangent_joints=q_pre,
+        ):
+            log.error("[q-pre-collision] 添加两个临时碰撞体失败")
+            return False
+
+        valid = False
+        removed = False
+        try:
+            valid = self._check_state_collision_free(
+                group,
+                q_pre,
+                state_joint_names,
+            )
+        finally:
+            removed = self.remove_frame_cutoff()
+            if not removed:
+                log.error("[q-pre-collision] 移除两个临时碰撞体失败")
+        return valid and removed
 
     def _cylinder_marker_numeric_id(self, object_id: str) -> int:
         if object_id not in self._cylinder_marker_ids:
@@ -3546,10 +3643,13 @@ class G01Demo(Node):
         n_candidates: int = IK_N_CANDIDATES,
         plan_frame: str = PLAN_FRAME,
         target_seeds: Sequence[dict[str, float]] | None = None,
+        cutoff_joint_names: Sequence[str] | None = None,
     ):
-        """从 target_pose 的多个 IK 解里挑「能直线退回 pre_pose」的一组。
+        """从 target_pose 的多个 IK 解里挑可用的一组。
 
         target_seeds 不为 None 时，只用这些 seed 求 IK，不做当前关节/随机 seed 枚举。
+        cutoff_joint_names 不为 None 时，还会临时加入隔离面和待抓物体，并要求
+        q_pre 通过 check_state_validity；这里只做状态碰撞检查，不做 OMPL 规划。
         返回 (q_pre, q_target, approach_traj) 三元组；找不到返回 None。
         approach_traj = reverse( cartesian(start=q_target, end=pre_pose) )
             即真正用来「从 pre_pose 直线接近 target_pose」的轨迹。
@@ -3573,8 +3673,7 @@ class G01Demo(Node):
             expected_points + CART_MAX_POINT_EXTRA,
             int(math.ceil(expected_points * CART_MAX_POINT_FACTOR)),
         )
-        best = None
-        best_score = float("inf")
+        feasible_pairs = []
 
         for idx, q_target in enumerate(candidates):
             retreat_traj = self._cartesian_plan(
@@ -3618,17 +3717,61 @@ class G01Demo(Node):
                 f"(轨迹 {point_count} 点, joint_motion={total_motion:.3f}, "
                 f"max_step={max_step:.3f}, score={score:.3f})"
             )
-            if score < best_score:
-                best_score = score
-                best = (q_pre, q_target, approach_traj, idx + 1, point_count, total_motion, max_step)
+            feasible_pairs.append(
+                (
+                    score,
+                    q_pre,
+                    q_target,
+                    approach_traj,
+                    idx + 1,
+                    point_count,
+                    total_motion,
+                    max_step,
+                )
+            )
 
-        if best is not None:
-            q_pre, q_target, approach_traj, best_idx, point_count, total_motion, max_step = best
+        feasible_pairs.sort(key=lambda item: item[0])
+        for (
+            _score,
+            q_pre,
+            q_target,
+            approach_traj,
+            best_idx,
+            point_count,
+            total_motion,
+            max_step,
+        ) in feasible_pairs:
+            if cutoff_joint_names is not None:
+                log.info(
+                    f"[grasp-select] 检查候选 IK {best_idx}/{len(candidates)}："
+                    f"加入「{FRAME_CUTOFF_ID}」+「{GRASP_OBJECT_COLLISION_ID}」后的 q_pre"
+                )
+                if not self._q_pre_valid_with_temporary_collisions(
+                    group,
+                    link,
+                    target_pose,
+                    plan_frame,
+                    q_pre,
+                    cutoff_joint_names,
+                ):
+                    log.info(
+                        f"[grasp-select] 候选 IK {best_idx}/{len(candidates)}："
+                        "q_pre 在两个新碰撞体加入后未通过碰撞检查 → 淘汰"
+                    )
+                    continue
             log.info(
                 f"[grasp-select] 选用候选 IK {best_idx}/{len(candidates)}："
-                f"{point_count} 点, joint_motion={total_motion:.3f}, max_step={max_step:.3f}"
+                f"{point_count} 点, joint_motion={total_motion:.3f}, "
+                f"max_step={max_step:.3f}"
             )
             return q_pre, q_target, approach_traj
+
+        if feasible_pairs and cutoff_joint_names is not None:
+            log.error(
+                f"[grasp-select] {len(feasible_pairs)} 个直线可行候选中，没有一个 q_pre "
+                f"能在加入「{FRAME_CUTOFF_ID}」+「{GRASP_OBJECT_COLLISION_ID}」后保持无碰撞"
+            )
+            return None
 
         log.error(
             f"[grasp-select] 共 {len(candidates)} 个候选 IK 解，没有一个能直线退回 pre_pose"
@@ -4025,9 +4168,13 @@ class G01Demo(Node):
             joint_names=joint_names,
             speed_scale=speed_scale,
             plan_frame=plan_frame,
+            cutoff_joint_names=cutoff_joint_names,
         )
         if picked is None:
-            log.error("[pick] 未找到「IK 可解 + cartesian approach 可行」的 IK 解")
+            log.error(
+                "[pick] 未找到「IK 可解 + cartesian approach 可行 + "
+                "加入两个临时碰撞体后 q_pre 无碰撞」的 IK 解"
+            )
             self.last_pick_failure_reason = "no_ik"
             return False
         q_pre, q_target, approach_traj = picked
@@ -4454,9 +4601,17 @@ def main(argv: list[str] | None = None) -> int:
         first_return_modes, all_xyz_rpy = vision_pose
 
         # 可达性验证：按视觉点顺序，依次验证 arm、waist、body。
-        reachable = validate_reachable_grasp(node, all_xyz_rpy, speed_scale=0.2)
+        reachable = validate_reachable_grasp(
+            node,
+            all_xyz_rpy,
+            speed_scale=0.2,
+            cutoff_joint_names=joint_names,
+        )
         if reachable is None:
-            log.error("没有找到 IK 可解 + cartesian approach 可行的视觉点")
+            log.error(
+                "没有找到 IK 可解 + cartesian approach 可行 + "
+                "加入两个临时碰撞体后 q_pre 无碰撞的视觉点"
+            )
             return False
 
         point_index = reachable["point_index"]
