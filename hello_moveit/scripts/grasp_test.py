@@ -425,9 +425,10 @@ UNLOAD_PLACE_RIGHT_IK_MAX_SOLUTIONS_PER_BODY = 10
 UNLOAD_PLACE_MAX_PAIR_PLANS = 200
 UNLOAD_PLACE_IK_PERTURB = math.pi
 UNLOAD_PLACE_IK_RANDOM_SEED = 20260724
-UNLOAD_BODY_JOINT1_LIMITS = (0.0, 0.19)
-UNLOAD_BODY_JOINT2_LIMITS = (0.0, 1.0)
-UNLOAD_ARM_JOINT_LIMITS_BY_INDEX = {
+# IK 随机种子使用的 URDF 位置限位。抓取与下料共用，避免生成越界 RobotState。
+BODY_JOINT1_LIMITS = (0.0, 0.19)
+BODY_JOINT2_LIMITS = (0.0, 1.0)
+ARM_JOINT_LIMITS_BY_INDEX = {
     1: (-3.14, 3.8),
     2: (-3.14, 3.14),
     3: (-2.79, 2.79),
@@ -738,7 +739,6 @@ VISION_LEFT_TRANSFORM_MM = _transform_xyz_wxyz_m_to_matrix_mm(VISION_LEFT_TRANSF
 
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
 IK_N_CANDIDATES = 200          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
-IK_SEED_PERTURB = math.pi/2     # 随机种子各关节的最大扰动幅度 [rad]，越大解越分散
 IK_TIMEOUT_SEC = 0.2          # 每次 /compute_ik 超时（KDL 对边界姿态需更长收敛时间）
 IK_RANDOM_SEED = 42           # 让 IK 多解枚举可复现；改成 None 则每次随机
 
@@ -1131,6 +1131,20 @@ def joint_names_for_group(group: str) -> list[str]:
     if group not in JOINT_TARGETS:
         raise KeyError(f"未知 group={group}，JOINT_TARGETS 可选: {list(JOINT_TARGETS)}")
     return list(JOINT_TARGETS[group].keys())
+
+
+def ik_seed_limits_for_joint(joint_name: str) -> tuple[float, float]:
+    """返回 IK 随机种子使用的 URDF 位置限位。"""
+    if joint_name == "body_joint1":
+        return BODY_JOINT1_LIMITS
+    if joint_name == "body_joint2":
+        return BODY_JOINT2_LIMITS
+
+    arm_match = re.fullmatch(r"[lr]_arm_joint([1-6])", joint_name)
+    if arm_match:
+        return ARM_JOINT_LIMITS_BY_INDEX[int(arm_match.group(1))]
+
+    raise KeyError(f"没有配置关节 {joint_name!r} 的 IK 随机种子限位")
 
 
 def make_unload_yubei_joint_target(
@@ -3273,9 +3287,9 @@ class G01Demo(Node):
                     if name not in seed:
                         continue
                     if name == "body_joint1":
-                        seed[name] = rng.uniform(*UNLOAD_BODY_JOINT1_LIMITS)
+                        seed[name] = rng.uniform(*BODY_JOINT1_LIMITS)
                     elif name == "body_joint2":
-                        seed[name] = rng.uniform(*UNLOAD_BODY_JOINT2_LIMITS)
+                        seed[name] = rng.uniform(*BODY_JOINT2_LIMITS)
                     else:
                         arm_match = re.fullmatch(
                             r"[lr]_arm_joint([1-6])",
@@ -3284,7 +3298,7 @@ class G01Demo(Node):
                         if arm_match:
                             joint_index = int(arm_match.group(1))
                             seed[name] = rng.uniform(
-                                *UNLOAD_ARM_JOINT_LIMITS_BY_INDEX[joint_index]
+                                *ARM_JOINT_LIMITS_BY_INDEX[joint_index]
                             )
                         else:
                             perturbed = (
@@ -3358,7 +3372,6 @@ class G01Demo(Node):
         pose: Pose,
         joint_names: Sequence[str],
         n_candidates: int = IK_N_CANDIDATES,
-        perturb: float = IK_SEED_PERTURB,
         dedup_tol: float = 1e-2,
         avoid_collisions: bool = True,
         plan_frame: str = PLAN_FRAME,
@@ -3366,7 +3379,7 @@ class G01Demo(Node):
         """通过随机种子枚举 pose 在 group 上的多个不同 IK 解。
 
         - 第 0 次以当前 joint_states 为种子，能拿到「最自然」的解。
-        - 之后每次对 `joint_names` 列出的关节做 ±perturb 的均匀随机扰动作为种子。
+        - 之后每次按 URDF 位置限位，对 `joint_names` 中的关节做全范围均匀采样。
         - 用 dedup_tol 在关节空间做去重（任一关节差异 < tol 视为同解）。
         - 失败时统计 error_code，方便区分「数值无解 / 碰撞被拒 / 输入非法」。
         - 若启用 avoid_collisions 全部失败，自动用 avoid_collisions=False 再试一轮，
@@ -3378,6 +3391,15 @@ class G01Demo(Node):
         current = self._get_joints(list(joint_names), wait_new=True)
         if current is None:
             log.error("[ik-multi] 读取当前关节失败，无法构造种子")
+            return []
+
+        try:
+            joint_limits = {
+                name: ik_seed_limits_for_joint(name)
+                for name in joint_names
+            }
+        except KeyError as exc:
+            log.error(f"[ik-multi] {exc}")
             return []
 
         solutions: list[dict] = []
@@ -3393,7 +3415,10 @@ class G01Demo(Node):
             if i == 0:
                 seed = dict(current)
             else:
-                seed = {n: current[n] + rng.uniform(-perturb, perturb) for n in joint_names}
+                seed = {
+                    name: rng.uniform(*joint_limits[name])
+                    for name in joint_names
+                }
             sol, code = self._solve_ik(
                 group, link, pose, seed,
                 avoid_collisions=avoid_collisions, return_code=True, plan_frame=plan_frame,
@@ -3410,7 +3435,7 @@ class G01Demo(Node):
 
         log.info(
             f"[ik-multi] {len(solutions)} 个不同 IK 解 / {n_candidates} 次尝试 "
-            f"(perturb=±{perturb:.2f} rad, avoid_collisions={avoid_collisions})"
+            f"(按 URDF 关节限位采样, avoid_collisions={avoid_collisions})"
         )
         if fail_codes:
             breakdown = ", ".join(
@@ -3433,7 +3458,7 @@ class G01Demo(Node):
                 )
                 no_col_sols = self._solve_ik_multi(
                     group, link, pose, joint_names,
-                    n_candidates=n_candidates, perturb=perturb, dedup_tol=dedup_tol,
+                    n_candidates=n_candidates, dedup_tol=dedup_tol,
                     avoid_collisions=False, plan_frame=plan_frame,
                 )
                 if no_col_sols:
@@ -3445,7 +3470,7 @@ class G01Demo(Node):
                 else:
                     log.error(
                         "[ik-multi] 关闭碰撞后仍 0 解 → 目标位姿真正不可达（数值无解 / 超出工作空间 / 关节限位）。"
-                        "  对策：抬高 target z、放大 IK_SEED_PERTURB / IK_TIMEOUT_SEC、或在 RViz 拖动 IK marker 直接验证可达性"
+                        "  对策：抬高 target z、增加 IK_N_CANDIDATES / IK_TIMEOUT_SEC、或在 RViz 拖动 IK marker 直接验证可达性"
                     )
         return solutions
 
