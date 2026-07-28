@@ -5,7 +5,7 @@
 G01 MoveIt 演示脚本
 
 功能（按顺序执行）：
-输入 1：先关节空间运动到 Q1，再发送 p,4 识别深框，
+输入 1：先关节空间运动到 框_Q1，再发送 p,4 识别深框，
         按识别坐标重建深框障碍物并连续执行 4 次上料：
     机器人先到初始位
     → 读取视觉点
@@ -307,7 +307,25 @@ POSE_START_JOINTS = list(JOINT_TARGETS.get(POSE_GROUP, {}).keys())
 if not POSE_START_JOINTS:
     raise KeyError(f"JOINT_TARGETS 中未找到 POSE_GROUP={POSE_GROUP} 的关节列表")
 
-# 深框识别和每轮抓取共用的视觉预备构型，顺序与 dual_arm_body 一致。
+# p,4 深框识别专用预备构型，顺序与 dual_arm_body 一致。
+框_Q1 = [
+    0.13,
+    50 * math.pi / 180,
+    -1.57,
+    -0.15,
+    -1.578090,
+    -1.370549,
+    -1.672852,
+    -0.588477,
+    1.57,
+    0.15,
+    1.578090,
+    1.370549,
+    1.672852,
+    0.588477,
+]
+
+# 每轮抓取使用的预备构型。
 GRASP_Q1 = [
     0.0,
     30 * math.pi / 180,
@@ -324,11 +342,12 @@ GRASP_Q1 = [
     1.672852,
     0.588477,
 ]
-if len(GRASP_Q1) != len(JOINT_TARGETS["dual_arm_body"]):
-    raise ValueError(
-        f"GRASP_Q1 长度 {len(GRASP_Q1)} 与 dual_arm_body 关节数 "
-        f"{len(JOINT_TARGETS['dual_arm_body'])} 不一致"
-    )
+for q1_name, q1_values in (("框_Q1", 框_Q1), ("GRASP_Q1", GRASP_Q1)):
+    if len(q1_values) != len(JOINT_TARGETS["dual_arm_body"]):
+        raise ValueError(
+            f"{q1_name} 长度 {len(q1_values)} 与 dual_arm_body 关节数 "
+            f"{len(JOINT_TARGETS['dual_arm_body'])} 不一致"
+        )
 
 
 # 规划器
@@ -4667,19 +4686,19 @@ def main(argv: list[str] | None = None) -> int:
         node.publish_grasp_cmd_result(result, success_grasp_number)
 
     def recognize_and_add_deep_frame() -> bool:
-        """先运动到 Q1，再发送 p,4 并用识别结果重建深框碰撞场景。"""
+        """先运动到 框_Q1，再发送 p,4 并用识别结果重建深框碰撞场景。"""
         nonlocal frame_added
         q1_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
         log.info(
-            "[frame-vision] p,4 识别前，dual_arm_body 先关节空间运动到 Q1"
+            "[frame-vision] p,4 识别前，dual_arm_body 先关节空间运动到 框_Q1"
         )
         if not node.plan_execute_joint_waypoints(
             "dual_arm_body",
             0.2,
             q1_joint_names,
-            [GRASP_Q1],
+            [框_Q1],
         ):
-            log.error("[frame-vision] 运动到 Q1 失败，不发送 p,4")
+            log.error("[frame-vision] 运动到 框_Q1 失败，不发送 p,4")
             return False
 
         vision_result = read_vision_object_pose(
