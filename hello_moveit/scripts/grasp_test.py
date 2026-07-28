@@ -5,7 +5,8 @@
 G01 MoveIt 演示脚本
 
 功能（按顺序执行）：
-回车：执行上料：
+输入 1：先关节空间运动到 Q1，再发送 p,4 识别深框，
+        按识别坐标重建深框障碍物并连续执行 4 次上料：
     机器人先到初始位
     → 读取视觉点
     → 生成左臂、右臂、SJ、base_link 下的目标位姿
@@ -18,7 +19,7 @@ G01 MoveIt 演示脚本
     → 根据 first_return_mode：
     ├─ mode=1：双臂交换 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
-输入 1：执行下料：
+输入 2：执行原下料：
     下料读取最新 SW 信号，0=有料。
     优先取右臂 SW1 + 左臂 SW3，其次右臂 SW4 + 左臂 SW2；必须整对有料。
     发送 p,2 识别。
@@ -306,6 +307,29 @@ POSE_START_JOINTS = list(JOINT_TARGETS.get(POSE_GROUP, {}).keys())
 if not POSE_START_JOINTS:
     raise KeyError(f"JOINT_TARGETS 中未找到 POSE_GROUP={POSE_GROUP} 的关节列表")
 
+# 深框识别和每轮抓取共用的视觉预备构型，顺序与 dual_arm_body 一致。
+GRASP_Q1 = [
+    0.0,
+    30 * math.pi / 180,
+    -1.57,
+    -0.15,
+    -1.578090,
+    -1.370549,
+    -1.672852,
+    -0.588477,
+    1.57,
+    0.15,
+    1.578090,
+    1.370549,
+    1.672852,
+    0.588477,
+]
+if len(GRASP_Q1) != len(JOINT_TARGETS["dual_arm_body"]):
+    raise ValueError(
+        f"GRASP_Q1 长度 {len(GRASP_Q1)} 与 dual_arm_body 关节数 "
+        f"{len(JOINT_TARGETS['dual_arm_body'])} 不一致"
+    )
+
 
 # 规划器
 PLANNER_ID = "RRTConnect"
@@ -324,6 +348,20 @@ WALL_T = 0.035  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 深框整体外轮廓中心，相对于 base_link [m]
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
+
+# p,4 返回的识别坐标系位于深框前壁（局部 -X）顶面中心下方 6 cm。
+# 因此前壁识别坐标系到深框中心的局部平移为：向框内 +X、向下 -Z。
+FRAME_VISION_TRIGGER_COMMAND = "p,4"
+FRAME_VISION_POSE_KEY = "right_body"
+FRAME_VISION_TF_FRAME = "deep_frame_vision"
+FRAME_CENTER_TF_FRAME = "deep_frame_center"
+FRAME_RECOGNITION_BELOW_TOP = 0.06
+FRAME_RECOGNITION_TO_CENTER_LOCAL = (
+    FRAME_SIZE[0] / 2.0 - WALL_T / 2.0,
+    0.0,
+    -FRAME_SIZE[2] / 2.0 + FRAME_RECOGNITION_BELOW_TOP,
+)
+FRAME_GRASP_REPEAT_COUNT = 4
 
 # 与深框同时添加/移除的长方体障碍物（位置为中心点，相对于 base_link）
 BOX_OBSTACLE_ID = "长方体障碍物"
@@ -696,14 +734,18 @@ SIM_UNLOAD_VISION_RESULT = (
     1,
     [-47.2306, -52.774, 621.5524, 0.3712, 0.9282, 0.0238, -0.0043],
 )
+# p,4 仿真时沿用同一套视觉协议；实际框中心仍由 6 cm 几何偏移计算。
+SIM_FRAME_VISION_RESULT = SIM_UNLOAD_VISION_RESULT
 
 
 def sim_vision_result_for_trigger(
     trigger_command: str,
 ) -> tuple[int, list[float]]:
-    """p,2 使用物料台仿真数据，其他视觉命令继续使用普通抓取仿真数据。"""
+    """按视觉触发命令选择对应的仿真数据。"""
     if trigger_command == UNLOAD_TRIGGER_COMMAND:
         return SIM_UNLOAD_VISION_RESULT
+    if trigger_command == FRAME_VISION_TRIGGER_COMMAND:
+        return SIM_FRAME_VISION_RESULT
     return SIM_VISION_RESULT
 
 def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
@@ -1000,11 +1042,12 @@ def read_vision_object_pose(
     if sim_mode:
         first_return_mode, pose = sim_vision_result_for_trigger(trigger_command)
         vision_results = [(first_return_mode, list(pose))]
-        sim_source = (
-            "物料台 p,2"
-            if trigger_command == UNLOAD_TRIGGER_COMMAND
-            else "普通抓取"
-        )
+        if trigger_command == UNLOAD_TRIGGER_COMMAND:
+            sim_source = "物料台 p,2"
+        elif trigger_command == FRAME_VISION_TRIGGER_COMMAND:
+            sim_source = "深框 p,4"
+        else:
+            sim_source = "普通抓取"
         log.info(f"[sim] viewer 点个数: 1，使用{sim_source}固定 pose")
         print(
             f"{GREEN}[sim] viewer point 1: "
@@ -1384,6 +1427,14 @@ def pose_offset_local(pose: Pose, dx: float, dy: float, dz: float) -> Pose:
     return out
 
 
+def deep_frame_pose_from_recognition(recognition_pose: Pose) -> Pose:
+    """由前壁顶面下方 6 cm 的 p,4 识别坐标系反推深框中心位姿。"""
+    return pose_offset_local(
+        recognition_pose,
+        *FRAME_RECOGNITION_TO_CENTER_LOCAL,
+    )
+
+
 def pose_rotate_local_rpy(
     pose: Pose,
     roll: float,
@@ -1462,17 +1513,18 @@ def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
     return pose_offset_local(pose, 0.0, 0.0, dz)
 
 
-def make_deep_frame() -> CollisionObject:
+def make_deep_frame(frame_pose: Pose | None = None) -> CollisionObject:
     """
     深框 = 1 块底板 + 4 块侧墙（BOX  primitive），顶部无盖。
-    FRAME_SIZE 为深框整体外尺寸，FRAME_CENTER 为外轮廓中心。
+    FRAME_SIZE 为深框整体外尺寸；frame_pose 为外轮廓中心位姿。
+    frame_pose=None 时使用静态 FRAME_CENTER / FRAME_RPY_DEG。
     WALL_T 只向内部收缩，外轮廓保持 L × W × H。
     """
     L, W, H = FRAME_SIZE
     t = WALL_T
-    bx, by, bz = FRAME_CENTER
-    roll, pitch, yaw = (math.radians(v) for v in FRAME_RPY_DEG)
-    qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
+    if frame_pose is None:
+        roll, pitch, yaw = (math.radians(v) for v in FRAME_RPY_DEG)
+        frame_pose = make_pose(*FRAME_CENTER, roll, pitch, yaw)
 
     obj = CollisionObject()
     obj.header.frame_id = SCENE_FRAME
@@ -1483,10 +1535,10 @@ def make_deep_frame() -> CollisionObject:
         prim = SolidPrimitive()
         prim.type = SolidPrimitive.BOX
         prim.dimensions = [dx, dy, dz]
-        rx, ry, rz = rotate_xyz_by_quat(ox, oy, oz, qx, qy, qz, qw)
-        pose = make_pose(bx + rx, by + ry, bz + rz, roll, pitch, yaw)
         obj.primitives.append(prim)
-        obj.primitive_poses.append(pose)
+        obj.primitive_poses.append(
+            pose_offset_local(frame_pose, ox, oy, oz)
+        )
 
     wall_h = H - t
     wall_z = -H / 2 + t + wall_h / 2
@@ -1604,13 +1656,17 @@ def make_unload_place_poses(recognition_pose: Pose) -> dict[int, Pose]:
     }
 
 
-def make_deep_frame_cutoff(scene_z: float) -> CollisionObject:
+def make_deep_frame_cutoff(
+    scene_z: float,
+    frame_pose: Pose | None = None,
+) -> CollisionObject:
     """在深框内生成水平隔离面，其上表面位于 SCENE_FRAME 的 scene_z。"""
     L, W, _ = FRAME_SIZE
     t = WALL_T
-    bx, by, _ = FRAME_CENTER
-    roll, pitch, yaw = (math.radians(v) for v in FRAME_RPY_DEG)
-    qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
+    if frame_pose is None:
+        roll, pitch, yaw = (math.radians(v) for v in FRAME_RPY_DEG)
+        frame_pose = make_pose(*FRAME_CENTER, roll, pitch, yaw)
+    q = frame_pose.orientation
 
     obj = CollisionObject()
     obj.header.frame_id = SCENE_FRAME
@@ -1627,10 +1683,20 @@ def make_deep_frame_cutoff(scene_z: float) -> CollisionObject:
     # 隔离面沿深框局部 X/Y 铺满内腔，局部 Z 为厚度方向。
     # scene_z 是隔离面上表面高度，实体中心向下偏半个厚度。
     ox, oy, oz = rotate_xyz_by_quat(
-        0.0, 0.0, -FRAME_CUTOFF_THICKNESS / 2.0, qx, qy, qz, qw
+        0.0,
+        0.0,
+        -FRAME_CUTOFF_THICKNESS / 2.0,
+        q.x,
+        q.y,
+        q.z,
+        q.w,
     )
     obj.primitives.append(prim)
-    obj.primitive_poses.append(make_pose(bx + ox, by + oy, scene_z + oz - 0.0, roll, pitch, yaw))
+    cutoff_pose = copy.deepcopy(frame_pose)
+    cutoff_pose.position.x += ox
+    cutoff_pose.position.y += oy
+    cutoff_pose.position.z = scene_z + oz
+    obj.primitive_poses.append(cutoff_pose)
     return obj
 
 
@@ -2095,7 +2161,16 @@ class G01Demo(Node):
         self._right_tool_cli = self.create_client(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE)
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
         self._exec_cli = ActionClient(self, ExecuteTrajectory, ACT_EXEC_TRAJ)
-        self._unload_vision_tf_broadcaster = StaticTransformBroadcaster(self)
+        self._vision_tf_broadcaster = StaticTransformBroadcaster(self)
+        frame_roll, frame_pitch, frame_yaw = (
+            math.radians(value) for value in FRAME_RPY_DEG
+        )
+        self._frame_pose = make_pose(
+            *FRAME_CENTER,
+            frame_roll,
+            frame_pitch,
+            frame_yaw,
+        )
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
@@ -2473,12 +2548,15 @@ class G01Demo(Node):
         return True
 
     def add_frame(self) -> bool:
-        """同时添加深框和长方体障碍物，并设置 RViz 显示颜色。"""
+        """按当前动态深框姿态添加深框和长方体障碍物。"""
         colors = [
             ObjectColor(id=FRAME_ID, color=FRAME_COLOR),
             ObjectColor(id=BOX_OBSTACLE_ID, color=BOX_OBSTACLE_COLOR),
         ]
-        return self._apply_scene([make_deep_frame(), make_box_obstacle()], colors)
+        return self._apply_scene(
+            [make_deep_frame(self._frame_pose), make_box_obstacle()],
+            colors,
+        )
 
     def remove_frame(self) -> bool:
         """同时从场景中删除深框和长方体障碍物。"""
@@ -2487,6 +2565,40 @@ class G01Demo(Node):
             CollisionObject(id=BOX_OBSTACLE_ID, operation=CollisionObject.REMOVE),
         ]
         return self._apply_scene(objects)
+
+    def configure_deep_frame_from_recognition(
+        self,
+        recognition_pose: Pose,
+    ) -> Pose:
+        """保存由 p,4 识别点反推得到的深框中心位姿。"""
+        self._frame_pose = deep_frame_pose_from_recognition(recognition_pose)
+        return copy.deepcopy(self._frame_pose)
+
+    def publish_deep_frame_vision_tf(
+        self,
+        recognition_pose: Pose,
+        frame_pose: Pose,
+    ) -> None:
+        """发布 p,4 视觉坐标系以及由它反推的深框中心坐标系。"""
+        transforms = []
+        for child_frame, pose in (
+            (FRAME_VISION_TF_FRAME, recognition_pose),
+            (FRAME_CENTER_TF_FRAME, frame_pose),
+        ):
+            transform = TransformStamped()
+            transform.header.frame_id = SCENE_FRAME
+            transform.header.stamp = self.get_clock().now().to_msg()
+            transform.child_frame_id = child_frame
+            transform.transform.translation.x = pose.position.x
+            transform.transform.translation.y = pose.position.y
+            transform.transform.translation.z = pose.position.z
+            transform.transform.rotation = copy.deepcopy(pose.orientation)
+            transforms.append(transform)
+        self._vision_tf_broadcaster.sendTransform(transforms)
+        self.get_logger().info(
+            f"[frame-vision] 已发布 TF: {SCENE_FRAME} → "
+            f"{FRAME_VISION_TF_FRAME}、{FRAME_CENTER_TF_FRAME}"
+        )
 
     def add_unload_scene(self, recognition_pose: Pose) -> bool:
         """添加 p,2 识别得到的料台、台面薄长方体及墙状障碍物。"""
@@ -2519,7 +2631,7 @@ class G01Demo(Node):
         transform.transform.rotation = copy.deepcopy(
             recognition_pose.orientation
         )
-        self._unload_vision_tf_broadcaster.sendTransform(transform)
+        self._vision_tf_broadcaster.sendTransform(transform)
         self.get_logger().info(
             f"[unload] 已发布视觉坐标系 TF: "
             f"{SCENE_FRAME} → {UNLOAD_VISION_TF_FRAME}"
@@ -2536,7 +2648,7 @@ class G01Demo(Node):
         transform.transform.translation.y = table_top_pose.position.y
         transform.transform.translation.z = table_top_pose.position.z
         transform.transform.rotation = copy.deepcopy(table_top_pose.orientation)
-        self._unload_vision_tf_broadcaster.sendTransform(transform)
+        self._vision_tf_broadcaster.sendTransform(transform)
         mode_prefix = "[sim] " if self.sim_mode else ""
         self.get_logger().info(
             f"[unload] {mode_prefix}已发布上料桌上表面中心 TF: "
@@ -2614,7 +2726,10 @@ class G01Demo(Node):
             f"隔板上表面 z={scene_z:.3f} m"
         )
         return self._apply_scene(
-            [make_deep_frame_cutoff(scene_z), make_grasp_object_collision(scene_pose)],
+            [
+                make_deep_frame_cutoff(scene_z, self._frame_pose),
+                make_grasp_object_collision(scene_pose),
+            ],
             # [make_deep_frame_cutoff(scene_z)],
             colors,
         )
@@ -2723,7 +2838,7 @@ class G01Demo(Node):
             f"隔板上表面 z={scene_z:.3f} m"
         )
         return self._apply_scene(
-            [make_deep_frame_cutoff(scene_z)],
+            [make_deep_frame_cutoff(scene_z, self._frame_pose)],
             [ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR)],
         )
 
@@ -4541,7 +4656,7 @@ def main(argv: list[str] | None = None) -> int:
             return False
 
     def prompt_workflow(message: str) -> str:
-        """回车选择上料，1 选择下料，q 退出。"""
+        """1 选择深框识别并连续抓取，2 选择原下料流程，q 退出。"""
         log.info(message)
         try:
             return input().strip().lower()
@@ -4550,6 +4665,77 @@ def main(argv: list[str] | None = None) -> int:
 
     def publish_attempt_result(result: bool, success_grasp_number: int) -> None:
         node.publish_grasp_cmd_result(result, success_grasp_number)
+
+    def recognize_and_add_deep_frame() -> bool:
+        """先运动到 Q1，再发送 p,4 并用识别结果重建深框碰撞场景。"""
+        nonlocal frame_added
+        q1_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
+        log.info(
+            "[frame-vision] p,4 识别前，dual_arm_body 先关节空间运动到 Q1"
+        )
+        if not node.plan_execute_joint_waypoints(
+            "dual_arm_body",
+            0.2,
+            q1_joint_names,
+            [GRASP_Q1],
+        ):
+            log.error("[frame-vision] 运动到 Q1 失败，不发送 p,4")
+            return False
+
+        vision_result = read_vision_object_pose(
+            node,
+            log,
+            sim_mode=sim_mode,
+            trigger_command=FRAME_VISION_TRIGGER_COMMAND,
+        )
+        if vision_result is None:
+            return False
+
+        _, all_xyz_rpy = vision_result
+        if not all_xyz_rpy or FRAME_VISION_POSE_KEY not in all_xyz_rpy[0]:
+            log.error(
+                f"[frame-vision] p,4 视觉结果缺少 "
+                f"{FRAME_VISION_POSE_KEY!r}"
+            )
+            return False
+
+        recognition_pose = make_pose(*all_xyz_rpy[0][FRAME_VISION_POSE_KEY])
+        frame_pose = deep_frame_pose_from_recognition(recognition_pose)
+        node.publish_deep_frame_vision_tf(recognition_pose, frame_pose)
+        recognition_rpy = pose_to_xyz_rpy(recognition_pose)[3:]
+        frame_rpy = pose_to_xyz_rpy(frame_pose)[3:]
+        log.info(
+            f"[frame-vision] p,4 识别点 @ {SCENE_FRAME}: "
+            f"pos=({recognition_pose.position.x:.4f}, "
+            f"{recognition_pose.position.y:.4f}, "
+            f"{recognition_pose.position.z:.4f}), "
+            f"rpy=({recognition_rpy[0]:.4f}, "
+            f"{recognition_rpy[1]:.4f}, {recognition_rpy[2]:.4f})"
+        )
+        log.info(
+            f"[frame-vision] 识别点按 local offset="
+            f"{FRAME_RECOGNITION_TO_CENTER_LOCAL} m 反推深框中心: "
+            f"pos=({frame_pose.position.x:.4f}, "
+            f"{frame_pose.position.y:.4f}, "
+            f"{frame_pose.position.z:.4f}), "
+            f"rpy=({frame_rpy[0]:.4f}, "
+            f"{frame_rpy[1]:.4f}, {frame_rpy[2]:.4f})"
+        )
+
+        if frame_added:
+            log.info(f"[frame-vision] 移除旧碰撞体「{FRAME_ID}」后更新场景 …")
+            if not node.remove_frame():
+                log.error("[frame-vision] 移除旧深框场景失败")
+                return False
+            frame_added = False
+
+        node.configure_deep_frame_from_recognition(recognition_pose)
+        log.info(f"[frame-vision] 按 p,4 识别位姿添加「{FRAME_ID}」 …")
+        if not node.add_frame():
+            log.error("[frame-vision] 添加动态深框场景失败")
+            return False
+        frame_added = True
+        return True
 
     def run_one_grasp() -> bool | None:
         """执行一轮抓取；True=成功，False=失败，None=用户选择退出。"""
@@ -4572,12 +4758,7 @@ def main(argv: list[str] | None = None) -> int:
         # --- 2. 关节空间运动 ---
         targets = JOINT_TARGETS["dual_arm_body"]
         joint_names = list(targets.keys())
-        Q1 = [
-            0.0, 30*math.pi/180,
-            -1.57, -0.15, -1.578090, -1.370549, -1.672852, -0.588477,
-            1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
-        ]
-        waypoints = [Q1]  # 需要多点时：继续 waypoints.append(q3) ...
+        waypoints = [GRASP_Q1]  # 需要多点时：继续 waypoints.append(q3) ...
 
         # log.info(f"关节规划组: {"dual_arm"}")
         current = node._get_joints(joint_names)
@@ -4665,6 +4846,41 @@ def main(argv: list[str] | None = None) -> int:
             log.error(f"{pick_label}抓取失败")
             return False
 
+        return True
+
+    def run_four_grasps() -> bool | None:
+        """顺序执行四次原“回车抓取”流程；失败时停止本批次。"""
+        success_count = 0
+        for grasp_index in range(FRAME_GRASP_REPEAT_COUNT):
+            log.info(
+                f"[frame-batch] 开始第 {grasp_index + 1}/"
+                f"{FRAME_GRASP_REPEAT_COUNT} 次抓取"
+            )
+            try:
+                grasp_result = run_one_grasp()
+            finally:
+                cleanup_grasp_display()
+
+            if grasp_result is None:
+                return None
+            if grasp_result:
+                success_count += 1
+            publish_attempt_result(grasp_result, success_count)
+            if not grasp_result:
+                log.error(
+                    f"[frame-batch] 第 {grasp_index + 1}/"
+                    f"{FRAME_GRASP_REPEAT_COUNT} 次抓取失败，停止本批次"
+                )
+                return False
+
+            log.info(
+                f"[frame-batch] 第 {grasp_index + 1}/"
+                f"{FRAME_GRASP_REPEAT_COUNT} 次抓取完成"
+            )
+
+        log.info(
+            f"[frame-batch] {FRAME_GRASP_REPEAT_COUNT} 次抓取全部完成"
+        )
         return True
 
     def unload_material_slots() -> list[str]:
@@ -5455,40 +5671,41 @@ def main(argv: list[str] | None = None) -> int:
         #     return 1
 
         workflow = prompt_workflow(
-            "按回车执行上料，输入 1 执行下料，输入 q 退出 …"
+            "输入 1：p,4 识别深框并连续抓取 4 次；"
+            "输入 2：执行原输入 1 的下料流程；输入 q 退出 …"
         )
         while workflow != "q":
-            if workflow == "":
-                if not frame_added:
-                    log.info(f"添加上料碰撞体「{FRAME_ID}」到 {SCENE_FRAME} …")
-                    if not node.add_frame():
-                        publish_attempt_result(False, 0)
-                        workflow = prompt_workflow(
-                            "上料场景添加失败；按回车重试上料，输入 1 下料，输入 q 退出 …"
-                        )
-                        continue
-                    frame_added = True
-                try:
-                    grasp_result = run_one_grasp()
-                finally:
-                    cleanup_grasp_display()
+            if workflow == "1":
+                if not recognize_and_add_deep_frame():
+                    publish_attempt_result(False, 0)
+                    workflow = prompt_workflow(
+                        "深框识别或场景添加失败；输入 1 重试，"
+                        "输入 2 执行原下料流程，输入 q 退出 …"
+                    )
+                    continue
 
-                if grasp_result is None:
+                log.info("按回车继续 …")
+                try:
+                    input()
+                except EOFError:
+                    pass
+
+                batch_result = run_four_grasps()
+                if batch_result is None:
                     code = 0
                     break
-
-                publish_attempt_result(grasp_result, 1 if grasp_result else 0)
-                if grasp_result:
+                if batch_result:
                     code = 0
 
-            elif workflow == "1":
+            elif workflow == "2":
                 # 下料使用 p,2 识别得到的取料台场景，不保留上料深框。
                 if frame_added:
                     log.info(f"切换下料，移除上料碰撞体「{FRAME_ID}」…")
                     if not node.remove_frame():
                         log.error("切换下料时移除上料碰撞体失败")
                         workflow = prompt_workflow(
-                            "场景切换失败；按回车上料，输入 1 重试下料，输入 q 退出 …"
+                            "场景切换失败；输入 1 重新识别深框，"
+                            "输入 2 重试原下料流程，输入 q 退出 …"
                         )
                         continue
                     frame_added = False
@@ -5498,11 +5715,13 @@ def main(argv: list[str] | None = None) -> int:
                     code = 0
             else:
                 log.warning(
-                    f"未知输入 {workflow!r}：回车=上料，1=下料，q=退出"
+                    f"未知输入 {workflow!r}：1=深框识别并抓取4次，"
+                    "2=原下料流程，q=退出"
                 )
 
             workflow = prompt_workflow(
-                "按回车执行下一次上料，输入 1 执行下一次下料，输入 q 退出 …"
+                "输入 1：重新识别深框并连续抓取 4 次；"
+                "输入 2：执行原下料流程；输入 q 退出 …"
             )
 
         if workflow == "q":
