@@ -368,25 +368,26 @@ FRAME_CENTER = (0.92, 0.01, 0.4545)  # 深框整体外轮廓中心，相对于 b
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 深框整体姿态，相对于 base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 
-# p,4 返回的识别坐标系位于深框前壁（局部 -X）顶面中心下方 6 cm。
-# 因此前壁识别坐标系到深框中心的局部平移为：向框内 +X、向下 -Z。
+# p,4 识别位姿先绕自身 Z 轴 +90°，再沿旋转后的自身坐标平移，
+# 得到深框顶部空心区域中心；该坐标点位于开口中，不落在框壁实体上。
 FRAME_VISION_TRIGGER_COMMAND = "p,4"
 FRAME_VISION_POSE_KEY = "right_body"
 FRAME_VISION_TF_FRAME = "deep_frame_vision"
+FRAME_TOP_CENTER_TF_FRAME = "deep_frame_top_center"
 FRAME_CENTER_TF_FRAME = "deep_frame_center"
-FRAME_RECOGNITION_BELOW_TOP = 0.06
-FRAME_RECOGNITION_TO_CENTER_LOCAL = (
-    FRAME_SIZE[0] / 2.0 - WALL_T / 2.0,
+FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0
+FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
+    0.385,
     0.0,
-    -FRAME_SIZE[2] / 2.0 + FRAME_RECOGNITION_BELOW_TOP,
+    0.065,
 )
 FRAME_GRASP_REPEAT_COUNT = 4
 
-# 与深框同时添加/移除的长方体障碍物（位置为中心点，相对于 base_link）
+# 长方体上表面中心相对深框顶部空心区域中心的局部平移。
 BOX_OBSTACLE_ID = "长方体障碍物"
-BOX_OBSTACLE_SIZE = (0.9, 1.5, 0.965)  # X × Y × Z [m]
-BOX_OBSTACLE_CENTER = (0.8, 2.35, 0.3825)  # 中心位置 [m]
-BOX_OBSTACLE_RPY_DEG = (0.0, 0.0, 0.0)
+BOX_OBSTACLE_SIZE = (0.9, 1.0, 0.965)  # X × Y × Z [m]
+BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL = (0.0, 1.65, 0.4)
+BOX_OBSTACLE_TOP_TF_FRAME = "box_obstacle_top_center"
 BOX_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=1.0)
 
 FRAME_CUTOFF_ID = "深框隔离面"
@@ -753,7 +754,7 @@ SIM_UNLOAD_VISION_RESULT = (
     1,
     [-47.2306, -52.774, 621.5524, 0.3712, 0.9282, 0.0238, -0.0043],
 )
-# p,4 仿真时沿用同一套视觉协议；实际框中心仍由 6 cm 几何偏移计算。
+# p,4 仿真时沿用同一套视觉协议；框位姿仍按旋转和平移链计算。
 SIM_FRAME_VISION_RESULT = SIM_UNLOAD_VISION_RESULT
 
 
@@ -1446,11 +1447,34 @@ def pose_offset_local(pose: Pose, dx: float, dy: float, dz: float) -> Pose:
     return out
 
 
-def deep_frame_pose_from_recognition(recognition_pose: Pose) -> Pose:
-    """由前壁顶面下方 6 cm 的 p,4 识别坐标系反推深框中心位姿。"""
-    return pose_offset_local(
+def deep_frame_poses_from_recognition(
+    recognition_pose: Pose,
+) -> tuple[Pose, Pose]:
+    """返回（深框顶部空心中心，深框实体中心）两个位姿。"""
+    rotated_pose = pose_rotate_local_rpy(
         recognition_pose,
-        *FRAME_RECOGNITION_TO_CENTER_LOCAL,
+        0.0,
+        0.0,
+        FRAME_RECOGNITION_LOCAL_YAW,
+    )
+    top_center_pose = pose_offset_local(
+        rotated_pose,
+        *FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL,
+    )
+    frame_center_pose = pose_offset_local(
+        top_center_pose,
+        0.0,
+        0.0,
+        -FRAME_SIZE[2] / 2.0,
+    )
+    return top_center_pose, frame_center_pose
+
+
+def box_obstacle_top_pose_from_frame_top(frame_top_pose: Pose) -> Pose:
+    """由深框顶部空心中心计算长方体障碍物的上表面中心。"""
+    return pose_offset_local(
+        frame_top_pose,
+        *BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL,
     )
 
 
@@ -1569,10 +1593,8 @@ def make_deep_frame(frame_pose: Pose | None = None) -> CollisionObject:
     return obj
 
 
-def make_box_obstacle() -> CollisionObject:
-    """创建与深框同时管理的长方体障碍物。"""
-    roll, pitch, yaw = (math.radians(v) for v in BOX_OBSTACLE_RPY_DEG)
-
+def make_box_obstacle(box_top_pose: Pose) -> CollisionObject:
+    """由长方体上表面中心向自身 -Z 下移半高，创建实体碰撞体。"""
     obj = CollisionObject()
     obj.header.frame_id = SCENE_FRAME
     obj.id = BOX_OBSTACLE_ID
@@ -1582,7 +1604,14 @@ def make_box_obstacle() -> CollisionObject:
     prim.type = SolidPrimitive.BOX
     prim.dimensions = list(BOX_OBSTACLE_SIZE)
     obj.primitives.append(prim)
-    obj.primitive_poses.append(make_pose(*BOX_OBSTACLE_CENTER, roll, pitch, yaw))
+    obj.primitive_poses.append(
+        pose_offset_local(
+            box_top_pose,
+            0.0,
+            0.0,
+            -BOX_OBSTACLE_SIZE[2] / 2.0,
+        )
+    )
     return obj
 
 
@@ -2190,6 +2219,15 @@ class G01Demo(Node):
             frame_pitch,
             frame_yaw,
         )
+        self._frame_top_pose = pose_offset_local(
+            self._frame_pose,
+            0.0,
+            0.0,
+            FRAME_SIZE[2] / 2.0,
+        )
+        self._box_obstacle_top_pose = (
+            box_obstacle_top_pose_from_frame_top(self._frame_top_pose)
+        )
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
@@ -2549,10 +2587,16 @@ class G01Demo(Node):
         log.info(f"{service_name} SetToolPower({status}) 成功")
         return True
 
-    def _apply_scene(self, objects: list[CollisionObject], colors: list[ObjectColor] | None = None) -> bool:
+    def _apply_scene(
+        self,
+        objects: list[CollisionObject],
+        colors: list[ObjectColor] | None = None,
+        report_error: bool = True,
+    ) -> bool:
         """向 move_group 提交规划场景 diff（添加/删除障碍物）。"""
         if not self._scene_cli.wait_for_service(timeout_sec=10.0):
-            self.get_logger().error(f"服务 {SVC_APPLY_SCENE} 不可用")
+            if report_error:
+                self.get_logger().error(f"服务 {SVC_APPLY_SCENE} 不可用")
             return False
         scene = PlanningScene(is_diff=True)
         scene.robot_state.is_diff = True
@@ -2562,7 +2606,8 @@ class G01Demo(Node):
         req = ApplyPlanningScene.Request(scene=scene)
         fut = self._scene_cli.call_async(req)
         if not self._spin_until(fut, 10.0) or not fut.result().success:
-            self.get_logger().error("apply_planning_scene 失败")
+            if report_error:
+                self.get_logger().error("apply_planning_scene 失败")
             return False
         return True
 
@@ -2573,7 +2618,10 @@ class G01Demo(Node):
             ObjectColor(id=BOX_OBSTACLE_ID, color=BOX_OBSTACLE_COLOR),
         ]
         return self._apply_scene(
-            [make_deep_frame(self._frame_pose), make_box_obstacle()],
+            [
+                make_deep_frame(self._frame_pose),
+                make_box_obstacle(self._box_obstacle_top_pose),
+            ],
             colors,
         )
 
@@ -2585,24 +2633,71 @@ class G01Demo(Node):
         ]
         return self._apply_scene(objects)
 
+    def clear_managed_scene_objects(self) -> None:
+        """逐个清除本程序的碰撞体；不存在或删除失败时直接继续。"""
+        object_ids = (
+            FRAME_ID,
+            BOX_OBSTACLE_ID,
+            FRAME_CUTOFF_ID,
+            GRASP_OBJECT_COLLISION_ID,
+            UNLOAD_TABLE_ID,
+            UNLOAD_TABLE_TOP_BOX_ID,
+            UNLOAD_OBSTACLE_ID,
+        )
+        if not self._scene_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().info(
+                f"[startup] 服务 {SVC_APPLY_SCENE} 暂不可用，跳过清理并继续"
+            )
+            return
+
+        removed_ids = []
+        skipped_ids = []
+        for object_id in object_ids:
+            removal = CollisionObject(
+                id=object_id,
+                operation=CollisionObject.REMOVE,
+            )
+            if self._apply_scene([removal], report_error=False):
+                removed_ids.append(object_id)
+            else:
+                skipped_ids.append(object_id)
+        self.get_logger().info(
+            f"[startup] 场景障碍物清理完成："
+            f"{len(removed_ids)} 个删除成功，{len(skipped_ids)} 个不存在或未确认；继续"
+        )
+        if skipped_ids:
+            self.get_logger().info(
+                "[startup] 以下障碍物不存在或删除未确认，已忽略: "
+                + ", ".join(skipped_ids)
+            )
+
     def configure_deep_frame_from_recognition(
         self,
         recognition_pose: Pose,
     ) -> Pose:
-        """保存由 p,4 识别点反推得到的深框中心位姿。"""
-        self._frame_pose = deep_frame_pose_from_recognition(recognition_pose)
+        """保存由 p,4 识别位姿计算出的深框和长方体动态基准。"""
+        self._frame_top_pose, self._frame_pose = (
+            deep_frame_poses_from_recognition(recognition_pose)
+        )
+        self._box_obstacle_top_pose = (
+            box_obstacle_top_pose_from_frame_top(self._frame_top_pose)
+        )
         return copy.deepcopy(self._frame_pose)
 
     def publish_deep_frame_vision_tf(
         self,
         recognition_pose: Pose,
+        frame_top_pose: Pose,
         frame_pose: Pose,
+        box_top_pose: Pose,
     ) -> None:
-        """发布 p,4 视觉坐标系以及由它反推的深框中心坐标系。"""
+        """发布 p,4、深框顶部/实体中心和长方体上表面中心坐标系。"""
         transforms = []
         for child_frame, pose in (
             (FRAME_VISION_TF_FRAME, recognition_pose),
+            (FRAME_TOP_CENTER_TF_FRAME, frame_top_pose),
             (FRAME_CENTER_TF_FRAME, frame_pose),
+            (BOX_OBSTACLE_TOP_TF_FRAME, box_top_pose),
         ):
             transform = TransformStamped()
             transform.header.frame_id = SCENE_FRAME
@@ -2616,7 +2711,8 @@ class G01Demo(Node):
         self._vision_tf_broadcaster.sendTransform(transforms)
         self.get_logger().info(
             f"[frame-vision] 已发布 TF: {SCENE_FRAME} → "
-            f"{FRAME_VISION_TF_FRAME}、{FRAME_CENTER_TF_FRAME}"
+            f"{FRAME_VISION_TF_FRAME}、{FRAME_TOP_CENTER_TF_FRAME}、"
+            f"{FRAME_CENTER_TF_FRAME}、{BOX_OBSTACLE_TOP_TF_FRAME}"
         )
 
     def add_unload_scene(self, recognition_pose: Pose) -> bool:
@@ -4719,9 +4815,24 @@ def main(argv: list[str] | None = None) -> int:
             return False
 
         recognition_pose = make_pose(*all_xyz_rpy[0][FRAME_VISION_POSE_KEY])
-        frame_pose = deep_frame_pose_from_recognition(recognition_pose)
-        node.publish_deep_frame_vision_tf(recognition_pose, frame_pose)
+        frame_top_pose, frame_pose = deep_frame_poses_from_recognition(
+            recognition_pose
+        )
+        box_top_pose = box_obstacle_top_pose_from_frame_top(frame_top_pose)
+        box_center_pose = pose_offset_local(
+            box_top_pose,
+            0.0,
+            0.0,
+            -BOX_OBSTACLE_SIZE[2] / 2.0,
+        )
+        node.publish_deep_frame_vision_tf(
+            recognition_pose,
+            frame_top_pose,
+            frame_pose,
+            box_top_pose,
+        )
         recognition_rpy = pose_to_xyz_rpy(recognition_pose)[3:]
+        frame_top_rpy = pose_to_xyz_rpy(frame_top_pose)[3:]
         frame_rpy = pose_to_xyz_rpy(frame_pose)[3:]
         log.info(
             f"[frame-vision] p,4 识别点 @ {SCENE_FRAME}: "
@@ -4732,13 +4843,32 @@ def main(argv: list[str] | None = None) -> int:
             f"{recognition_rpy[1]:.4f}, {recognition_rpy[2]:.4f})"
         )
         log.info(
-            f"[frame-vision] 识别点按 local offset="
-            f"{FRAME_RECOGNITION_TO_CENTER_LOCAL} m 反推深框中心: "
+            f"[frame-vision] 识别点先绕自身 Z +90°，再按 local offset="
+            f"{FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL} m 得到深框顶部空心中心: "
+            f"pos=({frame_top_pose.position.x:.4f}, "
+            f"{frame_top_pose.position.y:.4f}, "
+            f"{frame_top_pose.position.z:.4f}), "
+            f"rpy=({frame_top_rpy[0]:.4f}, "
+            f"{frame_top_rpy[1]:.4f}, {frame_top_rpy[2]:.4f})"
+        )
+        log.info(
+            f"[frame-vision] 深框实体中心（顶部中心沿自身 -Z "
+            f"{FRAME_SIZE[2] / 2.0:.4f} m）: "
             f"pos=({frame_pose.position.x:.4f}, "
             f"{frame_pose.position.y:.4f}, "
             f"{frame_pose.position.z:.4f}), "
             f"rpy=({frame_rpy[0]:.4f}, "
             f"{frame_rpy[1]:.4f}, {frame_rpy[2]:.4f})"
+        )
+        log.info(
+            f"[frame-vision] 长方体上表面中心（相对深框顶部 local offset="
+            f"{BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL} m）: "
+            f"pos=({box_top_pose.position.x:.4f}, "
+            f"{box_top_pose.position.y:.4f}, "
+            f"{box_top_pose.position.z:.4f}); "
+            f"碰撞体中心=({box_center_pose.position.x:.4f}, "
+            f"{box_center_pose.position.y:.4f}, "
+            f"{box_center_pose.position.z:.4f})"
         )
 
         if frame_added:
@@ -5688,6 +5818,10 @@ def main(argv: list[str] | None = None) -> int:
         # grasp_cmd = node.wait_for_grasp_start()
         # if grasp_cmd is None:
         #     return 1
+
+        log.info("[startup] 键盘输入前先清除本程序管理的场景障碍物 …")
+        node.clear_managed_scene_objects()
+        frame_added = False
 
         workflow = prompt_workflow(
             "输入 1：p,4 识别深框并连续抓取 4 次；"
