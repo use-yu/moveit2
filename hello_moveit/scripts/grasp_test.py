@@ -6,7 +6,7 @@ G01 MoveIt 演示脚本
 
 功能（按顺序执行）：
 输入 1：先关节空间运动到 框_Q1，再发送 p,4 识别深框，
-        按识别坐标重建深框障碍物并连续执行 4 次上料：
+        按识别坐标重建深框障碍物并持续上料，直到 SW1~SW4 没有空位：
     机器人先到初始位
     → 读取视觉点
     → 生成左臂、右臂、SJ、base_link 下的目标位姿
@@ -381,8 +381,6 @@ FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
     0.0,
     0.065,
 )
-FRAME_GRASP_REPEAT_COUNT = 4
-
 # 长方体上表面中心相对深框顶部空心区域中心的局部平移。
 BOX_OBSTACLE_ID = "长方体障碍物"
 BOX_OBSTACLE_SIZE = (0.9, 1.0, 0.965)  # X × Y × Z [m]
@@ -4888,6 +4886,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def run_one_grasp() -> bool | None:
         """执行一轮抓取；True=成功，False=失败，None=用户选择退出。"""
+        node.last_pick_failure_reason = None
         # 在机器人运动和视觉识别之前先确认放置区，避免无空位时仍触发识别。
         if not node._wait_for_driver_signal(require_new=True):
             node.last_pick_failure_reason = "no_place_signal"
@@ -4901,7 +4900,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{GREEN}[pick] 当前空位: {empty_slots_text}{RESET}")
         if not empty_place_slots:
             node.last_pick_failure_reason = "no_place"
-            log.error("[pick] SW1~SW4 均有物体，取消本次抓取，不执行视觉识别")
+            log.info("[pick] SW1~SW4 均无空位，结束连续抓取，不执行视觉识别")
             return False
 
         # --- 2. 关节空间运动 ---
@@ -4997,13 +4996,15 @@ def main(argv: list[str] | None = None) -> int:
 
         return True
 
-    def run_four_grasps() -> bool | None:
-        """顺序执行四次原“回车抓取”流程；失败时停止本批次。"""
+    def run_grasps_until_no_empty_slot() -> bool | None:
+        """持续执行抓取；检测到 SW1~SW4 均无空位时正常结束。"""
         success_count = 0
-        for grasp_index in range(FRAME_GRASP_REPEAT_COUNT):
+        grasp_index = 0
+        while rclpy.ok():
+            grasp_index += 1
             log.info(
-                f"[frame-batch] 开始第 {grasp_index + 1}/"
-                f"{FRAME_GRASP_REPEAT_COUNT} 次抓取"
+                f"[frame-batch] 开始第 {grasp_index} 次抓取，"
+                "抓取前读取最新 SW 空位状态"
             )
             try:
                 grasp_result = run_one_grasp()
@@ -5012,25 +5013,32 @@ def main(argv: list[str] | None = None) -> int:
 
             if grasp_result is None:
                 return None
+            if (
+                not grasp_result
+                and node.last_pick_failure_reason == "no_place"
+            ):
+                log.info(
+                    f"[frame-batch] SW1~SW4 已无空位，连续抓取正常结束；"
+                    f"本批次成功 {success_count} 次"
+                )
+                publish_attempt_result(True, success_count)
+                return True
+
             if grasp_result:
                 success_count += 1
             publish_attempt_result(grasp_result, success_count)
             if not grasp_result:
                 log.error(
-                    f"[frame-batch] 第 {grasp_index + 1}/"
-                    f"{FRAME_GRASP_REPEAT_COUNT} 次抓取失败，停止本批次"
+                    f"[frame-batch] 第 {grasp_index} 次抓取失败，停止本批次"
                 )
                 return False
 
             log.info(
-                f"[frame-batch] 第 {grasp_index + 1}/"
-                f"{FRAME_GRASP_REPEAT_COUNT} 次抓取完成"
+                f"[frame-batch] 第 {grasp_index} 次抓取完成；"
+                f"累计成功 {success_count} 次"
             )
 
-        log.info(
-            f"[frame-batch] {FRAME_GRASP_REPEAT_COUNT} 次抓取全部完成"
-        )
-        return True
+        return None
 
     def unload_material_slots() -> list[str]:
         """返回当前实时信号中有料的 SW 名称。"""
@@ -5824,7 +5832,7 @@ def main(argv: list[str] | None = None) -> int:
         frame_added = False
 
         workflow = prompt_workflow(
-            "输入 1：p,4 识别深框并连续抓取 4 次；"
+            "输入 1：p,4 识别深框并抓取至 SW 无空位；"
             "输入 2：执行原输入 1 的下料流程；输入 q 退出 …"
         )
         while workflow != "q":
@@ -5843,7 +5851,7 @@ def main(argv: list[str] | None = None) -> int:
                 except EOFError:
                     pass
 
-                batch_result = run_four_grasps()
+                batch_result = run_grasps_until_no_empty_slot()
                 if batch_result is None:
                     code = 0
                     break
@@ -5868,12 +5876,12 @@ def main(argv: list[str] | None = None) -> int:
                     code = 0
             else:
                 log.warning(
-                    f"未知输入 {workflow!r}：1=深框识别并抓取4次，"
+                    f"未知输入 {workflow!r}：1=深框识别并抓取至SW无空位，"
                     "2=原下料流程，q=退出"
                 )
 
             workflow = prompt_workflow(
-                "输入 1：重新识别深框并连续抓取 4 次；"
+                "输入 1：重新识别深框并抓取至 SW 无空位；"
                 "输入 2：执行原下料流程；输入 q 退出 …"
             )
 

@@ -77,10 +77,10 @@
     <collision>
       <origin
         xyz="0 0 0"
-        rpy="0 0 0" />
+        rpy="0 0 3.1415936" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/base_link.STL" />
+          filename="package://moveit_resources_g01_description/meshes/base_link_shell.STL" />
       </geometry>
     </collision>
     <collision>
@@ -89,7 +89,7 @@
         rpy="0 0 0" />
       <geometry>
         <box
-          size="0.34 0.34 0.03" />
+          size="0.34 0.34 0.035" />
       </geometry>
     </collision>
   </link>
