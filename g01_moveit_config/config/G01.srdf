@@ -262,4 +262,5 @@
     <disable_collisions link1="YB" link2="base_link" reason="Never"/>
     <disable_collisions link1="SJ" link2="base_sj" reason="Adjacent"/>
     <disable_collisions link1="base_sj" link2="base_link" reason="Adjacent"/>
+    <disable_collisions link1="YB" link2="head" reason="Adjacent"/>
 </robot>

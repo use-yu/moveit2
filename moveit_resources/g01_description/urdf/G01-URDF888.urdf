@@ -83,6 +83,15 @@
           filename="package://moveit_resources_g01_description/meshes/base_link.STL" />
       </geometry>
     </collision>
+    <collision>
+      <origin
+        xyz="-0.217 0 0.6495"
+        rpy="0 0 0" />
+      <geometry>
+        <box
+          size="0.34 0.34 0.03" />
+      </geometry>
+    </collision>
   </link>
 
   <joint name="base_joint2" type="revolute">
@@ -302,10 +311,19 @@
           filename="package://moveit_resources_g01_description/meshes/6.STL" />
       </geometry>
     </collision>
+    <collision>
+      <origin
+        xyz="0.02 0.1 -0.05"
+        rpy="0 0 0" />
+      <geometry>
+        <box
+          size="0.26 0.2 0.2" />
+      </geometry>
+    </collision>
   </link>
   <joint
     name="head_joint"
-    type="revolute">
+    type="fixed">
     <origin
       xyz="-0.047 0.5115 -0.1664"
       rpy="3.1416 0 3.1416" />
@@ -313,13 +331,13 @@
       link="YB" />
     <child
       link="head" />
-    <axis
+    <!-- <axis
       xyz="0 0 1" />
     <limit
       lower="-1.045"
       upper="0"
       effort="100"
-      velocity="100" />
+      velocity="100" /> -->
   </joint>
 
 
