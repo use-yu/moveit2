@@ -40,6 +40,16 @@ left_arm:
   longest_valid_segment_fraction: 0.005
   projection_evaluator: joints(l_arm_joint1,l_arm_joint2)
 
+left_waist:
+  default_planner_config: RRTConnect
+  longest_valid_segment_fraction: 0.005
+  projection_evaluator: joints(l_arm_joint1,l_arm_joint2)
+
+right_waist:
+  default_planner_config: RRTConnect
+  longest_valid_segment_fraction: 0.005
+  projection_evaluator: joints(r_arm_joint1,r_arm_joint2)
+
 right:
   default_planner_config: RRTConnect
   longest_valid_segment_fraction: 0.005
