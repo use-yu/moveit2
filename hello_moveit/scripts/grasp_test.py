@@ -435,12 +435,18 @@ ALL_PLACE_SLOTS_EMPTY_SIGNAL = (
 ALL_PLACE_SLOTS_MATERIAL_SIGNAL = 0x00
 DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 
-# 下料流程：双臂成对取料，优先右 SW1 + 左 SW3，其次右 SW4 + 左 SW2。
+# 下料流程：双臂成对取料，并把每对上料位固定绑定到物料台放置点。
+# 格式：(右臂 SW, 左臂 SW, 左臂物料台点, 右臂物料台点)
+#   SW1 + SW3 只能放物料台点 1/4：SW3→点1，SW1→点4
+#   SW2 + SW4 只能放物料台点 2/3：SW2→点2，SW4→点3
 UNLOAD_TRIGGER_COMMAND = "p,2"
 UNLOAD_VISION_POSE_KEY = "right_body"
 UNLOAD_VISION_TF_FRAME = "material_table_vision"
 UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
-UNLOAD_SLOT_PAIRS = (("sw1", "sw3"), ("sw4", "sw2"))  # (右臂 SW, 左臂 SW)
+UNLOAD_PAIR_ROUTES = (
+    ("sw1", "sw3", 1, 4),
+    ("sw4", "sw2", 2, 3),
+)
 UNLOAD_TABLE_ID = "unload_table"
 UNLOAD_TABLE_SIZE = (0.6, 1.7, 1.0)
 UNLOAD_RECOGNITION_ABOVE_TABLE = -0.045
@@ -471,15 +477,21 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
     "sw3": 0.003,  # 左臂：多降 4 mm
     "sw4": 0.005,  # 右臂：多降 8 mm
 }
-# 物料台放置点：在 material_table_top 桌子坐标系下的 xyz 偏移 [m]。
-UNLOAD_PLACE_LOCAL_YAW = math.radians(204.5)
-UNLOAD_PLACE_LOCAL_OFFSETS = {
-    1: (0.1 + 0.002782, 0.325-0.338809+0.347293, -0.16 + 1.115998 - 1.070837-0.01),
-    2: (0.1 + 0.653630-0.656605+0.005, 0.125-0.138855+0.146165-0.001, -0.16+1.206160-1.071223-0.1),
-    3: (0.1 + 0.643439-0.655317+0.012, -0.125+0.110927-0.111151-0.001, -0.16+1.203874-1.073237-0.1),
-    4: (0.1 + 0.644717-0.649813, -0.325+0.310772-0.311753, -0.16+1.109917-1.074118-0.01),
+# 注意是相对于桌子坐标系
+# 物料台放置点：在 material_table_top 桌子坐标系下的 xyz 偏移 [m] 和局部 yaw。
+UNLOAD_PLACE_LOCAL_YAWS = {
+    1: math.radians(204.5),
+    2: math.radians(204.5),
+    3: math.radians(204.5),
+    4: math.radians(204.5),
 }
-UNLOAD_PLACE_SEQUENCE = ((1, 4), (2, 3))  # 每轮 (左臂点位, 右臂点位)
+# 注意这里1234和机器人sw不一样
+UNLOAD_PLACE_LOCAL_OFFSETS = {
+    1: (0.1 + 0.005782-0.011, 0.325-0.338809+0.345293-0.002, -0.16 + 1.115998 - 1.070837-0.01),
+    2: (0.1 + 0.653630-0.656605+0.002, 0.125-0.138855+0.146165-0.002, -0.16+1.206160-1.071223-0.1),
+    3: (0.1 + 0.643439-0.655317+0.008, -0.125+0.110927-0.111151+0.002, -0.16+1.203874-1.073237-0.1),
+    4: (0.1 + 0.644717-0.649813+0.003, -0.325+0.310772-0.311753+0.004, -0.16+1.109917-1.074118-0.01),
+}
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
 UNLOAD_PLACE_ARM_IK_ATTEMPTS = 200
@@ -1692,14 +1704,14 @@ def make_unload_obstacle(recognition_pose: Pose) -> CollisionObject:
 
 
 def make_unload_place_poses(recognition_pose: Pose) -> dict[int, Pose]:
-    """以桌面为基准生成四个点位，姿态相对桌子绕局部 Z 轴 206°。"""
+    """以桌面为基准，按各点配置的偏移和局部 Z 轴 yaw 生成四个放置位姿。"""
     table_top_pose = make_unload_table_top_pose(recognition_pose)
     return {
         point_index: pose_rotate_local_rpy(
             pose_offset_local(table_top_pose, *local_offset),
             0.0,
             0.0,
-            UNLOAD_PLACE_LOCAL_YAW,
+            UNLOAD_PLACE_LOCAL_YAWS[point_index],
         )
         for point_index, local_offset in UNLOAD_PLACE_LOCAL_OFFSETS.items()
     }
@@ -5051,15 +5063,25 @@ def main(argv: list[str] | None = None) -> int:
             if node._place_slot_has_material(slot_name)
         ]
 
-    def select_unload_pair(start_index: int = 0) -> tuple[int, str, str] | None:
-        """从指定优先级位置开始选择完整料对，返回 (索引, 右SW, 左SW)。"""
-        for pair_index in range(max(0, start_index), len(UNLOAD_SLOT_PAIRS)):
-            right_slot, left_slot = UNLOAD_SLOT_PAIRS[pair_index]
+    def select_unload_pair(
+        start_index: int = 0,
+    ) -> tuple[int, str, str, int, int] | None:
+        """选择完整料对，返回索引、左右 SW 及与该料对绑定的左右放置点。"""
+        for pair_index in range(max(0, start_index), len(UNLOAD_PAIR_ROUTES)):
+            right_slot, left_slot, left_point, right_point = (
+                UNLOAD_PAIR_ROUTES[pair_index]
+            )
             if (
                 node._place_slot_has_material(right_slot)
                 and node._place_slot_has_material(left_slot)
             ):
-                return pair_index, right_slot, left_slot
+                return (
+                    pair_index,
+                    right_slot,
+                    left_slot,
+                    left_point,
+                    right_point,
+                )
         return None
 
     def set_unload_tool_power(status: int, stage: str) -> bool:
@@ -5694,7 +5716,7 @@ def main(argv: list[str] | None = None) -> int:
         return False
 
     def run_one_unload() -> bool:
-        """最多取两对料：首对放 1/4，实时复查后次对放 2/3。"""
+        """最多取两对料，每个料对只使用其固定绑定的物料台放置点。"""
         log.info("[unload] 开始下料前先给左右末端下电")
         if not set_unload_tool_power(0, "下料开始"):
             log.error("[unload] 双臂未全部下电，禁止执行后续动作")
@@ -5717,7 +5739,13 @@ def main(argv: list[str] | None = None) -> int:
                 "需要 SW1+SW3 或 SW2+SW4 同时有料，本轮不取"
             )
             return True
-        pair_cursor, right_slot, left_slot = selected
+        (
+            pair_cursor,
+            right_slot,
+            left_slot,
+            left_point,
+            right_point,
+        ) = selected
 
         # p,2 的识别姿态同时用于构造场景和四个物料台局部放置点。
         vision_result = read_vision_object_pose(
@@ -5747,8 +5775,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         for point_index, point_pose in place_poses.items():
             local_offset = UNLOAD_PLACE_LOCAL_OFFSETS[point_index]
+            local_yaw_deg = math.degrees(UNLOAD_PLACE_LOCAL_YAWS[point_index])
             log.info(
                 f"[unload] 物料台点{point_index} table_local={local_offset}, "
+                f"local_yaw={local_yaw_deg:.1f} deg, "
                 f"base=({point_pose.position.x:.4f}, "
                 f"{point_pose.position.y:.4f}, {point_pose.position.z:.4f})"
             )
@@ -5772,9 +5802,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"center_y={recognition_pose.position.y + UNLOAD_OBSTACLE_Y_OFFSET:.4f}"
             )
 
-            for batch_index, (left_point, right_point) in enumerate(
-                UNLOAD_PLACE_SEQUENCE
-            ):
+            for batch_index in range(len(UNLOAD_PAIR_ROUTES)):
                 if batch_index > 0:
                     if not node._wait_for_driver_signal(require_new=True):
                         return False
@@ -5795,12 +5823,18 @@ def main(argv: list[str] | None = None) -> int:
                             "不执行第二轮取料"
                         )
                         return True
-                    pair_cursor, right_slot, left_slot = selected
+                    (
+                        pair_cursor,
+                        right_slot,
+                        left_slot,
+                        left_point,
+                        right_point,
+                    ) = selected
 
                 log.info(
                     f"[unload] 第 {batch_index + 1} 轮："
-                    f"右臂 {right_slot.upper()}、左臂 {left_slot.upper()} → "
-                    f"物料台左点{left_point}/右点{right_point}"
+                    f"右臂 {right_slot.upper()}→物料台点{right_point}，"
+                    f"左臂 {left_slot.upper()}→物料台点{left_point}"
                 )
                 if not execute_unload_pick_pair(right_slot, left_slot):
                     return False
