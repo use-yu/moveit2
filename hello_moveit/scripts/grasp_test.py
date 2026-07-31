@@ -41,6 +41,8 @@ G01 MoveIt 演示脚本
 
 交换放置相比直接放绕z轴顺时针转1度
 
+路径绕调参数num_attempts=30
+
 实际测试遇到的问题：
 1. moveit关节空间规划时由于时间参数化（TOTG）有时候规划成功，执行失败
 可以通过修改 ompl_planning.yaml 中的 longest_valid_segment_fraction 参数来解决，值越小，规划时间越长，但是规划成功率越高
@@ -4784,7 +4786,7 @@ class G01Demo(Node):
             dual_speed,
             exchange_joint_names,
             [q2],
-            num_attempts=20,
+            num_attempts=30,
         ):
             log.error(f"[exchange] {exchange_group} 到 q2 失败")
             return False
@@ -5529,7 +5531,7 @@ def main(argv: list[str] | None = None) -> int:
                 plan_only=True,
                 speed_scale=UNLOAD_PLACE_JOINT_SPEED,
                 max_retries=1,
-                num_attempts=3,
+                num_attempts=30,
             )
             log.info(
                 f"[unload] {label}: {used_ms:.1f} ms "
