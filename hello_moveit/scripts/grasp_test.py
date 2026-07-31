@@ -5,7 +5,8 @@
 G01 MoveIt 演示脚本
 
 功能（按顺序执行）：
-输入 1：先关节空间运动到 框_Q1，再发送 p,4 识别深框，
+输入 1：先导航到深框工位，导航成功后关节空间运动到 框_Q1，
+        再发送 p,4 识别深框，
         按识别坐标重建深框障碍物并持续上料，直到 SW1~SW4 没有空位：
     机器人先到初始位
     → 读取视觉点
@@ -19,7 +20,7 @@ G01 MoveIt 演示脚本
     → 根据 first_return_mode：
     ├─ mode=1：双臂交换 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
-输入 2：执行原下料：
+输入 2：先导航到物料台工位，导航成功后执行原下料：
     下料读取最新 SW 信号，0=有料。
     优先取右臂 SW1 + 左臂 SW3，其次右臂 SW4 + 左臂 SW2；必须整对有料。
     发送 p,2 识别。
@@ -419,6 +420,36 @@ RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 GRASP_CMD_TOPIC = "/grasp_cmd"
 GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
 DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
+NAV_GOAL_TOPIC = "/goal_pose"
+NAV_RESULT_TOPIC = "/nav_result"
+NAV_GOAL_POSES = {
+    "1": {
+        "position": (
+            4.175657272338867,
+            -5.886521816253662,
+            0.13951128721237183,
+        ),
+        "orientation": (
+            -0.0035754789132624865,
+            -0.01661425270140171,
+            -0.7105110883712769,
+            0.7036274075508118,
+        ),
+    },
+    "2": {
+        "position": (
+            5.975770950317383,
+            -5.743568420410156,
+            0.2258175164461136,
+        ),
+        "orientation": (
+            0.005080036353319883,
+            -0.003726406954228878,
+            -0.7001469731330872,
+            0.7138881683349609,
+        ),
+    },
+}
 SIGNAL_SW1_MASK = 0x08
 SIGNAL_SW2_MASK = 0x10
 SIGNAL_SW3_MASK = 0x20
@@ -2254,14 +2285,102 @@ class G01Demo(Node):
             ALL_PLACE_SLOTS_MATERIAL_SIGNAL if self.sim_mode else None
         )
         self._driver_signal_count = 0
+        self._nav_result_count = 0
+        self._latest_nav_success: bool | None = None
+        self._latest_nav_message = ""
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
         # 只保留最新一帧，避免循环间 input() 阻塞时积压旧的开关状态。
         self.create_subscription(UInt8, DRIVER_SIGNAL_TOPIC, self._on_driver_signal, 1)
+        self.create_subscription(String, NAV_RESULT_TOPIC, self._on_nav_result, 10)
+        self._nav_goal_pub = self.create_publisher(
+            PoseStamped,
+            NAV_GOAL_TOPIC,
+            10,
+        )
         self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
+
+    def _on_nav_result(self, msg: String):
+        """缓存格式为 {"message": "...", "success": true} 的导航结果。"""
+        log = self.get_logger()
+        try:
+            result = json.loads(msg.data)
+        except json.JSONDecodeError as exc:
+            log.error(
+                f"{NAV_RESULT_TOPIC} JSON 解析失败: {exc}; data={msg.data!r}"
+            )
+            return
+
+        if not isinstance(result, dict):
+            log.error(f"{NAV_RESULT_TOPIC} JSON 必须是 object: {msg.data!r}")
+            return
+
+        success = result.get("success")
+        if not isinstance(success, bool):
+            log.error(
+                f"{NAV_RESULT_TOPIC} 的 success 必须是 JSON bool: {msg.data!r}"
+            )
+            return
+
+        self._nav_result_count += 1
+        self._latest_nav_success = success
+        self._latest_nav_message = str(result.get("message", ""))
+        log.info(
+            f"收到 {NAV_RESULT_TOPIC}: success={success}, "
+            f"message={self._latest_nav_message!r}"
+        )
+
+    def navigate_and_wait(self, workflow: str) -> bool:
+        """发布所选工位目标，并阻塞到收到本次导航的新结果。"""
+        goal_values = NAV_GOAL_POSES.get(str(workflow))
+        if goal_values is None:
+            self.get_logger().error(f"没有为输入 {workflow!r} 配置导航目标")
+            return False
+
+        goal = PoseStamped()
+        goal.header.frame_id = "map"
+        goal.header.stamp.sec = 0
+        goal.header.stamp.nanosec = 0
+        (
+            goal.pose.position.x,
+            goal.pose.position.y,
+            goal.pose.position.z,
+        ) = goal_values["position"]
+        (
+            goal.pose.orientation.x,
+            goal.pose.orientation.y,
+            goal.pose.orientation.z,
+            goal.pose.orientation.w,
+        ) = goal_values["orientation"]
+
+        result_count_before_publish = self._nav_result_count
+        self._nav_goal_pub.publish(goal)
+        self.get_logger().info(
+            f"[nav] 输入 {workflow}：已发布 {NAV_GOAL_TOPIC}，"
+            f"map 位置=({goal.pose.position.x:.6f}, "
+            f"{goal.pose.position.y:.6f}, {goal.pose.position.z:.6f})；"
+            f"阻塞等待 {NAV_RESULT_TOPIC}"
+        )
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self._nav_result_count <= result_count_before_publish:
+                continue
+            if self._latest_nav_success:
+                self.get_logger().info(
+                    f"[nav] 输入 {workflow} 导航成功，开始后续识别抓取流程"
+                )
+                return True
+            self.get_logger().error(
+                f"[nav] 输入 {workflow} 导航失败，"
+                f"message={self._latest_nav_message!r}，取消本次流程"
+            )
+            return False
+
+        return False
 
     def _on_driver_signal(self, msg: UInt8):
         """缓存驱动板 UInt8 信号；SW 位非 0=空，SW 位为 0=已有物体。"""
@@ -5869,10 +5988,19 @@ def main(argv: list[str] | None = None) -> int:
         frame_added = False
 
         workflow = prompt_workflow(
-            "输入 1：p,4 识别深框并抓取至 SW 无空位；"
-            "输入 2：执行原输入 1 的下料流程；输入 q 退出 …"
+            "输入 1：导航到深框工位，p,4 识别并抓取至 SW 无空位；"
+            "输入 2：导航到物料台工位并执行下料流程；输入 q 退出 …"
         )
         while workflow != "q":
+            if workflow in NAV_GOAL_POSES and not node.navigate_and_wait(workflow):
+                if workflow == "1":
+                    publish_attempt_result(False, 0)
+                workflow = prompt_workflow(
+                    "导航未成功；输入 1 重试深框工位，"
+                    "输入 2 重试物料台工位，输入 q 退出 …"
+                )
+                continue
+
             if workflow == "1":
                 if not recognize_and_add_deep_frame():
                     publish_attempt_result(False, 0)
@@ -5918,8 +6046,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             workflow = prompt_workflow(
-                "输入 1：重新识别深框并抓取至 SW 无空位；"
-                "输入 2：执行原下料流程；输入 q 退出 …"
+                "输入 1：导航后重新识别深框并抓取至 SW 无空位；"
+                "输入 2：导航后执行原下料流程；输入 q 退出 …"
             )
 
         if workflow == "q":
