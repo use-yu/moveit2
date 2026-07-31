@@ -53,13 +53,13 @@ import grasp_test as grasp
 # 用户可调参数
 # =============================================================================
 
-PLAN_FRAME = "base_link"
+PLAN_FRAME = "moveit_base_link"
 
 TABLE_ID = "table"
 TABLE_SIZE = (0.5, 1.8, 0.97)  # 桌体局部 X/Y/Z 尺寸 [m]
 TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
 
-# 仿真模式下的“视觉识别位姿”，在 base_link 下表达：xyz [m] + rpy [rad]。
+# 仿真模式下的“视觉识别位姿”，在 moveit_base_link 下表达：xyz [m] + rpy [rad]。
 SIM_RECOGNITION_XYZ_RPY = (0.8, 0.0, 0.97, 0.0, 0.0, 0.0)
 
 # 识别点比桌面上方中心高 0.045 m，因此桌面中心沿识别局部 -Z 偏移。
@@ -69,7 +69,7 @@ TABLE_LOCAL_Z_ROTATION =  math.pi / 2.0
 TABLE_LOCAL_Y_ROTATION = math.pi
 
 # grasp_test 的视觉结果同时给出多个规划坐标系下的位姿。
-# right_body 表示使用右侧视觉标定后转换到 base_link 的结果。
+# right_body 表示使用右侧视觉标定后转换到 moveit_base_link 的结果。
 VISION_TABLE_POSE_KEY = "right_body"
 VISION_TRIGGER_COMMAND = "p,2"
 
@@ -249,7 +249,7 @@ def make_table_markers(
 
 
 def acquire_recognition_pose(node: "TableGraspDemo", sim_mode: bool) -> Pose | None:
-    """返回 base_link 下未经 4.5 cm 偏移和 180 度修正的视觉识别位姿。"""
+    """返回 moveit_base_link 下未经 4.5 cm 偏移和 180 度修正的视觉识别位姿。"""
     log = node.get_logger()
     if sim_mode:
         pose = grasp.make_pose(*SIM_RECOGNITION_XYZ_RPY)
@@ -278,7 +278,7 @@ def acquire_recognition_pose(node: "TableGraspDemo", sim_mode: bool) -> Pose | N
     values = all_xyz_rpy[0][VISION_TABLE_POSE_KEY]
     pose = grasp.make_pose(*values)
     log.info(
-        "视觉识别位姿 @ base_link: "
+        "视觉识别位姿 @ moveit_base_link: "
         f"xyz=({values[0]:.4f}, {values[1]:.4f}, {values[2]:.4f}) m, "
         f"rpy=({math.degrees(values[3]):.2f}, {math.degrees(values[4]):.2f}, "
         f"{math.degrees(values[5]):.2f}) deg"
@@ -742,12 +742,12 @@ def main(argv: list[str] | None = None) -> int:
             f"再绕局部 Y={math.degrees(TABLE_LOCAL_Y_ROTATION):.1f} deg"
         )
         log.info(
-            "左抓取点(base_link): "
+            "左抓取点(moveit_base_link): "
             f"x={left_target.position.x:.4f}, y={left_target.position.y:.4f}, "
             f"z={left_target.position.z:.4f} m"
         )
         log.info(
-            "右抓取点(base_link): "
+            "右抓取点(moveit_base_link): "
             f"x={right_target.position.x:.4f}, y={right_target.position.y:.4f}, "
             f"z={right_target.position.z:.4f} m"
         )

@@ -10,7 +10,7 @@ G01 MoveIt 演示脚本
         按识别坐标重建深框障碍物并持续上料，直到 SW1~SW4 没有空位：
     机器人先到初始位
     → 读取视觉点
-    → 生成左臂、右臂、SJ、base_link 下的目标位姿
+    → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
     → 按视觉点和 group 顺序做可达性验证
     → 选中“有 IK + 直线 approach 可行 + 加入临时碰撞体后 q_pre 无碰撞”的候选
     → OMPL 到 q_pre
@@ -121,7 +121,7 @@ RESET = '\033[0m'
 # 第一步：关节空间规划使用哪个 SRDF 组
 
 
-# 第二步：末端位姿规划组与目标（连杆 L6，坐标系 base_link）
+# 第二步：末端位姿规划组与目标（连杆 L6，坐标系 moveit_base_link）
 POSE_GROUP = "right_arm"
 
 PLAN_FRAME = "r_base_link"  # 末端位姿约束坐标系
@@ -362,13 +362,13 @@ MOVE_MAX_RETRIES = 10  # move_action 失败后再试几次（应对 INVALID_MOTI
 # 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
 DEFAULT_SPEED_SCALE = 0.5
 
-# 深框障碍物（相对于 base_link 发布）
-SCENE_FRAME = "base_link"
+# 深框障碍物（相对于 moveit_base_link 发布）
+SCENE_FRAME = "moveit_base_link"
 FRAME_ID = "深框"
 FRAME_SIZE = (0.795, 0.795, 0.565)  # 深框整体外尺寸：长×宽×高 [m]
 WALL_T = 0.035  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
-FRAME_CENTER = (0.92, 0.01, 0.4545)  # 深框整体外轮廓中心，相对于 base_link [m]
-FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 深框整体姿态，相对于 base_link [degree]
+FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
+FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 相对于 moveit_base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 
 # p,4 识别位姿先绕自身 Z 轴 +90°，再沿旋转后的自身坐标平移，
@@ -1134,7 +1134,7 @@ def read_vision_object_pose(
 
         # 读取实际身体关节：
         #   body_joint2 用于把左/右臂基坐标下的物体位姿转到 SJ；
-        #   body_joint1 用于继续把 SJ 下的位姿转到 base_link。
+        #   body_joint1 用于继续把 SJ 下的位姿转到 moveit_base_link。
         body_joints = node._get_joints(["body_joint1", "body_joint2"], wait_new=True)
         if body_joints is None:
             log.error("读取实际身体关节失败，无法转换视觉位姿")
@@ -1163,10 +1163,10 @@ def read_vision_object_pose(
         sj_in_base = node._get_link_pose_fk(
             "SJ",
             joints=body_joints,
-            plan_frame="base_link",
+            plan_frame="moveit_base_link",
         )
         if sj_in_base is None:
-            log.error("计算 SJ → base_link 变换失败")
+            log.error("计算 SJ → moveit_base_link 变换失败")
             return None
 
         t_sj_r_base = pose_to_matrix(r_base_in_sj)
@@ -1327,7 +1327,7 @@ def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
             "side": side,
             "group": f"{side}_body",
             "link": "l_tool" if side == "left" else "r_tool",
-            "plan_frame": "base_link",
+            "plan_frame": "moveit_base_link",
             "xyz_key": f"{side}_body",
         })
     return attempts
@@ -1714,7 +1714,7 @@ def make_unload_table_top_box(recognition_pose: Pose) -> CollisionObject:
 
 
 def make_unload_obstacle(recognition_pose: Pose) -> CollisionObject:
-    """在识别点的 base_link +Y 方向 1.2 m 处生成 3 m 高墙状障碍物。"""
+    """在识别点的 moveit_base_link +Y 方向 1.2 m 处生成 3 m 高墙状障碍物。"""
     center_pose = make_pose(
         recognition_pose.position.x,
         recognition_pose.position.y + UNLOAD_OBSTACLE_Y_OFFSET,
@@ -2867,7 +2867,7 @@ class G01Demo(Node):
         )
 
     def publish_unload_vision_tf(self, recognition_pose: Pose) -> None:
-        """发布 base_link → 上料台视觉识别坐标系的固定 TF。"""
+        """发布 moveit_base_link → 上料台视觉识别坐标系的固定 TF。"""
         transform = TransformStamped()
         transform.header.frame_id = SCENE_FRAME
         transform.header.stamp = self.get_clock().now().to_msg()
@@ -4449,7 +4449,7 @@ class G01Demo(Node):
             speed_scale       : 抓取段速度缩放（0~1）
             group             : SRDF 规划组（如 left_body）
             link              : 末端连杆名（如 L6）
-            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 base_link、world）
+            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 moveit_base_link、world）
             joint_names       : group 内关节名顺序
             place_speed_scale : 放置段的速度缩放（0~1）
             cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
@@ -5596,7 +5596,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # ------------------------------------------------------------------
         # 第一级：身体保持当前位置，只求左右纯臂多组 IK。
-        # 目标原始表达在 base_link；纯臂 IK 必须分别转换到 l/r_base_link。
+        # 目标原始表达在 moveit_base_link；纯臂 IK 必须分别转换到 l/r_base_link。
         # ------------------------------------------------------------------
         left_base_pose = node._get_link_pose_fk(
             "l_base_link",

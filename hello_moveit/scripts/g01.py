@@ -76,7 +76,7 @@ from visualization_msgs.msg import Marker
 # 第一步：关节空间规划使用哪个 SRDF 组
 ACTIVE_GROUP = "dual_arm"
 
-# 第二步：末端位姿规划组与目标（连杆 L6，坐标系 base_link）
+# 第二步：末端位姿规划组与目标（连杆 L6，坐标系 moveit_base_link）
 POSE_GROUP = "left_body"
 
 # EE_LINK 必须在 末端linkL6 下游、用 fixed joint 连上去的子 link（例如 l_tool）
@@ -187,9 +187,9 @@ MOVE_MAX_RETRIES = 5  # move_action 失败后再试几次（应对 INVALID_MOTIO
 # 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
 DEFAULT_SPEED_SCALE = 0.5
 
-# 深框障碍物（固定在 world，与机器人 base_link 无关）
+# 深框障碍物（固定在 world，与机器人 moveit_base_link 无关）
 SCENE_FRAME = "world"
-PLAN_FRAME = "base_link"  # 末端位姿约束坐标系
+PLAN_FRAME = "moveit_base_link"  # 末端位姿约束坐标系
 FRAME_ID = "深框"
 FRAME_SIZE = (0.9, 0.9, 0.6)  # 长×宽×高 [m]
 WALL_T = 0.02
@@ -1379,7 +1379,7 @@ class G01Demo(Node):
             speed_scale       : 抓取段速度缩放（0~1）
             group             : SRDF 规划组（如 left_body）
             link              : 末端连杆名（如 L6）
-            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 base_link、world）
+            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 moveit_base_link、world）
             joint_names       : group 内关节名顺序（与 place_joints 一一对应）
             place_joints      : 放置位关节目标 [rad]（向量，顺序同 joint_names）
             place_speed_scale : 5/8 OMPL 到放置位的速度缩放（0~1）

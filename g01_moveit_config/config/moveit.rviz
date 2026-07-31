@@ -4,6 +4,7 @@ Panels:
     Name: Displays
     Property Tree Widget:
       Expanded:
+        - /Global Options1
         - /MotionPlanning1
         - /MotionPlanning1/Scene Robot1
         - /MotionPlanning1/Planning Request1
@@ -148,17 +149,17 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
-          base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
           base_sj:
             Alpha: 1
             Show Axes: false
             Show Trail: false
             Value: true
           base_x_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          head:
             Alpha: 1
             Show Axes: false
             Show Trail: false
@@ -172,6 +173,11 @@ Visualization Manager:
             Alpha: 1
             Show Axes: false
             Show Trail: false
+          moveit_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
           r_base_link:
             Alpha: 1
             Show Axes: false
@@ -306,17 +312,17 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
-          base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
           base_sj:
             Alpha: 1
             Show Axes: false
             Show Trail: false
             Value: true
           base_x_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          head:
             Alpha: 1
             Show Axes: false
             Show Trail: false
@@ -330,6 +336,11 @@ Visualization Manager:
             Alpha: 1
             Show Axes: false
             Show Trail: false
+          moveit_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
           r_base_link:
             Alpha: 1
             Show Axes: false
@@ -441,17 +452,17 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
-        base_link:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
-          Value: true
         base_sj:
           Alpha: 1
           Show Axes: false
           Show Trail: false
           Value: true
         base_x_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        head:
           Alpha: 1
           Show Axes: false
           Show Trail: false
@@ -465,6 +476,11 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
+        moveit_base_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
         r_base_link:
           Alpha: 1
           Show Axes: false
@@ -522,18 +538,20 @@ Visualization Manager:
         base_footprint:
           Value: true
         base_link:
-          Value: true
+          Value: false
         base_sj:
           Value: true
         base_x_link:
+          Value: true
+        head:
           Value: true
         l_base_link:
           Value: true
         l_tool:
           Value: true
-        material_table_top:
+        map:
           Value: true
-        material_table_vision:
+        moveit_base_link:
           Value: true
         r_base_link:
           Value: true
@@ -547,35 +565,36 @@ Visualization Manager:
       Show Axes: true
       Show Names: false
       Tree:
-        world:
-          base_footprint:
-            base_x_link:
-              base_link:
-                base_sj:
-                  SJ:
-                    YB:
-                      l_base_link:
-                        L1:
-                          L2:
-                            L3:
-                              L4:
-                                L5:
-                                  L6:
-                                    l_tool:
-                                      {}
-                      r_base_link:
-                        R1:
-                          R2:
-                            R3:
-                              R4:
-                                R5:
-                                  R6:
-                                    r_tool:
-                                      {}
-                material_table_top:
-                  {}
-                material_table_vision:
-                  {}
+        map:
+          base_link:
+            {}
+          world:
+            base_footprint:
+              base_x_link:
+                moveit_base_link:
+                  base_sj:
+                    SJ:
+                      YB:
+                        head:
+                          {}
+                        l_base_link:
+                          L1:
+                            L2:
+                              L3:
+                                L4:
+                                  L5:
+                                    L6:
+                                      l_tool:
+                                        {}
+                        r_base_link:
+                          R1:
+                            R2:
+                              R3:
+                                R4:
+                                  R5:
+                                    R6:
+                                      r_tool:
+                                        {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Marker
@@ -621,25 +640,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 4.746601581573486
+      Distance: 6.632602691650391
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.36493900418281555
-        Y: 0.7781789302825928
-        Z: 0.2719363570213318
+        X: 0.9236972332000732
+        Y: 1.8932244777679443
+        Z: -0.3507393002510071
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.3447951078414917
+      Pitch: 0.3197951018810272
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 4.618627071380615
+      Yaw: 4.703627109527588
     Saved: ~
 Window Geometry:
   Displays:

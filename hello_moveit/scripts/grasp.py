@@ -92,7 +92,7 @@ RESET = '\033[0m'
 # 第一步：关节空间规划使用哪个 SRDF 组
 ACTIVE_GROUP = "dual_arm_y"
 
-# 第二步：末端位姿规划组与目标（连杆 L6，坐标系 base_link）
+# 第二步：末端位姿规划组与目标（连杆 L6，坐标系 moveit_base_link）
 POSE_GROUP = "right_arm"
 
 PLAN_FRAME = "r_base_link"  # 末端位姿约束坐标系
@@ -234,13 +234,13 @@ MOVE_MAX_RETRIES = 5  # move_action 失败后再试几次（应对 INVALID_MOTIO
 # 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
 DEFAULT_SPEED_SCALE = 0.5
 
-# 深框障碍物（相对于 base_link 发布）
-SCENE_FRAME = "base_link"
+# 深框障碍物（相对于 moveit_base_link 发布）
+SCENE_FRAME = "moveit_base_link"
 FRAME_ID = "深框"
 FRAME_SIZE = (1.18, 1.18, 0.58)  # 深框整体外尺寸：长×宽×高 [m]
 WALL_T = 0.09  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
-FRAME_CENTER = (-0.81 - 0.005, -0.35, -0.08)  # 深框整体外轮廓中心，相对于 base_link [m]
-FRAME_RPY_DEG = (90.0, -0.0, 180.0)  # 深框整体姿态，相对于 base_link [degree]
+FRAME_CENTER = (-0.81 - 0.005, -0.35, -0.08)  # 相对于 moveit_base_link [m]
+FRAME_RPY_DEG = (90.0, -0.0, 180.0)  # 相对于 moveit_base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 FRAME_CUTOFF_ID = "深框隔离面"
 FRAME_CUTOFF_THICKNESS = 0.01  # 薄隔离面厚度 [m]，沿深框局部 z 轴；在 SCENE_FRAME 中等价于 y 方向厚度
@@ -2705,7 +2705,7 @@ class G01Demo(Node):
         """带腰 group 的可达性选择。
 
         先只在 body group 上求 target_pose IK；对每个 body IK 解，取其中腰部关节
-        计算 target/pre 在纯臂 base_link 下的位姿，再只用该 IK 解里的臂关节作为
+        计算 target/pre 在纯臂 moveit_base_link 下的位姿，再只用该 IK 解里的臂关节作为
         seed 调纯臂 _select_feasible_grasp_pair 做 approach 预检。
         """
         log = self.get_logger()
@@ -3050,7 +3050,7 @@ class G01Demo(Node):
             speed_scale       : 抓取段速度缩放（0~1）
             group             : SRDF 规划组（如 left_body）
             link              : 末端连杆名（如 L6）
-            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 base_link、world）
+            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 moveit_base_link、world）
             joint_names       : group 内关节名顺序（与 yubei/fang 数组一一对应）
             place_joints      : 含 yubei、fang 的放置关节目标 [rad]
             place_speed_scale : 放置段的速度缩放（0~1）

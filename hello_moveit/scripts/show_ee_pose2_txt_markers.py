@@ -72,7 +72,11 @@ def _iter_poses_from_txt(path: str) -> Iterable[dict]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--in", dest="in_path", default=_default_in_path(), help="输入 txt 文件路径")
-    parser.add_argument("--frame", default=PLAN_FRAME, help="Marker 坐标系（默认 base_link）")
+    parser.add_argument(
+        "--frame",
+        default=PLAN_FRAME,
+        help="Marker 坐标系（默认 moveit_base_link）",
+    )
     parser.add_argument("--diameter", type=float, default=CYLINDER_DIAMETER, help="圆柱直径")
     parser.add_argument("--height", type=float, default=CYLINDER_HEIGHT, help="圆柱高度")
     parser.add_argument("--republish-hz", type=float, default=0.0, help=">0 时按频率重发 MarkerArray（避免 RViz 丢消息）")
@@ -147,4 +151,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

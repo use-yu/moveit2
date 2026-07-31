@@ -223,7 +223,7 @@
     <disable_collisions link1="L1" link2="YB" reason="Adjacent"/>
     <disable_collisions link1="l_base_link" link2="YB" reason="Adjacent"/>
     <disable_collisions link1="l_base_link" link2="L1" reason="Adjacent"/>
-    <!-- <disable_collisions link1="L1" link2="base_link" reason="Never"/> -->
+    <!-- <disable_collisions link1="L1" link2="moveit_base_link" reason="Never"/> -->
     <disable_collisions link1="L2" link2="L3" reason="Adjacent"/>
     <disable_collisions link1="L2" link2="R1" reason="Never"/>
     <disable_collisions link1="L2" link2="R2" reason="Never"/>
@@ -231,7 +231,7 @@
     <disable_collisions link1="L2" link2="R4" reason="Never"/>
     <disable_collisions link1="L2" link2="SJ" reason="Never"/>
     <!-- <disable_collisions link1="L2" link2="YB" reason="Never"/> -->
-    <!-- <disable_collisions link1="L2" link2="base_link" reason="Never"/> -->
+    <!-- <disable_collisions link1="L2" link2="moveit_base_link" reason="Never"/> -->
     <disable_collisions link1="L3" link2="L4" reason="Adjacent"/>
     <disable_collisions link1="L3" link2="R1" reason="Never"/>
     <disable_collisions link1="L3" link2="R2" reason="Never"/>
@@ -248,19 +248,19 @@
     <disable_collisions link1="R1" link2="YB" reason="Adjacent"/>
     <disable_collisions link1="r_base_link" link2="YB" reason="Adjacent"/>
     <disable_collisions link1="r_base_link" link2="R1" reason="Adjacent"/>
-    <!-- <disable_collisions link1="R1" link2="base_link" reason="Never"/> -->
+    <!-- <disable_collisions link1="R1" link2="moveit_base_link" reason="Never"/> -->
     <disable_collisions link1="R2" link2="R3" reason="Adjacent"/>
     <disable_collisions link1="R2" link2="SJ" reason="Never"/>
     <!-- <disable_collisions link1="R2" link2="YB" reason="Never"/> -->
-    <!-- <disable_collisions link1="R2" link2="base_link" reason="Never"/> -->
+    <!-- <disable_collisions link1="R2" link2="moveit_base_link" reason="Never"/> -->
     <disable_collisions link1="R3" link2="R4" reason="Adjacent"/>
     <disable_collisions link1="R4" link2="R5" reason="Adjacent"/>
     <disable_collisions link1="R4" link2="R6" reason="Never"/>
     <disable_collisions link1="R5" link2="R6" reason="Adjacent"/>
     <disable_collisions link1="SJ" link2="YB" reason="Adjacent"/>
-    <disable_collisions link1="SJ" link2="base_link" reason="Adjacent"/>
-    <disable_collisions link1="YB" link2="base_link" reason="Never"/>
+    <disable_collisions link1="SJ" link2="moveit_base_link" reason="Adjacent"/>
+    <disable_collisions link1="YB" link2="moveit_base_link" reason="Never"/>
     <disable_collisions link1="SJ" link2="base_sj" reason="Adjacent"/>
-    <disable_collisions link1="base_sj" link2="base_link" reason="Adjacent"/>
+    <disable_collisions link1="base_sj" link2="moveit_base_link" reason="Adjacent"/>
     <disable_collisions link1="YB" link2="head" reason="Adjacent"/>
 </robot>

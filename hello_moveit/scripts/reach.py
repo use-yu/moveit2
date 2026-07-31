@@ -77,7 +77,7 @@ from visualization_msgs.msg import Marker
 # 第一步：关节空间规划使用哪个 SRDF 组
 ACTIVE_GROUP = "dual_arm"
 
-# 第二步：末端位姿规划组与目标（连杆 L6，坐标系 base_link）
+# 第二步：末端位姿规划组与目标（连杆 L6，坐标系 moveit_base_link）
 POSE_GROUP = "left"
 
 # EE_LINK 必须在 末端linkL6 下游、用 fixed joint 连上去的子 link（例如 l_tool）
@@ -185,9 +185,9 @@ MOVE_MAX_RETRIES = 5  # move_action 失败后再试几次（应对 INVALID_MOTIO
 # 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
 DEFAULT_SPEED_SCALE = 0.5
 
-# 深框障碍物（固定在 world，与机器人 base_link 无关）
+# 深框障碍物（固定在 world，与机器人 moveit_base_link 无关）
 SCENE_FRAME = "world"
-PLAN_FRAME = "base_link"  # 末端位姿约束坐标系
+PLAN_FRAME = "moveit_base_link"  # 末端位姿约束坐标系
 FRAME_ID = "深框"
 FRAME_SIZE = (0.9, 0.9, 0.6)  # 长×宽×高 [m]
 WALL_T = 0.02
@@ -1369,7 +1369,7 @@ class G01Demo(Node):
             speed_scale       : 抓取段速度缩放（0~1）
             group             : SRDF 规划组（如 left_body）
             link              : 末端连杆名（如 L6）
-            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 base_link、world）
+            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 moveit_base_link、world）
             joint_names       : group 内关节名顺序（与 place_joints 一一对应）
             place_joints      : 放置位关节目标 [rad]（向量，顺序同 joint_names）
             place_speed_scale : 5/8 OMPL 到放置位的速度缩放（0~1）
@@ -1576,11 +1576,14 @@ def main(argv: list[str] | None = None) -> int:
         log.info("  " + ", ".join(joint_names))
         log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
 
-        # --- 3. 循环检测：随机生成 EE_POSE2（相对 base_link），只判断可解并保存 ---
+        # --- 3. 循环检测：随机生成 EE_POSE2（相对 moveit_base_link），只判断可解并保存 ---
         # 说明：
-        # - 深框以 SCENE_FRAME=world 发布；EE_POSE2 需要以 PLAN_FRAME=base_link 表达。
-        # - 因此：先在 world 下深框“内腔”采样点，再用 TF(world->base_link 的逆，即 lookup_transform(base_link <- world))
-        #   把点变换到 base_link，得到 EE_POSE2 的 xyz。
+        # - 深框以 SCENE_FRAME=world 发布；EE_POSE2 需要以
+        #   PLAN_FRAME=moveit_base_link 表达。
+        # - 因此：先在 world 下深框“内腔”采样点，再用
+        #   TF(world->moveit_base_link 的逆，即
+        #   lookup_transform(moveit_base_link <- world))
+        #   把点变换到 moveit_base_link，得到 EE_POSE2 的 xyz。
         trials = 100000
         ok_path = "ee_pose2_ok.txt"
         bad_path = "ee_pose2_bad.txt"
@@ -1619,7 +1622,7 @@ def main(argv: list[str] | None = None) -> int:
         with open(ok_path, "a", encoding="utf-8") as f_ok, open(bad_path, "a", encoding="utf-8") as f_bad:
             for i in range(trials):
                 ep = dict(EE_POSE2)
-                # 先在 world 下采样深框内点，再变换到 base_link
+                # 先在 world 下采样深框内点，再变换到 moveit_base_link
                 xw = random.uniform(inner_x_min_w, inner_x_max_w)
                 yw = random.uniform(inner_y_min_w, inner_y_max_w)
                 zw = random.uniform(inner_z_min_w, inner_z_max_w)
