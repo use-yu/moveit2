@@ -2334,11 +2334,17 @@ class G01Demo(Node):
         )
 
     def navigate_and_wait(self, workflow: str) -> bool:
-        """发布所选工位目标，并阻塞到收到本次导航的新结果。"""
+        """真机发布工位目标并等待结果；仿真模式直接跳过导航。"""
         goal_values = NAV_GOAL_POSES.get(str(workflow))
         if goal_values is None:
             self.get_logger().error(f"没有为输入 {workflow!r} 配置导航目标")
             return False
+
+        if self.sim_mode:
+            self.get_logger().info(
+                f"[sim][nav] 输入 {workflow}：跳过导航，直接进入识别抓取流程"
+            )
+            return True
 
         goal = PoseStamped()
         goal.header.frame_id = "map"
