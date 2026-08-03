@@ -133,6 +133,9 @@ RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 82.0)
 TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 124.0)
 FT_SENSOR_ONLINE_TIMEOUT_SEC = 5.0
+FEEDBACK_FRAME_SIZE = MyType.itemsize
+FEEDBACK_TEST_VALUE = 0x0123456789ABCDEF
+FEEDBACK_TEST_VALUE_OFFSET = MyType.fields["test_value"][1]
 
 
 class fankuis():
@@ -140,32 +143,73 @@ class fankuis():
         self.ip = ip
         self.port = port
         self.socket_feedback = 0
+        self._recv_buffer = bytearray()
+        self._last_error_log_time = 0.0
 
         if self.port == 30005 or self.port == 30004:
             self.socket_feedback = socket.socket()
-            self.socket_feedback.settimeout(1)
+            self.socket_feedback.settimeout(1.0)
             self.socket_feedback.connect((self.ip, self.port))
         else:
-            print("Connect to feedback server need use port 30003 !")
+            raise ValueError("反馈端口只支持 30004 或 30005")
+
+    def _log_feedback_error(self, error):
+        # 网络短暂抖动时避免 100 Hz 循环刷屏，但不能再静默吞掉解析错误。
+        now = time.monotonic()
+        if now - self._last_error_log_time >= 2.0:
+            print(f"{self.ip}:{self.port} 反馈接收解析失败：{error}")
+            self._last_error_log_time = now
+
+    def _pop_valid_frame(self):
+        """从 TCP 字节流中取一帧，并在错位时利用 test_value 重新同步。"""
+        while len(self._recv_buffer) >= FEEDBACK_FRAME_SIZE:
+            test_value = int.from_bytes(
+                self._recv_buffer[
+                    FEEDBACK_TEST_VALUE_OFFSET:FEEDBACK_TEST_VALUE_OFFSET + 8
+                ],
+                byteorder="little",
+                signed=False,
+            )
+            if test_value == FEEDBACK_TEST_VALUE:
+                frame = bytes(self._recv_buffer[:FEEDBACK_FRAME_SIZE])
+                del self._recv_buffer[:FEEDBACK_FRAME_SIZE]
+                return frame
+
+            # recv() 可能从半帧开始；逐字节寻找下一处合法帧头。
+            del self._recv_buffer[0]
+
+        return None
+
+    def _read_latest_frame(self):
+        while True:
+            frame = self._pop_valid_frame()
+            if frame is not None:
+                # 一次 recv() 可能带回多帧。丢弃积压的旧帧，只发布最新完整帧。
+                while True:
+                    newer_frame = self._pop_valid_frame()
+                    if newer_frame is None:
+                        return frame
+                    frame = newer_frame
+
+            chunk = self.socket_feedback.recv(FEEDBACK_FRAME_SIZE * 8)
+            if not chunk:
+                raise ConnectionError("机器人已关闭反馈连接")
+            self._recv_buffer.extend(chunk)
 
     def feed(self):
         try:
-            self.socket_feedback.settimeout(1.0)
-            self.all = self.socket_feedback.recv(10240)
-            data = self.all[0:1440]
-            # print(data)
-            a = np.frombuffer(data, dtype=MyType)
-            if hex((a['test_value'][0])) == '0x123456789abcdef':
-                tool_v = a['tool_vector_actual'][0]
-                tool_j = a['q_actual'][0]
-                tool_i = a['i_actual'][0]
-                tcp_force = a['TCP_force'][0]
-                ft_sensor = a['six_force_value'][0]
-                ft_sensor_online = int(a['six_force_online'][0])
+            frame = self._read_latest_frame()
+            feedback = np.frombuffer(frame, dtype=MyType, count=1)[0]
+            tool_v = feedback['tool_vector_actual'].copy()
+            tool_j = feedback['q_actual'].copy()
+            tool_i = feedback['i_actual'].copy()
+            tcp_force = feedback['TCP_force'].copy()
+            ft_sensor = feedback['six_force_value'].copy()
+            ft_sensor_online = int(feedback['six_force_online'])
             return [tool_v, tool_j, tool_i, tcp_force, ft_sensor, ft_sensor_online]
-        except:
+        except (OSError, ConnectionError, ValueError) as error:
+            self._log_feedback_error(error)
             return ["NG"]
-            print("反馈接收解析失败")
 
 class ArmRosBridge(Node):
     def __init__(self, clients):
@@ -295,18 +339,19 @@ def joint(feed_v, side, state_node):
     global q_actual, i_actual, TCP_force, FT_sensor
     while stop:
         actual = feed_v.feed()
-        #print(actual)
-        if actual != ["NG"]:
-           q_actual[side] = [round(num, 6) for num in actual[1]]
-           i_actual[side] = [round(num, 6) for num in actual[2]]
-           TCP_force[side] = [round(num, 6) for num in actual[3]]
-           FT_sensor[side] = [round(num, 6) for num in actual[4]]
-           state_node.publish_arm_state(side, q_actual[side])
-           state_node.publish_arm_i_actual(side, i_actual[side])
-           state_node.publish_arm_tcp_force(side, TCP_force[side])
-           state_node.publish_ft_sensor(side, FT_sensor[side])
-           #print(q_actual[side])  # 输出: [3.141593, 2.718282, 1.414214]
-        time.sleep(0.01)
+        if actual == ["NG"]:
+            time.sleep(0.01)
+            continue
+
+        q_actual[side] = [round(num, 6) for num in actual[1]]
+        i_actual[side] = [round(num, 6) for num in actual[2]]
+        TCP_force[side] = [float(num) for num in actual[3]]
+        FT_sensor[side] = [float(num) for num in actual[4]]
+        state_node.publish_arm_state(side, q_actual[side])
+        state_node.publish_arm_i_actual(side, i_actual[side])
+        state_node.publish_arm_tcp_force(side, TCP_force[side])
+        state_node.publish_ft_sensor(side, FT_sensor[side])
+        # feed() 本身按控制器约 8 ms 的反馈周期阻塞，不再额外 sleep，避免旧帧积压。
 
 def wait_ft_sensor_online(
     feed_v,
