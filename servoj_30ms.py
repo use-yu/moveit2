@@ -337,6 +337,7 @@ TCP_force = {"left": [], "right": []}
 FT_sensor = {"left": [], "right": []}
 def joint(feed_v, side, state_node):
     global q_actual, i_actual, TCP_force, FT_sensor
+    last_ft_state = None
     while stop:
         actual = feed_v.feed()
         if actual == ["NG"]:
@@ -346,11 +347,41 @@ def joint(feed_v, side, state_node):
         q_actual[side] = [round(num, 6) for num in actual[1]]
         i_actual[side] = [round(num, 6) for num in actual[2]]
         TCP_force[side] = [float(num) for num in actual[3]]
-        FT_sensor[side] = [float(num) for num in actual[4]]
         state_node.publish_arm_state(side, q_actual[side])
         state_node.publish_arm_i_actual(side, i_actual[side])
         state_node.publish_arm_tcp_force(side, TCP_force[side])
-        state_node.publish_ft_sensor(side, FT_sensor[side])
+
+        ft_sensor_status = int(actual[5])
+        force_values = [float(num) for num in actual[4]]
+        force_valid = len(force_values) == 6 and all(
+            math.isfinite(value) for value in force_values
+        )
+        ft_state = (ft_sensor_status, force_valid)
+
+        if ft_state != last_ft_state:
+            if ft_sensor_status == 1 and force_valid:
+                state_node.get_logger().info(
+                    f"{side} 力传感器已在线，恢复发布 /g01/{side}/FTSensor"
+                )
+            else:
+                reason = (
+                    f"six_force_online={ft_sensor_status}"
+                    if ft_sensor_status != 1
+                    else "六维力数据无效"
+                )
+                state_node.get_logger().warning(
+                    f"{side} 力传感器不可用（{reason}），停止发布 /g01/{side}/FTSensor"
+                )
+            last_ft_state = ft_state
+
+        # 传感器下电时控制器可能继续重复最后一帧；必须用在线状态拦截。
+        if ft_sensor_status == 1 and force_valid:
+            FT_sensor[side] = force_values
+            state_node.publish_ft_sensor(side, FT_sensor[side])
+        else:
+            # 清空内部缓存，避免其他代码误把下电前的最后一帧当作实时数据。
+            FT_sensor[side] = []
+
         # feed() 本身按控制器约 8 ms 的反馈周期阻塞，不再额外 sleep，避免旧帧积压。
 
 def wait_ft_sensor_online(
@@ -364,8 +395,8 @@ def wait_ft_sensor_online(
     """
     使能力传感器并等待第一帧有效六维力反馈。
 
-    部分控制器固件即使 six_force_value 已有有效数据，
-    six_force_online 仍长期返回 0，因此 0 只告警、不再阻塞启动。
+    只有 six_force_online=1 时才发布；离线或异常时不发布旧值。
+    启动等待超时后仍继续运行，由实时线程监测重新上电并自动恢复发布。
     这里故意不调用 SixForceHome()，保留传感器当前零点。
     """
     dashboard_command(
@@ -376,6 +407,7 @@ def wait_ft_sensor_online(
     )
     print(f"{name} 力传感器已使能；不执行 SixForceHome() 清零")
 
+    topic = f"/g01/{side}/FTSensor"
     deadline = time.monotonic() + timeout
     last_status = None
     while time.monotonic() < deadline:
@@ -393,28 +425,22 @@ def wait_ft_sensor_online(
             continue
 
         force_values = [float(value) for value in force]
-        state_node.publish_ft_sensor(side, force_values)
-        topic = f"/g01/{side}/FTSensor"
 
         if last_status == 1:
+            state_node.publish_ft_sensor(side, force_values)
             print(
                 f"{name} 力传感器已在线：six_force_online=1，"
                 f"首帧已发布到 {topic}：{force_values}"
             )
             return
-        if last_status == 2:
-            raise RuntimeError(f"{name} 力传感器异常：six_force_online=2")
 
-        print(
-            f"{name} 警告：six_force_online={last_status}，"
-            "但已收到有效六维力数据，不再等待在线状态位；"
-            f"首帧已发布到 {topic}：{force_values}"
-        )
-        return
+        # 状态为 0/2 时即使数值字段仍保留上一帧，也不能发布。
+        time.sleep(0.05)
 
-    raise RuntimeError(
-        f"{name} 未收到有效六维力反馈："
-        f"six_force_online={last_status}, 等待 {timeout:.1f}s 超时"
+    print(
+        f"{name} 警告：力传感器当前不可用，"
+        f"six_force_online={last_status}；不发布 {topic}，"
+        "重新上电并恢复在线后将自动开始发布"
     )
 
 def setup_logger(log_file='app.log'):

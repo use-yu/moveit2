@@ -6000,14 +6000,14 @@ def main(argv: list[str] | None = None) -> int:
             "输入 2：导航到物料台工位并执行下料流程；输入 q 退出 …"
         )
         while workflow != "q":
-            if workflow in NAV_GOAL_POSES and not node.navigate_and_wait(workflow):
-                if workflow == "1":
-                    publish_attempt_result(False, 0)
-                workflow = prompt_workflow(
-                    "导航未成功；输入 1 重试深框工位，"
-                    "输入 2 重试物料台工位，输入 q 退出 …"
-                )
-                continue
+            # if workflow in NAV_GOAL_POSES and not node.navigate_and_wait(workflow):
+            #     if workflow == "1":
+            #         publish_attempt_result(False, 0)
+            #     workflow = prompt_workflow(
+            #         "导航未成功；输入 1 重试深框工位，"
+            #         "输入 2 重试物料台工位，输入 q 退出 …"
+            #     )
+            #     continue
 
             if workflow == "1":
                 if not recognize_and_add_deep_frame():
