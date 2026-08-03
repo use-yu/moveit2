@@ -13,10 +13,9 @@ G01 MoveIt 演示脚本
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
     → 按视觉点和 group 顺序做可达性验证
     → 选中“有 IK + 直线 approach 可行 + 加入临时碰撞体后 q_pre 无碰撞”的候选
-    → OMPL 到 q_pre
+    → OMPL 到 q_pre，工具上电并读取该臂力传感器 Z 基准值
     → Cartesian approach 到抓取点
-    → 工具上电抓取
-    → 反向 Cartesian 回 q_pre
+    → 反向 Cartesian 回 q_pre，再读取 Z 值判断是否吸附成功
     → 根据 first_return_mode：
     ├─ mode=1：双臂交换 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
@@ -109,7 +108,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import ColorRGBA, String, UInt8
+from std_msgs.msg import ColorRGBA, Float32MultiArray, String, UInt8
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker
@@ -419,6 +418,8 @@ SVC_COMPUTE_FK = "compute_fk"
 SVC_CHECK_STATE_VALIDITY = "check_state_validity"
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
+LEFT_FT_SENSOR_TOPIC = "/g01/left/FTSensor"
+RIGHT_FT_SENSOR_TOPIC = "/g01/right/FTSensor"
 GRASP_CMD_TOPIC = "/grasp_cmd"
 GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
 DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
@@ -734,6 +735,8 @@ PLACE_JOINTS = {
 
 # 抓取流程默认参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
+GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增量阈值 [N]
+FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
 PLACE_SPEED_SCALE = 0.5     # 5/9~9/9 放置与返回的速度缩放
 FIRST_RETURN_MODE = 2       # 1: 只反向直线回到 q_pre；2: 直线+OMPL 回到 1/9 初始位置
 EXCHANGE_Q1 = [
@@ -2290,8 +2293,26 @@ class G01Demo(Node):
         self._nav_result_count = 0
         self._latest_nav_success: bool | None = None
         self._latest_nav_message = ""
+        self._ft_sensor_z: dict[str, float | None] = {
+            "left": None,
+            "right": None,
+        }
+        self._ft_sensor_count = {"left": 0, "right": 0}
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
+        # servoj_30ms.py 在传感器离线时停止发布；这里只接受调用后到达的新帧。
+        self.create_subscription(
+            Float32MultiArray,
+            LEFT_FT_SENSOR_TOPIC,
+            lambda msg: self._on_ft_sensor(msg, "left"),
+            1,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            RIGHT_FT_SENSOR_TOPIC,
+            lambda msg: self._on_ft_sensor(msg, "right"),
+            1,
+        )
         # 只保留最新一帧，避免循环间 input() 阻塞时积压旧的开关状态。
         self.create_subscription(UInt8, DRIVER_SIGNAL_TOPIC, self._on_driver_signal, 1)
         self.create_subscription(String, NAV_RESULT_TOPIC, self._on_nav_result, 10)
@@ -2405,6 +2426,57 @@ class G01Demo(Node):
             self.get_logger().info(
                 f"收到 {DRIVER_SIGNAL_TOPIC}: uint8=0x{signal:02X}, {states}"
             )
+
+    def _on_ft_sensor(self, msg: Float32MultiArray, side: str) -> None:
+        """缓存左右臂六维力中的 Z；数据顺序为 Fx/Fy/Fz/Mx/My/Mz。"""
+        if side not in self._ft_sensor_z:
+            return
+        if len(msg.data) < 3:
+            self.get_logger().error(
+                f"{side} 力传感器消息长度不足：{len(msg.data)} < 3"
+            )
+            return
+        force_z = float(msg.data[2])
+        if not math.isfinite(force_z):
+            self.get_logger().error(f"{side} 力传感器 Z 非有限值：{force_z}")
+            return
+        self._ft_sensor_z[side] = force_z
+        self._ft_sensor_count[side] += 1
+
+    def wait_for_ft_sensor_z(
+        self,
+        side: str,
+        timeout_sec: float = FT_SENSOR_SAMPLE_TIMEOUT_SEC,
+    ) -> float | None:
+        """阻塞等待调用后到达的一帧对应臂力数据，并返回 Fz。"""
+        if side not in self._ft_sensor_z:
+            self.get_logger().error(f"未知力传感器 side={side}")
+            return None
+        if self.sim_mode:
+            self.get_logger().info(f"[sim] 跳过 {side} 力传感器阻塞读取")
+            return 0.0
+
+        count_before_wait = self._ft_sensor_count[side]
+        topic = LEFT_FT_SENSOR_TOPIC if side == "left" else RIGHT_FT_SENSOR_TOPIC
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(
+                self,
+                timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
+            )
+            if self._ft_sensor_count[side] > count_before_wait:
+                force_z = self._ft_sensor_z[side]
+                if force_z is not None:
+                    self.get_logger().info(
+                        f"[pick] 收到 {topic} 新帧：Fz={force_z:.6f} N"
+                    )
+                    return force_z
+
+        self.get_logger().error(
+            f"[pick] {timeout_sec:.1f}s 内未收到 {topic} 新帧；"
+            "传感器可能离线，禁止使用旧力值判断吸附"
+        )
+        return None
 
     def _wait_for_driver_signal(
         self,
@@ -4598,7 +4670,23 @@ class G01Demo(Node):
             return False
 
         log.info(
-            f"[pick] 2/9  执行已缓存的 approach 轨迹 → q_target "
+            f"[pick] 2/9  已到 q_pre，{tool_label}工具上电并读取吸附前 Fz 基准"
+        )
+        if not self.set_tool_power(tool_side, 1):
+            log.error(f"[pick] {tool_label}工具上电失败")
+            return False
+        print(f"\033[32m{tool_label}在 q_pre 上电成功\033[0m")
+
+        force_z_before = self.wait_for_ft_sensor_z(tool_side)
+        if force_z_before is None:
+            log.error(f"[pick] 无法读取{tool_label}吸附前 Fz，取消本次抓取")
+            self.last_pick_failure_reason = "force_sensor_timeout"
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 取消抓取时{tool_label}工具下电失败")
+            return False
+
+        log.info(
+            f"[pick] 3/9  执行已缓存的 approach 轨迹 → q_target "
             f"（{len(approach_traj.joint_trajectory.points)} 点，免重规划）"
         )
 
@@ -4609,6 +4697,8 @@ class G01Demo(Node):
 
         if not self._execute_traj(approach_traj):
             log.error("[pick] 直线接近执行失败")
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 直线接近失败后{tool_label}工具下电失败")
             return False
 
         self._log_actual_fk_error(
@@ -4618,27 +4708,55 @@ class G01Demo(Node):
             plan_frame=plan_frame,
             joint_names=joint_names,
         )
-        log.info("[pick] 3/9  到达抓取位置，按回车继续 …")
+        log.info("[pick] 3/9  到达抓取位置，工具已上电，按回车继续 …")
         try:
             input()
         except EOFError:
             pass
 
-        if not self.set_tool_power(tool_side, 1):
-            log.error(f"[pick] {tool_label}工具上电失败")
-            return False
-        print(f"\033[32m{tool_label}上电成功\033[0m")
-        # 日志
-        return_desc = (
-            "反向 approach → q_pre"
-            if first_return_mode == 1
-            else "反向 approach + 1/9 OMPL → 1/9 初始位置"
-        )
-        log.info(f"[pick] 4/9  第一段复位：{return_desc}")
+        log.info("[pick] 4/9  反向播放 approach，直线复位回 q_pre")
         retreat_approach = self._reverse_trajectory(approach_traj)
         if not self._execute_traj(retreat_approach):
             log.error("[pick] 反向播放 approach 失败")
             return False
+
+        force_z_after = self.wait_for_ft_sensor_z(tool_side)
+        if force_z_after is None:
+            log.error(
+                f"[pick] 已回 q_pre，但无法读取{tool_label}吸附后 Fz；"
+                "保持工具上电并停止本批次"
+            )
+            self.last_pick_failure_reason = "force_sensor_timeout"
+            return False
+
+        force_z_increase = force_z_after - force_z_before
+        log.info(
+            f"[pick] {tool_label}吸附检测："
+            f"q_pre 吸附前 Fz={force_z_before:.6f} N，"
+            f"吸附后 Fz={force_z_after:.6f} N，"
+            f"增加={force_z_increase:.6f} N，"
+            f"阈值>{GRASP_FORCE_Z_INCREASE_THRESHOLD:.6f} N"
+        )
+        suction_ok = (
+            self.sim_mode
+            or force_z_increase > GRASP_FORCE_Z_INCREASE_THRESHOLD
+        )
+        if not suction_ok:
+            log.warning(
+                f"[pick] {tool_label}Fz 增加未超过 "
+                f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定未吸附；"
+                "工具下电并开始下一次复位、识别、抓取"
+            )
+            self.last_pick_failure_reason = "suction_failed"
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 未吸附后{tool_label}工具下电失败")
+                self.last_pick_failure_reason = "tool_power_off_failed"
+            return False
+
+        log.info(
+            f"[pick] {tool_label}Fz 增加超过 "
+            f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定吸附成功，继续放置"
+        )
 
         try:
             input()
@@ -5169,6 +5287,15 @@ def main(argv: list[str] | None = None) -> int:
             if grasp_result:
                 success_count += 1
             publish_attempt_result(grasp_result, success_count)
+            if (
+                not grasp_result
+                and node.last_pick_failure_reason == "suction_failed"
+            ):
+                log.warning(
+                    f"[frame-batch] 第 {grasp_index} 次未吸附，"
+                    "不执行放置；直接进入下一次 Q1 复位和视觉识别"
+                )
+                continue
             if not grasp_result:
                 log.error(
                     f"[frame-batch] 第 {grasp_index} 次抓取失败，停止本批次"
