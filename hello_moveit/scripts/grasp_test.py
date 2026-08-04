@@ -423,6 +423,7 @@ LEFT_FT_SENSOR_TOPIC = "/g01/left/FTSensor"
 RIGHT_FT_SENSOR_TOPIC = "/g01/right/FTSensor"
 SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
 SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
+MOTOR_COMMAND_TOPIC = "/g01/motor_commands"
 GRASP_CMD_TOPIC = "/grasp_cmd"
 GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
 DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
@@ -2345,6 +2346,11 @@ class G01Demo(Node):
             SERVOJ_CONTROL_TOPIC,
             10,
         )
+        self._motor_command_pub = self.create_publisher(
+            UInt8,
+            MOTOR_COMMAND_TOPIC,
+            10,
+        )
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
@@ -2494,6 +2500,7 @@ class G01Demo(Node):
         guard["force_drop"] = force_drop
         guard["travelled"] = travelled
         guard["trigger"] = "all" if whole_path_contact else "first_9cm"
+        self._motor_command_pub.publish(UInt8(data=1))
         guard["stop_request_id"] = self._send_servoj_control(side, "stop")
         threshold = (
             APPROACH_FORCE_Z_DROP_ALL_THRESHOLD
@@ -2505,7 +2512,7 @@ class G01Demo(Node):
             f"已行进约 {travelled * 100.0:.2f} cm，"
             f"q_pre Fz={guard['baseline_force_z']:.6f} N，"
             f"当前 Fz={force_z:.6f} N，减小={force_drop:.6f} N > "
-            f"{threshold:.3f} N；已立即请求 ServoJ 停止"
+            f"{threshold:.3f} N；已发布 {MOTOR_COMMAND_TOPIC}=1 并立即请求 ServoJ 停止"
         )
 
     def _on_servoj_control_state(self, msg: String) -> None:
