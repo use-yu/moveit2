@@ -5099,8 +5099,12 @@ class G01Demo(Node):
         if approach_result == "contact":
             log.warning(
                 "[pick] 直线接近中途接触障碍物；接近轨迹和 ServoJ 状态均已确认，"
-                "开始从当前位置直线退回 q_pre"
+                f"先将{tool_label}工具下电，再从当前位置直线退回 q_pre"
             )
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 障碍物接触后{tool_label}工具下电失败")
+                self.last_pick_failure_reason = "tool_power_off_failed"
+                return False
             if not self._return_to_pre_after_approach_contact(
                 group,
                 link,
@@ -5110,12 +5114,6 @@ class G01Demo(Node):
                 speed_scale,
             ):
                 self.last_pick_failure_reason = "approach_obstacle_recovery_failed"
-                if not self.set_tool_power(tool_side, 0):
-                    log.error(f"[pick] 障碍物恢复失败后{tool_label}工具下电失败")
-                return False
-            if not self.set_tool_power(tool_side, 0):
-                log.error(f"[pick] 障碍物接触退回 q_pre 后{tool_label}工具下电失败")
-                self.last_pick_failure_reason = "tool_power_off_failed"
                 return False
             self.last_pick_failure_reason = "approach_obstacle"
             log.warning(
