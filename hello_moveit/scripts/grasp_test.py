@@ -736,12 +736,12 @@ PLACE_JOINTS = {
     },
 }
 
-# 抓取流程默认参数
+# 抓取流程默认参数力传感器抓取失败判断参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
 GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增量阈值 [N]
 FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
-APPROACH_FORCE_GUARD_DISTANCE = 0.09  # 从 q_pre 起前 9 cm 使用小阈值 [m]
-APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 20.0  # 前 9 cm 的 Fz 减小阈值 [N]
+APPROACH_FORCE_GUARD_DISTANCE = 0.07  # 从 q_pre 起前 9 cm 使用小阈值 [m]
+APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 15.0  # 前 9 cm 的 Fz 减小阈值 [N]
 APPROACH_FORCE_Z_DROP_ALL_THRESHOLD = 200.0  # 整段接近的 Fz 减小阈值 [N]
 SERVOJ_CONTROL_ACK_TIMEOUT_SEC = 2.0
 APPROACH_CANCEL_TIMEOUT_SEC = 5.0
