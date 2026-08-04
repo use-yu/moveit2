@@ -19,19 +19,21 @@
 
 # 没有手臂关节或关节不完整
 # → 不发送 ServoJ
+# /g01/servoj_control 可按臂 stop/resume；停止时关闭指令入口并清轨迹缓存，
+# 处理结果发布到 /g01/servoj_control_state。
+import json
 import socket
 from time import sleep
 import time
 import threading
 import logging
 from logging.handlers import RotatingFileHandler
-import socket
 import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String
 from dobot_msgs_v4.srv import SetToolPower
 
 MyType = np.dtype([('len', np.int64,), ('digital_input_bits', np.uint64,), ('digital_output_bits',
@@ -126,6 +128,9 @@ RIGHT_JOINTS = JOINT_ORDER[10:16]
 ARM_COMMAND_SIZE = 6
 SERVOJ_SEND_PERIOD_SEC = 0.03
 COMMAND_TOPIC = "/g01/joint_commands"
+SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
+SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
+SERVOJ_RESUME_GUARD_SEC = 0.1
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 # DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 45.0)
@@ -226,8 +231,21 @@ class ArmRosBridge(Node):
         # 200Hz输入只保留最新一条，30ms定时器按固定频率下发最新完整目标。
         self._latest_arm_commands = {"left": None, "right": None}
         self._new_arm_commands = {"left": False, "right": False}
+        self._arm_paused = {"left": False, "right": False}
+        self._accept_commands_after = {"left": 0.0, "right": 0.0}
         self._arm_command_lock = threading.Lock()
         self.create_subscription(JointState, COMMAND_TOPIC, self._on_joint_commands, 1)
+        self.create_subscription(
+            String,
+            SERVOJ_CONTROL_TOPIC,
+            self._on_servoj_control,
+            10,
+        )
+        self._servoj_control_state_pub = self.create_publisher(
+            String,
+            SERVOJ_CONTROL_STATE_TOPIC,
+            10,
+        )
         self.create_timer(SERVOJ_SEND_PERIOD_SEC, self._send_latest_joint_commands)
         self.create_service(SetToolPower, LEFT_TOOL_COMMAND_SERVICE, self._on_left_tool_command)
         self.create_service(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE, self._on_right_tool_command)
@@ -282,18 +300,100 @@ class ArmRosBridge(Node):
         right_cmd = self._extract_arm_command(name_to_pos, RIGHT_JOINTS)
 
         # 高频回调只覆盖缓存，不直接发送；同一个30ms周期内的旧目标会被新目标替换。
+        now = time.monotonic()
         with self._arm_command_lock:
-            if left_cmd is not None:
+            if (
+                left_cmd is not None
+                and not self._arm_paused["left"]
+                and now >= self._accept_commands_after["left"]
+            ):
                 self._latest_arm_commands["left"] = left_cmd
                 self._new_arm_commands["left"] = True
-            if right_cmd is not None:
+            if (
+                right_cmd is not None
+                and not self._arm_paused["right"]
+                and now >= self._accept_commands_after["right"]
+            ):
                 self._latest_arm_commands["right"] = right_cmd
                 self._new_arm_commands["right"] = True
+
+    def _publish_servoj_control_state(
+        self,
+        side,
+        state,
+        request_id,
+        success=True,
+        message="",
+    ):
+        reply = String()
+        reply.data = json.dumps(
+            {
+                "side": side,
+                "state": state,
+                "request_id": request_id,
+                "success": bool(success),
+                "message": str(message),
+            },
+            ensure_ascii=False,
+        )
+        self._servoj_control_state_pub.publish(reply)
+
+    def _on_servoj_control(self, msg):
+        """按臂停止/恢复 ServoJ，并用带 request_id 的状态话题确认。"""
+        try:
+            request = json.loads(msg.data)
+            side = str(request["side"])
+            command = str(request["command"])
+            request_id = int(request["request_id"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            self.get_logger().error(
+                f"{SERVOJ_CONTROL_TOPIC} 命令格式错误：{msg.data!r}; {exc}"
+            )
+            return
+
+        if side not in ("left", "right") or command not in ("stop", "resume"):
+            self.get_logger().error(
+                f"{SERVOJ_CONTROL_TOPIC} 命令非法：side={side!r}, "
+                f"command={command!r}"
+            )
+            return
+
+        if command == "stop":
+            # 先在同一回调内关闸并清除缓存。之后到达的旧 MoveIt 轨迹点也会被丢弃。
+            with self._arm_command_lock:
+                self._arm_paused[side] = True
+                self._latest_arm_commands[side] = None
+                self._new_arm_commands[side] = False
+
+            self.get_logger().warning(
+                f"{side} ServoJ 已停止接收指令并清除轨迹缓存，"
+                f"request_id={request_id}"
+            )
+            self._publish_servoj_control_state(side, "stopped", request_id)
+            return
+
+        # 恢复时仍清一次缓存，并短暂过滤可能已排队的旧轨迹消息；下一条新规划
+        # 至少要经过服务规划和 action 握手，不会被这 100 ms 防陈旧窗口误丢弃。
+        with self._arm_command_lock:
+            self._arm_paused[side] = False
+            self._latest_arm_commands[side] = None
+            self._new_arm_commands[side] = False
+            self._accept_commands_after[side] = (
+                time.monotonic() + SERVOJ_RESUME_GUARD_SEC
+            )
+        self.get_logger().info(
+            f"{side} ServoJ 已恢复，request_id={request_id}"
+        )
+        self._publish_servoj_control_state(side, "running", request_id)
 
     def _send_latest_joint_commands(self):
         pending_commands = []
         with self._arm_command_lock:
             for side, client_index in (("left", 0), ("right", 1)):
+                if self._arm_paused[side]:
+                    self._latest_arm_commands[side] = None
+                    self._new_arm_commands[side] = False
+                    continue
                 command = self._latest_arm_commands[side]
                 if not self._new_arm_commands[side] or command is None:
                     continue

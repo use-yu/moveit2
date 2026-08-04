@@ -14,7 +14,8 @@ G01 MoveIt 演示脚本
     → 按视觉点和 group 顺序做可达性验证
     → 选中“有 IK + 直线 approach 可行 + 加入临时碰撞体后 q_pre 无碰撞”的候选
     → OMPL 到 q_pre，工具上电并读取该臂力传感器 Z 基准值
-    → Cartesian approach 到抓取点
+    → Cartesian approach 到抓取点；以前 9cm/Fz 减小 20N、整段/Fz 减小
+      200N 监测中途接触，触发后停止 ServoJ、取消轨迹并从当前位置直退 q_pre
     → 反向 Cartesian 回 q_pre，再读取 Z 值判断是否吸附成功
     → 根据 first_return_mode：
     ├─ mode=1：双臂交换 → 接物臂放置
@@ -420,6 +421,8 @@ LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 LEFT_FT_SENSOR_TOPIC = "/g01/left/FTSensor"
 RIGHT_FT_SENSOR_TOPIC = "/g01/right/FTSensor"
+SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
+SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
 GRASP_CMD_TOPIC = "/grasp_cmd"
 GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
 DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
@@ -737,6 +740,12 @@ PLACE_JOINTS = {
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
 GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增量阈值 [N]
 FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
+APPROACH_FORCE_GUARD_DISTANCE = 0.09  # 从 q_pre 起前 9 cm 使用小阈值 [m]
+APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 20.0  # 前 9 cm 的 Fz 减小阈值 [N]
+APPROACH_FORCE_Z_DROP_ALL_THRESHOLD = 200.0  # 整段接近的 Fz 减小阈值 [N]
+SERVOJ_CONTROL_ACK_TIMEOUT_SEC = 2.0
+APPROACH_CANCEL_TIMEOUT_SEC = 5.0
+SERVOJ_RECOVERY_SETTLE_SEC = 0.12
 PLACE_SPEED_SCALE = 0.5     # 5/9~9/9 放置与返回的速度缩放
 FIRST_RETURN_MODE = 2       # 1: 只反向直线回到 q_pre；2: 直线+OMPL 回到 1/9 初始位置
 EXCHANGE_Q1 = [
@@ -2298,6 +2307,9 @@ class G01Demo(Node):
             "right": None,
         }
         self._ft_sensor_count = {"left": 0, "right": 0}
+        self._active_approach_guard: dict | None = None
+        self._servoj_request_id = 0
+        self._servoj_control_acks: dict[tuple[str, str, int], dict] = {}
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
         self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
         # servoj_30ms.py 在传感器离线时停止发布；这里只接受调用后到达的新帧。
@@ -2313,6 +2325,12 @@ class G01Demo(Node):
             lambda msg: self._on_ft_sensor(msg, "right"),
             1,
         )
+        self.create_subscription(
+            String,
+            SERVOJ_CONTROL_STATE_TOPIC,
+            self._on_servoj_control_state,
+            10,
+        )
         # 只保留最新一帧，避免循环间 input() 阻塞时积压旧的开关状态。
         self.create_subscription(UInt8, DRIVER_SIGNAL_TOPIC, self._on_driver_signal, 1)
         self.create_subscription(String, NAV_RESULT_TOPIC, self._on_nav_result, 10)
@@ -2322,6 +2340,11 @@ class G01Demo(Node):
             10,
         )
         self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
+        self._servoj_control_pub = self.create_publisher(
+            String,
+            SERVOJ_CONTROL_TOPIC,
+            10,
+        )
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
@@ -2442,6 +2465,136 @@ class G01Demo(Node):
             return
         self._ft_sensor_z[side] = force_z
         self._ft_sensor_count[side] += 1
+
+        guard = self._active_approach_guard
+        if (
+            guard is None
+            or not guard["monitoring"]
+            or guard["contact"]
+            or guard["side"] != side
+        ):
+            return
+
+        force_drop = guard["baseline_force_z"] - force_z
+        travelled = guard["progress_fraction"] * guard["total_distance"]
+        in_first_zone = travelled <= min(
+            APPROACH_FORCE_GUARD_DISTANCE,
+            guard["total_distance"],
+        )
+        whole_path_contact = force_drop > APPROACH_FORCE_Z_DROP_ALL_THRESHOLD
+        first_zone_contact = (
+            in_first_zone
+            and force_drop > APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD
+        )
+        if not whole_path_contact and not first_zone_contact:
+            return
+
+        guard["contact"] = True
+        guard["force_z"] = force_z
+        guard["force_drop"] = force_drop
+        guard["travelled"] = travelled
+        guard["trigger"] = "all" if whole_path_contact else "first_9cm"
+        guard["stop_request_id"] = self._send_servoj_control(side, "stop")
+        threshold = (
+            APPROACH_FORCE_Z_DROP_ALL_THRESHOLD
+            if whole_path_contact
+            else APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD
+        )
+        self.get_logger().error(
+            f"[pick][force-guard] {side} 臂直线接近中检测到障碍物："
+            f"已行进约 {travelled * 100.0:.2f} cm，"
+            f"q_pre Fz={guard['baseline_force_z']:.6f} N，"
+            f"当前 Fz={force_z:.6f} N，减小={force_drop:.6f} N > "
+            f"{threshold:.3f} N；已立即请求 ServoJ 停止"
+        )
+
+    def _on_servoj_control_state(self, msg: String) -> None:
+        """缓存 servoj_30ms.py 对停止/恢复命令的确认。"""
+        try:
+            state = json.loads(msg.data)
+            side = str(state["side"])
+            state_name = str(state["state"])
+            request_id = int(state["request_id"])
+            success = state["success"]
+            if not isinstance(success, bool):
+                raise TypeError("success 必须是 JSON bool")
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            self.get_logger().error(
+                f"{SERVOJ_CONTROL_STATE_TOPIC} 消息格式错误：{msg.data!r}; {exc}"
+            )
+            return
+
+        if side not in ("left", "right") or state_name not in ("stopped", "running"):
+            self.get_logger().error(
+                f"{SERVOJ_CONTROL_STATE_TOPIC} 状态非法：{msg.data!r}"
+            )
+            return
+        state["success"] = success
+        self._servoj_control_acks[(side, state_name, request_id)] = state
+
+    def _send_servoj_control(
+        self,
+        side: str,
+        command: str,
+        request_id: int | None = None,
+    ) -> int:
+        """发布按臂 stop/resume；request_id 用于排除陈旧确认。"""
+        if request_id is None:
+            self._servoj_request_id += 1
+            request_id = self._servoj_request_id
+        msg = String()
+        msg.data = json.dumps(
+            {
+                "side": side,
+                "command": command,
+                "request_id": request_id,
+            },
+            ensure_ascii=False,
+        )
+        self._servoj_control_pub.publish(msg)
+        return request_id
+
+    def _wait_for_servoj_control_state(
+        self,
+        side: str,
+        command: str,
+        request_id: int,
+        timeout_sec: float = SERVOJ_CONTROL_ACK_TIMEOUT_SEC,
+    ) -> bool:
+        """等待匹配的停止/恢复确认，等待期间周期性重发同一幂等命令。"""
+        expected_state = "stopped" if command == "stop" else "running"
+        key = (side, expected_state, request_id)
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        next_retry = time.monotonic() + 0.25
+        while rclpy.ok() and time.monotonic() < deadline:
+            ack = self._servoj_control_acks.pop(key, None)
+            if ack is not None:
+                if ack["success"]:
+                    self.get_logger().info(
+                        f"[pick][force-guard] ServoJ {side} 已确认 "
+                        f"{expected_state}，request_id={request_id}"
+                    )
+                    return True
+                self.get_logger().error(
+                    f"[pick][force-guard] ServoJ {side} {expected_state} 失败："
+                    f"{ack.get('message', '')}"
+                )
+                return False
+
+            now = time.monotonic()
+            if now >= next_retry:
+                self._send_servoj_control(side, command, request_id=request_id)
+                next_retry = now + 0.25
+            rclpy.spin_once(
+                self,
+                timeout_sec=min(0.05, max(0.0, deadline - now)),
+            )
+
+        self.get_logger().error(
+            f"[pick][force-guard] {timeout_sec:.1f}s 内未收到 ServoJ {side} "
+            f"{expected_state} 确认，request_id={request_id}"
+        )
+        return False
 
     def wait_for_ft_sensor_z(
         self,
@@ -2622,6 +2775,34 @@ class G01Demo(Node):
         for i, name in enumerate(msg.name):
             if i < len(msg.position):
                 self._joints[name] = msg.position[i]
+
+        guard = self._active_approach_guard
+        if guard is None or not guard["monitoring"] or guard["contact"]:
+            return
+        trajectory = guard["trajectory"].joint_trajectory
+        if not trajectory.points or any(
+            name not in self._joints for name in trajectory.joint_names
+        ):
+            return
+
+        current = [self._joints[name] for name in trajectory.joint_names]
+        closest_index = min(
+            range(len(trajectory.points)),
+            key=lambda index: sum(
+                (actual - planned) ** 2
+                for actual, planned in zip(
+                    current,
+                    trajectory.points[index].positions,
+                )
+            ),
+        )
+        denominator = max(1, len(trajectory.points) - 1)
+        # 直线轨迹点由 compute_cartesian_path 按固定 eef_step 生成；最近点索引
+        # 因而可直接换算为沿直线的进度。只允许进度前进，避免反馈噪声跨阈值回跳。
+        guard["progress_fraction"] = max(
+            guard["progress_fraction"],
+            closest_index / denominator,
+        )
 
     def _spin_until(self, future, timeout: float) -> bool:
         """阻塞直到 future 完成或超时。"""
@@ -3701,6 +3882,219 @@ class G01Demo(Node):
             return False
         return True
 
+    def _execute_approach_with_force_guard(
+        self,
+        traj: RobotTrajectory,
+        side: str,
+        baseline_force_z: float,
+        total_distance: float,
+        timeout: float = 60.0,
+    ) -> str:
+        """执行接近轨迹并实时监测 Fz。
+
+        返回 ``success``、``contact``、``failed`` 或 ``safety_failed``。
+        ``contact`` 表示已完成 ServoJ 停止确认、MoveIt 轨迹终止确认以及 ServoJ
+        恢复确认，可以安全地从实测当前位置规划退回 q_pre。
+        """
+        if self.sim_mode:
+            return "success" if self._execute_traj(traj, timeout=timeout) else "failed"
+
+        log = self.get_logger()
+        if not self._exec_cli.wait_for_server(timeout_sec=10.0):
+            log.error(f"动作 {ACT_EXEC_TRAJ} 不可用")
+            return "failed"
+
+        guard = {
+            "side": side,
+            "baseline_force_z": float(baseline_force_z),
+            "total_distance": max(0.0, float(total_distance)),
+            "trajectory": traj,
+            "monitoring": False,
+            "progress_fraction": 0.0,
+            "contact": False,
+            "force_z": None,
+            "force_drop": 0.0,
+            "travelled": 0.0,
+            "trigger": None,
+            "stop_request_id": None,
+            "completion_force_checked": False,
+        }
+        self._active_approach_guard = guard
+        try:
+            goal = ExecuteTrajectory.Goal(trajectory=traj)
+            send_fut = self._exec_cli.send_goal_async(goal)
+            if not self._spin_until(send_fut, 15.0):
+                log.error("execute_trajectory 目标发送超时")
+                return "failed"
+            goal_handle = send_fut.result()
+            if not goal_handle.accepted:
+                log.error("execute_trajectory 目标被拒绝")
+                return "failed"
+
+            result_fut = goal_handle.get_result_async()
+            guard["monitoring"] = True
+            deadline = time.monotonic() + max(0.0, timeout)
+            while rclpy.ok() and time.monotonic() < deadline:
+                rclpy.spin_once(
+                    self,
+                    timeout_sec=min(0.01, max(0.0, deadline - time.monotonic())),
+                )
+                if guard["contact"]:
+                    guard["monitoring"] = False
+                    # ServoJ 的 stop 已由力回调先发出；紧接着取消 MoveIt action，
+                    # 防止控制器继续产生这条接近轨迹的后续关节点。
+                    cancel_fut = goal_handle.cancel_goal_async()
+                    cancel_reply_received = self._spin_until(
+                        cancel_fut,
+                        APPROACH_CANCEL_TIMEOUT_SEC,
+                    )
+                    if not cancel_reply_received:
+                        log.error("[pick][force-guard] 取消直线接近轨迹请求超时")
+                    else:
+                        cancel_result = cancel_fut.result()
+                        if not cancel_result.goals_canceling and not result_fut.done():
+                            log.error(
+                                "[pick][force-guard] MoveIt 未接受直线接近轨迹取消请求"
+                            )
+
+                    stop_request_id = guard["stop_request_id"]
+                    stop_confirmed = self._wait_for_servoj_control_state(
+                        side,
+                        "stop",
+                        stop_request_id,
+                    )
+                    trajectory_ended = self._spin_until(
+                        result_fut,
+                        APPROACH_CANCEL_TIMEOUT_SEC,
+                    )
+                    if trajectory_ended:
+                        action_result = result_fut.result()
+                        exec_code = (
+                            action_result.result.error_code.val
+                            if action_result.result
+                            else None
+                        )
+                        log.warning(
+                            "[pick][force-guard] 直线接近轨迹已结束："
+                            f"status={action_result.status}, error_code={exec_code}"
+                        )
+                    else:
+                        log.error(
+                            "[pick][force-guard] 未能确认直线接近轨迹已经结束，"
+                            "保持 ServoJ 停止，禁止自动恢复"
+                        )
+
+                    if not stop_confirmed or not trajectory_ended:
+                        return "safety_failed"
+
+                    resume_request_id = self._send_servoj_control(side, "resume")
+                    if not self._wait_for_servoj_control_state(
+                        side,
+                        "resume",
+                        resume_request_id,
+                    ):
+                        log.error(
+                            "[pick][force-guard] 未确认 ServoJ 恢复，禁止执行退回 q_pre"
+                        )
+                        return "safety_failed"
+                    return "contact"
+
+                if result_fut.done():
+                    action_result = result_fut.result()
+                    exec_code = (
+                        action_result.result.error_code.val
+                        if action_result.result
+                        else None
+                    )
+                    if (
+                        action_result.status == GoalStatus.STATUS_SUCCEEDED
+                        and exec_code == MoveItErrorCodes.SUCCESS
+                    ):
+                        if not guard["completion_force_checked"]:
+                            # action 结果和力话题来自不同通道。成功终态后再处理一帧
+                            # 新力数据，确保末端最后时刻仍受整段 200 N 阈值保护；
+                            # 此时进度置 100%，不会误用“前 9 cm”的 20 N 阈值。
+                            guard["completion_force_checked"] = True
+                            guard["progress_fraction"] = 1.0
+                            force_count = self._ft_sensor_count[side]
+                            sample_deadline = time.monotonic() + 0.1
+                            while (
+                                rclpy.ok()
+                                and not guard["contact"]
+                                and self._ft_sensor_count[side] <= force_count
+                                and time.monotonic() < sample_deadline
+                            ):
+                                rclpy.spin_once(
+                                    self,
+                                    timeout_sec=min(
+                                        0.01,
+                                        max(0.0, sample_deadline - time.monotonic()),
+                                    ),
+                                )
+                            if guard["contact"]:
+                                continue
+                        return "success"
+                    log.error(
+                        "execute_trajectory 失败："
+                        f"status={action_result.status}, error_code={exec_code}"
+                        f"({_moveit_error_name(exec_code) if exec_code is not None else 'None'})"
+                    )
+                    return "failed"
+
+            log.error("execute_trajectory 结果超时")
+            return "failed"
+        finally:
+            if self._active_approach_guard is guard:
+                self._active_approach_guard = None
+
+    def _return_to_pre_after_approach_contact(
+        self,
+        group: str,
+        link: str,
+        pre_pose: Pose,
+        joint_names: Sequence[str],
+        plan_frame: str,
+        speed_scale: float,
+    ) -> bool:
+        """ServoJ 恢复后，从实测停止位置重新规划直线退回 pre。"""
+        settle_deadline = time.monotonic() + SERVOJ_RECOVERY_SETTLE_SEC
+        while rclpy.ok() and time.monotonic() < settle_deadline:
+            rclpy.spin_once(
+                self,
+                timeout_sec=min(0.02, settle_deadline - time.monotonic()),
+            )
+
+        current = self._get_joints(list(joint_names), wait_new=True)
+        if current is None:
+            self.get_logger().error(
+                "[pick][force-guard] 无法读取停止后的实测关节位置"
+            )
+            return False
+        retreat = self._cartesian_plan(
+            group,
+            link,
+            pre_pose,
+            speed_scale=speed_scale,
+            avoid_collisions=True,
+            start_joints=current,
+            joint_names=joint_names,
+            plan_frame=plan_frame,
+        )
+        if retreat is None:
+            self.get_logger().error(
+                "[pick][force-guard] 无法从停止位置规划直线退回 q_pre"
+            )
+            return False
+        if not self._execute_traj(retreat):
+            self.get_logger().error(
+                "[pick][force-guard] 从停止位置直线退回 q_pre 执行失败"
+            )
+            return False
+        self.get_logger().info(
+            "[pick][force-guard] 已从中途停止位置直线退回 q_pre"
+        )
+        return True
+
     @staticmethod
     def _reverse_trajectory(traj):
         """反向播放：positions/time 反序、velocity 取负、acceleration 仅反序（不变号）。
@@ -4695,7 +5089,52 @@ class G01Demo(Node):
         except EOFError:
             pass
 
-        if not self._execute_traj(approach_traj):
+        approach_distance = _pose_distance(pre_pose, target_pose)
+        approach_result = self._execute_approach_with_force_guard(
+            approach_traj,
+            tool_side,
+            force_z_before,
+            approach_distance,
+        )
+        if approach_result == "contact":
+            log.warning(
+                "[pick] 直线接近中途接触障碍物；接近轨迹和 ServoJ 状态均已确认，"
+                "开始从当前位置直线退回 q_pre"
+            )
+            if not self._return_to_pre_after_approach_contact(
+                group,
+                link,
+                pre_pose,
+                joint_names,
+                plan_frame,
+                speed_scale,
+            ):
+                self.last_pick_failure_reason = "approach_obstacle_recovery_failed"
+                if not self.set_tool_power(tool_side, 0):
+                    log.error(f"[pick] 障碍物恢复失败后{tool_label}工具下电失败")
+                return False
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 障碍物接触退回 q_pre 后{tool_label}工具下电失败")
+                self.last_pick_failure_reason = "tool_power_off_failed"
+                return False
+            self.last_pick_failure_reason = "approach_obstacle"
+            log.warning(
+                "[pick] 障碍物接触恢复完成；工具已下电，"
+                "开始下一次 Q1 复位、视觉识别和抓取"
+            )
+            return False
+
+        if approach_result == "safety_failed":
+            log.error(
+                "[pick] 障碍物接触后的停止/轨迹终止/恢复确认失败；"
+                "不执行自动退回，停止本批次"
+            )
+            self.last_pick_failure_reason = "approach_force_guard_failed"
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 安全停止失败后{tool_label}工具下电失败")
+            return False
+
+        if approach_result != "success":
             log.error("[pick] 直线接近执行失败")
             if not self.set_tool_power(tool_side, 0):
                 log.error(f"[pick] 直线接近失败后{tool_label}工具下电失败")
@@ -5289,12 +5728,21 @@ def main(argv: list[str] | None = None) -> int:
             publish_attempt_result(grasp_result, success_count)
             if (
                 not grasp_result
-                and node.last_pick_failure_reason == "suction_failed"
-            ):
-                log.warning(
-                    f"[frame-batch] 第 {grasp_index} 次未吸附，"
-                    "不执行放置；直接进入下一次 Q1 复位和视觉识别"
+                and node.last_pick_failure_reason in (
+                    "suction_failed",
+                    "approach_obstacle",
                 )
+            ):
+                if node.last_pick_failure_reason == "approach_obstacle":
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次接近中途碰到障碍物，"
+                        "已退回 pre；直接进入下一次 Q1 复位和视觉识别"
+                    )
+                else:
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次未吸附，"
+                        "不执行放置；直接进入下一次 Q1 复位和视觉识别"
+                    )
                 continue
             if not grasp_result:
                 log.error(
