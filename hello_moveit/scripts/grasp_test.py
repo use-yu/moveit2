@@ -4,8 +4,9 @@
 """
 G01 MoveIt 演示脚本
 
-功能（按顺序执行）：
-输入 1：先导航到深框工位，导航成功后关节空间运动到 框_Q1，
+功能（由上位机话题分阶段触发）：
+/move_to_grasp_pose_cmd：导航到深框工位，导航结束发布对应 result。
+/grasp_cmd：关节空间运动到 框_Q1，
         再发送 p,4 识别深框，
         按识别坐标重建深框障碍物并持续上料，直到 SW1~SW4 没有空位：
     机器人先到初始位
@@ -20,7 +21,8 @@ G01 MoveIt 演示脚本
     → 根据 first_return_mode：
     ├─ mode=1：双臂交换 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
-输入 2：先导航到物料台工位，导航成功后执行原下料：
+/move_to_place_pose_cmd：导航到物料台工位，导航结束发布对应 result。
+/place_cmd：执行下料：
     下料读取最新 SW 信号，0=有料。
     优先取右臂 SW1 + 左臂 SW3，其次右臂 SW4 + 左臂 SW2；必须整对有料。
     发送 p,2 识别。
@@ -28,6 +30,7 @@ G01 MoveIt 演示脚本
     拼接对应 SW 的 yubei，腰部、升降均设为 0。
     双臂分别计算末端 +Z 10cm 的 IK/Cartesian 路径，合成一条 12 关节轨迹，一次执行。
     两个末端上电后，反向同一轨迹直线复位。
+/return_init_pose：导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)，不发布 result。
 前提：
   - 已启动 move_group： ros2 launch g01_moveit_config demo.launch.py
   - 本节点与 move_group 在同一 ROS 域
@@ -424,13 +427,35 @@ RIGHT_FT_SENSOR_TOPIC = "/g01/right/FTSensor"
 SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
 SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
 MOTOR_COMMAND_TOPIC = "/g01/motor_commands"
+MOVE_TO_GRASP_POSE_CMD_TOPIC = "/move_to_grasp_pose_cmd"
+MOVE_TO_GRASP_POSE_RESULT_TOPIC = "/move_to_grasp_pose_cmd_result"
 GRASP_CMD_TOPIC = "/grasp_cmd"
 GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
+MOVE_TO_PLACE_POSE_CMD_TOPIC = "/move_to_place_pose_cmd"
+MOVE_TO_PLACE_POSE_RESULT_TOPIC = "/move_to_place_pose_cmd_result"
+PLACE_CMD_TOPIC = "/place_cmd"
+PLACE_CMD_RESULT_TOPIC = "/place_cmd_result"
+RETURN_INIT_POSE_TOPIC = "/return_init_pose"
 DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
 NAV_GOAL_TOPIC = "/goal_pose"
 NAV_RESULT_TOPIC = "/nav_result"
+NAV_TARGET_GRASP = "grasp"
+NAV_TARGET_PLACE = "place"
+NAV_TARGET_INIT = "init"
+UPPER_COMMAND_EXPECTED_TYPES = {
+    MOVE_TO_GRASP_POSE_CMD_TOPIC: 0,
+    GRASP_CMD_TOPIC: 1,
+    MOVE_TO_PLACE_POSE_CMD_TOPIC: 2,
+    PLACE_CMD_TOPIC: 3,
+}
+UPPER_COMMAND_RESULT_TOPICS = {
+    MOVE_TO_GRASP_POSE_CMD_TOPIC: MOVE_TO_GRASP_POSE_RESULT_TOPIC,
+    GRASP_CMD_TOPIC: GRASP_CMD_RESULT_TOPIC,
+    MOVE_TO_PLACE_POSE_CMD_TOPIC: MOVE_TO_PLACE_POSE_RESULT_TOPIC,
+    PLACE_CMD_TOPIC: PLACE_CMD_RESULT_TOPIC,
+}
 NAV_GOAL_POSES = {
-    "1": {
+    NAV_TARGET_GRASP: {
         "position": (
             4.175657272338867,
             -5.886521816253662,
@@ -443,7 +468,7 @@ NAV_GOAL_POSES = {
             0.7036274075508118,
         ),
     },
-    "2": {
+    NAV_TARGET_PLACE: {
         "position": (
             5.975770950317383,
             -5.743568420410156,
@@ -455,6 +480,10 @@ NAV_GOAL_POSES = {
             -0.7001469731330872,
             0.7138881683349609,
         ),
+    },
+    NAV_TARGET_INIT: {
+        "position": (0.0, 0.0, 0.0),
+        "orientation": (0.0, 0.0, 0.0, 1.0),
     },
 }
 SIGNAL_SW1_MASK = 0x08
@@ -2254,9 +2283,10 @@ def merge_dual_arm_cartesian_trajectories(
 class G01Demo(Node):
     """封装 apply_planning_scene 与 move_action，对外提供少量高层接口。"""
 
-    def __init__(self, sim_mode: bool = False):
+    def __init__(self, sim_mode: bool = False, upper_control_mode: bool = True):
         super().__init__("g01_demo")
         self.sim_mode = bool(sim_mode)
+        self.upper_control_mode = bool(upper_control_mode)
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
         self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
         self._ik_cli = self.create_client(GetPositionIK, SVC_COMPUTE_IK)
@@ -2290,8 +2320,8 @@ class G01Demo(Node):
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
-        self._latest_grasp_cmd: dict | None = None
-        self._start_grasp_cmd: dict | None = None
+        # 上位机命令只保留最近收到的一条；新命令直接覆盖尚未处理的旧命令。
+        self._latest_upper_command: tuple[str, dict] | None = None
         self.last_pick_failure_reason: str | None = None
         # UInt8 会在回调中显式限制到 uint8 范围。真实模式在收到首帧前为未知，
         # 未知状态按“没有安全空位”处理；仿真模式默认四个 SW 均有料，
@@ -2312,7 +2342,19 @@ class G01Demo(Node):
         self._servoj_request_id = 0
         self._servoj_control_acks: dict[tuple[str, str, int], dict] = {}
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
-        self.create_subscription(String, GRASP_CMD_TOPIC, self._on_grasp_cmd, 10)
+        for command_topic in (
+            MOVE_TO_GRASP_POSE_CMD_TOPIC,
+            GRASP_CMD_TOPIC,
+            MOVE_TO_PLACE_POSE_CMD_TOPIC,
+            PLACE_CMD_TOPIC,
+            RETURN_INIT_POSE_TOPIC,
+        ):
+            self.create_subscription(
+                String,
+                command_topic,
+                lambda msg, topic=command_topic: self._on_upper_command(msg, topic),
+                1,
+            )
         # servoj_30ms.py 在传感器离线时停止发布；这里只接受调用后到达的新帧。
         self.create_subscription(
             Float32MultiArray,
@@ -2332,7 +2374,7 @@ class G01Demo(Node):
             self._on_servoj_control_state,
             10,
         )
-        # 只保留最新一帧，避免循环间 input() 阻塞时积压旧的开关状态。
+        # 只保留最新一帧，避免各阶段运动时积压旧的开关状态。
         self.create_subscription(UInt8, DRIVER_SIGNAL_TOPIC, self._on_driver_signal, 1)
         self.create_subscription(String, NAV_RESULT_TOPIC, self._on_nav_result, 10)
         self._nav_goal_pub = self.create_publisher(
@@ -2340,7 +2382,10 @@ class G01Demo(Node):
             NAV_GOAL_TOPIC,
             10,
         )
-        self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
+        self._upper_result_pubs = {
+            result_topic: self.create_publisher(String, result_topic, 10)
+            for result_topic in UPPER_COMMAND_RESULT_TOPICS.values()
+        }
         self._servoj_control_pub = self.create_publisher(
             String,
             SERVOJ_CONTROL_TOPIC,
@@ -2389,12 +2434,12 @@ class G01Demo(Node):
         """真机发布工位目标并等待结果；仿真模式直接跳过导航。"""
         goal_values = NAV_GOAL_POSES.get(str(workflow))
         if goal_values is None:
-            self.get_logger().error(f"没有为输入 {workflow!r} 配置导航目标")
+            self.get_logger().error(f"没有为阶段 {workflow!r} 配置导航目标")
             return False
 
         if self.sim_mode:
             self.get_logger().info(
-                f"[sim][nav] 输入 {workflow}：跳过导航，直接进入识别抓取流程"
+                f"[sim][nav] 阶段 {workflow}：跳过导航"
             )
             return True
 
@@ -2417,7 +2462,7 @@ class G01Demo(Node):
         result_count_before_publish = self._nav_result_count
         self._nav_goal_pub.publish(goal)
         self.get_logger().info(
-            f"[nav] 输入 {workflow}：已发布 {NAV_GOAL_TOPIC}，"
+            f"[nav] 阶段 {workflow}：已发布 {NAV_GOAL_TOPIC}，"
             f"map 位置=({goal.pose.position.x:.6f}, "
             f"{goal.pose.position.y:.6f}, {goal.pose.position.z:.6f})；"
             f"阻塞等待 {NAV_RESULT_TOPIC}"
@@ -2429,11 +2474,11 @@ class G01Demo(Node):
                 continue
             if self._latest_nav_success:
                 self.get_logger().info(
-                    f"[nav] 输入 {workflow} 导航成功，开始后续识别抓取流程"
+                    f"[nav] 阶段 {workflow} 导航成功"
                 )
                 return True
             self.get_logger().error(
-                f"[nav] 输入 {workflow} 导航失败，"
+                f"[nav] 阶段 {workflow} 导航失败，"
                 f"message={self._latest_nav_message!r}，取消本次流程"
             )
             return False
@@ -2687,60 +2732,90 @@ class G01Demo(Node):
     def _has_any_empty_place_slot(self) -> bool:
         return any(self._place_slot_is_empty(name) for name in PLACE_SLOT_MASKS)
 
-    def _on_grasp_cmd(self, msg: String):
-        """解析 /grasp_cmd 的 JSON 字符串，cmd_type=1 表示启动抓取。"""
+    def _on_upper_command(self, msg: String, command_topic: str) -> None:
+        """解析并排队上位机命令；return_init_pose 允许空字符串。"""
         log = self.get_logger()
-        try:
-            data = json.loads(msg.data)
-        except json.JSONDecodeError as exc:
-            log.error(f"{GRASP_CMD_TOPIC} JSON 解析失败: {exc}; data={msg.data!r}")
-            return
+        raw = msg.data.strip()
+        payload: dict = {}
+        if raw:
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                if command_topic == RETURN_INIT_POSE_TOPIC:
+                    payload = {"raw": raw}
+                else:
+                    log.error(
+                        f"{command_topic} JSON 解析失败: {exc}; data={msg.data!r}"
+                    )
+                    self.publish_upper_result(command_topic, False)
+                    return
+            else:
+                if not isinstance(decoded, dict):
+                    log.error(f"{command_topic} JSON 必须是 object: {msg.data!r}")
+                    if command_topic != RETURN_INIT_POSE_TOPIC:
+                        self.publish_upper_result(command_topic, False)
+                    return
+                payload = decoded
 
-        if not isinstance(data, dict):
-            log.error(f"{GRASP_CMD_TOPIC} JSON 必须是 object: {msg.data!r}")
-            return
+        expected_cmd_type = UPPER_COMMAND_EXPECTED_TYPES.get(command_topic)
+        if expected_cmd_type is not None and "cmd_type" in payload:
+            try:
+                cmd_type = int(payload["cmd_type"])
+            except (TypeError, ValueError) as exc:
+                log.error(
+                    f"{command_topic} cmd_type 类型错误: {exc}; data={msg.data!r}"
+                )
+                self.publish_upper_result(command_topic, False)
+                return
+            if cmd_type != expected_cmd_type:
+                log.error(
+                    f"{command_topic} cmd_type={cmd_type}，"
+                    f"期望 {expected_cmd_type}"
+                )
+                self.publish_upper_result(command_topic, False)
+                return
 
-        try:
-            cmd_type = int(data.get("cmd_type", 0))
-            grasp_number = int(data.get("grasp_number", 0))
-            release_number = int(data.get("release_number", 0))
-        except (TypeError, ValueError) as exc:
-            log.error(f"{GRASP_CMD_TOPIC} 字段类型错误: {exc}; data={msg.data!r}")
-            return
-
-        parsed = {
-            "cmd_type": cmd_type,
-            "grasp_number": grasp_number,
-            "release_number": release_number,
-        }
-        self._latest_grasp_cmd = parsed
+        self._latest_upper_command = (command_topic, payload)
         log.info(
-            f"收到抓取命令: cmd_type={cmd_type}, "
-            f"grasp_number={grasp_number}, release_number={release_number}"
+            f"收到上位机命令 {command_topic}: "
+            f"{json.dumps(payload, ensure_ascii=False)}"
         )
-        if cmd_type == 1:
-            self._start_grasp_cmd = parsed
 
-    def wait_for_grasp_start(self) -> dict | None:
-        """等待 /grasp_cmd 收到 cmd_type=1。"""
-        log = self.get_logger()
-        log.info(f"等待 {GRASP_CMD_TOPIC} JSON 命令 cmd_type=1 后开始视觉识别 …")
+    def wait_for_upper_command(self) -> tuple[str, dict] | None:
+        """阻塞等待下一条上位机命令。"""
+        self.get_logger().info(
+            "等待上位机命令：move_to_grasp_pose/grasp/"
+            "move_to_place_pose/place/return_init_pose"
+        )
         while rclpy.ok():
-            if self._start_grasp_cmd is not None:
-                return self._start_grasp_cmd
+            if self._latest_upper_command is not None:
+                latest_command = self._latest_upper_command
+                self._latest_upper_command = None
+                return latest_command
             rclpy.spin_once(self, timeout_sec=0.1)
         return None
 
-    def publish_grasp_cmd_result(self, result: bool, success_grasp_number: int):
-        """发布 /grasp_cmd_result 的 JSON 字符串。"""
-        data = {
-            "result": bool(result),
-            "success_grasp_number": int(success_grasp_number),
-        }
+    def publish_upper_result(self, command_topic: str, result: bool) -> None:
+        """四个阶段结果统一发布 JSON String：{"result": bool}。"""
+        result_topic = UPPER_COMMAND_RESULT_TOPICS.get(command_topic)
+        publisher = self._upper_result_pubs.get(result_topic or "")
+        if publisher is None:
+            self.get_logger().error(f"命令 {command_topic} 没有结果话题")
+            return
         msg = String()
-        msg.data = json.dumps(data, ensure_ascii=False)
-        self._grasp_result_pub.publish(msg)
-        self.get_logger().info(f"发布抓取结果 {GRASP_CMD_RESULT_TOPIC}: {msg.data}")
+        msg.data = json.dumps({"result": bool(result)}, ensure_ascii=False)
+        publisher.publish(msg)
+        self.get_logger().info(f"发布阶段结果 {result_topic}: {msg.data}")
+
+    def wait_for_operator(self, message: str = "按回车继续 …") -> None:
+        """上位机模式不阻塞；--interactive 调试模式保留人工确认。"""
+        if self.upper_control_mode:
+            return
+        self.get_logger().info(message)
+        try:
+            input()
+        except EOFError:
+            pass
 
     def move_body_joint2(self, angle_rad: float, speed_scale: float = 0.5) -> bool:
         """读取 body 组当前位置，只改变 body_joint2 后做关节空间规划执行。"""
@@ -4795,11 +4870,7 @@ class G01Demo(Node):
             log.error(f"[pick] 运动到 {yubei_name} 失败")
             return False
 
-        log.info("按回车继续 …")
-        try:
-            input()
-        except EOFError:
-            pass
+        self.wait_for_operator()
 
         log.info(f"[pick] 6/9  {arm_group} 笛卡尔直线 → {place_name}（不考虑碰撞）")
         current = self._get_joints(arm_joint_names, wait_new=True)
@@ -4835,11 +4906,7 @@ class G01Demo(Node):
             + ", ".join(f"{n}={v:.3f}" for n, v in zip(arm_joint_names, fang_joints))
         )
 
-        log.info("按回车继续 …")
-        try:
-            input()
-        except EOFError:
-            pass
+        self.wait_for_operator()
 
         tool_side = tool_side_for_link(link)
         if tool_side is None:
@@ -5091,10 +5158,7 @@ class G01Demo(Node):
             f"（{len(approach_traj.joint_trajectory.points)} 点，免重规划）"
         )
 
-        try:
-            input()
-        except EOFError:
-            pass
+        self.wait_for_operator()
 
         approach_distance = _pose_distance(pre_pose, target_pose)
         approach_result = self._execute_approach_with_force_guard(
@@ -5152,11 +5216,7 @@ class G01Demo(Node):
             plan_frame=plan_frame,
             joint_names=joint_names,
         )
-        log.info("[pick] 3/9  到达抓取位置，工具已上电，按回车继续 …")
-        try:
-            input()
-        except EOFError:
-            pass
+        self.wait_for_operator("[pick] 3/9  到达抓取位置，工具已上电，按回车继续 …")
 
         log.info("[pick] 4/9  反向播放 approach，直线复位回 q_pre")
         retreat_approach = self._reverse_trajectory(approach_traj)
@@ -5202,10 +5262,7 @@ class G01Demo(Node):
             f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定吸附成功，继续放置"
         )
 
-        try:
-            input()
-        except EOFError:
-            pass
+        self.wait_for_operator()
 
         if not self.add_frame_cutoff_only_for_pose(
             target_pose,
@@ -5224,11 +5281,7 @@ class G01Demo(Node):
                 + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
             )
             
-            log.info("[pick] 3/9  到达抓取位置，按回车继续 …")
-            try:
-                input()
-            except EOFError:
-                pass
+            self.wait_for_operator("[pick] 3/9  到达抓取位置，按回车继续 …")
 
             exchange_q3 = EXCHANGE_Q3.get(tool_side)
             if exchange_q3 is None:
@@ -5358,11 +5411,7 @@ class G01Demo(Node):
             f"{z_down_distance:.3f} m"
         )
 
-        log.info("按回车继续 …")
-        try:
-            input()
-        except EOFError:
-            pass
+        self.wait_for_operator()
 
         current = self._get_joints(source_joint_names, wait_new=True)
         if current is None:
@@ -5396,11 +5445,7 @@ class G01Demo(Node):
             log.error(f"[exchange] {source_group} z 向下直线执行失败")
             return False
 
-        log.info("按回车继续 …")
-        try:
-            input()
-        except EOFError:
-            pass
+        self.wait_for_operator()
 
         if not self.set_tool_power(source_side, 0):
             log.error(f"[exchange] {source_label}工具下电失败")
@@ -5438,18 +5483,26 @@ class G01Demo(Node):
 # =============================================================================
 
 
-def split_sim_args(argv: list[str] | None = None) -> tuple[bool, list[str]]:
-    """取出脚本自己的 --sim，其余参数继续交给 rclpy。"""
+def split_runtime_args(
+    argv: list[str] | None = None,
+) -> tuple[bool, bool, list[str]]:
+    """取出 --sim/--interactive，其余参数继续交给 rclpy。"""
     raw_args = list(sys.argv if argv is None else argv)
     sim_mode = "--sim" in raw_args
-    ros_args = [arg for arg in raw_args if arg != "--sim"]
-    return sim_mode, ros_args
+    upper_control_mode = "--interactive" not in raw_args
+    ros_args = [
+        arg for arg in raw_args if arg not in ("--sim", "--interactive")
+    ]
+    return sim_mode, upper_control_mode, ros_args
 
 
 def main(argv: list[str] | None = None) -> int:
-    sim_mode, ros_args = split_sim_args(argv)
+    sim_mode, upper_control_mode, ros_args = split_runtime_args(argv)
     rclpy.init(args=ros_args)
-    node = G01Demo(sim_mode=sim_mode)
+    node = G01Demo(
+        sim_mode=sim_mode,
+        upper_control_mode=upper_control_mode,
+    )
     log = node.get_logger()
     if sim_mode:
         log.info(
@@ -5466,22 +5519,13 @@ def main(argv: list[str] | None = None) -> int:
             log.warning(f"清理「{FRAME_CUTOFF_ID}」/「{GRASP_OBJECT_COLLISION_ID}」失败")
 
     def prompt_exit(message: str) -> bool:
+        if node.upper_control_mode:
+            return False
         log.info(message)
         try:
             return input().strip().lower() == "q"
         except EOFError:
             return False
-
-    def prompt_workflow(message: str) -> str:
-        """1 选择深框识别并连续抓取，2 选择原下料流程，q 退出。"""
-        log.info(message)
-        try:
-            return input().strip().lower()
-        except EOFError:
-            return "q"
-
-    def publish_attempt_result(result: bool, success_grasp_number: int) -> None:
-        node.publish_grasp_cmd_result(result, success_grasp_number)
 
     def recognize_and_add_deep_frame() -> bool:
         """先运动到 框_Q1，再发送 p,4 并用识别结果重建深框碰撞场景。"""
@@ -5725,12 +5769,10 @@ def main(argv: list[str] | None = None) -> int:
                     f"[frame-batch] SW1~SW4 已无空位，连续抓取正常结束；"
                     f"本批次成功 {success_count} 次"
                 )
-                publish_attempt_result(True, success_count)
                 return True
 
             if grasp_result:
                 success_count += 1
-            publish_attempt_result(grasp_result, success_count)
             if (
                 not grasp_result
                 and node.last_pick_failure_reason in (
@@ -5953,10 +5995,7 @@ def main(argv: list[str] | None = None) -> int:
             log.error(f"[unload] 合并双臂 Cartesian 轨迹失败: {exc}")
             return False
 
-        try:
-            input("按回车执行双臂同步直线取料: ")
-        except EOFError:
-            pass
+        node.wait_for_operator("按回车执行双臂同步直线取料: ")
 
         log.info(
             f"[unload] 一次执行双臂沿末端 +Z 直线："
@@ -5967,10 +6006,7 @@ def main(argv: list[str] | None = None) -> int:
             log.error("[unload] 双臂同步直线取料失败")
             return False
 
-        try:
-            input("按回车给左右末端上电: ")
-        except EOFError:
-            pass
+        node.wait_for_operator("按回车给左右末端上电: ")
 
         if not set_unload_tool_power(1, "取料"):
             return False
@@ -6145,13 +6181,10 @@ def main(argv: list[str] | None = None) -> int:
                 log.error(f"[unload] {label} 联合轨迹执行失败")
                 return False
 
-            try:
-                input(
-                    f"已到物料台左点{left_point}/右点{right_point}，"
-                    "按回车执行双臂末端局部 +Z 10 cm 同步下降: "
-                )
-            except EOFError:
-                pass
+            node.wait_for_operator(
+                f"已到物料台左点{left_point}/右点{right_point}，"
+                "按回车执行双臂末端局部 +Z 10 cm 同步下降: "
+            )
 
             log.info(
                 "[unload] 执行已预检的双臂同步放置直线："
@@ -6162,13 +6195,10 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("[unload] 双臂同步直线下降放置失败")
                 return False
 
-            try:
-                input(
-                    f"已下降到物料台左点{left_point}/右点{right_point}，"
-                    "按回车给双臂下电: "
-                )
-            except EOFError:
-                pass
+            node.wait_for_operator(
+                f"已下降到物料台左点{left_point}/右点{right_point}，"
+                "按回车给双臂下电: "
+            )
             if not set_unload_tool_power(
                 0,
                 f"物料台左点{left_point}/右点{right_point}放置",
@@ -6565,81 +6595,62 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("[unload] 移除料台/台面薄长方体/墙状障碍物失败")
 
     try:
-
-        # 上位机通信
-        # grasp_cmd = node.wait_for_grasp_start()
-        # if grasp_cmd is None:
-        #     return 1
-
-        log.info("[startup] 键盘输入前先清除本程序管理的场景障碍物 …")
+        log.info("[startup] 上位机控制模式启动前先清除本程序管理的场景障碍物 …")
         node.clear_managed_scene_objects()
         frame_added = False
+        code = 0
 
-        workflow = prompt_workflow(
-            "输入 1：导航到深框工位，p,4 识别并抓取至 SW 无空位；"
-            "输入 2：导航到物料台工位并执行下料流程；输入 q 退出 …"
-        )
-        while workflow != "q":
-            # if workflow in NAV_GOAL_POSES and not node.navigate_and_wait(workflow):
-            #     if workflow == "1":
-            #         publish_attempt_result(False, 0)
-            #     workflow = prompt_workflow(
-            #         "导航未成功；输入 1 重试深框工位，"
-            #         "输入 2 重试物料台工位，输入 q 退出 …"
-            #     )
-            #     continue
+        while rclpy.ok():
+            queued_command = node.wait_for_upper_command()
+            if queued_command is None:
+                break
+            command_topic, payload = queued_command
 
-            if workflow == "1":
-                if not recognize_and_add_deep_frame():
-                    publish_attempt_result(False, 0)
-                    workflow = prompt_workflow(
-                        "深框识别或场景添加失败；输入 1 重试，"
-                        "输入 2 执行原下料流程，输入 q 退出 …"
-                    )
-                    continue
+            if command_topic == MOVE_TO_GRASP_POSE_CMD_TOPIC:
+                nav_ok = node.navigate_and_wait(NAV_TARGET_GRASP)
+                node.publish_upper_result(command_topic, nav_ok)
+                continue
 
-                log.info("按回车继续 …")
-                try:
-                    input()
-                except EOFError:
-                    pass
+            if command_topic == GRASP_CMD_TOPIC:
+                log.info(
+                    f"[upper] 开始抓满四个放置位；命令参数="
+                    f"{json.dumps(payload, ensure_ascii=False)}"
+                )
+                grasp_ok = recognize_and_add_deep_frame()
+                if grasp_ok:
+                    grasp_ok = run_grasps_until_no_empty_slot() is True
+                node.publish_upper_result(command_topic, grasp_ok)
+                continue
 
-                batch_result = run_grasps_until_no_empty_slot()
-                if batch_result is None:
-                    code = 0
-                    break
-                if batch_result:
-                    code = 0
+            if command_topic == MOVE_TO_PLACE_POSE_CMD_TOPIC:
+                nav_ok = node.navigate_and_wait(NAV_TARGET_PLACE)
+                node.publish_upper_result(command_topic, nav_ok)
+                continue
 
-            elif workflow == "2":
+            if command_topic == PLACE_CMD_TOPIC:
                 # 下料使用 p,2 识别得到的取料台场景，不保留上料深框。
+                scene_ok = True
                 if frame_added:
                     log.info(f"切换下料，移除上料碰撞体「{FRAME_ID}」…")
-                    if not node.remove_frame():
+                    scene_ok = node.remove_frame()
+                    if scene_ok:
+                        frame_added = False
+                    else:
                         log.error("切换下料时移除上料碰撞体失败")
-                        workflow = prompt_workflow(
-                            "场景切换失败；输入 1 重新识别深框，"
-                            "输入 2 重试原下料流程，输入 q 退出 …"
-                        )
-                        continue
-                    frame_added = False
+                place_ok = run_one_unload() if scene_ok else False
+                node.publish_upper_result(command_topic, place_ok)
+                continue
 
-                unload_result = run_one_unload()
-                if unload_result:
-                    code = 0
-            else:
-                log.warning(
-                    f"未知输入 {workflow!r}：1=深框识别并抓取至SW无空位，"
-                    "2=原下料流程，q=退出"
+            if command_topic == RETURN_INIT_POSE_TOPIC:
+                log.info(
+                    "[upper] 收到 return_init_pose，导航到 map 起点 "
+                    "(0, 0, 0, 0, 0, 0, 1)；按协议不发布结果"
                 )
+                if not node.navigate_and_wait(NAV_TARGET_INIT):
+                    log.error("[upper] 返回起点导航失败（按协议不发布结果）")
+                continue
 
-            workflow = prompt_workflow(
-                "输入 1：导航后重新识别深框并抓取至 SW 无空位；"
-                "输入 2：导航后执行原下料流程；输入 q 退出 …"
-            )
-
-        if workflow == "q":
-            code = 0
+            log.error(f"未处理的上位机命令话题: {command_topic}")
 
     finally:
         cleanup_grasp_display(remove_scene_objects=frame_added)
