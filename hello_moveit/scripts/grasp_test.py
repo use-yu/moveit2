@@ -6620,28 +6620,28 @@ def main(argv: list[str] | None = None) -> int:
                     f"[upper] 开始抓满四个放置位；命令参数="
                     f"{json.dumps(payload, ensure_ascii=False)}"
                 )
-                # grasp_ok = recognize_and_add_deep_frame()
-                # if grasp_ok:
-                #     grasp_ok = run_grasps_until_no_empty_slot() is True
+                grasp_ok = recognize_and_add_deep_frame()
+                if grasp_ok:
+                    grasp_ok = run_grasps_until_no_empty_slot() is True
                 node.publish_upper_result(command_topic, True)
                 continue
 
             if command_topic == MOVE_TO_PLACE_POSE_CMD_TOPIC:
-                # nav_ok = node.navigate_and_wait(NAV_TARGET_PLACE)
+                nav_ok = node.navigate_and_wait(NAV_TARGET_PLACE)
                 node.publish_upper_result(command_topic, True)
                 continue
 
             if command_topic == PLACE_CMD_TOPIC:
                 # 下料使用 p,2 识别得到的取料台场景，不保留上料深框。
-                # scene_ok = True
-                # if frame_added:
-                #     log.info(f"切换下料，移除上料碰撞体「{FRAME_ID}」…")
-                #     scene_ok = node.remove_frame()
-                #     if scene_ok:
-                #         frame_added = False
-                #     else:
-                #         log.error("切换下料时移除上料碰撞体失败")
-                # place_ok = run_one_unload() if scene_ok else False
+                scene_ok = True
+                if frame_added:
+                    log.info(f"切换下料，移除上料碰撞体「{FRAME_ID}」…")
+                    scene_ok = node.remove_frame()
+                    if scene_ok:
+                        frame_added = False
+                    else:
+                        log.error("切换下料时移除上料碰撞体失败")
+                place_ok = run_one_unload() if scene_ok else False
                 node.publish_upper_result(command_topic, True)
                 continue
 
@@ -6650,9 +6650,9 @@ def main(argv: list[str] | None = None) -> int:
                     "[upper] 收到 return_init_pose，导航到 map 起点 "
                     "(0, 0, 0, 0, 0, 0, 1)；按协议不发布结果"
                 )
-                # if not node.navigate_and_wait(NAV_TARGET_INIT):
-                #     log.error("[upper] 返回起点导航失败（按协议不发布结果）")
-                # continue
+                if not node.navigate_and_wait(NAV_TARGET_INIT):
+                    log.error("[upper] 返回起点导航失败（按协议不发布结果）")
+                continue
 
             log.error(f"未处理的上位机命令话题: {command_topic}")
 
