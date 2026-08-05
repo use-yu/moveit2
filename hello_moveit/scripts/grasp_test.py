@@ -772,7 +772,7 @@ GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增
 FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
 APPROACH_FORCE_GUARD_DISTANCE = 0.07  # 从 q_pre 起前 9 cm 使用小阈值 [m]
 APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 15.0  # 前 9 cm 的 Fz 减小阈值 [N]
-APPROACH_FORCE_Z_DROP_ALL_THRESHOLD = 200.0  # 整段接近的 Fz 减小阈值 [N]
+APPROACH_FORCE_Z_DROP_ALL_THRESHOLD = 210.0  # 整段接近的 Fz 减小阈值 [N]
 SERVOJ_CONTROL_ACK_TIMEOUT_SEC = 2.0
 APPROACH_CANCEL_TIMEOUT_SEC = 5.0
 SERVOJ_RECOVERY_SETTLE_SEC = 0.12
@@ -821,10 +821,10 @@ NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
 # 下面会转成平移单位为毫米的 4x4 矩阵，与 viewer pose 的毫米单位保持一致。
 VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
-    -0.150665, -0.147699, -0.137334, 0.654304, -0.254175, -0.659826, -0.268161
+    -0.161808, -0.157540, -0.132602, 0.657557, -0.266621, -0.652446, -0.266170
 ]
 VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
-    0.152736, -0.146261, -0.214731, 0.657772, -0.272723, 0.653477, 0.256760
+    0.164052, -0.156038, -0.219171, 0.650271, -0.270801, 0.656813, 0.269093
 ]
 # 左臂抓
 SIM_VISION_RESULT = (
@@ -5140,7 +5140,12 @@ class G01Demo(Node):
         if to_pre_traj is None or not to_pre_traj.joint_trajectory.points:
             log.error("[pick] 1/9 未返回 OMPL 轨迹，无法原路退回初始位置")
             return False
-
+        
+        time.sleep(1)
+        try:
+            input()
+        except EOFError:
+            pass
         log.info(
             f"[pick] 2/9  已到 q_pre，{tool_label}工具上电并读取吸附前 Fz 基准"
         )
@@ -6189,7 +6194,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"已到物料台左点{left_point}/右点{right_point}，"
                 "按回车执行双臂末端局部 +Z 10 cm 同步下降: "
             )
-
+            try:
+                input()
+            except EOFError:
+                pass
             log.info(
                 "[unload] 执行已预检的双臂同步放置直线："
                 f"左右末端局部 +Z {UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m"

@@ -424,7 +424,7 @@
   <joint name="${prefix}tool_to_${link_prefix}6" type="fixed">
     <parent link="${link_prefix}6" />
     <child link="${prefix}tool" />
-    <origin xyz="0 0 0.124" rpy="0 0 1.5708" />
+    <origin xyz="0 0 0.126" rpy="0 0 1.5708" />
   </joint>
   </xacro:macro>
 </robot>
