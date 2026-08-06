@@ -8,7 +8,9 @@ G01 MoveIt 演示脚本
 /move_to_grasp_pose_cmd：导航到深框工位，导航结束发布对应 result。
 /grasp_cmd：关节空间运动到 框_Q1，
         再发送 p,4 识别深框，
-        按识别坐标重建深框障碍物并持续上料，直到 SW1~SW4 没有空位：
+        按识别坐标重建深框障碍物，
+        再以 20Hz 发布 [0.1, 0.0] 1.5s 并停车，
+        随后持续上料，直到 SW1~SW4 没有空位：
     机器人先到初始位
     → 读取视觉点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
@@ -112,7 +114,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import ColorRGBA, Float32MultiArray, String, UInt8
+from std_msgs.msg import ColorRGBA, Float32MultiArray, Float64MultiArray, String, UInt8
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker
@@ -317,8 +319,8 @@ if not POSE_START_JOINTS:
 
 # p,4 深框识别专用预备构型，顺序与 dual_arm_body 一致。
 框_Q1 = [
-    0.13,
-    50 * math.pi / 180,
+    0.0,
+    20 * math.pi / 180,
     -1.57,
     -0.15,
     -1.578090,
@@ -370,24 +372,24 @@ DEFAULT_SPEED_SCALE = 0.5
 # 深框障碍物（相对于 moveit_base_link 发布）
 SCENE_FRAME = "moveit_base_link"
 FRAME_ID = "深框"
-FRAME_SIZE = (0.795, 0.795, 0.565)  # 深框整体外尺寸：长×宽×高 [m]
-WALL_T = 0.035  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
+FRAME_SIZE = (1.1, 1.1, 0.86)  # 深框整体外尺寸：长×宽×高 [m]
+WALL_T = 0.05  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 相对于 moveit_base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 
 # p,4 识别位姿先绕自身 Z 轴 +90°，再沿旋转后的自身坐标平移，
 # 得到深框顶部空心区域中心；该坐标点位于开口中，不落在框壁实体上。
-FRAME_VISION_TRIGGER_COMMAND = "p,4"
+FRAME_VISION_TRIGGER_COMMAND = "p,7"
 FRAME_VISION_POSE_KEY = "right_body"
 FRAME_VISION_TF_FRAME = "deep_frame_vision"
 FRAME_TOP_CENTER_TF_FRAME = "deep_frame_top_center"
 FRAME_CENTER_TF_FRAME = "deep_frame_center"
-FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0
+FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0 *0
 FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
-    0.385,
+    0.53-0.35,
     0.0,
-    0.065,
+    0.05,
 )
 # 长方体上表面中心相对深框顶部空心区域中心的局部平移。
 BOX_OBSTACLE_ID = "长方体障碍物"
@@ -439,6 +441,11 @@ RETURN_INIT_POSE_TOPIC = "/return_init_pose"
 DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
 NAV_GOAL_TOPIC = "/goal_pose"
 NAV_RESULT_TOPIC = "/nav_result"
+AGV_AUTO_CONTROL_SPEED_TOPIC = "/agv_auto_control_speed"
+AGV_FORWARD_SPEED_MPS = 0.1
+AGV_ROTATION_SPEED_RADPS = 0.0
+AGV_SPEED_PUBLISH_HZ = 20.0
+AGV_FORWARD_DURATION_SEC = 3.5
 NAV_TARGET_GRASP = "grasp"
 NAV_TARGET_PLACE = "place"
 NAV_TARGET_INIT = "init"
@@ -457,28 +464,28 @@ UPPER_COMMAND_RESULT_TOPICS = {
 NAV_GOAL_POSES = {
     NAV_TARGET_GRASP: {
         "position": (
-            4.175657272338867,
-            -5.886521816253662,
-            0.13951128721237183,
+            1.8139628171920776,
+            -1.5662699937820435,
+            0.038682736456394196,
         ),
         "orientation": (
-            -0.0035754789132624865,
-            -0.01661425270140171,
-            -0.7105110883712769,
-            0.7036274075508118,
+            -0.005365730728954077,
+            0.013535164296627045,
+            0.9996762275695801,
+            0.015394207090139389,
         ),
     },
     NAV_TARGET_PLACE: {
         "position": (
-            5.975770950317383,
-            -5.743568420410156,
-            0.2258175164461136,
+            1.3109312057495117,
+            -3.812164068222046,
+            0.04256782308220863,
         ),
         "orientation": (
-            0.005080036353319883,
-            -0.003726406954228878,
-            -0.7001469731330872,
-            0.7138881683349609,
+            -0.006499480456113815,
+            0.014839546754956245,
+            0.9996234178543091,
+            0.024502452462911606,
         ),
     },
     NAV_TARGET_INIT: {
@@ -2382,6 +2389,11 @@ class G01Demo(Node):
             NAV_GOAL_TOPIC,
             10,
         )
+        self._agv_speed_pub = self.create_publisher(
+            Float64MultiArray,
+            AGV_AUTO_CONTROL_SPEED_TOPIC,
+            10,
+        )
         self._upper_result_pubs = {
             result_topic: self.create_publisher(String, result_topic, 10)
             for result_topic in UPPER_COMMAND_RESULT_TOPICS.values()
@@ -2484,6 +2496,53 @@ class G01Demo(Node):
             return False
 
         return False
+
+    def move_agv_after_deep_frame_recognition(self) -> bool:
+        """深框识别后匀速前进一小段，并在结束时明确发送停车指令。"""
+        period_sec = 1.0 / AGV_SPEED_PUBLISH_HZ
+        sample_count = max(
+            1,
+            int(round(AGV_FORWARD_DURATION_SEC * AGV_SPEED_PUBLISH_HZ)),
+        )
+        speed_command = Float64MultiArray(
+            data=[AGV_FORWARD_SPEED_MPS, AGV_ROTATION_SPEED_RADPS]
+        )
+        stop_command = Float64MultiArray(data=[0.0, 0.0])
+        start_time = time.monotonic()
+        completed = False
+
+        self.get_logger().info(
+            f"[frame-vision][agv] 向 {AGV_AUTO_CONTROL_SPEED_TOPIC} 以 "
+            f"{AGV_SPEED_PUBLISH_HZ:g} Hz 发布 "
+            f"[{AGV_FORWARD_SPEED_MPS:.3f}, {AGV_ROTATION_SPEED_RADPS:.3f}]，"
+            f"持续 {AGV_FORWARD_DURATION_SEC:.3f} s"
+        )
+        try:
+            for sample_index in range(sample_count):
+                publish_time = start_time + sample_index * period_sec
+                while rclpy.ok():
+                    remaining = publish_time - time.monotonic()
+                    if remaining <= 0.0:
+                        break
+                    rclpy.spin_once(self, timeout_sec=min(remaining, period_sec))
+                if not rclpy.ok():
+                    return False
+                self._agv_speed_pub.publish(speed_command)
+
+            end_time = start_time + AGV_FORWARD_DURATION_SEC
+            while rclpy.ok():
+                remaining = end_time - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                rclpy.spin_once(self, timeout_sec=min(remaining, period_sec))
+            completed = rclpy.ok()
+            return completed
+        finally:
+            self._agv_speed_pub.publish(stop_command)
+            self.get_logger().info(
+                f"[frame-vision][agv] 已向 {AGV_AUTO_CONTROL_SPEED_TOPIC} 发布 "
+                f"[0.0, 0.0]；速度段{'完成' if completed else '中止'}"
+            )
 
     def _on_driver_signal(self, msg: UInt8):
         """缓存驱动板 UInt8 信号；SW 位非 0=空，SW 位为 0=已有物体。"""
@@ -6629,6 +6688,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"{json.dumps(payload, ensure_ascii=False)}"
                 )
                 grasp_ok = recognize_and_add_deep_frame()
+                # if grasp_ok:
+                #     grasp_ok = node.move_agv_after_deep_frame_recognition()
                 if grasp_ok:
                     grasp_ok = run_grasps_until_no_empty_slot() is True
                 node.publish_upper_result(command_topic, True)
@@ -6654,12 +6715,12 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             if command_topic == RETURN_INIT_POSE_TOPIC:
-                log.info(
-                    "[upper] 收到 return_init_pose，导航到 map 起点 "
-                    "(0, 0, 0, 0, 0, 0, 1)；按协议不发布结果"
-                )
-                if not node.navigate_and_wait(NAV_TARGET_INIT):
-                    log.error("[upper] 返回起点导航失败（按协议不发布结果）")
+                # log.info(
+                #     "[upper] 收到 return_init_pose，导航到 map 起点 "
+                #     "(0, 0, 0, 0, 0, 0, 1)；按协议不发布结果"
+                # )
+                # if not node.navigate_and_wait(NAV_TARGET_INIT):
+                #     log.error("[upper] 返回起点导航失败（按协议不发布结果）")
                 continue
 
             log.error(f"未处理的上位机命令话题: {command_topic}")
