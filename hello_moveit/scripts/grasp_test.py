@@ -511,26 +511,30 @@ DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 
 # 下料流程：双臂成对取料，并把每对上料位固定绑定到物料台放置点。
 # 格式：(右臂 SW, 左臂 SW, 左臂物料台点, 右臂物料台点)
-#   SW1 + SW3 只能放物料台点 1/4：SW3→点1，SW1→点4
-#   SW2 + SW4 只能放物料台点 2/3：SW2→点2，SW4→点3
-UNLOAD_TRIGGER_COMMAND = "p,2"
+#   SW1 + SW3 只能放物料台点 1/3：SW3→点1，SW1→点3
+#   SW2 + SW4 只能放物料台点 2/4：SW2→点2，SW4→点4
+UNLOAD_TRIGGER_COMMAND = "p,8"
 UNLOAD_VISION_POSE_KEY = "right_body"
 UNLOAD_VISION_TF_FRAME = "material_table_vision"
 UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
 UNLOAD_PAIR_ROUTES = (
-    ("sw1", "sw3", 1, 4),
-    ("sw4", "sw2", 2, 3),
+    ("sw1", "sw3", 1, 3),
+    ("sw4", "sw2", 2, 4),
 )
 UNLOAD_TABLE_ID = "unload_table"
-UNLOAD_TABLE_SIZE = (0.6, 1.7, 1.0)
-UNLOAD_RECOGNITION_ABOVE_TABLE = -0.045
-UNLOAD_TABLE_LOCAL_RPY = (0.0, math.pi, math.pi / 2.0)  # 局部 Y=180°，Z=90°
+UNLOAD_TABLE_SIZE = (0.64, 1.2, 0.98)
+UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL = (
+    0.0,
+    0.1125,
+    0.09,
+)
+UNLOAD_TABLE_LOCAL_RPY = (0.0, 0.0, 0.0)  # 局部 Y=180°，Z=90°
 UNLOAD_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
 UNLOAD_TABLE_TOP_BOX_ID = "unload_table_top_box"
 UNLOAD_TABLE_TOP_BOX_SIZE = (
     UNLOAD_TABLE_SIZE[0],
     UNLOAD_TABLE_SIZE[1],
-    0.035,
+    0.0,
 )
 UNLOAD_TABLE_TOP_BOX_COLOR = ColorRGBA(
     r=0.72,
@@ -542,7 +546,7 @@ UNLOAD_OBSTACLE_ID = "unload_vision_y_obstacle"
 UNLOAD_OBSTACLE_SIZE = (1.5, 0.2, 3.0)
 UNLOAD_OBSTACLE_Y_OFFSET = 1.2
 UNLOAD_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=0.85)
-UNLOAD_APPROACH_DISTANCE = 0.10
+UNLOAD_APPROACH_DISTANCE = 0.15
 UNLOAD_PLACE_DESCENT_DISTANCE = 0.10
 # 上料放置位抓取
 UNLOAD_EXTRA_APPROACH_BY_SLOT = {
@@ -552,7 +556,8 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
     "sw4": 0.005,  # 右臂：多降 8 mm
 }
 # 注意是相对于桌子坐标系
-# 物料台放置点：在 material_table_top 桌子坐标系下的 xyz 偏移 [m] 和局部 yaw。
+# 物料台放置点：在 material_table_top 桌子坐标系下的 xyz 偏移 [m] 和局部旋转。
+UNLOAD_PLACE_LOCAL_PITCH = math.pi
 UNLOAD_PLACE_LOCAL_YAWS = {
     1: math.radians(204.5),
     2: math.radians(204.5),
@@ -561,10 +566,10 @@ UNLOAD_PLACE_LOCAL_YAWS = {
 }
 # 注意这里1234和机器人sw不一样
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    1: (0.1 + 0.005782-0.011, 0.325-0.338809+0.345293-0.002, -0.16 + 1.115998 - 1.070837-0.01),
-    2: (0.1 + 0.653630-0.656605+0.002, 0.125-0.138855+0.146165-0.002, -0.16+1.206160-1.071223-0.1),
-    3: (0.1 + 0.643439-0.655317+0.008, -0.125+0.110927-0.111151+0.002, -0.16+1.203874-1.073237-0.1),
-    4: (0.1 + 0.644717-0.649813+0.003, -0.325+0.310772-0.311753+0.004, -0.16+1.109917-1.074118-0.01),
+    1: (0.0, 0.225+0.1125, 0.05),
+    2: (0.0, 0.1125, 0.05),
+    3: (0.0, -0.1125, 0.05),
+    4: (0.0, -0.225 - 0.1125, 0.05),
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
@@ -1711,10 +1716,10 @@ def make_box_obstacle(box_top_pose: Pose) -> CollisionObject:
 
 
 def make_unload_table_top_pose(recognition_pose: Pose) -> Pose:
-    """桌面中心沿视觉 -Z 偏移，姿态再相对视觉绕局部 Y=180°、Z=90°。"""
-    translated = pose_offset_local_z(
+    """桌面中心按配置的视觉局部 xyz 偏移，再施加局部旋转。"""
+    translated = pose_offset_local(
         recognition_pose,
-        -UNLOAD_RECOGNITION_ABOVE_TABLE,
+        *UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL,
     )
     return pose_rotate_local_rpy(translated, *UNLOAD_TABLE_LOCAL_RPY)
 
@@ -1786,13 +1791,13 @@ def make_unload_obstacle(recognition_pose: Pose) -> CollisionObject:
 
 
 def make_unload_place_poses(recognition_pose: Pose) -> dict[int, Pose]:
-    """以桌面为基准，按各点配置的偏移和局部 Z 轴 yaw 生成四个放置位姿。"""
+    """以桌面为基准，按各点偏移和局部 pitch/yaw 生成四个放置位姿。"""
     table_top_pose = make_unload_table_top_pose(recognition_pose)
     return {
         point_index: pose_rotate_local_rpy(
             pose_offset_local(table_top_pose, *local_offset),
             0.0,
-            0.0,
+            UNLOAD_PLACE_LOCAL_PITCH,
             UNLOAD_PLACE_LOCAL_YAWS[point_index],
         )
         for point_index, local_offset in UNLOAD_PLACE_LOCAL_OFFSETS.items()
@@ -6583,10 +6588,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         for point_index, point_pose in place_poses.items():
             local_offset = UNLOAD_PLACE_LOCAL_OFFSETS[point_index]
+            local_pitch_deg = math.degrees(UNLOAD_PLACE_LOCAL_PITCH)
             local_yaw_deg = math.degrees(UNLOAD_PLACE_LOCAL_YAWS[point_index])
             log.info(
                 f"[unload] 物料台点{point_index} table_local={local_offset}, "
-                f"local_yaw={local_yaw_deg:.1f} deg, "
+                f"local_rpy=(0.0, {local_pitch_deg:.1f}, "
+                f"{local_yaw_deg:.1f}) deg, "
                 f"base=({point_pose.position.x:.4f}, "
                 f"{point_pose.position.y:.4f}, {point_pose.position.z:.4f})"
             )
@@ -6696,7 +6703,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             if command_topic == MOVE_TO_PLACE_POSE_CMD_TOPIC:
-                nav_ok = node.navigate_and_wait(NAV_TARGET_PLACE)
+                # nav_ok = node.navigate_and_wait(NAV_TARGET_PLACE)
                 node.publish_upper_result(command_topic, True)
                 continue
 
