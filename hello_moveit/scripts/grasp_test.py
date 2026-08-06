@@ -337,8 +337,8 @@ if not POSE_START_JOINTS:
 
 # 每轮抓取使用的预备构型。
 GRASP_Q1 = [
-    0.0,
-    30 * math.pi / 180,
+    0.1,
+    15 * math.pi / 180,
     -1.57,
     -0.15,
     -1.578090,
@@ -778,7 +778,7 @@ PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距�
 GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增量阈值 [N]
 FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
 APPROACH_FORCE_GUARD_DISTANCE = 0.07  # 从 q_pre 起前 9 cm 使用小阈值 [m]
-APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 15.0  # 前 9 cm 的 Fz 减小阈值 [N]
+APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 40.0  # 前 9 cm 的 Fz 减小阈值 [N]
 APPROACH_FORCE_Z_DROP_ALL_THRESHOLD = 210.0  # 整段接近的 Fz 减小阈值 [N]
 SERVOJ_CONTROL_ACK_TIMEOUT_SEC = 2.0
 APPROACH_CANCEL_TIMEOUT_SEC = 5.0
@@ -5200,7 +5200,7 @@ class G01Demo(Node):
             log.error("[pick] 1/9 未返回 OMPL 轨迹，无法原路退回初始位置")
             return False
         
-        time.sleep(1)
+        time.sleep(2)
         try:
             input()
         except EOFError:
@@ -6678,7 +6678,7 @@ def main(argv: list[str] | None = None) -> int:
             command_topic, payload = queued_command
 
             if command_topic == MOVE_TO_GRASP_POSE_CMD_TOPIC:
-                # nav_ok = node.navigate_and_wait(NAV_TARGET_GRASP)
+                nav_ok = node.navigate_and_wait(NAV_TARGET_GRASP)
                 node.publish_upper_result(command_topic, True)
                 continue
 
@@ -6688,8 +6688,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"{json.dumps(payload, ensure_ascii=False)}"
                 )
                 grasp_ok = recognize_and_add_deep_frame()
-                # if grasp_ok:
-                #     grasp_ok = node.move_agv_after_deep_frame_recognition()
+                if grasp_ok:
+                    grasp_ok = node.move_agv_after_deep_frame_recognition()
                 if grasp_ok:
                     grasp_ok = run_grasps_until_no_empty_slot() is True
                 node.publish_upper_result(command_topic, True)
