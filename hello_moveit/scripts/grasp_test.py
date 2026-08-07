@@ -5,12 +5,12 @@
 G01 MoveIt 演示脚本
 
 功能（由上位机话题分阶段触发）：
-/move_to_grasp_pose_cmd：导航到深框工位，导航结束发布对应 result。
-/grasp_cmd：关节空间运动到 框_Q1，
+/move_to_grasp_pose_cmd：dual_arm_body 先运动到复位位姿，导航到深框工位，
+        然后关节空间运动到 框_Q1，
         再发送 p,4 识别深框，
         按识别坐标重建深框障碍物，
-        再以 20Hz 发布 [0.1, 0.0] 1.5s 并停车，
-        随后持续上料，直到 SW1~SW4 没有空位：
+        再以 20Hz 发布 [0.1, 0.0] 3.5s 并停车，
+/grasp_cmd：持续上料，直到 SW1~SW4 没有空位：
     机器人先到初始位
     → 读取视觉点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
@@ -28,7 +28,7 @@ G01 MoveIt 演示脚本
     下料读取最新 SW 信号，0=有料。
     优先取右臂 SW1 + 左臂 SW3，其次右臂 SW4 + 左臂 SW2；必须整对有料。
     发送 p,2 识别。
-    添加 0.6×1.5×1.0m 取料台和 1.5×0.2×3.0m 障碍物。
+    添加 0.64×1.2×0.98m 取料台。
     拼接对应 SW 的 yubei，腰部、升降均设为 0。
     双臂分别计算末端 +Z 10cm 的 IK/Cartesian 路径，合成一条 12 关节轨迹，一次执行。
     两个末端上电后，反向同一轨迹直线复位。
@@ -317,6 +317,24 @@ POSE_START_JOINTS = list(JOINT_TARGETS.get(POSE_GROUP, {}).keys())
 if not POSE_START_JOINTS:
     raise KeyError(f"JOINT_TARGETS 中未找到 POSE_GROUP={POSE_GROUP} 的关节列表")
 
+# /move_to_grasp_pose_cmd 第一步使用的复位构型，顺序与 dual_arm_body 一致。
+MOVE_TO_GRASP_RESET_Q = [
+    0.0,
+    0 * math.pi / 180,
+    -90 * math.pi / 180,
+    80 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    90 * math.pi / 180,
+    -80 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+]
+
 # p,4 深框识别专用预备构型，顺序与 dual_arm_body 一致。
 框_Q1 = [
     0.0,
@@ -352,7 +370,11 @@ GRASP_Q1 = [
     1.672852,
     0.588477,
 ]
-for q1_name, q1_values in (("框_Q1", 框_Q1), ("GRASP_Q1", GRASP_Q1)):
+for q1_name, q1_values in (
+    ("MOVE_TO_GRASP_RESET_Q", MOVE_TO_GRASP_RESET_Q),
+    ("框_Q1", 框_Q1),
+    ("GRASP_Q1", GRASP_Q1),
+):
     if len(q1_values) != len(JOINT_TARGETS["dual_arm_body"]):
         raise ValueError(
             f"{q1_name} 长度 {len(q1_values)} 与 dual_arm_body 关节数 "
@@ -389,7 +411,7 @@ FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0 *0
 FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
     0.53-0.35,
     0.0,
-    0.05,
+    0.15,
 )
 # 长方体上表面中心相对深框顶部空心区域中心的局部平移。
 BOX_OBSTACLE_ID = "长方体障碍物"
@@ -517,6 +539,7 @@ UNLOAD_TRIGGER_COMMAND = "p,8"
 UNLOAD_VISION_POSE_KEY = "right_body"
 UNLOAD_VISION_TF_FRAME = "material_table_vision"
 UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
+UNLOAD_PLACE_TF_FRAME_PREFIX = "material_table_place_point_"
 UNLOAD_PAIR_ROUTES = (
     ("sw1", "sw3", 1, 3),
     ("sw4", "sw2", 2, 4),
@@ -528,26 +551,13 @@ UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL = (
     0.1125,
     0.09,
 )
-UNLOAD_TABLE_LOCAL_RPY = (0.0, 0.0, 0.0)  # 局部 Y=180°，Z=90°
+UNLOAD_TABLE_LOCAL_RPY = (0.0, 0.0, 0.0)
 UNLOAD_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
+# 仅用于清理旧版本可能残留在 MoveIt 场景中的物体。
 UNLOAD_TABLE_TOP_BOX_ID = "unload_table_top_box"
-UNLOAD_TABLE_TOP_BOX_SIZE = (
-    UNLOAD_TABLE_SIZE[0],
-    UNLOAD_TABLE_SIZE[1],
-    0.0,
-)
-UNLOAD_TABLE_TOP_BOX_COLOR = ColorRGBA(
-    r=0.72,
-    g=0.52,
-    b=0.20,
-    a=0.90,
-)
 UNLOAD_OBSTACLE_ID = "unload_vision_y_obstacle"
-UNLOAD_OBSTACLE_SIZE = (1.5, 0.2, 3.0)
-UNLOAD_OBSTACLE_Y_OFFSET = 1.2
-UNLOAD_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=0.85)
-UNLOAD_APPROACH_DISTANCE = 0.15
-UNLOAD_PLACE_DESCENT_DISTANCE = 0.10
+UNLOAD_APPROACH_DISTANCE = 0.1
+UNLOAD_PLACE_DESCENT_DISTANCE = 0.16
 # 上料放置位抓取
 UNLOAD_EXTRA_APPROACH_BY_SLOT = {
     "sw1": 0.003,  # 右臂：多降 4 mm
@@ -559,17 +569,17 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
 # 物料台放置点：在 material_table_top 桌子坐标系下的 xyz 偏移 [m] 和局部旋转。
 UNLOAD_PLACE_LOCAL_PITCH = math.pi
 UNLOAD_PLACE_LOCAL_YAWS = {
-    1: math.radians(204.5),
-    2: math.radians(204.5),
-    3: math.radians(204.5),
-    4: math.radians(204.5),
+    1: math.radians(204.5+112),
+    2: math.radians(204.5+112),
+    3: math.radians(204.5+112),
+    4: math.radians(204.5+112),
 }
 # 注意这里1234和机器人sw不一样
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    1: (0.0, 0.225+0.1125, 0.05),
-    2: (0.0, 0.1125, 0.05),
-    3: (0.0, -0.1125, 0.05),
-    4: (0.0, -0.225 - 0.1125, 0.05),
+    1: (0.0-0.012, 0.225+0.1125-0.0015, 0.1-0.015),
+    2: (0.0-0.009, 0.1125-0.0025, 0.1-0.014),
+    3: (0.0-0.0045, -0.1125-0.001, 0.1),
+    4: (0.0-0.0015, -0.225-0.001 - 0.1125, 0.1),
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
@@ -783,7 +793,7 @@ PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距�
 GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增量阈值 [N]
 FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
 APPROACH_FORCE_GUARD_DISTANCE = 0.07  # 从 q_pre 起前 9 cm 使用小阈值 [m]
-APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 40.0  # 前 9 cm 的 Fz 减小阈值 [N]
+APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 60.0  # 前 9 cm 的 Fz 减小阈值 [N]
 APPROACH_FORCE_Z_DROP_ALL_THRESHOLD = 210.0  # 整段接近的 Fz 减小阈值 [N]
 SERVOJ_CONTROL_ACK_TIMEOUT_SEC = 2.0
 APPROACH_CANCEL_TIMEOUT_SEC = 5.0
@@ -1725,11 +1735,11 @@ def make_unload_table_top_pose(recognition_pose: Pose) -> Pose:
 
 
 def make_unload_table(recognition_pose: Pose) -> CollisionObject:
-    """生成相对 p,2 视觉姿态绕局部 Y=180°、Z=90° 的取料台。"""
+    """以 material_table_top 为上表面中心，向局部 -Z 生成取料台实体。"""
     table_top_pose = make_unload_table_top_pose(recognition_pose)
     center_pose = pose_offset_local_z(
         table_top_pose,
-        UNLOAD_TABLE_SIZE[2] / 2.0,
+        -UNLOAD_TABLE_SIZE[2] / 2.0,
     )
 
     primitive = SolidPrimitive()
@@ -1739,51 +1749,6 @@ def make_unload_table(recognition_pose: Pose) -> CollisionObject:
     obj = CollisionObject()
     obj.header.frame_id = SCENE_FRAME
     obj.id = UNLOAD_TABLE_ID
-    obj.operation = CollisionObject.ADD
-    obj.primitives.append(primitive)
-    obj.primitive_poses.append(center_pose)
-    return obj
-
-
-def make_unload_table_top_box(recognition_pose: Pose) -> CollisionObject:
-    """生成薄长方体；下表面中心与视觉识别位置重合，姿态与料台一致。"""
-    bottom_pose = pose_rotate_local_rpy(
-        recognition_pose,
-        *UNLOAD_TABLE_LOCAL_RPY,
-    )
-    center_pose = pose_offset_local_z(
-        bottom_pose,
-        -UNLOAD_TABLE_TOP_BOX_SIZE[2] / 2.0,
-    )
-
-    primitive = SolidPrimitive()
-    primitive.type = SolidPrimitive.BOX
-    primitive.dimensions = list(UNLOAD_TABLE_TOP_BOX_SIZE)
-
-    obj = CollisionObject()
-    obj.header.frame_id = SCENE_FRAME
-    obj.id = UNLOAD_TABLE_TOP_BOX_ID
-    obj.operation = CollisionObject.ADD
-    obj.primitives.append(primitive)
-    obj.primitive_poses.append(center_pose)
-    return obj
-
-
-def make_unload_obstacle(recognition_pose: Pose) -> CollisionObject:
-    """在识别点的 moveit_base_link +Y 方向 1.2 m 处生成 3 m 高墙状障碍物。"""
-    center_pose = make_pose(
-        recognition_pose.position.x,
-        recognition_pose.position.y + UNLOAD_OBSTACLE_Y_OFFSET,
-        UNLOAD_OBSTACLE_SIZE[2] / 2.0,
-    )
-
-    primitive = SolidPrimitive()
-    primitive.type = SolidPrimitive.BOX
-    primitive.dimensions = list(UNLOAD_OBSTACLE_SIZE)
-
-    obj = CollisionObject()
-    obj.header.frame_id = SCENE_FRAME
-    obj.id = UNLOAD_OBSTACLE_ID
     obj.operation = CollisionObject.ADD
     obj.primitives.append(primitive)
     obj.primitive_poses.append(center_pose)
@@ -3259,20 +3224,13 @@ class G01Demo(Node):
         )
 
     def add_unload_scene(self, recognition_pose: Pose) -> bool:
-        """添加 p,2 识别得到的料台、台面薄长方体及墙状障碍物。"""
+        """添加视觉识别得到的料台。"""
         colors = [
             ObjectColor(id=UNLOAD_TABLE_ID, color=UNLOAD_TABLE_COLOR),
-            ObjectColor(
-                id=UNLOAD_TABLE_TOP_BOX_ID,
-                color=UNLOAD_TABLE_TOP_BOX_COLOR,
-            ),
-            ObjectColor(id=UNLOAD_OBSTACLE_ID, color=UNLOAD_OBSTACLE_COLOR),
         ]
         return self._apply_scene(
             [
                 make_unload_table(recognition_pose),
-                make_unload_table_top_box(recognition_pose),
-                make_unload_obstacle(recognition_pose),
             ],
             colors,
         )
@@ -3296,7 +3254,7 @@ class G01Demo(Node):
         )
 
     def publish_unload_table_top_tf(self, recognition_pose: Pose) -> None:
-        """发布相对视觉局部 Y=180°、Z=90° 的桌面中心固定 TF。"""
+        """发布物料台上表面中心的固定 TF。"""
         table_top_pose = make_unload_table_top_pose(recognition_pose)
         transform = TransformStamped()
         transform.header.frame_id = SCENE_FRAME
@@ -3313,8 +3271,35 @@ class G01Demo(Node):
             f"{SCENE_FRAME} → {UNLOAD_TABLE_TOP_TF_FRAME}"
         )
 
+    def publish_unload_place_tfs(self, place_poses: dict[int, Pose]) -> None:
+        """发布物料台四个放置点的固定 TF，位姿与下料规划目标一致。"""
+        stamp = self.get_clock().now().to_msg()
+        transforms: list[TransformStamped] = []
+        for point_index, pose in sorted(place_poses.items()):
+            transform = TransformStamped()
+            transform.header.frame_id = SCENE_FRAME
+            transform.header.stamp = stamp
+            transform.child_frame_id = (
+                f"{UNLOAD_PLACE_TF_FRAME_PREFIX}{point_index}"
+            )
+            transform.transform.translation.x = pose.position.x
+            transform.transform.translation.y = pose.position.y
+            transform.transform.translation.z = pose.position.z
+            transform.transform.rotation = copy.deepcopy(pose.orientation)
+            transforms.append(transform)
+
+        if not transforms:
+            return
+        self._vision_tf_broadcaster.sendTransform(transforms)
+        frame_names = "、".join(
+            transform.child_frame_id for transform in transforms
+        )
+        self.get_logger().info(
+            f"[unload] 已发布物料台放置点 TF: {frame_names}"
+        )
+
     def remove_unload_scene(self) -> bool:
-        """移除下料流程使用的料台、台面薄长方体和墙状障碍物。"""
+        """移除料台及旧版本可能残留的场景物体。"""
         objects = [
             CollisionObject(
                 id=UNLOAD_TABLE_ID,
@@ -6275,6 +6260,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"已下降到物料台左点{left_point}/右点{right_point}，"
                 "按回车给双臂下电: "
             )
+
+            try:
+                input()
+            except EOFError:
+                pass
+
             if not set_unload_tool_power(
                 0,
                 f"物料台左点{left_point}/右点{right_point}放置",
@@ -6580,6 +6571,7 @@ def main(argv: list[str] | None = None) -> int:
         node.publish_unload_vision_tf(recognition_pose)
         node.publish_unload_table_top_tf(recognition_pose)
         place_poses = make_unload_place_poses(recognition_pose)
+        node.publish_unload_place_tfs(place_poses)
         log.info(
             f"[unload] p,2 识别点 @ {SCENE_FRAME}: "
             f"({recognition_pose.position.x:.4f}, "
@@ -6601,21 +6593,24 @@ def main(argv: list[str] | None = None) -> int:
         unload_scene_added = False
         try:
             if not node.add_unload_scene(recognition_pose):
-                log.error("[unload] 添加料台/台面薄长方体/墙状障碍物失败")
+                log.error("[unload] 添加料台失败")
                 return False
             unload_scene_added = True
             table_top_pose = make_unload_table_top_pose(recognition_pose)
+            table_rpy_deg = tuple(
+                math.degrees(value) for value in UNLOAD_TABLE_LOCAL_RPY
+            )
             log.info(
                 f"[unload] 已添加取料台 size={UNLOAD_TABLE_SIZE} m, "
                 f"top_center=({table_top_pose.position.x:.4f}, "
                 f"{table_top_pose.position.y:.4f}, "
                 f"{table_top_pose.position.z:.4f})，"
-                "姿态相对视觉绕局部 Y=180°、Z=90°；"
-                f"台面薄长方体 size={UNLOAD_TABLE_TOP_BOX_SIZE} m，"
-                "下表面中心=视觉识别位置；"
-                f"障碍物 size={UNLOAD_OBSTACLE_SIZE} m, "
-                f"center_y={recognition_pose.position.y + UNLOAD_OBSTACLE_Y_OFFSET:.4f}"
+                f"table_local_rpy_deg={table_rpy_deg}"
             )
+            try:
+                input()
+            except EOFError:
+                pass
 
             for batch_index in range(len(UNLOAD_PAIR_ROUTES)):
                 if batch_index > 0:
@@ -6670,7 +6665,7 @@ def main(argv: list[str] | None = None) -> int:
             return True
         finally:
             if unload_scene_added and not node.remove_unload_scene():
-                log.error("[unload] 移除料台/台面薄长方体/墙状障碍物失败")
+                log.error("[unload] 移除料台失败")
 
     try:
         log.info("[startup] 上位机控制模式启动前先清除本程序管理的场景障碍物 …")
@@ -6685,8 +6680,31 @@ def main(argv: list[str] | None = None) -> int:
             command_topic, payload = queued_command
 
             if command_topic == MOVE_TO_GRASP_POSE_CMD_TOPIC:
-                nav_ok = node.navigate_and_wait(NAV_TARGET_GRASP)
-                node.publish_upper_result(command_topic, True)
+                reset_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
+                log.info(
+                    "[upper] move_to_grasp_pose 第一步："
+                    "dual_arm_body 运动到复位位姿"
+                )
+                move_to_grasp_ok = node.plan_execute_joint_waypoints(
+                    "dual_arm_body",
+                    0.2,
+                    reset_joint_names,
+                    [MOVE_TO_GRASP_RESET_Q],
+                )
+                if not move_to_grasp_ok:
+                    log.error(
+                        "[upper] dual_arm_body 复位失败，"
+                        "不再继续导航和深框识别"
+                    )
+                if move_to_grasp_ok:
+                    move_to_grasp_ok = node.navigate_and_wait(NAV_TARGET_GRASP)
+                if move_to_grasp_ok:
+                    move_to_grasp_ok = recognize_and_add_deep_frame()
+                if move_to_grasp_ok:
+                    move_to_grasp_ok = (
+                        node.move_agv_after_deep_frame_recognition()
+                    )
+                node.publish_upper_result(command_topic, move_to_grasp_ok)
                 continue
 
             if command_topic == GRASP_CMD_TOPIC:
@@ -6694,17 +6712,13 @@ def main(argv: list[str] | None = None) -> int:
                     f"[upper] 开始抓满四个放置位；命令参数="
                     f"{json.dumps(payload, ensure_ascii=False)}"
                 )
-                grasp_ok = recognize_and_add_deep_frame()
-                if grasp_ok:
-                    grasp_ok = node.move_agv_after_deep_frame_recognition()
-                if grasp_ok:
-                    grasp_ok = run_grasps_until_no_empty_slot() is True
-                node.publish_upper_result(command_topic, True)
+                grasp_ok = run_grasps_until_no_empty_slot() is True
+                node.publish_upper_result(command_topic, grasp_ok)
                 continue
 
             if command_topic == MOVE_TO_PLACE_POSE_CMD_TOPIC:
-                # nav_ok = node.navigate_and_wait(NAV_TARGET_PLACE)
-                node.publish_upper_result(command_topic, True)
+                nav_ok = node.navigate_and_wait(NAV_TARGET_PLACE)
+                node.publish_upper_result(command_topic, nav_ok)
                 continue
 
             if command_topic == PLACE_CMD_TOPIC:
@@ -6718,16 +6732,16 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         log.error("切换下料时移除上料碰撞体失败")
                 place_ok = run_one_unload() if scene_ok else False
-                node.publish_upper_result(command_topic, True)
+                node.publish_upper_result(command_topic, place_ok)
                 continue
 
             if command_topic == RETURN_INIT_POSE_TOPIC:
-                # log.info(
-                #     "[upper] 收到 return_init_pose，导航到 map 起点 "
-                #     "(0, 0, 0, 0, 0, 0, 1)；按协议不发布结果"
-                # )
-                # if not node.navigate_and_wait(NAV_TARGET_INIT):
-                #     log.error("[upper] 返回起点导航失败（按协议不发布结果）")
+                log.info(
+                    "[upper] 收到 return_init_pose，导航到 map 起点 "
+                    "(0, 0, 0, 0, 0, 0, 1)；按协议不发布结果"
+                )
+                if not node.navigate_and_wait(NAV_TARGET_INIT):
+                    log.error("[upper] 返回起点导航失败（按协议不发布结果）")
                 continue
 
             log.error(f"未处理的上位机命令话题: {command_topic}")
