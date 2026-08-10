@@ -15,7 +15,7 @@ G01 MoveIt 演示脚本
     → 读取视觉点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
     → 按视觉点和 group 顺序做可达性验证
-    → 选中“有 IK + 直线 approach 可行 + 加入临时碰撞体后 q_pre 无碰撞”的候选
+    → 选中“有无碰撞 IK + 直线 approach 可行 + OMPL 可到 q_pre”的候选
     → OMPL 到 q_pre，工具上电并读取该臂力传感器 Z 基准值
     → Cartesian approach 到抓取点；以前 9cm/Fz 减小 20N、整段/Fz 减小
       200N 监测中途接触，触发后停止 ServoJ、取消轨迹并从当前位置直退 q_pre
@@ -112,7 +112,6 @@ from moveit_msgs.srv import (
     GetCartesianPath,
     GetPositionFK,
     GetPositionIK,
-    GetStateValidity,
 )
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -362,7 +361,9 @@ for q1_name, q1_values in (
 PLANNER_ID = "RRTConnect"
 NUM_ATTEMPTS = 20
 PLAN_TIME_SEC = 10.0
-MOVE_MAX_RETRIES = 10  # move_action 失败后再试几次（应对 INVALID_MOTION_PLAN 等 OMPL 随机性失败）
+# 每次 move() 最多发送的完整 MoveGroup 请求数（包含第 1 次）。
+# 例如值为 10 时，日志中最多出现“第 10/10 次”，而不是首次 + 10 次重试。
+MOVE_MAX_RETRIES = 10
 
 # 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
 DEFAULT_SPEED_SCALE = 0.5
@@ -419,7 +420,9 @@ SVC_APPLY_SCENE = "apply_planning_scene"
 SVC_CARTESIAN_PATH = "compute_cartesian_path"
 SVC_COMPUTE_IK = "compute_ik"
 SVC_COMPUTE_FK = "compute_fk"
-SVC_CHECK_STATE_VALIDITY = "check_state_validity"
+# 启动清理采用短等待，避免 move_group 尚未启动时卡住菜单。
+STARTUP_SCENE_CLEAR_SERVICE_WAIT_SEC = 0.2
+SCENE_CLEAR_RESPONSE_TIMEOUT_SEC = 2.0
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 LEFT_FT_SENSOR_TOPIC = "/g01/left/FTSensor"
@@ -826,7 +829,7 @@ VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
 ]
 # 左臂抓
 SIM_VISION_RESULT = (
-    0,
+    1,
     [-195.0305, 43.2781, 889.8122, -0.481, 0.0739, -0.1165, -0.8658],
 )
 # 右臂抓
@@ -893,7 +896,7 @@ VISION_RIGHT_TRANSFORM_MM = _transform_xyz_wxyz_m_to_matrix_mm(VISION_RIGHT_TRAN
 VISION_LEFT_TRANSFORM_MM = _transform_xyz_wxyz_m_to_matrix_mm(VISION_LEFT_TRANSFORM_XYZ_WXYZ)
 
 # IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
-IK_N_CANDIDATES = 200          # 总共尝试的 IK 种子数（含 1 次以当前关节为种子）
+IK_N_CANDIDATES = 100          # 在 URDF 关节限位内尝试的 IK 种子数（含当前状态）
 IK_TIMEOUT_SEC = 0.2          # 每次 /compute_ik 超时（KDL 对边界姿态需更长收敛时间）
 IK_RANDOM_SEED = 42           # 让 IK 多解枚举可复现；改成 None 则每次随机
 
@@ -1399,7 +1402,7 @@ def validate_reachable_grasp(
     speed_scale: float = 0.2,
     cutoff_joint_names: Sequence[str] | None = None,
 ):
-    """验证 IK、Cartesian approach 以及加入两个临时碰撞体后的 q_pre。"""
+    """依次验证无碰撞 IK、Cartesian approach 和 OMPL 到 q_pre。"""
     log = node.get_logger()
     if not all_xyz_rpy:
         log.error("[reach] 没有可验证的视觉点")
@@ -1446,7 +1449,7 @@ def validate_reachable_grasp(
                 log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
                 continue
 
-            q_pre, q_target, _approach_traj = picked
+            q_pre, q_target, to_pre_traj, approach_traj = picked
             log.info(f"[reach] 点 {point_index + 1} / {pick_group}: 可达 ✓")
             # log.info(
             #     f"{GREEN}[reach] 可行点 xyz_rpy[{xyz_key}]: "
@@ -1467,6 +1470,8 @@ def validate_reachable_grasp(
                 "pick_target_pose": pick_target_pose,
                 "pick_q_pre": q_pre,
                 "pick_q_target": q_target,
+                "pick_to_pre_traj": to_pre_traj,
+                "pick_approach_traj": approach_traj,
             }
 
     log.error("[reach] 所有视觉点的所有候选 group 均不可达")
@@ -2253,9 +2258,6 @@ class G01Demo(Node):
         self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
         self._ik_cli = self.create_client(GetPositionIK, SVC_COMPUTE_IK)
         self._fk_cli = self.create_client(GetPositionFK, SVC_COMPUTE_FK)
-        self._state_validity_cli = self.create_client(
-            GetStateValidity, SVC_CHECK_STATE_VALIDITY
-        )
         self._left_tool_cli = self.create_client(SetToolPower, LEFT_TOOL_COMMAND_SERVICE)
         self._right_tool_cli = self.create_client(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE)
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
@@ -2286,10 +2288,10 @@ class G01Demo(Node):
         self._latest_upper_command: tuple[str, dict] | None = None
         self.last_pick_failure_reason: str | None = None
         # UInt8 会在回调中显式限制到 uint8 范围。真实模式在收到首帧前为未知，
-        # 未知状态按“没有安全空位”处理；仿真模式初始四个 SW 均有料，
-        # 之后由上料/下料动作实时更新对应 SW，避免每轮一直重复使用同一组。
+        # 未知状态按“没有安全空位”处理；仿真模式初始四个 SW 均为空，
+        # 之后由上料/下料动作实时更新对应 SW。
         self._driver_signal: int | None = (
-            ALL_PLACE_SLOTS_MATERIAL_SIGNAL if self.sim_mode else None
+            ALL_PLACE_SLOTS_EMPTY_SIGNAL if self.sim_mode else None
         )
         self._driver_signal_count = 0
         self._nav_result_count = 0
@@ -3147,9 +3149,18 @@ class G01Demo(Node):
         objects: list[CollisionObject],
         colors: list[ObjectColor] | None = None,
         report_error: bool = True,
+        *,
+        service_timeout: float = 10.0,
+        response_timeout: float = 10.0,
     ) -> bool:
-        """向 move_group 提交规划场景 diff（添加/删除障碍物）。"""
-        if not self._scene_cli.wait_for_service(timeout_sec=10.0):
+        """向 move_group 提交规划场景 diff（添加/删除障碍物）。
+
+        ``service_timeout`` 和 ``response_timeout`` 可由启动清理使用较短值；
+        普通运动流程仍保留原来的 10 秒默认等待，不改变既有行为。
+        """
+        if not self._scene_cli.wait_for_service(
+            timeout_sec=max(0.0, float(service_timeout))
+        ):
             if report_error:
                 self.get_logger().error(f"服务 {SVC_APPLY_SCENE} 不可用")
             return False
@@ -3160,7 +3171,13 @@ class G01Demo(Node):
             scene.object_colors.extend(colors)
         req = ApplyPlanningScene.Request(scene=scene)
         fut = self._scene_cli.call_async(req)
-        if not self._spin_until(fut, 10.0) or not fut.result().success:
+        if (
+            not self._spin_until(
+                fut,
+                max(0.0, float(response_timeout)),
+            )
+            or not fut.result().success
+        ):
             if report_error:
                 self.get_logger().error("apply_planning_scene 失败")
             return False
@@ -3188,8 +3205,19 @@ class G01Demo(Node):
         ]
         return self._apply_scene(objects)
 
-    def clear_managed_scene_objects(self) -> None:
-        """逐个清除本程序的碰撞体；不存在或删除失败时直接继续。"""
+    def clear_managed_scene_objects(
+        self,
+        *,
+        service_timeout: float = STARTUP_SCENE_CLEAR_SERVICE_WAIT_SEC,
+        response_timeout: float = SCENE_CLEAR_RESPONSE_TIMEOUT_SEC,
+    ) -> bool:
+        """用一个 PlanningScene diff 批量清除本程序管理的所有碰撞体。
+
+        旧实现逐个发送删除请求，最坏情况下每个物体都单独等待，既慢又可能只
+        删除一部分。现在将全部 REMOVE 操作放进同一请求：服务确认成功即表示
+        整批 diff 已应用；服务尚未就绪或响应超时时返回 False，由启动流程直接
+        忽略并继续运行。
+        """
         object_ids = (
             FRAME_ID,
             BOX_OBSTACLE_ID,
@@ -3199,32 +3227,32 @@ class G01Demo(Node):
             UNLOAD_TABLE_TOP_BOX_ID,
             UNLOAD_OBSTACLE_ID,
         )
-        if not self._scene_cli.wait_for_service(timeout_sec=2.0):
-            self.get_logger().info(
-                f"[startup] 服务 {SVC_APPLY_SCENE} 暂不可用，跳过清理并继续"
-            )
-            return
-
-        removed_ids = []
-        skipped_ids = []
-        for object_id in object_ids:
-            removal = CollisionObject(
+        removals = [
+            CollisionObject(
                 id=object_id,
                 operation=CollisionObject.REMOVE,
             )
-            if self._apply_scene([removal], report_error=False):
-                removed_ids.append(object_id)
-            else:
-                skipped_ids.append(object_id)
-        self.get_logger().info(
-            f"[startup] 场景障碍物清理完成："
-            f"{len(removed_ids)} 个删除成功，{len(skipped_ids)} 个不存在或未确认；继续"
+            for object_id in object_ids
+        ]
+        started_at = time.monotonic()
+        cleared = self._apply_scene(
+            removals,
+            report_error=False,
+            service_timeout=service_timeout,
+            response_timeout=response_timeout,
         )
-        if skipped_ids:
+        elapsed_ms = (time.monotonic() - started_at) * 1000.0
+        if not cleared:
             self.get_logger().info(
-                "[startup] 以下障碍物不存在或删除未确认，已忽略: "
-                + ", ".join(skipped_ids)
+                f"[scene-cleanup] 启动清理未完成 ({elapsed_ms:.1f} ms)，继续运行"
             )
+            return False
+
+        self.get_logger().info(
+            f"[scene-cleanup] 已用一次请求批量清理 {len(removals)} 个场景物体 "
+            f"({elapsed_ms:.1f} ms)"
+        )
+        return True
 
     def configure_deep_frame_from_recognition(
         self,
@@ -3371,6 +3399,7 @@ class G01Demo(Node):
         joint_names: Sequence[str] | None = None,
         tangent_link: str | None = None,
         tangent_joints: dict[str, float] | None = None,
+        verbose: bool = True,
     ) -> bool:
         """添加隔板和临时物体；传入 link 时，隔板低于其 collision 最低面 1 cm。"""
         scene_pose = self._pose_in_frame(
@@ -3410,11 +3439,13 @@ class G01Demo(Node):
             ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR),
             ObjectColor(id=GRASP_OBJECT_COLLISION_ID, color=GRASP_OBJECT_COLLISION_COLOR),
         ]
-        self.get_logger().info(
-            f"添加碰撞体「{FRAME_CUTOFF_ID}」+「{GRASP_OBJECT_COLLISION_ID}」到 {target_frame}: "
-            f"隔板以{tangent_desc}为基准, "
-            f"隔板上表面 z={scene_z:.3f} m"
-        )
+        if verbose:
+            self.get_logger().info(
+                f"添加碰撞体「{FRAME_CUTOFF_ID}」+"
+                f"「{GRASP_OBJECT_COLLISION_ID}」到 {target_frame}: "
+                f"隔板以{tangent_desc}为基准, "
+                f"隔板上表面 z={scene_z:.3f} m"
+            )
         return self._apply_scene(
             [
                 make_deep_frame_cutoff(scene_z, self._frame_pose),
@@ -3540,62 +3571,30 @@ class G01Demo(Node):
         ]
         return self._apply_scene(removals)
 
-    def _check_state_collision_free(
-        self,
-        group: str,
-        joints: dict[str, float],
-        state_joint_names: Sequence[str],
-    ) -> bool:
-        """用当前完整状态补齐 joints，并检查该 group 是否无碰撞。"""
-        log = self.get_logger()
-        state_joint_names = list(state_joint_names)
-        current = self._get_joints(state_joint_names, wait_new=True)
-        if current is None:
-            log.error("[q-pre-collision] 读取完整机器人状态失败")
-            return False
-
-        state = dict(current)
-        state.update(joints)
-        if not self._state_validity_cli.wait_for_service(timeout_sec=10.0):
-            log.error(f"服务 {SVC_CHECK_STATE_VALIDITY} 不可用")
-            return False
-
-        req = GetStateValidity.Request()
-        req.group_name = group
-        req.robot_state.is_diff = True
-        req.robot_state.joint_state.name = list(state.keys())
-        req.robot_state.joint_state.position = list(state.values())
-        fut = self._state_validity_cli.call_async(req)
-        if not self._spin_until(fut, 10.0):
-            log.error(f"服务 {SVC_CHECK_STATE_VALIDITY} 调用超时")
-            return False
-
-        res = fut.result()
-        if res.valid:
-            return True
-
-        contact_pairs = []
-        for contact in res.contacts[:6]:
-            body_1 = getattr(contact, "contact_body_1", "")
-            body_2 = getattr(contact, "contact_body_2", "")
-            pair = f"{body_1}<->{body_2}" if body_1 or body_2 else "未知碰撞对"
-            if pair not in contact_pairs:
-                contact_pairs.append(pair)
-        contacts_text = ", ".join(contact_pairs) if contact_pairs else "服务未返回碰撞对"
-        log.info(f"[q-pre-collision] q_pre 有碰撞：{contacts_text}")
-        return False
-
-    def _q_pre_valid_with_temporary_collisions(
+    def _plan_q_pre_with_temporary_collisions(
         self,
         group: str,
         link: str,
         target_pose: Pose,
         plan_frame: str,
         q_pre: dict[str, float],
+        joint_names: Sequence[str],
         state_joint_names: Sequence[str],
-    ) -> bool:
-        """临时加入隔离面和待抓物体，仅检查 q_pre 状态，然后恢复场景。"""
+        speed_scale: float,
+    ) -> RobotTrajectory | None:
+        """临时加入抓取碰撞体，规划当前位置到 q_pre 的 OMPL 路径。
+
+        这一步放在 IK 和 Cartesian approach 通过之后。使用 ``plan_only``，只
+        验证完整路径而不移动机器人；规划结束后无论成功与否都恢复临时场景。
+        成功时返回已通过碰撞检查和时间参数化的轨迹，供后续直接执行；
+        失败或临时场景未能恢复时返回 ``None``。
+        """
         log = self.get_logger()
+        current = self._get_joints(list(joint_names), wait_new=True)
+        if current is None:
+            log.error("[grasp-select] 读取关节空间规划起点失败")
+            return None
+
         if not self.add_frame_cutoff_for_pose(
             target_pose,
             source_frame=plan_frame,
@@ -3603,23 +3602,35 @@ class G01Demo(Node):
             joint_names=state_joint_names,
             tangent_link=link,
             tangent_joints=q_pre,
+            verbose=False,
         ):
-            log.error("[q-pre-collision] 添加两个临时碰撞体失败")
-            return False
+            log.error("[grasp-select] 添加关节空间预检碰撞体失败")
+            return None
 
-        valid = False
+        planned_trajectory: RobotTrajectory | None = None
         removed = False
         try:
-            valid = self._check_state_collision_free(
+            ok, _, trajectory = self.plan_joint_motion(
                 group,
                 q_pre,
-                state_joint_names,
+                joint_names=joint_names,
+                start_joints=current,
+                speed_scale=speed_scale,
+                max_retries=1,
+                avoid_collisions=True,
+                execute=False,
             )
+            if (
+                ok
+                and trajectory is not None
+                and trajectory.joint_trajectory.points
+            ):
+                planned_trajectory = trajectory
         finally:
             removed = self.remove_frame_cutoff()
             if not removed:
-                log.error("[q-pre-collision] 移除两个临时碰撞体失败")
-        return valid and removed
+                log.error("[grasp-select] 移除关节空间预检碰撞体失败")
+        return planned_trajectory if removed else None
 
     def _cylinder_marker_numeric_id(self, object_id: str) -> int:
         if object_id not in self._cylinder_marker_ids:
@@ -3812,8 +3823,8 @@ class G01Demo(Node):
         """
         调用 move_action：规划（plan_only=True）或规划并执行（False）。
 
-        失败时自动重试最多 MOVE_MAX_RETRIES 次（应对 INVALID_MOTION_PLAN 等
-        postprocessing 漏检/重采样碰撞；OMPL 每次随机采样可能换一条路）。
+        单次调用最多发送 MOVE_MAX_RETRIES 个完整 MoveGroup 请求
+        （包含第一次），用于应对 INVALID_MOTION_PLAN 等 OMPL 随机性失败。
 
         返回 (是否成功, 墙钟耗时 [ms]（含所有尝试）, planned_trajectory)；
         失败或无轨迹时第三项为 None。
@@ -3903,8 +3914,9 @@ class G01Demo(Node):
                 单次 MoveGroup 请求内部的规划求解次数；省略时使用
                 ``NUM_ATTEMPTS``。
             max_retries:
-                整个 MoveGroup 请求失败后的重发次数；省略时使用
-                ``MOVE_MAX_RETRIES``。它和 ``num_attempts`` 是两层不同的重试。
+                最多发送的完整 MoveGroup 请求总数（包含第一次）；
+                省略时使用 ``MOVE_MAX_RETRIES``。它和 ``num_attempts``
+                是两层不同的尝试计数。
             avoid_collisions:
                 True 使用规划场景碰撞检查；False 仅对本次请求临时放开碰撞，
                 不修改全局场景，但真实机器人使用时有撞击风险。
@@ -4737,8 +4749,7 @@ class G01Demo(Node):
         - 之后每次按 URDF 位置限位，对 `joint_names` 中的关节做全范围均匀采样。
         - 用 dedup_tol 在关节空间做去重（任一关节差异 < tol 视为同解）。
         - 失败时统计 error_code，方便区分「数值无解 / 碰撞被拒 / 输入非法」。
-        - 若启用 avoid_collisions 全部失败，自动用 avoid_collisions=False 再试一轮，
-          用于区分是「IK 数值无解」还是「IK 有解但被碰撞拒绝」。
+        - 抓取可达性始终保留碰撞检查；0 解时不再关闭碰撞重新求解。
         """
         rng = random.Random(IK_RANDOM_SEED) if IK_RANDOM_SEED is not None else random
         log = self.get_logger()
@@ -4798,35 +4809,13 @@ class G01Demo(Node):
             )
             log.info(f"[ik-multi] 失败原因分布: {breakdown}")
 
-        # 全失败时打印 pose 详情，并尝试一次 avoid_collisions=False 以区分原因
         if not solutions:
             p = pose.position
-            o = pose.orientation
             log.error(
-                f"[ik-multi] target pose 详情: frame={plan_frame}, link={link}, group={group}\n"
-                f"           position=({p.x:.4f}, {p.y:.4f}, {p.z:.4f})\n"
-                f"           quat=({o.x:.4f}, {o.y:.4f}, {o.z:.4f}, {o.w:.4f})"
+                f"[ik-multi] {n_candidates} 次限位内采样后仍无无碰撞 IK："
+                f"group={group}, link={link}, frame={plan_frame}, "
+                f"position=({p.x:.4f}, {p.y:.4f}, {p.z:.4f})"
             )
-            if avoid_collisions:
-                log.warning(
-                    "[ik-multi] 重试一轮 avoid_collisions=False，用于区分「数值无解 vs 碰撞被拒」"
-                )
-                no_col_sols = self._solve_ik_multi(
-                    group, link, pose, joint_names,
-                    n_candidates=n_candidates, dedup_tol=dedup_tol,
-                    avoid_collisions=False, plan_frame=plan_frame,
-                )
-                if no_col_sols:
-                    log.warning(
-                        f"[ik-multi] 关闭碰撞后找到 {len(no_col_sols)} 个 IK 解 → "
-                        f"目标位姿本身可达，但 IK 解全在碰撞中。"
-                        f"  对策：检查 default_robot_padding / 自碰撞 ACM / 抬高 target z / 改姿态"
-                    )
-                else:
-                    log.error(
-                        "[ik-multi] 关闭碰撞后仍 0 解 → 目标位姿真正不可达（数值无解 / 超出工作空间 / 关节限位）。"
-                        "  对策：抬高 target z、增加 IK_N_CANDIDATES / IK_TIMEOUT_SEC、或在 RViz 拖动 IK marker 直接验证可达性"
-                    )
         return solutions
 
     def _solve_ik_from_seeds(
@@ -4906,16 +4895,25 @@ class G01Demo(Node):
         """从 target_pose 的多个 IK 解里挑可用的一组。
 
         target_seeds 不为 None 时，只用这些 seed 求 IK，不做当前关节/随机 seed 枚举。
-        cutoff_joint_names 不为 None 时，还会临时加入隔离面和待抓物体，并要求
-        q_pre 通过 check_state_validity；这里只做状态碰撞检查，不做 OMPL 规划。
-        返回 (q_pre, q_target, approach_traj) 三元组；找不到返回 None。
+        筛选顺序固定为：碰撞 IK → Cartesian approach → OMPL 到 q_pre。
+        cutoff_joint_names 不为 None 时，OMPL 预检会临时加入隔离面和待抓物体，
+        使验证条件与后续实际执行一致。
+        返回 (q_pre, q_target, to_pre_traj, approach_traj) 四元组；
+        找不到返回 None。to_pre_traj 是当前位置到 q_pre 的 OMPL 轨迹，
+        后续抓取直接执行它，不再随机重规划。
         approach_traj = reverse( cartesian(start=q_target, end=pre_pose) )
             即真正用来「从 pre_pose 直线接近 target_pose」的轨迹。
         """
         log = self.get_logger()
         if target_seeds is None:
             candidates = self._solve_ik_multi(
-                group, link, target_pose, joint_names, n_candidates, plan_frame=plan_frame
+                group,
+                link,
+                target_pose,
+                joint_names,
+                n_candidates,
+                avoid_collisions=True,
+                plan_frame=plan_frame,
             )
         else:
             candidates = self._solve_ik_from_seeds(
@@ -4932,6 +4930,9 @@ class G01Demo(Node):
             int(math.ceil(expected_points * CART_MAX_POINT_FACTOR)),
         )
         feasible_pairs = []
+        cartesian_failed = 0
+        point_count_rejected = 0
+        joint_jump_rejected = 0
 
         for idx, q_target in enumerate(candidates):
             retreat_traj = self.plan_cartesian_line(
@@ -4943,26 +4944,17 @@ class G01Demo(Node):
                 verbose=False,
             )
             if retreat_traj is None:
-                log.info(
-                    f"[grasp-select] 候选 IK {idx + 1}/{len(candidates)}：retreat 不可行 → 淘汰"
-                )
+                cartesian_failed += 1
                 continue
 
             point_count = len(retreat_traj.joint_trajectory.points)
-            total_motion, max_step = _trajectory_joint_stats(retreat_traj)
+            total_motion, _max_step = _trajectory_joint_stats(retreat_traj)
             if point_count > max_points:
-                log.warning(
-                    f"[grasp-select] 候选 IK {idx + 1}/{len(candidates)}："
-                    f"retreat 点数异常 {point_count}>{max_points} "
-                    f"(理论约 {expected_points} 点, 直线距离 {line_distance:.3f} m) → 淘汰"
-                )
+                point_count_rejected += 1
                 continue
             jump_reason = _trajectory_joint_jump_reason(retreat_traj)
             if jump_reason:
-                log.warning(
-                    f"[grasp-select] 候选 IK {idx + 1}/{len(candidates)}："
-                    f"检测到关节跳变（{jump_reason}）→ 淘汰"
-                )
+                joint_jump_rejected += 1
                 continue
 
             approach_traj = self._reverse_trajectory(retreat_traj)
@@ -4970,11 +4962,6 @@ class G01Demo(Node):
             names = list(retreat_traj.joint_trajectory.joint_names)
             q_pre = {n: p for n, p in zip(names, last_pt.positions)}
             score = total_motion + 0.01 * point_count
-            log.info(
-                f"[grasp-select] 候选 IK {idx + 1}/{len(candidates)}：retreat 可行 ✓ "
-                f"(轨迹 {point_count} 点, joint_motion={total_motion:.3f}, "
-                f"max_step={max_step:.3f}, score={score:.3f})"
-            )
             feasible_pairs.append(
                 (
                     score,
@@ -4982,12 +4969,15 @@ class G01Demo(Node):
                     q_target,
                     approach_traj,
                     idx + 1,
-                    point_count,
-                    total_motion,
-                    max_step,
                 )
             )
 
+        log.info(
+            f"[grasp-select] Cartesian 直线接近：{len(feasible_pairs)}/"
+            f"{len(candidates)} 组可行"
+            f"（无路径={cartesian_failed}, 点数异常={point_count_rejected}, "
+            f"关节跳变={joint_jump_rejected}）"
+        )
         feasible_pairs.sort(key=lambda item: item[0])
         for (
             _score,
@@ -4995,39 +4985,51 @@ class G01Demo(Node):
             q_target,
             approach_traj,
             best_idx,
-            point_count,
-            total_motion,
-            max_step,
         ) in feasible_pairs:
+            ompl_trajectory: RobotTrajectory | None
             if cutoff_joint_names is not None:
-                log.info(
-                    f"[grasp-select] 检查候选 IK {best_idx}/{len(candidates)}："
-                    f"加入「{FRAME_CUTOFF_ID}」+「{GRASP_OBJECT_COLLISION_ID}」后的 q_pre"
-                )
-                if not self._q_pre_valid_with_temporary_collisions(
+                ompl_trajectory = self._plan_q_pre_with_temporary_collisions(
                     group,
                     link,
                     target_pose,
                     plan_frame,
                     q_pre,
+                    joint_names,
                     cutoff_joint_names,
+                    speed_scale,
+                )
+                if ompl_trajectory is None:
+                    continue
+            else:
+                current = self._get_joints(list(joint_names), wait_new=True)
+                if current is None:
+                    return None
+                ompl_ok, _, ompl_trajectory = self.plan_joint_motion(
+                    group,
+                    q_pre,
+                    joint_names=joint_names,
+                    start_joints=current,
+                    speed_scale=speed_scale,
+                    max_retries=1,
+                    avoid_collisions=True,
+                    execute=False,
+                )
+                if not (
+                    ompl_ok
+                    and ompl_trajectory is not None
+                    and ompl_trajectory.joint_trajectory.points
                 ):
-                    log.info(
-                        f"[grasp-select] 候选 IK {best_idx}/{len(candidates)}："
-                        "q_pre 在两个新碰撞体加入后未通过碰撞检查 → 淘汰"
-                    )
                     continue
             log.info(
                 f"[grasp-select] 选用候选 IK {best_idx}/{len(candidates)}："
-                f"{point_count} 点, joint_motion={total_motion:.3f}, "
-                f"max_step={max_step:.3f}"
+                "IK、Cartesian 接近、OMPL 到 q_pre 均通过"
             )
-            return q_pre, q_target, approach_traj
+            return q_pre, q_target, ompl_trajectory, approach_traj
 
         if feasible_pairs and cutoff_joint_names is not None:
             log.error(
-                f"[grasp-select] {len(feasible_pairs)} 个直线可行候选中，没有一个 q_pre "
-                f"能在加入「{FRAME_CUTOFF_ID}」+「{GRASP_OBJECT_COLLISION_ID}」后保持无碰撞"
+                f"[grasp-select] {len(feasible_pairs)} 个直线可行候选中，"
+                "没有一个能从当前位置通过 OMPL 到达 q_pre"
             )
             return None
 
@@ -5213,6 +5215,7 @@ class G01Demo(Node):
             joint_names=body_joint_names,
             start_joints=current,
             speed_scale=speed,
+            num_attempts=50,
             execute=True,
         )
         log.info(f"[pick] OMPL → {yubei_name}: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
@@ -5356,6 +5359,12 @@ class G01Demo(Node):
         first_return_mode: int = FIRST_RETURN_MODE,
         waist_moved: bool = False,
         waist_reset_angle: float = WAIST_RESET_ANGLE_RAD,
+        prevalidated_pair: tuple[
+            dict[str, float],
+            dict[str, float],
+            RobotTrajectory,
+            RobotTrajectory,
+        ] | None = None,
     ) -> bool:
         """抓取流程（IK 多解 + approach 预检 + 放置 + 原路返回）。
 
@@ -5371,6 +5380,9 @@ class G01Demo(Node):
             first_return_mode : 1=使用 *_j 并交换；2=使用普通放置点；0 兼容旧普通模式
             waist_moved       : 抓取前是否为了可达性移动过腰部；若移动过，放置/交换前先回 30°
             waist_reset_angle : 腰部回正角度 [rad]
+            prevalidated_pair : 可达性验证已选出的 (q_pre, q_target,
+                to_pre_traj, approach_traj)；传入后不再重复执行 100 次
+                IK、OMPL 到 q_pre 规划和 Cartesian 直线预检。
         """
         log = self.get_logger()
         self.last_pick_failure_reason = None
@@ -5439,36 +5451,49 @@ class G01Demo(Node):
             f"预备点（沿末端 z 退 {PRE_GRASP_OFFSET:.3f} m）pos({pp.x:.3f}, {pp.y:.3f}, {pp.z:.3f})"
         )
 
-        log.info("[pick] 0/9  IK 多解枚举 + approach 预检 …")
-        picked = self._select_feasible_grasp_pair(
-            group, link, target_pose, pre_pose,
-            joint_names=joint_names,
-            speed_scale=speed_scale,
-            plan_frame=plan_frame,
-            cutoff_joint_names=cutoff_joint_names,
-        )
+        picked = prevalidated_pair
+        if picked is None:
+            log.info("[pick] 0/9  IK 多解枚举 + approach + OMPL 预检 …")
+            picked = self._select_feasible_grasp_pair(
+                group,
+                link,
+                target_pose,
+                pre_pose,
+                joint_names=joint_names,
+                speed_scale=speed_scale,
+                plan_frame=plan_frame,
+                cutoff_joint_names=cutoff_joint_names,
+            )
+        else:
+            log.info(
+                "[pick] 0/9 复用可达性验证选出的 IK、"
+                "OMPL 到 q_pre 轨迹和 Cartesian 轨迹"
+            )
         if picked is None:
             log.error(
-                "[pick] 未找到「IK 可解 + cartesian approach 可行 + "
-                "加入两个临时碰撞体后 q_pre 无碰撞」的 IK 解"
+                "[pick] 未找到「无碰撞 IK + Cartesian approach + "
+                "OMPL 到 q_pre」均可行的解"
             )
             self.last_pick_failure_reason = "no_ik"
             return False
-        q_pre, q_target, approach_traj = picked
+        q_pre, q_target, to_pre_traj, approach_traj = picked
         log.info(
             "[pick] 选定 q_pre: "
             + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
         )
 
-        log.info("[pick] 1/9  OMPL  → q_pre（关节目标，IK 解已确定）")
-        current = self._get_joints(joint_names, wait_new=True)
-        if current is None:
-            log.error("[pick] 读取当前关节失败")
+        if not to_pre_traj.joint_trajectory.points:
+            log.error("[pick] 1/9 缓存的 OMPL 到 q_pre 轨迹为空")
             return False
+        log.info(
+            f"[pick] 1/9  执行已验证的 OMPL 轨迹 → q_pre "
+            f"（{len(to_pre_traj.joint_trajectory.points)} 点，免重规划）"
+        )
         # IK 多解与 q_pre → q_target 直线 approach 预检在无隔板场景下完成；
-        # 隔板只用于这一段 OMPL：从当前状态运动到 q_pre。
+        # 缓存的 OMPL 轨迹在带隔板场景下规划，执行前恢复相同场景。
         cutoff_added = False
         cutoff_removed = True
+        execute_started = time.monotonic()
         try:
             if not self.add_frame_cutoff_for_pose(
                 target_pose,
@@ -5481,29 +5506,20 @@ class G01Demo(Node):
                 log.error("[pick] 添加 q_pre OMPL 隔板失败")
                 return False
             cutoff_added = True
-            ok, used_ms, to_pre_traj = self.plan_joint_motion(
-                group,
-                q_pre,
-                joint_names=joint_names,
-                start_joints=current,
-                speed_scale=speed_scale,
-                execute=True,
-            )
+            ok = self._execute_traj(to_pre_traj)
         finally:
             if cutoff_added:
                 log.info(f"[pick] 移除「{FRAME_CUTOFF_ID}」，后续直线 approach 不使用隔板")
                 cutoff_removed = self.remove_frame_cutoff()
 
-        log.info(f"[pick] OMPL → q_pre: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        used_ms = (time.monotonic() - execute_started) * 1000.0
+        log.info(f"[pick] 缓存轨迹 → q_pre: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not cutoff_removed:
             log.error("[pick] 移除 q_pre OMPL 隔板失败")
             return False
         if not ok:
-            log.error("[pick] OMPL 到 q_pre 失败")
+            log.error("[pick] 执行已验证的 OMPL 到 q_pre 轨迹失败")
             self.last_pick_failure_reason = "q_pre"
-            return False
-        if to_pre_traj is None or not to_pre_traj.joint_trajectory.points:
-            log.error("[pick] 1/9 未返回 OMPL 轨迹，无法原路退回初始位置")
             return False
         
         time.sleep(2)
@@ -5775,7 +5791,7 @@ class G01Demo(Node):
             dual_speed,
             exchange_joint_names,
             [q2],
-            num_attempts=30,
+            num_attempts=50,
         ):
             log.error(f"[exchange] {exchange_group} 到 q2 失败")
             return False
@@ -5936,7 +5952,7 @@ def main(argv: list[str] | None = None) -> int:
     if sim_mode:
         log.info(
             "[sim] 仿真模式：跳过工具电源服务，视觉使用固定 viewer pose，"
-            "SW1~SW4 初始有料（driver_signal=0x00），抓放后动态更新"
+            "SW1~SW4 初始为空（driver_signal=0x78），抓放后动态更新"
         )
     if keyboard_control_mode:
         log.info(
@@ -6105,16 +6121,12 @@ def main(argv: list[str] | None = None) -> int:
         joint_names = list(targets.keys())
         waypoints = [GRASP_Q1]  # 需要多点时：继续 waypoints.append(q3) ...
 
-        # log.info(f"关节规划组: {"dual_arm"}")
-        current = node._get_joints(joint_names)
-        if current is None:
-            log.error("读取当前关节位置失败，无法规划")
-            return False
-        log.info("规划前当前关节位置 [rad]:")
-        log.info("  " + ", ".join(joint_names))
-        log.info("  " + ", ".join(f"{current[name]:.6f}" for name in joint_names))
-
-        if not node.plan_execute_joint_waypoints("dual_arm_body", 0.2, joint_names, waypoints):
+        if not node.plan_execute_joint_waypoints(
+            "dual_arm_body",
+            0.2,
+            joint_names,
+            waypoints,
+        ):
             log.error("关节规划/执行失败")
             return False
 
@@ -6130,13 +6142,13 @@ def main(argv: list[str] | None = None) -> int:
         reachable = validate_reachable_grasp(
             node,
             all_xyz_rpy,
-            speed_scale=0.2,
+            speed_scale=0.4,
             cutoff_joint_names=joint_names,
         )
         if reachable is None:
             log.error(
-                "没有找到 IK 可解 + cartesian approach 可行 + "
-                "加入两个临时碰撞体后 q_pre 无碰撞的视觉点"
+                "没有找到无碰撞 IK、Cartesian approach、"
+                "OMPL 到 q_pre 均可行的视觉点"
             )
             return False
 
@@ -6187,6 +6199,12 @@ def main(argv: list[str] | None = None) -> int:
             cutoff_joint_names=joint_names,
             first_return_mode=first_return_mode,
             waist_moved=waist_moved,
+            prevalidated_pair=(
+                reachable["pick_q_pre"],
+                reachable["pick_q_target"],
+                reachable["pick_to_pre_traj"],
+                reachable["pick_approach_traj"],
+            ),
         ):
             log.error(f"{pick_label}抓取失败")
             return False
@@ -6206,7 +6224,12 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 grasp_result = run_one_grasp()
             finally:
-                cleanup_grasp_display()
+                cleanup_grasp_display(
+                    remove_scene_objects=(
+                        node.last_pick_failure_reason
+                        not in {"no_place", "no_place_signal"}
+                    )
+                )
 
             if grasp_result is None:
                 return None
