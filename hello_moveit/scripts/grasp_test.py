@@ -863,7 +863,7 @@ SIM_VISION_RESULT = (
 # 原始协议为 1,x,y,z,qw,qx,qy,qz,mode；首个 1 是点数量，末尾 1 是模式码。
 SIM_UNLOAD_VISION_RESULT = (
     1,
-    [-47.2306, -52.774, 621.5524, 0.3712, 0.9282, 0.0238, -0.0043],
+    [-47.2306, -52.774, 621.5524, 0.2655, 0.6732, -0.6395, 0.2594],
 )
 # p,4 仿真时沿用同一套视觉协议；框位姿仍按旋转和平移链计算。
 SIM_FRAME_VISION_RESULT = SIM_UNLOAD_VISION_RESULT
