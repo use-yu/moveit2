@@ -42,6 +42,11 @@ G01 MoveIt 演示脚本
   colcon build --packages-select hello_moveit && source install/setup.bash
   ros2 run hello_moveit g01.py
 
+控制方式：
+  默认：等待上位机话题命令。
+  --keyboard：不等待上位机命令，每轮通过数字菜单选择要执行的流程。
+  --interactive：运动流程中的人工确认点也等待按回车；可与 --keyboard 同时使用。
+
 腰部30度/0.523598 放置和交换
 
 交换放置相比直接放绕z轴顺时针转1度
@@ -73,7 +78,6 @@ import bisect
 import copy
 import json
 import math
-import multiprocessing
 import random
 import re
 import socket
@@ -83,7 +87,7 @@ import time
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Mapping, Sequence
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -136,34 +140,6 @@ PLAN_FRAME = "r_base_link"  # 末端位姿约束坐标系
 # EE_LINK 必须在 末端linkL6 下游、用 fixed joint 连上去的子 link（例如 l_tool）
 EE_LINK = "r_tool"
 
-# r_base_link r_tool
-# EE_POSE2 = dict(
-#     x=-0.865,
-#     y=0.240,
-#     z=0.103,
-#     roll=-2.125,
-#     pitch=-0.131,
-#     yaw=1.044,
-# )
-
-# L6
-# EE_POSE2 = dict(
-#     x=-0.75,
-#     y=-0.35,
-#     z=0.0,
-#     roll=-math.pi / 4,
-#     pitch=-math.pi / 4,
-#     yaw=-math.pi,
-# )
-# R6
-# EE_POSE2 = dict(
-#     x=-0.788,
-#     y=-0.101,
-#     z=0.054,
-#     roll=-1.603,
-#     pitch=-1.340,
-#     yaw=3.071,
-# )
 # 各组的关节目标 [rad]（键名须与 URDF/SRDF 一致）
 JOINT_TARGETS = {
 
@@ -1911,6 +1887,24 @@ def _urdf_collision_data(urdf_path: str = str(DEFAULT_ROBOT_URDF)):
     return collisions_by_link, parent_by_child
 
 
+@lru_cache(maxsize=1)
+def _urdf_collision_link_names(
+    urdf_path: str = str(DEFAULT_ROBOT_URDF),
+) -> tuple[str, ...]:
+    """返回 URDF 中所有带 collision 几何体的 link 名称。
+
+    该列表只用于构造单次关节空间规划请求的 Allowed Collision Matrix。
+    与 ``_urdf_collision_data`` 不同，这里不限定几何体必须是圆柱，因此网格、
+    box、sphere 等碰撞几何也不会漏掉。
+    """
+    root = _expanded_robot_urdf_root(urdf_path)
+    return tuple(
+        link_name
+        for link in root.iter("link")
+        if (link_name := link.attrib.get("name")) and link.find("collision") is not None
+    )
+
+
 def collision_link_for_link(link: str) -> str | None:
     """若 link 本身无 collision，则向父 link 查找最近的圆柱 collision link。"""
     collisions_by_link, parent_by_child = _urdf_collision_data()
@@ -2123,15 +2117,6 @@ def make_joint_constraints(group: str, joints: dict[str, float]) -> Constraints:
     return c
 
 
-def make_joint_constraints_from_vector(
-    group: str, joint_names: Sequence[str], joint_values: Sequence[float]
-) -> Constraints:
-    """关节目标（vector）→ MoveIt goal_constraints。"""
-    if len(joint_names) != len(joint_values):
-        raise ValueError(f"joint_names 与 joint_values 长度不一致: {len(joint_names)} vs {len(joint_values)}")
-    return make_joint_constraints(group, dict(zip(joint_names, joint_values)))
-
-
 def make_pose_constraints(link: str, pose: Pose, frame_id: str = PLAN_FRAME) -> Constraints:
     """
     末端位姿目标 → PositionConstraint（位置球）+ OrientationConstraint。
@@ -2301,8 +2286,8 @@ class G01Demo(Node):
         self._latest_upper_command: tuple[str, dict] | None = None
         self.last_pick_failure_reason: str | None = None
         # UInt8 会在回调中显式限制到 uint8 范围。真实模式在收到首帧前为未知，
-        # 未知状态按“没有安全空位”处理；仿真模式默认四个 SW 均有料，
-        # 便于直接测试双臂下料流程。
+        # 未知状态按“没有安全空位”处理；仿真模式初始四个 SW 均有料，
+        # 之后由上料/下料动作实时更新对应 SW，避免每轮一直重复使用同一组。
         self._driver_signal: int | None = (
             ALL_PLACE_SLOTS_MATERIAL_SIGNAL if self.sim_mode else None
         )
@@ -2529,6 +2514,67 @@ class G01Demo(Node):
             self.get_logger().info(
                 f"收到 {DRIVER_SIGNAL_TOPIC}: uint8=0x{signal:02X}, {states}"
             )
+
+    def _update_simulated_place_slots(
+        self,
+        slot_names: Sequence[str],
+        *,
+        has_material: bool,
+        reason: str,
+    ) -> bool:
+        """原子更新仿真模式下一个或多个 SW 的有料状态。
+
+        驱动板协议中对应 bit 为 0 表示有料、为 1 表示空位：
+
+        - 上料完成后传 ``has_material=True``，清除对应 bit；
+        - 下料抓走后传 ``has_material=False``，置位对应 bit。
+
+        一组动作无论包含一个还是两个 SW，都只生成一帧模拟信号并递增一次
+        ``_driver_signal_count``。真实模式禁止调用，真实信号仍完全由驱动板话题
+        更新。
+        """
+        log = self.get_logger()
+        if not self.sim_mode:
+            log.error("仅仿真模式允许直接更新 SW 状态")
+            return False
+
+        normalized_names = [str(name).lower() for name in slot_names]
+        unknown_names = [
+            name for name in normalized_names if name not in PLACE_SLOT_MASKS
+        ]
+        if unknown_names:
+            log.error(f"[sim][SW] 未知位置: {unknown_names}")
+            return False
+        if not normalized_names:
+            log.error("[sim][SW] 更新位置列表为空")
+            return False
+
+        signal = (
+            ALL_PLACE_SLOTS_MATERIAL_SIGNAL
+            if self._driver_signal is None
+            else int(self._driver_signal)
+        )
+        for slot_name in normalized_names:
+            mask = PLACE_SLOT_MASKS[slot_name]
+            if has_material:
+                signal &= ~mask
+            else:
+                signal |= mask
+
+        self._driver_signal = signal & 0xFF
+        self._driver_signal_count += 1
+        states = ", ".join(
+            f"{slot_name.upper()}="
+            f"{'空' if self._driver_signal & mask else '有物体'}"
+            for slot_name, mask in PLACE_SLOT_MASKS.items()
+        )
+        changed_slots = ", ".join(name.upper() for name in normalized_names)
+        target_state = "有物体" if has_material else "空"
+        log.info(
+            f"[sim][SW] {reason}：{changed_slots} → {target_state}; "
+            f"uint8=0x{self._driver_signal:02X}, {states}"
+        )
+        return True
 
     def _on_ft_sensor(self, msg: Float32MultiArray, side: str) -> None:
         """缓存左右臂六维力中的 Z；数据顺序为 Fx/Fy/Fz/Mx/My/Mz。"""
@@ -2874,12 +2920,13 @@ class G01Demo(Node):
             f"{WAIST_BODY_JOINT} {current[WAIST_BODY_JOINT]:.6f} -> {angle_rad:.6f} rad "
             f"({math.degrees(angle_rad):.2f} deg), speed_scale={_clamp01(speed_scale):.2f}"
         )
-        ok, used_ms, _ = self.move(
+        ok, used_ms, _ = self.plan_joint_motion(
             WAIST_BODY_GROUP,
-            [make_joint_constraints(WAIST_BODY_GROUP, target)],
-            start=current,
-            plan_only=False,
+            target,
+            joint_names=joint_names,
+            start_joints=current,
             speed_scale=speed_scale,
+            execute=True,
         )
         log.info(f"[waist] move body_joint2: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         return ok
@@ -3652,9 +3699,18 @@ class G01Demo(Node):
         start: dict[str, float] | None,
         plan_only: bool,
         speed_scale: float | None,
+        avoid_collisions: bool = True,
         num_attempts: int | None = None,
     ) -> tuple[bool, float, RobotTrajectory | None, int | None]:
-        """单次 move_action 调用。返回 (ok, 耗时 ms, trajectory, error_code)。"""
+        """执行一次 MoveGroup 请求。
+
+        ``avoid_collisions=True`` 使用 move_group 当前规划场景的正常碰撞检查。
+        ``False`` 只在本次请求的 planning_scene_diff 中临时允许机器人 collision
+        link 与其他对象相交，不会写入或污染全局规划场景。关闭碰撞检查具有真实
+        机械臂撞击风险，调用方必须明确承担安全责任。
+
+        返回 ``(是否成功, 耗时毫秒, 轨迹, MoveIt 错误码)``。
+        """
         log = self.get_logger()
         t0 = time.monotonic()
         elapsed_ms = lambda: (time.monotonic() - t0) * 1000.0
@@ -3675,6 +3731,28 @@ class G01Demo(Node):
             g.request.start_state.joint_state.name = list(start.keys())
             g.request.start_state.joint_state.position = list(start.values())
         g.planning_options.plan_only = plan_only
+        if not avoid_collisions:
+            try:
+                collision_links = _urdf_collision_link_names()
+            except RuntimeError as exc:
+                log.error(f"读取 URDF collision link 失败，无法关闭碰撞检查：{exc}")
+                return False, elapsed_ms(), None, MoveItErrorCodes.FAILURE
+            if not collision_links:
+                log.error("URDF 中没有 collision link，无法构造忽略碰撞的规划请求")
+                return False, elapsed_ms(), None, MoveItErrorCodes.FAILURE
+
+            # AllowedCollisionMatrix 放在 MoveGroup.Goal 自带的场景 diff 中，
+            # 生命周期仅覆盖本次规划。把每个 collision link 的默认规则设为 True，
+            # 即允许它与机器人其他 link 及世界碰撞体发生接触。
+            scene_diff = g.planning_options.planning_scene_diff
+            scene_diff.is_diff = True
+            scene_diff.robot_state.is_diff = True
+            acm = scene_diff.allowed_collision_matrix
+            acm.default_entry_names = list(collision_links)
+            acm.default_entry_values = [True] * len(collision_links)
+            log.warning(
+                f"[{group}] 本次关节空间规划已关闭碰撞检查，仅允许用于受控调试"
+            )
 
         send_fut = self._move_cli.send_goal_async(g)
         if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
@@ -3727,6 +3805,7 @@ class G01Demo(Node):
         start: dict[str, float] | None = None,
         plan_only: bool = False,
         speed_scale: float | None = None,
+        avoid_collisions: bool = True,
         max_retries: int | None = None,
         num_attempts: int | None = None,
     ) -> tuple[bool, float, RobotTrajectory | None]:
@@ -3740,6 +3819,7 @@ class G01Demo(Node):
         失败或无轨迹时第三项为 None。
         joint_names + 未传 start：从 joint_states 读当前位置作为起点。
         start：显式指定起点（位姿规划在关节运动后用）。
+        avoid_collisions：是否使用规划场景做碰撞检查；False 仅影响本次请求。
         """
         log = self.get_logger()
         retries = MOVE_MAX_RETRIES if max_retries is None else max(1, max_retries)
@@ -3758,7 +3838,13 @@ class G01Demo(Node):
         last_code: int | None = None
         for attempt in range(1, retries + 1):
             ok, _, traj, code = self._move_once(
-                group, goal_constraints, start, plan_only, speed_scale, num_attempts
+                group,
+                goal_constraints,
+                start,
+                plan_only,
+                speed_scale,
+                avoid_collisions,
+                num_attempts,
             )
             last_code = code
             if ok:
@@ -3785,26 +3871,149 @@ class G01Demo(Node):
             )
         return no_traj(False)
 
+    def plan_joint_motion(
+        self,
+        group: str,
+        end_joints: Mapping[str, float] | Sequence[float],
+        *,
+        joint_names: Sequence[str] | None = None,
+        start_joints: Mapping[str, float] | None = None,
+        speed_scale: float = 0.2,
+        num_attempts: int | None = None,
+        max_retries: int | None = None,
+        avoid_collisions: bool = True,
+        execute: bool = False,
+    ) -> tuple[bool, float, RobotTrajectory | None]:
+        """通用关节空间规划入口，可选择只规划或规划并执行。
+
+        参数：
+            group:
+                SRDF 规划组，例如 ``left_arm``、``dual_arm_body``。
+            end_joints:
+                终点关节。可传 ``{关节名: 位置}``；也可传数值序列，此时必须
+                同时传 ``joint_names``，两者按下标一一对应。
+            joint_names:
+                规划组的关节顺序。终点为字典时可省略，默认沿用字典插入顺序。
+            start_joints:
+                显式规划起点 ``{关节名: 位置}``。省略时读取最新 joint_states。
+                可包含组外关节，以便完整描述机器人起始状态。
+            speed_scale:
+                MoveIt 速度和加速度缩放，范围会限制到 0~1。
+            num_attempts:
+                单次 MoveGroup 请求内部的规划求解次数；省略时使用
+                ``NUM_ATTEMPTS``。
+            max_retries:
+                整个 MoveGroup 请求失败后的重发次数；省略时使用
+                ``MOVE_MAX_RETRIES``。它和 ``num_attempts`` 是两层不同的重试。
+            avoid_collisions:
+                True 使用规划场景碰撞检查；False 仅对本次请求临时放开碰撞，
+                不修改全局场景，但真实机器人使用时有撞击风险。
+            execute:
+                False 只规划并返回轨迹；True 由 MoveGroup 规划后立即执行。
+
+        返回：
+            ``(是否成功, 总耗时毫秒, RobotTrajectory 或 None)``。
+        """
+        log = self.get_logger()
+        try:
+            if isinstance(end_joints, Mapping):
+                names = (
+                    list(joint_names)
+                    if joint_names is not None
+                    else list(end_joints)
+                )
+                missing = [name for name in names if name not in end_joints]
+                if missing:
+                    log.error(f"[{group}] 终点关节字典缺少: {missing}")
+                    return False, 0.0, None
+                target = {name: float(end_joints[name]) for name in names}
+            else:
+                if joint_names is None:
+                    log.error(f"[{group}] 终点使用数值序列时必须提供 joint_names")
+                    return False, 0.0, None
+                names = list(joint_names)
+                values = list(end_joints)
+                if len(names) != len(values):
+                    log.error(
+                        f"[{group}] joint_names 与 end_joints 长度不一致: "
+                        f"{len(names)} != {len(values)}"
+                    )
+                    return False, 0.0, None
+                target = {
+                    name: float(value)
+                    for name, value in zip(names, values)
+                }
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 终点关节必须是可转换为 float 的数值: {exc}")
+            return False, 0.0, None
+
+        if not names:
+            log.error(f"[{group}] 关节列表为空")
+            return False, 0.0, None
+        if len(set(names)) != len(names):
+            log.error(f"[{group}] joint_names 中存在重复关节")
+            return False, 0.0, None
+        if any(not math.isfinite(value) for value in target.values()):
+            log.error(f"[{group}] 终点关节包含 NaN 或无穷值")
+            return False, 0.0, None
+
+        try:
+            start = (
+                {
+                    name: float(value)
+                    for name, value in start_joints.items()
+                }
+                if start_joints is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 起点关节必须是可转换为 float 的数值: {exc}")
+            return False, 0.0, None
+        if start is not None and any(
+            not math.isfinite(value) for value in start.values()
+        ):
+            log.error(f"[{group}] 起点关节包含 NaN 或无穷值")
+            return False, 0.0, None
+        goal = [make_joint_constraints(group, target)]
+        return self.move(
+            group,
+            goal,
+            joint_names=names,
+            start=start,
+            plan_only=not execute,
+            speed_scale=speed_scale,
+            avoid_collisions=avoid_collisions,
+            max_retries=max_retries,
+            num_attempts=num_attempts,
+        )
+
     def plan_execute_joint_waypoints(
         self,
         group: str,
         speed_scale: float,
         joint_names: Sequence[str],
-        waypoints: Sequence[Sequence[float]],
+        waypoints: Sequence[Mapping[str, float] | Sequence[float]],
         num_attempts: int | None = None,
+        *,
+        start_joints: Mapping[str, float] | None = None,
+        max_retries: int | None = None,
+        avoid_collisions: bool = True,
     ) -> bool:
-        """
-        关节空间多点规划（vector<vector>）：
-        - joint_names: 关节名顺序
-        - waypoints: 每个路径点是一组关节角（与 joint_names 等长）
-        逐段：一次 move_action（plan + execute 同时），完成后用 joint_states 作为下一段起点。
+        """按顺序规划并执行多个关节空间路径点。
+
+        每个 waypoint 都复用 :meth:`plan_joint_motion`。第一段可从调用方指定的
+        ``start_joints`` 开始；后续段必须读取上一段执行后的真实 joint_states，
+        避免控制误差累积。``num_attempts``、``max_retries`` 和
+        ``avoid_collisions`` 会一致地应用到每一段。
         """
         log = self.get_logger()
         if not waypoints:
             log.error(f"[{group}] waypoints 为空")
             return False
 
-        start = self._get_joints(list(joint_names))
+        start = dict(start_joints) if start_joints is not None else self._get_joints(
+            list(joint_names)
+        )
         if start is None:
             return False
         planning_attempts = NUM_ATTEMPTS if num_attempts is None else max(1, int(num_attempts))
@@ -3815,11 +4024,16 @@ class G01Demo(Node):
         )
 
         for idx, q in enumerate(waypoints):
-            goal = [make_joint_constraints_from_vector(group, joint_names, q)]
-
-            ok, used_ms, _ = self.move(
-                group, goal, start=start, plan_only=False, speed_scale=speed_scale,
-                num_attempts=planning_attempts
+            ok, used_ms, _ = self.plan_joint_motion(
+                group,
+                q,
+                joint_names=joint_names,
+                start_joints=start,
+                speed_scale=speed_scale,
+                num_attempts=planning_attempts,
+                max_retries=max_retries,
+                avoid_collisions=avoid_collisions,
+                execute=True,
             )
             log.info(
                 f"[{group}] segment {idx + 1}/{len(waypoints)} plan+exec: {used_ms:.3f} ms "
@@ -3890,40 +4104,79 @@ class G01Demo(Node):
         pose = make_pose(x, y, z, roll, pitch, yaw)
         return self.plan_execute_pose(group, speed_scale, link, pose, use_cartesian)
 
-    def _cartesian_plan(
+    def plan_cartesian_line(
         self,
         group: str,
         link: str,
         end_pose: Pose,
+        *,
         speed_scale: float = 0.2,
         avoid_collisions: bool = True,
         eef_step: float = CART_EEF_STEP,
         min_fraction: float = CART_MIN_FRACTION,
-        start_joints: dict | None = None,
+        start_joints: Mapping[str, float] | None = None,
         joint_names: Sequence[str] | None = None,
         plan_frame: str = PLAN_FRAME,
+        num_attempts: int = 1,
         verbose: bool = True,
-    ):
-        """调 compute_cartesian_path 服务，规划成功返回（已缩放速度的）RobotTrajectory。
+    ) -> RobotTrajectory | None:
+        """规划一条从指定关节起点到末端目标位姿的笛卡尔直线。
 
         参数：
-            start_joints : 起点关节 {name: pos}。None 时从 joint_states 读取当前关节
-                （等价机器人「真实」起点）。指定时可在「不动机器人」的前提下
-                预演任意起点出发的笛卡尔路径，用于 IK 多解 + approach 预检。
-            verbose      : 是否打印 "笛卡尔直线 ..." / "cartesian planning ..." 信息。
-                预检批量调用时建议关掉，避免日志刷屏。
+            group:
+                SRDF 规划组，例如 ``left_arm``、``right_body``。
+            link:
+                沿直线运动的末端 link，例如 ``l_tool`` 或 ``r_tool``。
+            end_pose:
+                直线终点位姿，必须在 ``plan_frame`` 中表达。
+            speed_scale:
+                轨迹速度缩放。Humble 的 GetCartesianPath 没有速度字段，因此
+                本函数统一缩放时间戳、速度和加速度后再返回轨迹。
+            avoid_collisions:
+                是否在 Cartesian 离散 IK 求解过程中检查规划场景碰撞。
+            eef_step:
+                末端直线的最大离散步长，单位 m；必须大于 0。
+            min_fraction:
+                可接受的最小完成比例，范围 0~1；低于该值视为失败。
+            start_joints:
+                起点关节 ``{name: pos}``。省略时读取 ``joint_names`` 对应的最新
+                joint_states。服务会先对该起点做 FK，因此无需另传 start_pose。
+                显式传入时可在不移动机器人的情况下预演任意起点。
+            joint_names:
+                未指定 ``start_joints`` 时要读取的关节名；省略则使用
+                ``POSE_START_JOINTS``。
+            plan_frame:
+                ``end_pose`` 所属的参考坐标系。
+            num_attempts:
+                compute_cartesian_path 的最大调用次数，至少为 1。任意一次达到
+                ``min_fraction`` 即返回。
+            verbose:
+                是否打印详细日志。批量 IK 候选预检时可关闭，避免刷屏。
 
-        失败返回 None。返回的 trajectory 可直接缓存以备后续反向播放/重发。
+        返回：
+            成功时返回已按 ``speed_scale`` 缩放的 ``RobotTrajectory``；所有
+            尝试均失败时返回 None。轨迹可直接执行、缓存或反向播放。
+
+        关闭碰撞检查只影响本次服务请求，不会修改全局规划场景。
         """
         log = self.get_logger()
-        t0 = time.monotonic()
+        total_t0 = time.monotonic()
+
+        if eef_step <= 0.0:
+            log.error(f"[{group}] eef_step 必须大于 0，当前={eef_step}")
+            return None
+        if not 0.0 <= min_fraction <= 1.0:
+            log.error(f"[{group}] min_fraction 必须在 0~1，当前={min_fraction}")
+            return None
+        attempts = max(1, int(num_attempts))
 
         if not self._cart_cli.wait_for_service(timeout_sec=10.0):
             log.error(f"服务 {SVC_CARTESIAN_PATH} 不可用")
             return None
 
-        start = start_joints if start_joints is not None else self._get_joints(
-            list(joint_names) if joint_names is not None else POSE_START_JOINTS, wait_new=True
+        start = dict(start_joints) if start_joints is not None else self._get_joints(
+            list(joint_names) if joint_names is not None else POSE_START_JOINTS,
+            wait_new=True,
         )
         if start is None:
             return None
@@ -3948,49 +4201,83 @@ class G01Demo(Node):
                 f"[{group}] 笛卡尔直线 {link} @ {plan_frame}: "
                 f"end pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
                 f"max_step={eef_step:.4f}, avoid_collisions={avoid_collisions}, "
-                f"jump={CART_JUMP_THRESHOLD:.1f}/{CART_REVOLUTE_JUMP_THRESHOLD:.2f}rad, "
-                f"speed_scale={_clamp01(speed_scale):.2f}"
+                f"jump={CART_JUMP_THRESHOLD:.1f}/"
+                f"{CART_REVOLUTE_JUMP_THRESHOLD:.2f}rad, "
+                f"speed_scale={_clamp01(speed_scale):.2f}, attempts={attempts}"
             )
 
-        fut = self._cart_cli.call_async(req)
-        if not self._spin_until(fut, 15.0):
-            log.error("compute_cartesian_path 超时")
-            return None
+        trajectory: RobotTrajectory | None = None
+        last_fraction = 0.0
+        last_code: int | None = None
+        for attempt in range(1, attempts + 1):
+            attempt_t0 = time.monotonic()
+            fut = self._cart_cli.call_async(req)
+            if not self._spin_until(fut, 15.0):
+                if verbose:
+                    log.warning(
+                        f"[{group}] compute_cartesian_path "
+                        f"第 {attempt}/{attempts} 次超时"
+                    )
+                continue
 
-        res = fut.result()
-        code_val = res.error_code.val
-        plan_ms = (time.monotonic() - t0) * 1000.0
-        if verbose:
-            log.info(
-                f"[{group}] cartesian planning: {plan_ms:.3f} ms, fraction={res.fraction:.3f}, "
-                f"error_code={code_val}({_moveit_error_name(code_val)})"
-            )
-        if res.fraction < min_fraction or code_val != MoveItErrorCodes.SUCCESS:
+            res = fut.result()
+            last_fraction = res.fraction
+            last_code = res.error_code.val
             if verbose:
+                log.info(
+                    f"[{group}] cartesian planning {attempt}/{attempts}: "
+                    f"{(time.monotonic() - attempt_t0) * 1000.0:.3f} ms, "
+                    f"fraction={last_fraction:.3f}, "
+                    f"error_code={last_code}({_moveit_error_name(last_code)})"
+                )
+            if (
+                last_fraction >= min_fraction
+                and last_code == MoveItErrorCodes.SUCCESS
+            ):
+                trajectory = res.solution
+                break
+
+        if trajectory is None:
+            if verbose:
+                error_name = (
+                    _moveit_error_name(last_code)
+                    if last_code is not None
+                    else "timeout"
+                )
                 log.error(
-                    f"笛卡尔直线规划未达标：fraction={res.fraction:.3f} < {min_fraction}, "
-                    f"error_code={code_val}({_moveit_error_name(code_val)})"
+                    f"[{group}] 笛卡尔直线 {attempts} 次规划均未达标："
+                    f"fraction={last_fraction:.3f} < {min_fraction}, "
+                    f"error_code={last_code}({error_name}), "
+                    f"total={(time.monotonic() - total_t0) * 1000.0:.3f} ms"
                 )
             return None
 
-        traj = res.solution
-        s = _clamp01(speed_scale)
-        if s > 0.0 and abs(s - 1.0) > 1e-6:
-            for pt in traj.joint_trajectory.points:
-                total = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
-                scaled = total / s
-                pt.time_from_start.sec = int(scaled)
-                pt.time_from_start.nanosec = int(round((scaled - int(scaled)) * 1e9))
-                pt.velocities = [v * s for v in pt.velocities]
-                pt.accelerations = [a * s * s for a in pt.accelerations]
+        scale = _clamp01(speed_scale)
+        if scale > 0.0 and abs(scale - 1.0) > 1e-6:
+            for point in trajectory.joint_trajectory.points:
+                total_seconds = (
+                    point.time_from_start.sec
+                    + point.time_from_start.nanosec * 1e-9
+                )
+                scaled_ns = int(
+                    round(total_seconds * 1_000_000_000 / scale)
+                )
+                (
+                    point.time_from_start.sec,
+                    point.time_from_start.nanosec,
+                ) = divmod(scaled_ns, 1_000_000_000)
+                point.velocities = [value * scale for value in point.velocities]
+                point.accelerations = [
+                    value * scale * scale for value in point.accelerations
+                ]
 
-        return traj
+        return trajectory
 
     def _execute_traj(self, traj, timeout: float = 60.0) -> bool:
         """直接把一条 RobotTrajectory 发给 execute_trajectory action。
 
-        traj 必须已是「速度缩放后」的最终轨迹（_cartesian_plan 或 _reverse_trajectory
-        的返回值均已满足）。
+        traj 必须已是「速度缩放后」的最终轨迹（plan_cartesian_line 或
+        _reverse_trajectory 的返回值均已满足）。
         """
         log = self.get_logger()
         if not self._exec_cli.wait_for_server(timeout_sec=10.0):
@@ -4205,7 +4492,7 @@ class G01Demo(Node):
                 "[pick][force-guard] 无法读取停止后的实测关节位置"
             )
             return False
-        retreat = self._cartesian_plan(
+        retreat = self.plan_cartesian_line(
             group,
             link,
             pre_pose,
@@ -4647,7 +4934,7 @@ class G01Demo(Node):
         feasible_pairs = []
 
         for idx, q_target in enumerate(candidates):
-            retreat_traj = self._cartesian_plan(
+            retreat_traj = self.plan_cartesian_line(
                 group, link, pre_pose,
                 speed_scale=speed_scale,
                 start_joints=q_target,
@@ -4754,43 +5041,49 @@ class G01Demo(Node):
         group: str,
         link: str,
         end_pose: Pose,
+        *,
         speed_scale: float = 0.2,
         avoid_collisions: bool = True,
         eef_step: float = CART_EEF_STEP,
         min_fraction: float = CART_MIN_FRACTION,
+        start_joints: Mapping[str, float] | None = None,
+        joint_names: Sequence[str] | None = None,
+        plan_frame: str = PLAN_FRAME,
+        num_attempts: int = 1,
+        execute_timeout: float = 60.0,
     ) -> bool:
-        """从当前末端位姿直线移动到 end_pose：先 _cartesian_plan 再 _execute_traj。
+        """复用 :meth:`plan_cartesian_line` 规划并立即执行直线轨迹。
 
-        - 走 compute_cartesian_path 服务：服务从 start_state 做 FK 得到当前 EE 位姿，
-          再沿 waypoints[0]=end_pose 做直线段（关节空间逐段 IK 拼接而成）。
-        - 拿到 RobotTrajectory 后用 execute_trajectory action 执行。
-        - Humble 的 GetCartesianPath 没有 max_velocity_scaling_factor 字段，速度缩放
-          在客户端通过缩放 time_from_start / velocities / accelerations 实现。
-        - fraction < min_fraction 视为失败（默认 0.99，要求基本走完整条直线）。
+        ``group``、速度、起点、终点、求解次数、碰撞策略、参考坐标系和离散
+        精度均可由调用方配置，含义与 ``plan_cartesian_line`` 完全一致。
+        ``execute_timeout`` 仅控制 execute_trajectory 的等待超时。若显式传入
+        ``start_joints``，执行前必须确保机器人实际处于该起点，否则控制器会因
+        轨迹起点不匹配而拒绝执行。
         """
         log = self.get_logger()
         t0 = time.monotonic()
-        traj = self._cartesian_plan(
-            group, link, end_pose, speed_scale, avoid_collisions, eef_step, min_fraction
+        traj = self.plan_cartesian_line(
+            group,
+            link,
+            end_pose,
+            speed_scale=speed_scale,
+            avoid_collisions=avoid_collisions,
+            eef_step=eef_step,
+            min_fraction=min_fraction,
+            start_joints=start_joints,
+            joint_names=joint_names,
+            plan_frame=plan_frame,
+            num_attempts=num_attempts,
         )
         if traj is None:
             return False
-        if not self._execute_traj(traj):
+        if not self._execute_traj(traj, timeout=execute_timeout):
             return False
-        log.info(f"[{group}] cartesian plan+exec: {(time.monotonic() - t0) * 1000.0:.3f} ms (success)")
-        return True
-
-    def _has_available_place_target(
-        self,
-        arm_group: str,
-        place_joints: dict[str, object],
-        first_return_mode: int,
-    ) -> bool:
-        """检查硬件信号所示的空位中，是否存在已配置的放置目标。"""
-        available, _ = self._select_available_place_target(
-            arm_group, place_joints, first_return_mode
+        log.info(
+            f"[{group}] cartesian plan+exec: "
+            f"{(time.monotonic() - t0) * 1000.0:.3f} ms (success)"
         )
-        return available
+        return True
 
     def _select_available_place_target(
         self,
@@ -4914,9 +5207,13 @@ class G01Demo(Node):
         if current is None:
             log.error("[pick] 读取当前 body+手臂关节失败")
             return False
-        goal = [make_joint_constraints_from_vector(body_group, body_joint_names, yubei_joints)]
-        ok, used_ms, _to_yubei_traj = self.move(
-            body_group, goal, start=current, plan_only=False, speed_scale=speed
+        ok, used_ms, _to_yubei_traj = self.plan_joint_motion(
+            body_group,
+            yubei_joints,
+            joint_names=body_joint_names,
+            start_joints=current,
+            speed_scale=speed,
+            execute=True,
         )
         log.info(f"[pick] OMPL → {yubei_name}: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not ok:
@@ -4938,7 +5235,7 @@ class G01Demo(Node):
         if fang_pose is None:
             log.error(f"[pick] 无法由 {place_name} 关节角计算末端位姿")
             return False
-        to_fang_traj = self._cartesian_plan(
+        to_fang_traj = self.plan_cartesian_line(
             arm_group,
             link,
             fang_pose,
@@ -4979,6 +5276,19 @@ class G01Demo(Node):
             log.error(f"[pick] {tool_label}工具下电失败")
             return False
         print(f"\033[32m{tool_label}下电成功\033[0m")
+        if self.sim_mode:
+            if slot_name is None:
+                log.error(
+                    "[sim][SW] 当前放置配置没有对应的 SW 名称，"
+                    "无法模拟上料后的占用状态"
+                )
+                return False
+            if not self._update_simulated_place_slots(
+                [slot_name],
+                has_material=True,
+                reason=f"{tool_label}完成上料",
+            ):
+                return False
 
         log.info(
             f"[pick] 8/9  反向播放到 {place_name} 的轨迹原路返回 "
@@ -5015,9 +5325,13 @@ class G01Demo(Node):
         if current is None:
             log.error("[pick] 9/9 读取当前关节失败")
             return False
-        goal = [make_joint_constraints_from_vector(arm_group, arm_joint_names, q1_joints)]
-        ok, used_ms, _to_q1_traj = self.move(
-            arm_group, goal, start=current, plan_only=False, speed_scale=speed
+        ok, used_ms, _to_q1_traj = self.plan_joint_motion(
+            arm_group,
+            q1_joints,
+            joint_names=arm_joint_names,
+            start_joints=current,
+            speed_scale=speed,
+            execute=True,
         )
         log.info(f"[pick] OMPL → Q1 固定点: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not ok:
@@ -5151,9 +5465,6 @@ class G01Demo(Node):
         if current is None:
             log.error("[pick] 读取当前关节失败")
             return False
-        pick_start_joints = current
-        goal = [make_joint_constraints(group, q_pre)]
-
         # IK 多解与 q_pre → q_target 直线 approach 预检在无隔板场景下完成；
         # 隔板只用于这一段 OMPL：从当前状态运动到 q_pre。
         cutoff_added = False
@@ -5170,8 +5481,13 @@ class G01Demo(Node):
                 log.error("[pick] 添加 q_pre OMPL 隔板失败")
                 return False
             cutoff_added = True
-            ok, used_ms, to_pre_traj = self.move(
-                group, goal, start=current, plan_only=False, speed_scale=speed_scale
+            ok, used_ms, to_pre_traj = self.plan_joint_motion(
+                group,
+                q_pre,
+                joint_names=joint_names,
+                start_joints=current,
+                speed_scale=speed_scale,
+                execute=True,
             )
         finally:
             if cutoff_added:
@@ -5487,7 +5803,7 @@ class G01Demo(Node):
             return False
 
         down_pose = pose_offset_local_z(ee_pose, abs(z_down_distance))
-        down_traj = self._cartesian_plan(
+        down_traj = self.plan_cartesian_line(
             source_group,
             source_link,
             down_pose,
@@ -5543,19 +5859,74 @@ class G01Demo(Node):
 
 def split_runtime_args(
     argv: list[str] | None = None,
-) -> tuple[bool, bool, list[str]]:
-    """取出 --sim/--interactive，其余参数继续交给 rclpy。"""
+) -> tuple[bool, bool, bool, list[str]]:
+    """解析本程序参数，并把剩余 ROS 参数交给 rclpy。
+
+    返回 ``(sim_mode, upper_control_mode, keyboard_control_mode, ros_args)``：
+
+    - ``--sim``：跳过真机工具服务并使用仿真输入。
+    - ``--interactive``：保留运动流程内部的按回车确认点。
+    - ``--keyboard``：主循环使用数字菜单，不等待上位机话题命令。
+
+    ``--keyboard`` 和 ``--interactive`` 相互独立：前者选择高层流程，后者控制
+    流程内部是否逐步确认。
+    """
     raw_args = list(sys.argv if argv is None else argv)
     sim_mode = "--sim" in raw_args
     upper_control_mode = "--interactive" not in raw_args
+    keyboard_control_mode = "--keyboard" in raw_args
+    program_args = {"--sim", "--interactive", "--keyboard"}
     ros_args = [
-        arg for arg in raw_args if arg not in ("--sim", "--interactive")
+        arg for arg in raw_args if arg not in program_args
     ]
-    return sim_mode, upper_control_mode, ros_args
+    return sim_mode, upper_control_mode, keyboard_control_mode, ros_args
+
+
+def wait_for_keyboard_command() -> tuple[str, dict] | None:
+    """显示数字菜单并返回与上位机命令相同格式的本地流程命令。
+
+    数字直接映射到现有五个命令话题，因此主循环后面的业务分支只保留一份，
+    键盘模式和上位机模式执行完全相同的流程。输入 ``0``/``q``，收到 EOF，
+    或按 Ctrl+C 时返回 None，让主循环退出并进入统一清理逻辑。
+    """
+    options = {
+        "1": (MOVE_TO_GRASP_POSE_CMD_TOPIC, "移动到抓取工位并识别深框"),
+        "2": (GRASP_CMD_TOPIC, "执行连续抓取"),
+        "3": (MOVE_TO_PLACE_POSE_CMD_TOPIC, "移动到下料工位"),
+        "4": (PLACE_CMD_TOPIC, "执行下料"),
+        "5": (RETURN_INIT_POSE_TOPIC, "返回导航初始位置"),
+    }
+
+    while rclpy.ok():
+        print("\n========== 键盘流程选择 ==========")
+        for number, (_, description) in options.items():
+            print(f"  {number}. {description}")
+        print("  0. 退出程序")
+        try:
+            choice = input("请输入流程编号: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n键盘输入结束，退出程序。")
+            return None
+
+        if choice in {"0", "q", "quit", "exit"}:
+            return None
+        selected = options.get(choice)
+        if selected is None:
+            print(f"无效编号 {choice!r}，请输入 0~5。")
+            continue
+
+        command_topic, description = selected
+        print(f"{GREEN}[keyboard] 已选择：{description}{RESET}")
+        return command_topic, {"source": "keyboard", "choice": int(choice)}
 
 
 def main(argv: list[str] | None = None) -> int:
-    sim_mode, upper_control_mode, ros_args = split_runtime_args(argv)
+    (
+        sim_mode,
+        upper_control_mode,
+        keyboard_control_mode,
+        ros_args,
+    ) = split_runtime_args(argv)
     rclpy.init(args=ros_args)
     node = G01Demo(
         sim_mode=sim_mode,
@@ -5565,7 +5936,12 @@ def main(argv: list[str] | None = None) -> int:
     if sim_mode:
         log.info(
             "[sim] 仿真模式：跳过工具电源服务，视觉使用固定 viewer pose，"
-            "SW1~SW4 默认一直有料（driver_signal=0x00）"
+            "SW1~SW4 初始有料（driver_signal=0x00），抓放后动态更新"
+        )
+    if keyboard_control_mode:
+        log.info(
+            "[keyboard] 已启用键盘流程选择；主循环不等待上位机命令。"
+            "输入 1~5 执行流程，输入 0 退出"
         )
     code = 1
     frame_added = False
@@ -5584,6 +5960,21 @@ def main(argv: list[str] | None = None) -> int:
             return input().strip().lower() == "q"
         except EOFError:
             return False
+
+    def report_flow_result(command_topic: str, result: bool) -> None:
+        """上位机模式发布结果；键盘模式只在终端打印，避免发布无请求结果。"""
+        if not keyboard_control_mode:
+            node.publish_upper_result(command_topic, result)
+            return
+
+        result_text = "成功" if result else "失败"
+        message = f"[keyboard] 流程 {command_topic} 执行{result_text}"
+        if result:
+            log.info(message)
+            print(f"{GREEN}{message}{RESET}")
+        else:
+            log.error(message)
+            print(message)
 
     def recognize_and_add_deep_frame() -> bool:
         """先运动到 框_Q1，再发送 p,4 并用识别结果重建深框碰撞场景。"""
@@ -6020,7 +6411,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
 
-        left_trajectory = node._cartesian_plan(
+        left_trajectory = node.plan_cartesian_line(
             "left_arm",
             "l_tool",
             left_target,
@@ -6030,7 +6421,7 @@ def main(argv: list[str] | None = None) -> int:
             joint_names=left_joint_names,
             plan_frame="l_base_link",
         )
-        right_trajectory = node._cartesian_plan(
+        right_trajectory = node.plan_cartesian_line(
             "right_arm",
             "r_tool",
             right_target,
@@ -6067,6 +6458,12 @@ def main(argv: list[str] | None = None) -> int:
         node.wait_for_operator("按回车给左右末端上电: ")
 
         if not set_unload_tool_power(1, "取料"):
+            return False
+        if node.sim_mode and not node._update_simulated_place_slots(
+            [right_slot, left_slot],
+            has_material=False,
+            reason="双臂完成下料取料",
+        ):
             return False
         time.sleep(UNLOAD_TOOL_SETTLE_SEC)
 
@@ -6137,7 +6534,7 @@ def main(argv: list[str] | None = None) -> int:
                 right_start_pose,
                 UNLOAD_PLACE_DESCENT_DISTANCE,
             )
-            left_descent = node._cartesian_plan(
+            left_descent = node.plan_cartesian_line(
                 "left_arm",
                 "l_tool",
                 left_descent_pose,
@@ -6155,7 +6552,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return None
 
-            right_descent = node._cartesian_plan(
+            right_descent = node.plan_cartesian_line(
                 "right_arm",
                 "r_tool",
                 right_descent_pose,
@@ -6198,14 +6595,15 @@ def main(argv: list[str] | None = None) -> int:
             label: str,
         ) -> bool | None:
             """候选未通过返回 None；开始执行后返回最终成功与否。"""
-            ok, used_ms, trajectory = node.move(
+            ok, used_ms, trajectory = node.plan_joint_motion(
                 group,
-                [make_joint_constraints(group, target)],
-                start=start,
-                plan_only=True,
+                target,
+                joint_names=joint_names_for_group(group),
+                start_joints=start,
                 speed_scale=UNLOAD_PLACE_JOINT_SPEED,
                 max_retries=1,
                 num_attempts=30,
+                execute=False,
             )
             log.info(
                 f"[unload] {label}: {used_ms:.1f} ms "
@@ -6668,21 +7066,30 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("[unload] 移除料台失败")
 
     try:
-        log.info("[startup] 上位机控制模式启动前先清除本程序管理的场景障碍物 …")
+        control_source = "键盘" if keyboard_control_mode else "上位机"
+        log.info(
+            f"[startup] {control_source}控制模式启动前先清除本程序管理的"
+            "场景障碍物 …"
+        )
         node.clear_managed_scene_objects()
         frame_added = False
         code = 0
 
         while rclpy.ok():
-            queued_command = node.wait_for_upper_command()
+            queued_command = (
+                wait_for_keyboard_command()
+                if keyboard_control_mode
+                else node.wait_for_upper_command()
+            )
             if queued_command is None:
                 break
             command_topic, payload = queued_command
+            command_source = "keyboard" if keyboard_control_mode else "upper"
 
             if command_topic == MOVE_TO_GRASP_POSE_CMD_TOPIC:
                 reset_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
                 log.info(
-                    "[upper] move_to_grasp_pose 第一步："
+                    f"[{command_source}] move_to_grasp_pose 第一步："
                     "dual_arm_body 运动到复位位姿"
                 )
                 move_to_grasp_ok = node.plan_execute_joint_waypoints(
@@ -6704,21 +7111,21 @@ def main(argv: list[str] | None = None) -> int:
                     move_to_grasp_ok = (
                         node.move_agv_after_deep_frame_recognition()
                     )
-                node.publish_upper_result(command_topic, move_to_grasp_ok)
+                report_flow_result(command_topic, move_to_grasp_ok)
                 continue
 
             if command_topic == GRASP_CMD_TOPIC:
                 log.info(
-                    f"[upper] 开始抓满四个放置位；命令参数="
+                    f"[{command_source}] 开始抓满四个放置位；命令参数="
                     f"{json.dumps(payload, ensure_ascii=False)}"
                 )
                 grasp_ok = run_grasps_until_no_empty_slot() is True
-                node.publish_upper_result(command_topic, grasp_ok)
+                report_flow_result(command_topic, grasp_ok)
                 continue
 
             if command_topic == MOVE_TO_PLACE_POSE_CMD_TOPIC:
                 nav_ok = node.navigate_and_wait(NAV_TARGET_PLACE)
-                node.publish_upper_result(command_topic, nav_ok)
+                report_flow_result(command_topic, nav_ok)
                 continue
 
             if command_topic == PLACE_CMD_TOPIC:
@@ -6732,12 +7139,12 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         log.error("切换下料时移除上料碰撞体失败")
                 place_ok = run_one_unload() if scene_ok else False
-                node.publish_upper_result(command_topic, place_ok)
+                report_flow_result(command_topic, place_ok)
                 continue
 
             if command_topic == RETURN_INIT_POSE_TOPIC:
                 log.info(
-                    "[upper] 收到 return_init_pose，导航到 map 起点 "
+                    f"[{command_source}] 收到 return_init_pose，导航到 map 起点 "
                     "(0, 0, 0, 0, 0, 0, 1)；按协议不发布结果"
                 )
                 if not node.navigate_and_wait(NAV_TARGET_INIT):
