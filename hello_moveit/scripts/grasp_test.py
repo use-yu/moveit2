@@ -27,7 +27,7 @@ G01 MoveIt 演示脚本
 /place_cmd：执行下料：
     下料读取最新 SW 信号，0=有料。
     优先取右臂 SW1 + 左臂 SW3，其次右臂 SW4 + 左臂 SW2；必须整对有料。
-    发送 p,2 识别。
+    发送 p,8 识别。
     添加 0.64×1.2×0.98m 取料台。
     拼接对应 SW 的 yubei，腰部、升降均设为 0。
     双臂分别计算末端 +Z 10cm 的 IK/Cartesian 路径，合成一条 12 关节轨迹，一次执行。
@@ -103,6 +103,7 @@ from moveit_msgs.msg import (
     ObjectColor,
     OrientationConstraint,
     PlanningScene,
+    PlanningSceneComponents,
     PositionConstraint,
     RobotState,
     RobotTrajectory,
@@ -110,6 +111,7 @@ from moveit_msgs.msg import (
 from moveit_msgs.srv import (
     ApplyPlanningScene,
     GetCartesianPath,
+    GetPlanningScene,
     GetPositionFK,
     GetPositionIK,
 )
@@ -297,13 +299,13 @@ MOVE_TO_GRASP_RESET_Q = [
     0.0,
     0 * math.pi / 180,
     -90 * math.pi / 180,
-    80 * math.pi / 180,
+    86 * math.pi / 180,
     0 * math.pi / 180,
     0 * math.pi / 180,
     0 * math.pi / 180,
     0 * math.pi / 180,
     90 * math.pi / 180,
-    -80 * math.pi / 180,
+    -86 * math.pi / 180,
     0 * math.pi / 180,
     0 * math.pi / 180,
     0 * math.pi / 180,
@@ -345,10 +347,29 @@ GRASP_Q1 = [
     1.672852,
     0.588477,
 ]
+# 下料流程识别物料台前的预备构型，顺序与 dual_arm_body 一致。
+# 前两项是 body_joint1/body_joint2，后面为左右臂各 6 个关节。
+UNLOAD_TABLE_VISION_PREP_Q = [
+    0.0,
+    0 * math.pi / 180,
+    -1.57,
+    -0.15,
+    -1.578090,
+    -1.370549,
+    -1.672852,
+    -0.588477,
+    1.57,
+    0.15,
+    1.578090,
+    1.370549,
+    1.672852,
+    0.588477,
+]
 for q1_name, q1_values in (
     ("MOVE_TO_GRASP_RESET_Q", MOVE_TO_GRASP_RESET_Q),
     ("框_Q1", 框_Q1),
     ("GRASP_Q1", GRASP_Q1),
+    ("UNLOAD_TABLE_VISION_PREP_Q", UNLOAD_TABLE_VISION_PREP_Q),
 ):
     if len(q1_values) != len(JOINT_TARGETS["dual_arm_body"]):
         raise ValueError(
@@ -417,12 +438,13 @@ Z_AXIS_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
 
 # ROS 接口名（move_group 默认）
 SVC_APPLY_SCENE = "apply_planning_scene"
+SVC_GET_PLANNING_SCENE = "get_planning_scene"
 SVC_CARTESIAN_PATH = "compute_cartesian_path"
 SVC_COMPUTE_IK = "compute_ik"
 SVC_COMPUTE_FK = "compute_fk"
-# 启动清理采用短等待，避免 move_group 尚未启动时卡住菜单。
-STARTUP_SCENE_CLEAR_SERVICE_WAIT_SEC = 0.2
-SCENE_CLEAR_RESPONSE_TIMEOUT_SEC = 2.0
+# 启动清理先等待 move_group 的场景查询服务；服务一就绪就立即继续。
+STARTUP_SCENE_CLEAR_SERVICE_WAIT_SEC = 5.0
+SCENE_CLEAR_RESPONSE_TIMEOUT_SEC = 5.0
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 LEFT_FT_SENSOR_TOPIC = "/g01/left/FTSensor"
@@ -837,7 +859,7 @@ SIM_VISION_RESULT = (
 #     1,
 #     [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
 # )
-# 物料台 p,2 仿真视觉数据：
+# 物料台 p,8 仿真视觉数据：
 # 原始协议为 1,x,y,z,qw,qx,qy,qz,mode；首个 1 是点数量，末尾 1 是模式码。
 SIM_UNLOAD_VISION_RESULT = (
     1,
@@ -1152,7 +1174,7 @@ def read_vision_object_pose(
         first_return_mode, pose = sim_vision_result_for_trigger(trigger_command)
         vision_results = [(first_return_mode, list(pose))]
         if trigger_command == UNLOAD_TRIGGER_COMMAND:
-            sim_source = "物料台 p,2"
+            sim_source = "物料台 p,8"
         elif trigger_command == FRAME_VISION_TRIGGER_COMMAND:
             sim_source = "深框 p,4"
         else:
@@ -1993,6 +2015,18 @@ def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
+def _resolve_planning_time(planning_time_sec: float | None) -> float:
+    """返回本次 MoveGroup 请求的规划时间上限。
+
+    ``None`` 表示使用全局默认值 ``PLAN_TIME_SEC``。显式传入的值必须
+    是大于 0 的有限秒数，避免把 0、NaN 或无穷大发给 MoveIt。
+    """
+    value = PLAN_TIME_SEC if planning_time_sec is None else float(planning_time_sec)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"planning_time_sec 必须是大于 0 的有限秒数，当前={value}")
+    return value
+
+
 def _pose_distance(a: Pose, b: Pose) -> float:
     dx = a.position.x - b.position.x
     dy = a.position.y - b.position.y
@@ -2255,6 +2289,10 @@ class G01Demo(Node):
         self.sim_mode = bool(sim_mode)
         self.upper_control_mode = bool(upper_control_mode)
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
+        self._get_scene_cli = self.create_client(
+            GetPlanningScene,
+            SVC_GET_PLANNING_SCENE,
+        )
         self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
         self._ik_cli = self.create_client(GetPositionIK, SVC_COMPUTE_IK)
         self._fk_cli = self.create_client(GetPositionFK, SVC_COMPUTE_FK)
@@ -2288,8 +2326,9 @@ class G01Demo(Node):
         self._latest_upper_command: tuple[str, dict] | None = None
         self.last_pick_failure_reason: str | None = None
         # UInt8 会在回调中显式限制到 uint8 范围。真实模式在收到首帧前为未知，
-        # 未知状态按“没有安全空位”处理；仿真模式初始四个 SW 均为空，
-        # 之后由上料/下料动作实时更新对应 SW。
+        # 未知状态按“没有安全空位”处理；仿真默认四个 SW 均为空。
+        # 键盘模式选择 2 时会重置为全空，选择 4 时会重置为全满；
+        # 进入具体流程后再由上料/下料动作实时更新对应 SW。
         self._driver_signal: int | None = (
             ALL_PLACE_SLOTS_EMPTY_SIGNAL if self.sim_mode else None
         )
@@ -3205,28 +3244,76 @@ class G01Demo(Node):
         ]
         return self._apply_scene(objects)
 
-    def clear_managed_scene_objects(
+    def clear_world_scene_objects(
         self,
         *,
         service_timeout: float = STARTUP_SCENE_CLEAR_SERVICE_WAIT_SEC,
         response_timeout: float = SCENE_CLEAR_RESPONSE_TIMEOUT_SEC,
     ) -> bool:
-        """用一个 PlanningScene diff 批量清除本程序管理的所有碰撞体。
+        """查询并批量清除 MoveIt world 中的全部碰撞体。
 
-        旧实现逐个发送删除请求，最坏情况下每个物体都单独等待，既慢又可能只
-        删除一部分。现在将全部 REMOVE 操作放进同一请求：服务确认成功即表示
-        整批 diff 已应用；服务尚未就绪或响应超时时返回 False，由启动流程直接
-        忽略并继续运行。
+        流程固定为：等待 ``get_planning_scene`` → 读取全部 world
+        collision object ID → 通过一次 ``apply_planning_scene`` 批量
+        REMOVE。只清理 world object，不修改机器人状态、ACM、attached
+        object 或 Octomap。
         """
-        object_ids = (
-            FRAME_ID,
-            BOX_OBSTACLE_ID,
-            FRAME_CUTOFF_ID,
-            GRASP_OBJECT_COLLISION_ID,
-            UNLOAD_TABLE_ID,
-            UNLOAD_TABLE_TOP_BOX_ID,
-            UNLOAD_OBSTACLE_ID,
+        log = self.get_logger()
+        service_timeout = max(0.0, float(service_timeout))
+        response_timeout = max(0.0, float(response_timeout))
+        started_at = time.monotonic()
+
+        if not self._get_scene_cli.wait_for_service(timeout_sec=service_timeout):
+            log.info(
+                f"[scene-cleanup] {SVC_GET_PLANNING_SCENE} 在 "
+                f"{service_timeout:.1f}s 内未就绪，未清理 world 场景"
+            )
+            return False
+
+        service_ready_ms = (time.monotonic() - started_at) * 1000.0
+        log.info(
+            f"[scene-cleanup] {SVC_GET_PLANNING_SCENE} 已就绪 "
+            f"({service_ready_ms:.1f} ms)，读取 world object ID …"
         )
+        request = GetPlanningScene.Request()
+        request.components.components = PlanningSceneComponents.WORLD_OBJECT_NAMES
+        future = self._get_scene_cli.call_async(request)
+        if not self._spin_until(future, response_timeout):
+            future.cancel()
+            log.info(
+                f"[scene-cleanup] {SVC_GET_PLANNING_SCENE} 响应超时 "
+                f"({response_timeout:.1f}s)，未清理 world 场景"
+            )
+            return False
+
+        try:
+            response = future.result()
+        except Exception as exc:  # rclpy Future 会在 result() 时重新抛出服务异常
+            log.info(f"[scene-cleanup] 读取 world 场景失败: {exc}")
+            return False
+        if response is None:
+            log.info("[scene-cleanup] get_planning_scene 未返回结果")
+            return False
+
+        query_elapsed_ms = (time.monotonic() - started_at) * 1000.0
+        object_ids = sorted(
+            {
+                obj.id
+                for obj in response.scene.world.collision_objects
+                if obj.id
+            }
+        )
+        if not object_ids:
+            log.info(
+                f"[scene-cleanup] world 场景已为空 "
+                f"({query_elapsed_ms:.1f} ms)"
+            )
+            return True
+
+        log.info(
+            f"[scene-cleanup] 读取到 {len(object_ids)} 个 world object "
+            f"({query_elapsed_ms:.1f} ms)，批量删除 …"
+        )
+
         removals = [
             CollisionObject(
                 id=object_id,
@@ -3234,7 +3321,6 @@ class G01Demo(Node):
             )
             for object_id in object_ids
         ]
-        started_at = time.monotonic()
         cleared = self._apply_scene(
             removals,
             report_error=False,
@@ -3243,13 +3329,14 @@ class G01Demo(Node):
         )
         elapsed_ms = (time.monotonic() - started_at) * 1000.0
         if not cleared:
-            self.get_logger().info(
-                f"[scene-cleanup] 启动清理未完成 ({elapsed_ms:.1f} ms)，继续运行"
+            log.info(
+                f"[scene-cleanup] 已读取 {len(object_ids)} 个 world object，"
+                f"但批量 REMOVE 未应用 ({elapsed_ms:.1f} ms)"
             )
             return False
 
-        self.get_logger().info(
-            f"[scene-cleanup] 已用一次请求批量清理 {len(removals)} 个场景物体 "
+        log.info(
+            f"[scene-cleanup] 已用一次请求清空 {len(removals)} 个 world object "
             f"({elapsed_ms:.1f} ms)"
         )
         return True
@@ -3712,6 +3799,7 @@ class G01Demo(Node):
         speed_scale: float | None,
         avoid_collisions: bool = True,
         num_attempts: int | None = None,
+        planning_time_sec: float | None = None,
     ) -> tuple[bool, float, RobotTrajectory | None, int | None]:
         """执行一次 MoveGroup 请求。
 
@@ -3726,12 +3814,17 @@ class G01Demo(Node):
         t0 = time.monotonic()
         elapsed_ms = lambda: (time.monotonic() - t0) * 1000.0
         planning_attempts = NUM_ATTEMPTS if num_attempts is None else max(1, int(num_attempts))
+        try:
+            planning_time = _resolve_planning_time(planning_time_sec)
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 规划时间参数无效: {exc}")
+            return False, elapsed_ms(), None, MoveItErrorCodes.FAILURE
 
         g = MoveGroup.Goal()
         g.request.group_name = group
         g.request.planner_id = PLANNER_ID
         g.request.num_planning_attempts = planning_attempts
-        g.request.allowed_planning_time = PLAN_TIME_SEC
+        g.request.allowed_planning_time = planning_time
         g.request.goal_constraints = goal_constraints
         if speed_scale is not None:
             s = _clamp01(speed_scale)
@@ -3771,7 +3864,7 @@ class G01Demo(Node):
             return False, elapsed_ms(), None, None
 
         res_fut = send_fut.result().get_result_async()
-        if not self._spin_until(res_fut, PLAN_TIME_SEC + 30.0):
+        if not self._spin_until(res_fut, planning_time + 30.0):
             log.error("move_action 结果超时")
             return False, elapsed_ms(), None, MoveItErrorCodes.TIMED_OUT
 
@@ -3819,6 +3912,7 @@ class G01Demo(Node):
         avoid_collisions: bool = True,
         max_retries: int | None = None,
         num_attempts: int | None = None,
+        planning_time_sec: float | None = None,
     ) -> tuple[bool, float, RobotTrajectory | None]:
         """
         调用 move_action：规划（plan_only=True）或规划并执行（False）。
@@ -3831,11 +3925,19 @@ class G01Demo(Node):
         joint_names + 未传 start：从 joint_states 读当前位置作为起点。
         start：显式指定起点（位姿规划在关节运动后用）。
         avoid_collisions：是否使用规划场景做碰撞检查；False 仅影响本次请求。
+        planning_time_sec：每个 MoveGroup 请求的规划时间上限；None 使用
+        PLAN_TIME_SEC。
         """
         log = self.get_logger()
         retries = MOVE_MAX_RETRIES if max_retries is None else max(1, max_retries)
         t0 = time.monotonic()
         no_traj = lambda ok: (ok, (time.monotonic() - t0) * 1000.0, None)
+
+        try:
+            planning_time = _resolve_planning_time(planning_time_sec)
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 规划时间参数无效: {exc}")
+            return no_traj(False)
 
         if not self._move_cli.wait_for_server(timeout_sec=10.0):
             log.error(f"动作 {ACT_MOVE_GROUP} 不可用")
@@ -3856,6 +3958,7 @@ class G01Demo(Node):
                 speed_scale,
                 avoid_collisions,
                 num_attempts,
+                planning_time,
             )
             last_code = code
             if ok:
@@ -3892,6 +3995,7 @@ class G01Demo(Node):
         speed_scale: float = 0.2,
         num_attempts: int | None = None,
         max_retries: int | None = None,
+        planning_time_sec: float | None = None,
         avoid_collisions: bool = True,
         execute: bool = False,
     ) -> tuple[bool, float, RobotTrajectory | None]:
@@ -3917,6 +4021,10 @@ class G01Demo(Node):
                 最多发送的完整 MoveGroup 请求总数（包含第一次）；
                 省略时使用 ``MOVE_MAX_RETRIES``。它和 ``num_attempts``
                 是两层不同的尝试计数。
+            planning_time_sec:
+                单个 MoveGroup 请求允许的总规划时间 [s]；省略时
+                使用 ``PLAN_TIME_SEC``。同一请求内的 ``num_attempts``
+                共享这个时间上限。
             avoid_collisions:
                 True 使用规划场景碰撞检查；False 仅对本次请求临时放开碰撞，
                 不修改全局场景，但真实机器人使用时有撞击风险。
@@ -3997,6 +4105,7 @@ class G01Demo(Node):
             avoid_collisions=avoid_collisions,
             max_retries=max_retries,
             num_attempts=num_attempts,
+            planning_time_sec=planning_time_sec,
         )
 
     def plan_execute_joint_waypoints(
@@ -4009,14 +4118,15 @@ class G01Demo(Node):
         *,
         start_joints: Mapping[str, float] | None = None,
         max_retries: int | None = None,
+        planning_time_sec: float | None = None,
         avoid_collisions: bool = True,
     ) -> bool:
         """按顺序规划并执行多个关节空间路径点。
 
         每个 waypoint 都复用 :meth:`plan_joint_motion`。第一段可从调用方指定的
         ``start_joints`` 开始；后续段必须读取上一段执行后的真实 joint_states，
-        避免控制误差累积。``num_attempts``、``max_retries`` 和
-        ``avoid_collisions`` 会一致地应用到每一段。
+        避免控制误差累积。``num_attempts``、``max_retries``、
+        ``planning_time_sec`` 和 ``avoid_collisions`` 会一致地应用到每一段。
         """
         log = self.get_logger()
         if not waypoints:
@@ -4029,10 +4139,15 @@ class G01Demo(Node):
         if start is None:
             return False
         planning_attempts = NUM_ATTEMPTS if num_attempts is None else max(1, int(num_attempts))
+        try:
+            planning_time = _resolve_planning_time(planning_time_sec)
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 规划时间参数无效: {exc}")
+            return False
 
         log.info(
             f"[{group}] 关节多点路径: {len(waypoints)} waypoints, speed_scale={_clamp01(speed_scale):.2f}, "
-            f"planner={PLANNER_ID}, attempts={planning_attempts}, time={PLAN_TIME_SEC:.1f}s"
+            f"planner={PLANNER_ID}, attempts={planning_attempts}, time={planning_time:.1f}s"
         )
 
         for idx, q in enumerate(waypoints):
@@ -4044,6 +4159,7 @@ class G01Demo(Node):
                 speed_scale=speed_scale,
                 num_attempts=planning_attempts,
                 max_retries=max_retries,
+                planning_time_sec=planning_time,
                 avoid_collisions=avoid_collisions,
                 execute=True,
             )
@@ -4067,12 +4183,14 @@ class G01Demo(Node):
         link: str,
         pose: Pose,
         use_cartesian: bool = False,
+        planning_time_sec: float | None = None,
     ) -> bool:
         """位姿目标：直接输入 geometry_msgs/Pose。
 
         use_cartesian=False（默认）：走 move_action（OMPL 关节空间规划，可绕障）。
         use_cartesian=True         ：走 compute_cartesian_path 服务（笛卡尔直线，
             等价于 RViz MotionPlanning 插件中 "Use Cartesian Path" 复选框）。
+        planning_time_sec 仅对 OMPL 分支生效；None 使用 PLAN_TIME_SEC。
         """
         p = pose.position
         log = self.get_logger()
@@ -4095,7 +4213,14 @@ class G01Demo(Node):
 
         goal = [make_pose_constraints(link, pose)]
 
-        ok, used_ms, _ = self.move(group, goal, start=start, plan_only=False, speed_scale=speed_scale)
+        ok, used_ms, _ = self.move(
+            group,
+            goal,
+            start=start,
+            plan_only=False,
+            speed_scale=speed_scale,
+            planning_time_sec=planning_time_sec,
+        )
         log.info(f"[{group}] pose plan+exec: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         return ok
 
@@ -4111,10 +4236,18 @@ class G01Demo(Node):
         pitch: float,
         yaw: float,
         use_cartesian: bool = False,
+        planning_time_sec: float | None = None,
     ) -> bool:
         """位姿目标：输入 xyz + rpy；内部转 Pose 后调 plan_execute_pose。"""
         pose = make_pose(x, y, z, roll, pitch, yaw)
-        return self.plan_execute_pose(group, speed_scale, link, pose, use_cartesian)
+        return self.plan_execute_pose(
+            group,
+            speed_scale,
+            link,
+            pose,
+            use_cartesian,
+            planning_time_sec,
+        )
 
     def plan_cartesian_line(
         self,
@@ -5216,6 +5349,7 @@ class G01Demo(Node):
             start_joints=current,
             speed_scale=speed,
             num_attempts=50,
+            planning_time_sec=20.0,
             execute=True,
         )
         log.info(f"[pick] OMPL → {yubei_name}: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
@@ -5792,6 +5926,7 @@ class G01Demo(Node):
             exchange_joint_names,
             [q2],
             num_attempts=50,
+            planning_time_sec=20.0,
         ):
             log.error(f"[exchange] {exchange_group} 到 q2 失败")
             return False
@@ -5952,7 +6087,8 @@ def main(argv: list[str] | None = None) -> int:
     if sim_mode:
         log.info(
             "[sim] 仿真模式：跳过工具电源服务，视觉使用固定 viewer pose，"
-            "SW1~SW4 初始为空（driver_signal=0x78），抓放后动态更新"
+            "SW1~SW4 默认为空；键盘选择 2 时重置为全空(0x78)，"
+            "选择 4 时重置为全满(0x00)"
         )
     if keyboard_control_mode:
         log.info(
@@ -6972,7 +7108,25 @@ def main(argv: list[str] | None = None) -> int:
             right_point,
         ) = selected
 
-        # p,2 的识别姿态同时用于构造场景和四个物料台局部放置点。
+        vision_prep_group = "dual_arm_body"
+        vision_prep_joint_names = joint_names_for_group(vision_prep_group)
+        log.info(
+            f"[unload] 物料台识别前，{vision_prep_group} 先通过 OMPL "
+            "运动到 UNLOAD_TABLE_VISION_PREP_Q"
+        )
+        if not node.plan_execute_joint_waypoints(
+            vision_prep_group,
+            UNLOAD_JOINT_SPEED,
+            vision_prep_joint_names,
+            [UNLOAD_TABLE_VISION_PREP_Q],
+        ):
+            log.error(
+                "[unload] 运动到物料台识别预备构型失败，"
+                f"不发送 {UNLOAD_TRIGGER_COMMAND}"
+            )
+            return False
+
+        # 物料台识别姿态同时用于构造场景和四个局部放置点。
         vision_result = read_vision_object_pose(
             node,
             log,
@@ -6984,7 +7138,7 @@ def main(argv: list[str] | None = None) -> int:
         _, all_xyz_rpy = vision_result
         if not all_xyz_rpy or UNLOAD_VISION_POSE_KEY not in all_xyz_rpy[0]:
             log.error(
-                f"[unload] p,2 视觉结果缺少 {UNLOAD_VISION_POSE_KEY!r}"
+                f"[unload] p,8 视觉结果缺少 {UNLOAD_VISION_POSE_KEY!r}"
             )
             return False
         recognition_values = all_xyz_rpy[0][UNLOAD_VISION_POSE_KEY]
@@ -6994,7 +7148,7 @@ def main(argv: list[str] | None = None) -> int:
         place_poses = make_unload_place_poses(recognition_pose)
         node.publish_unload_place_tfs(place_poses)
         log.info(
-            f"[unload] p,2 识别点 @ {SCENE_FRAME}: "
+            f"[unload] p,8 识别点 @ {SCENE_FRAME}: "
             f"({recognition_pose.position.x:.4f}, "
             f"{recognition_pose.position.y:.4f}, "
             f"{recognition_pose.position.z:.4f})"
@@ -7091,10 +7245,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         control_source = "键盘" if keyboard_control_mode else "上位机"
         log.info(
-            f"[startup] {control_source}控制模式启动前先清除本程序管理的"
-            "场景障碍物 …"
+            f"[startup] {control_source}控制模式启动前先清空 "
+            "MoveIt world collision objects …"
         )
-        node.clear_managed_scene_objects()
+        node.clear_world_scene_objects()
         frame_added = False
         code = 0
 
@@ -7108,6 +7262,24 @@ def main(argv: list[str] | None = None) -> int:
                 break
             command_topic, payload = queued_command
             command_source = "keyboard" if keyboard_control_mode else "upper"
+
+            # 键盘仿真每次进入高层流程前都给定明确的物料初态：
+            #   2=上料/抓取，四个 SW 先全部置空；
+            #   4=下料，四个 SW 先全部置为有料。
+            # 只在 --sim --keyboard 下执行，不影响真机话题信号。
+            if sim_mode and keyboard_control_mode:
+                if command_topic == GRASP_CMD_TOPIC:
+                    node._update_simulated_place_slots(
+                        list(PLACE_SLOT_MASKS),
+                        has_material=False,
+                        reason="键盘选择 2，初始化抓取/上料流程",
+                    )
+                elif command_topic == PLACE_CMD_TOPIC:
+                    node._update_simulated_place_slots(
+                        list(PLACE_SLOT_MASKS),
+                        has_material=True,
+                        reason="键盘选择 4，初始化下料流程",
+                    )
 
             if command_topic == MOVE_TO_GRASP_POSE_CMD_TOPIC:
                 reset_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
@@ -7152,7 +7324,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             if command_topic == PLACE_CMD_TOPIC:
-                # 下料使用 p,2 识别得到的取料台场景，不保留上料深框。
+                # 下料使用 p,8 识别得到的物料台场景，不保留上料深框。
                 scene_ok = True
                 if frame_added:
                     log.info(f"切换下料，移除上料碰撞体「{FRAME_ID}」…")
