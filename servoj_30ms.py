@@ -493,21 +493,33 @@ def wait_ft_sensor_online(
     timeout=FT_SENSOR_ONLINE_TIMEOUT_SEC,
 ):
     """
-    使能力传感器并等待第一帧有效六维力反馈。
+    先读取力传感器状态；不在线时使能并等待有效六维力反馈。
 
     只有 six_force_online=1 时才发布；离线或异常时不发布旧值。
-    启动等待超时后仍继续运行，由实时线程监测重新上电并自动恢复发布。
     这里故意不调用 SixForceHome()，保留传感器当前零点。
     """
+    topic = f"/g01/{side}/FTSensor"
+    actual = feed_v.feed()
+    if actual != ["NG"]:
+        status = int(actual[5])
+        force = np.asarray(actual[4], dtype=float)
+        if status == 1 and force.shape == (6,) and np.all(np.isfinite(force)):
+            force_values = [float(value) for value in force]
+            state_node.publish_ft_sensor(side, force_values)
+            print(
+                f"{name} 力传感器已在线，无需发送 EnableFTSensor(1)；"
+                f"首帧已发布到 {topic}：{force_values}"
+            )
+            return
+
     dashboard_command(
         dashboard_client,
         "EnableFTSensor(1)",
         name=name,
         required=True,
     )
-    print(f"{name} 力传感器已使能；不执行 SixForceHome() 清零")
+    print(f"{name} 力传感器不在线，已发送 EnableFTSensor(1)")
 
-    topic = f"/g01/{side}/FTSensor"
     deadline = time.monotonic() + timeout
     last_status = None
     while time.monotonic() < deadline:
@@ -537,10 +549,9 @@ def wait_ft_sensor_online(
         # 状态为 0/2 时即使数值字段仍保留上一帧，也不能发布。
         time.sleep(0.05)
 
-    print(
-        f"{name} 警告：力传感器当前不可用，"
-        f"six_force_online={last_status}；不发布 {topic}，"
-        "重新上电并恢复在线后将自动开始发布"
+    raise RuntimeError(
+        f"{name} 力传感器在 {timeout:.1f}s 内未上线，"
+        f"six_force_online={last_status}"
     )
 
 def setup_logger(log_file='app.log'):
@@ -940,6 +951,16 @@ try:
             state_node,
         )
         feedback_connections[side] = feed_v
+
+    print("左右力传感器均已在线，开始给双臂末端下电")
+    for index, client_socket in enumerate(client_sockets, start=1):
+        dashboard_command(
+            client_socket,
+            "SetToolPower(0)",
+            name=f'第{index}个机械臂',
+            required=True,
+        )
+    print("左右机械臂末端已下电")
 
     for side in ["left", "right"]:
         feed_thread1 = threading.Thread(
