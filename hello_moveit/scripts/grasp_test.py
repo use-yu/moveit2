@@ -553,7 +553,7 @@ UNLOAD_TABLE_SIZE = (0.64, 1.2, 0.98)
 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL = (
     0.0,
     0.1125,
-    0.09+0.1,
+    0.09+0.15,
 )
 UNLOAD_TABLE_LOCAL_RPY = (0.0, 0.0, 0.0)
 UNLOAD_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
@@ -6690,20 +6690,20 @@ def main(argv: list[str] | None = None) -> int:
         ) -> RobotTrajectory | None:
             """验证并缓存一侧手臂从放置预备位开始的直线下降。
 
-            ``endpoint_state`` 是放置预备位的完整关节状态。左右臂分别从该
-            状态做 FK，再沿末端局部 +Z 规划下降。这里明确关闭碰撞检查，
-            因为放置末段需要接近料台。返回值会一直缓存到执行阶段。
+            ``endpoint_state`` 是尚未执行的放置预备位完整关节状态，因此 FK
+            和 Cartesian waypoint 必须统一表达在固定的 ``SCENE_FRAME``。
+            不得使用 l/r_base_link，否则 MoveIt 会用机器人当前 TF 而不是该
+            候选 body 状态转换 waypoint。下降明确关闭碰撞检查，返回轨迹会
+            一直缓存到执行阶段。
             """
             if side == "left":
                 group = "left_arm"
                 link = "l_tool"
-                plan_frame = "l_base_link"
                 joint_names = left_joint_names
                 side_text = "左臂"
             elif side == "right":
                 group = "right_arm"
                 link = "r_tool"
-                plan_frame = "r_base_link"
                 joint_names = right_joint_names
                 side_text = "右臂"
             else:
@@ -6712,7 +6712,7 @@ def main(argv: list[str] | None = None) -> int:
             start_pose = node._get_link_pose_fk(
                 link,
                 joints=endpoint_state,
-                plan_frame=plan_frame,
+                plan_frame=SCENE_FRAME,
             )
             if start_pose is None:
                 log.info(
@@ -6732,7 +6732,7 @@ def main(argv: list[str] | None = None) -> int:
                 avoid_collisions=False,
                 start_joints=endpoint_state,
                 joint_names=joint_names,
-                plan_frame=plan_frame,
+                plan_frame=SCENE_FRAME,
                 verbose=False,
             )
             if descent is None:
@@ -7130,8 +7130,9 @@ def main(argv: list[str] | None = None) -> int:
 
         # ------------------------------------------------------------------
         # 第二级：左臂先用 left_body 枚举升降+腰部+左臂解。
-        # 对每个左侧解固定 body_joint1/2，重新计算 r_base_link，再求右纯臂。
-        # 最终目标包含 body+两臂，因此改用 dual_arm_body 联合规划。
+        # 对每个左侧解固定 body_joint1/2，再以该完整候选 RobotState 求右纯臂。
+        # 右目标保持在固定 SCENE_FRAME，避免 MoveIt 使用当前 r_base_link TF
+        # 转换尚未执行的候选 body 状态。最终使用 dual_arm_body 联合规划。
         # ------------------------------------------------------------------
         left_body_solutions = node._solve_ik_candidates_from_seed(
             "left_body",
@@ -7170,28 +7171,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"body_joint2={waist:.4f} rad"
             )
 
-            candidate_right_base_pose = node._get_link_pose_fk(
-                "r_base_link",
-                joints=candidate_state,
-                plan_frame=SCENE_FRAME,
-            )
-            if candidate_right_base_pose is None:
-                log.warning(
-                    f"[unload] body 构型 {body_index} 无法计算 r_base_link，"
-                    "尝试下一构型"
-                )
-                continue
-            right_pose_for_body = pose_relative_to_frame(
-                right_pose,
-                candidate_right_base_pose,
-            )
             right_solutions = node._solve_ik_candidates_from_seed(
                 "right_arm",
                 "r_tool",
-                right_pose_for_body,
+                right_pose,
                 right_joint_names,
                 candidate_state,
-                plan_frame="r_base_link",
+                plan_frame=SCENE_FRAME,
                 n_attempts=UNLOAD_PLACE_RIGHT_IK_ATTEMPTS_PER_BODY,
                 max_solutions=UNLOAD_PLACE_RIGHT_IK_MAX_SOLUTIONS_PER_BODY,
                 random_seed=(
