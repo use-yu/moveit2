@@ -32,6 +32,9 @@ G01 MoveIt 演示脚本
     拼接对应 SW 的 yubei，腰部、升降均设为 0。
     双臂分别计算末端 +Z 10cm 的 IK/Cartesian 路径，合成一条 12 关节轨迹，一次执行。
     两个末端上电后，反向同一轨迹直线复位。
+    吸附完成后先做物料台放置可达性验证：纯臂 IK 优先；必要时先求
+    left_body，再固定该腰部/升降状态求右臂 IK。左右下降分别预检且不考虑
+    碰撞，通过后缓存 OMPL 和同步下降轨迹，执行阶段不重新规划。
 /return_init_pose：导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)，不发布 result。
 前提：
   - 已启动 move_group： ros2 launch g01_moveit_config demo.launch.py
@@ -550,7 +553,7 @@ UNLOAD_TABLE_SIZE = (0.64, 1.2, 0.98)
 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL = (
     0.0,
     0.1125,
-    0.09,
+    0.09+0.1,
 )
 UNLOAD_TABLE_LOCAL_RPY = (0.0, 0.0, 0.0)
 UNLOAD_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
@@ -6480,6 +6483,8 @@ def main(argv: list[str] | None = None) -> int:
             UNLOAD_JOINT_SPEED,
             dual_body_joint_names,
             [yubei_target],
+            num_attempts=30,
+            planning_time_sec=10.0,
         ):
             log.error("[unload] dual_arm_body 到 yubei 失败")
             return False
@@ -6642,7 +6647,14 @@ def main(argv: list[str] | None = None) -> int:
         left_point: int,
         right_point: int,
     ) -> bool:
-        """多构型求解放置目标，并验证/执行双臂末端 +Z 直线放置。"""
+        """吸附取料后验证放置可达性，并执行已经缓存的放置轨迹。
+
+        先保持身体不动分别求左右纯臂 IK；若任一侧无解或所有纯臂组合未
+        通过后续验证，再由 ``left_body`` 联合求左臂、腰部和升降，并在每个
+        候选身体状态下求右纯臂 IK。所有 IK 都保留碰撞检测；每个单臂 IK 解
+        的下降直线只验证一次且不检查碰撞，最终再验证到预备位的 OMPL 路径。
+        执行阶段不重新规划。
+        """
         left_joint_names = joint_names_for_group("left_arm")
         right_joint_names = joint_names_for_group("right_arm")
         dual_arm_joint_names = joint_names_for_group("dual_arm")
@@ -6656,6 +6668,11 @@ def main(argv: list[str] | None = None) -> int:
             log.error("[unload] 读取物料台放置规划起点失败")
             return False
 
+        log.info(
+            "[unload][reach] 双臂已吸附物料并返回取料预备位，"
+            "开始验证物料台放置可达性"
+        )
+
         left_pose = place_poses[left_point]
         right_pose = place_poses[right_point]
         log.info(
@@ -6666,69 +6683,101 @@ def main(argv: list[str] | None = None) -> int:
             f"{right_pose.position.y:.4f}, {right_pose.position.z:.4f})"
         )
 
+        def plan_arm_place_descent(
+            side: str,
+            endpoint_state: dict[str, float],
+            label: str,
+        ) -> RobotTrajectory | None:
+            """验证并缓存一侧手臂从放置预备位开始的直线下降。
+
+            ``endpoint_state`` 是放置预备位的完整关节状态。左右臂分别从该
+            状态做 FK，再沿末端局部 +Z 规划下降。这里明确关闭碰撞检查，
+            因为放置末段需要接近料台。返回值会一直缓存到执行阶段。
+            """
+            if side == "left":
+                group = "left_arm"
+                link = "l_tool"
+                plan_frame = "l_base_link"
+                joint_names = left_joint_names
+                side_text = "左臂"
+            elif side == "right":
+                group = "right_arm"
+                link = "r_tool"
+                plan_frame = "r_base_link"
+                joint_names = right_joint_names
+                side_text = "右臂"
+            else:
+                raise ValueError(f"未知手臂侧别: {side}")
+
+            start_pose = node._get_link_pose_fk(
+                link,
+                joints=endpoint_state,
+                plan_frame=plan_frame,
+            )
+            if start_pose is None:
+                log.info(
+                    f"[unload] {label}：{side_text}放置直线起点 FK 失败"
+                )
+                return None
+
+            descent_pose = pose_offset_local_z(
+                start_pose,
+                UNLOAD_PLACE_DESCENT_DISTANCE,
+            )
+            descent = node.plan_cartesian_line(
+                group,
+                link,
+                descent_pose,
+                speed_scale=UNLOAD_CARTESIAN_SPEED,
+                avoid_collisions=False,
+                start_joints=endpoint_state,
+                joint_names=joint_names,
+                plan_frame=plan_frame,
+                verbose=False,
+            )
+            if descent is None:
+                log.info(
+                    f"[unload] {label}：{side_text}末端局部 +Z "
+                    f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 不可达"
+                )
+                return None
+            return descent
+
         def plan_place_descent(
             endpoint_state: dict[str, float],
             label: str,
         ) -> RobotTrajectory | None:
-            """从候选构型 FK 出发，预检并合并双臂末端局部 +Z 10 cm 路径。"""
-            left_start_pose = node._get_link_pose_fk(
-                "l_tool",
-                joints=endpoint_state,
-                plan_frame="l_base_link",
-            )
-            right_start_pose = node._get_link_pose_fk(
-                "r_tool",
-                joints=endpoint_state,
-                plan_frame="r_base_link",
-            )
-            if left_start_pose is None or right_start_pose is None:
-                log.info(f"[unload] {label}：放置直线起点 FK 失败，换下一构型")
-                return None
-
-            left_descent_pose = pose_offset_local_z(
-                left_start_pose,
-                UNLOAD_PLACE_DESCENT_DISTANCE,
-            )
-            right_descent_pose = pose_offset_local_z(
-                right_start_pose,
-                UNLOAD_PLACE_DESCENT_DISTANCE,
-            )
-            left_descent = node.plan_cartesian_line(
-                "left_arm",
-                "l_tool",
-                left_descent_pose,
-                speed_scale=UNLOAD_CARTESIAN_SPEED,
-                avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
-                start_joints=endpoint_state,
-                joint_names=left_joint_names,
-                plan_frame="l_base_link",
-                verbose=False,
+            """按同一完整状态分别验证左右下降，并生成同步执行缓存。"""
+            left_descent = plan_arm_place_descent(
+                "left",
+                endpoint_state,
+                label,
             )
             if left_descent is None:
-                log.info(
-                    f"[unload] {label}：左臂末端局部 +Z "
-                    f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 不可达，换下一构型"
-                )
                 return None
-
-            right_descent = node.plan_cartesian_line(
-                "right_arm",
-                "r_tool",
-                right_descent_pose,
-                speed_scale=UNLOAD_CARTESIAN_SPEED,
-                avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
-                start_joints=endpoint_state,
-                joint_names=right_joint_names,
-                plan_frame="r_base_link",
-                verbose=False,
+            right_descent = plan_arm_place_descent(
+                "right",
+                endpoint_state,
+                label,
             )
             if right_descent is None:
-                log.info(
-                    f"[unload] {label}：右臂末端局部 +Z "
-                    f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 不可达，换下一构型"
-                )
                 return None
 
+            merged = merge_place_descents(
+                left_descent,
+                right_descent,
+                label,
+            )
+            if merged is None:
+                return None
+            return merged
+
+        def merge_place_descents(
+            left_descent: RobotTrajectory,
+            right_descent: RobotTrajectory,
+            label: str,
+        ) -> RobotTrajectory | None:
+            """把已经分别验证通过的左右下降轨迹合成为同步执行轨迹。"""
             try:
                 merged = merge_dual_arm_cartesian_trajectories(
                     left_descent,
@@ -6742,18 +6791,33 @@ def main(argv: list[str] | None = None) -> int:
                 return None
 
             log.info(
-                f"[unload] {label}：双臂末端局部 +Z "
-                f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 直线预检通过"
+                f"[unload] {label}：左右直线均通过并已缓存同步轨迹"
             )
             return merged
 
-        def try_plan_validate_and_execute(
+        def validate_place_candidate(
             group: str,
             target: dict[str, float],
             start: dict[str, float],
             label: str,
-        ) -> bool | None:
-            """候选未通过返回 None；开始执行后返回最终成功与否。"""
+            left_descent: RobotTrajectory,
+            right_descent: RobotTrajectory,
+        ) -> tuple[RobotTrajectory, RobotTrajectory] | None:
+            """验证一个 IK 组合并缓存到预备位和直线下降轨迹。
+
+            验证顺序为：左右臂分别验证无碰撞检查的 Cartesian 下降，再用
+            OMPL 验证从当前状态到放置预备位。成功时返回
+            ``(to_place_trajectory, merged_descent_trajectory)``；本函数绝不执行
+            运动，因此可以安全地继续尝试其他 IK 构型。
+            """
+            merged_descent = merge_place_descents(
+                left_descent,
+                right_descent,
+                label,
+            )
+            if merged_descent is None:
+                return None
+
             ok, used_ms, trajectory = node.plan_joint_motion(
                 group,
                 target,
@@ -6761,7 +6825,7 @@ def main(argv: list[str] | None = None) -> int:
                 start_joints=start,
                 speed_scale=UNLOAD_PLACE_JOINT_SPEED,
                 max_retries=1,
-                num_attempts=30,
+                num_attempts=50,
                 execute=False,
             )
             log.info(
@@ -6774,8 +6838,8 @@ def main(argv: list[str] | None = None) -> int:
                 log.error(f"[unload] {label} 成功但没有返回轨迹")
                 return None
 
-            # Cartesian 预检必须从联合关节规划的实际末点开始，而不是直接使用
-            # IK 目标值，避免规划容差造成直线起点不一致。
+            # 通常 OMPL 终点就是关节目标。若受目标容差影响出现偏差，则按真实
+            # 轨迹末点重新生成 Cartesian 缓存，确保执行时首点与实际状态一致。
             endpoint_state = dict(current_full)
             endpoint_state.update(target)
             final_point = trajectory.joint_trajectory.points[-1]
@@ -6785,29 +6849,61 @@ def main(argv: list[str] | None = None) -> int:
                     final_point.positions,
                 )
             )
-            descent = plan_place_descent(endpoint_state, label)
-            if descent is None:
-                return None
+
+            candidate_state = dict(current_full)
+            candidate_state.update(target)
+            endpoint_delta = max(
+                (
+                    abs(endpoint_state[name] - candidate_state[name])
+                    for name in target
+                    if name in endpoint_state and name in candidate_state
+                ),
+                default=0.0,
+            )
+            if endpoint_delta > 1e-4:
+                log.info(
+                    f"[unload] {label}：OMPL 末点与 IK 目标最大偏差 "
+                    f"{endpoint_delta:.6f}，按实际末点更新直线缓存"
+                )
+                merged_descent = plan_place_descent(endpoint_state, label)
+                if merged_descent is None:
+                    return None
 
             log.info(
-                f"[unload] 已选中 {label}，执行 {group} 联合轨迹到放置预备位"
+                f"[unload] {label}：IK、左右 Cartesian、OMPL 均通过，"
+                "已缓存全部执行轨迹"
             )
-            if not node._execute_traj(trajectory):
+            return trajectory, merged_descent
+
+        def execute_cached_place_plan(
+            group: str,
+            label: str,
+            to_place: RobotTrajectory,
+            descent: RobotTrajectory,
+        ) -> bool:
+            """只执行可达性阶段缓存的轨迹，不再调用 IK 或规划服务。"""
+
+            log.info(
+                f"[unload] 已选中 {label}，直接执行缓存的 {group} "
+                "联合轨迹到放置预备位"
+            )
+            if not node._execute_traj(to_place):
                 log.error(f"[unload] {label} 联合轨迹执行失败")
                 return False
 
             node.wait_for_operator(
                 f"已到物料台左点{left_point}/右点{right_point}，"
-                "按回车执行双臂末端局部 +Z 10 cm 同步下降: "
+                f"按回车执行双臂末端局部 +Z "
+                f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 同步下降: "
             )
             try:
                 input()
             except EOFError:
                 pass
             log.info(
-                "[unload] 执行已预检的双臂同步放置直线："
+                "[unload] 直接执行缓存的双臂同步放置直线："
                 f"左右末端局部 +Z {UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m"
-                f"（avoid_collisions={UNLOAD_CARTESIAN_AVOID_COLLISIONS}）"
+                "（avoid_collisions=False）"
             )
             if not node._execute_traj(descent):
                 log.error("[unload] 双臂同步直线下降放置失败")
@@ -6835,6 +6931,36 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("[unload] 放置后双臂同步直线复位失败")
                 return False
             return True
+
+        def prevalidate_arm_solutions(
+            side: str,
+            solutions: Sequence[dict[str, float]],
+            base_state: dict[str, float],
+            label_prefix: str,
+        ) -> list[tuple[dict[str, float], RobotTrajectory]]:
+            """逐个验证单臂 IK 解的下降直线并缓存可行解。
+
+            ``base_state`` 提供另一只手臂以及腰部/升降的固定关节状态；每个
+            IK 解只规划一次 Cartesian 路径，后续左右组合不会重复调用服务。
+            """
+            reachable: list[tuple[dict[str, float], RobotTrajectory]] = []
+            for solution_index, solution in enumerate(solutions, start=1):
+                endpoint_state = dict(base_state)
+                endpoint_state.update(solution)
+                trajectory = plan_arm_place_descent(
+                    side,
+                    endpoint_state,
+                    f"{label_prefix} IK {solution_index}/{len(solutions)}",
+                )
+                if trajectory is not None:
+                    reachable.append((solution, trajectory))
+            side_text = "左臂" if side == "left" else "右臂"
+            log.info(
+                f"[unload] {label_prefix}：{side_text}下降直线 "
+                f"{len(reachable)}/{len(solutions)} 组可行"
+                "（avoid_collisions=False）"
+            )
+            return reachable
 
         # ------------------------------------------------------------------
         # 第一级：身体保持当前位置，只求左右纯臂多组 IK。
@@ -6879,7 +7005,7 @@ def main(argv: list[str] | None = None) -> int:
                 UNLOAD_PLACE_IK_RANDOM_SEED + left_point * 100 + 1
             ),
             perturb_joint_names=left_joint_names,
-            avoid_collisions=False,
+            avoid_collisions=True,
         )
         right_arm_solutions = node._solve_ik_candidates_from_seed(
             "right_arm",
@@ -6894,18 +7020,48 @@ def main(argv: list[str] | None = None) -> int:
                 UNLOAD_PLACE_IK_RANDOM_SEED + right_point * 100 + 2
             ),
             perturb_joint_names=right_joint_names,
-            avoid_collisions=False,
+            avoid_collisions=True,
         )
         log.info(
             f"[unload] 纯臂多构型：左点{left_point}="
             f"{len(left_arm_solutions)} 解，右点{right_point}="
             f"{len(right_arm_solutions)} 解"
         )
+        if not left_arm_solutions or not right_arm_solutions:
+            missing_sides = []
+            if not left_arm_solutions:
+                missing_sides.append("左臂")
+            if not right_arm_solutions:
+                missing_sides.append("右臂")
+            log.warning(
+                f"[unload] {'、'.join(missing_sides)}纯臂无 IK，"
+                "纯臂组合无法成立，将加入腰部和升降"
+            )
+
+        left_arm_reachable: list[
+            tuple[dict[str, float], RobotTrajectory]
+        ] = []
+        right_arm_reachable: list[
+            tuple[dict[str, float], RobotTrajectory]
+        ] = []
+        if left_arm_solutions and right_arm_solutions:
+            left_arm_reachable = prevalidate_arm_solutions(
+                "left",
+                left_arm_solutions,
+                current_full,
+                f"纯臂左点{left_point}",
+            )
+            right_arm_reachable = prevalidate_arm_solutions(
+                "right",
+                right_arm_solutions,
+                current_full,
+                f"纯臂右点{right_point}",
+            )
 
         pure_pairs = [
-            (left_solution, right_solution)
-            for left_solution in left_arm_solutions
-            for right_solution in right_arm_solutions
+            (left_solution, left_descent, right_solution, right_descent)
+            for left_solution, left_descent in left_arm_reachable
+            for right_solution, right_descent in right_arm_reachable
         ]
         pure_pairs.sort(
             key=lambda pair: (
@@ -6915,7 +7071,7 @@ def main(argv: list[str] | None = None) -> int:
                     left_joint_names,
                 )
                 + joint_distance_squared(
-                    pair[1],
+                    pair[2],
                     current_full,
                     right_joint_names,
                 )
@@ -6933,7 +7089,12 @@ def main(argv: list[str] | None = None) -> int:
             name: current_full[name]
             for name in dual_arm_joint_names
         }
-        for pair_index, (left_solution, right_solution) in enumerate(
+        for pair_index, (
+            left_solution,
+            left_descent,
+            right_solution,
+            right_descent,
+        ) in enumerate(
             pure_pairs_to_validate,
             start=1,
         ):
@@ -6941,21 +7102,30 @@ def main(argv: list[str] | None = None) -> int:
                 **left_solution,
                 **right_solution,
             }
-            result = try_plan_validate_and_execute(
+            label = (
+                f"dual_arm 纯臂构型 {pair_index}/"
+                f"{len(pure_pairs_to_validate)}"
+            )
+            cached_plan = validate_place_candidate(
                 "dual_arm",
                 target,
                 pure_start,
-                (
-                    f"dual_arm 纯臂构型 {pair_index}/"
-                    f"{len(pure_pairs_to_validate)}"
-                ),
+                label,
+                left_descent,
+                right_descent,
             )
-            if result is not None:
-                return result
+            if cached_plan is not None:
+                to_place, descent = cached_plan
+                return execute_cached_place_plan(
+                    "dual_arm",
+                    label,
+                    to_place,
+                    descent,
+                )
 
         log.warning(
-            "[unload] 当前腰部/升降位置下没有可执行的纯臂组合，"
-            "开始枚举 left_body 构型"
+            "[unload] 当前腰部/升降位置下没有通过 IK、左右直线和 OMPL "
+            "全部验证的纯臂组合，开始先求 left_body 构型"
         )
 
         # ------------------------------------------------------------------
@@ -6976,7 +7146,7 @@ def main(argv: list[str] | None = None) -> int:
                 UNLOAD_PLACE_IK_RANDOM_SEED + left_point * 1000 + 3
             ),
             perturb_joint_names=left_body_joint_names,
-            avoid_collisions=False,
+            avoid_collisions=True,
         )
         if not left_body_solutions:
             log.error(
@@ -7031,7 +7201,7 @@ def main(argv: list[str] | None = None) -> int:
                     + 100
                 ),
                 perturb_joint_names=right_joint_names,
-                avoid_collisions=False,
+                avoid_collisions=True,
             )
             if not right_solutions:
                 log.info(
@@ -7040,8 +7210,26 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 continue
 
-            for right_index, right_solution in enumerate(
+            left_descent = plan_arm_place_descent(
+                "left",
+                candidate_state,
+                f"left_body 构型 {body_index}",
+            )
+            if left_descent is None:
+                log.info(
+                    f"[unload] body 构型 {body_index} 左臂下降直线不可行，"
+                    "尝试下一组腰部/升降"
+                )
+                continue
+            right_reachable = prevalidate_arm_solutions(
+                "right",
                 right_solutions,
+                candidate_state,
+                f"body 构型 {body_index} 右点{right_point}",
+            )
+
+            for right_index, (right_solution, right_descent) in enumerate(
+                right_reachable,
                 start=1,
             ):
                 if body_plan_count >= UNLOAD_PLACE_MAX_PAIR_PLANS:
@@ -7055,18 +7243,27 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     for name in dual_body_joint_names
                 }
-                result = try_plan_validate_and_execute(
+                label = (
+                    f"dual_arm_body 左body构型{body_index}/"
+                    f"{len(left_body_solutions)}，"
+                    f"右可行解{right_index}/{len(right_reachable)}"
+                )
+                cached_plan = validate_place_candidate(
                     "dual_arm_body",
                     target,
                     current_full,
-                    (
-                        f"dual_arm_body 左body构型{body_index}/"
-                        f"{len(left_body_solutions)}，"
-                        f"右解{right_index}/{len(right_solutions)}"
-                    ),
+                    label,
+                    left_descent,
+                    right_descent,
                 )
-                if result is not None:
-                    return result
+                if cached_plan is not None:
+                    to_place, descent = cached_plan
+                    return execute_cached_place_plan(
+                        "dual_arm_body",
+                        label,
+                        to_place,
+                        descent,
+                    )
             if body_plan_count >= UNLOAD_PLACE_MAX_PAIR_PLANS:
                 break
 
