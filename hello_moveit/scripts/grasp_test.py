@@ -395,24 +395,24 @@ DEFAULT_SPEED_SCALE = 0.5
 # 深框障碍物（相对于 moveit_base_link 发布）
 SCENE_FRAME = "moveit_base_link"
 FRAME_ID = "深框"
-FRAME_SIZE = (1.1, 1.1, 0.86)  # 深框整体外尺寸：长×宽×高 [m]
-WALL_T = 0.05  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
+FRAME_SIZE = (0.795, 0.795, 0.565)  # 深框整体外尺寸：长×宽×高 [m]
+WALL_T = 0.06  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 相对于 moveit_base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 
 # p,4 识别位姿先绕自身 Z 轴 +90°，再沿旋转后的自身坐标平移，
 # 得到深框顶部空心区域中心；该坐标点位于开口中，不落在框壁实体上。
-FRAME_VISION_TRIGGER_COMMAND = "p,7"
+FRAME_VISION_TRIGGER_COMMAND = "p,5"
 FRAME_VISION_POSE_KEY = "right_body"
 FRAME_VISION_TF_FRAME = "deep_frame_vision"
 FRAME_TOP_CENTER_TF_FRAME = "deep_frame_top_center"
 FRAME_CENTER_TF_FRAME = "deep_frame_center"
 FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0 *0
 FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
-    0.53-0.35,
+    0.3975,
     0.0,
-    0.15,
+    0.1,
 )
 # 长方体上表面中心相对深框顶部空心区域中心的局部平移。
 BOX_OBSTACLE_ID = "长方体障碍物"
@@ -7470,25 +7470,26 @@ def main(argv: list[str] | None = None) -> int:
                     f"[{command_source}] move_to_grasp_pose 第一步："
                     "dual_arm_body 运动到复位位姿"
                 )
-                move_to_grasp_ok = node.plan_execute_joint_waypoints(
-                    "dual_arm_body",
-                    0.2,
-                    reset_joint_names,
-                    [MOVE_TO_GRASP_RESET_Q],
-                )
-                if not move_to_grasp_ok:
-                    log.error(
-                        "[upper] dual_arm_body 复位失败，"
-                        "不再继续导航和深框识别"
-                    )
-                if move_to_grasp_ok:
-                    move_to_grasp_ok = node.navigate_and_wait(NAV_TARGET_GRASP)
+                # move_to_grasp_ok = node.plan_execute_joint_waypoints(
+                #     "dual_arm_body",
+                #     0.2,
+                #     reset_joint_names,
+                #     [MOVE_TO_GRASP_RESET_Q],
+                # )
+                # if not move_to_grasp_ok:
+                #     log.error(
+                #         "[upper] dual_arm_body 复位失败，"
+                #         "不再继续导航和深框识别"
+                #     )
+                # if move_to_grasp_ok:
+                    # move_to_grasp_ok = node.navigate_and_wait(NAV_TARGET_GRASP)
+                move_to_grasp_ok = True
                 if move_to_grasp_ok:
                     move_to_grasp_ok = recognize_and_add_deep_frame()
-                if move_to_grasp_ok:
-                    move_to_grasp_ok = (
-                        node.move_agv_after_deep_frame_recognition()
-                    )
+                # if move_to_grasp_ok:
+                #     move_to_grasp_ok = (
+                #         node.move_agv_after_deep_frame_recognition()
+                #     )
                 report_flow_result(command_topic, move_to_grasp_ok)
                 continue
 

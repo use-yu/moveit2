@@ -543,6 +543,14 @@ Visualization Manager:
           Value: true
         base_x_link:
           Value: true
+        box_obstacle_top_center:
+          Value: true
+        deep_frame_center:
+          Value: false
+        deep_frame_top_center:
+          Value: true
+        deep_frame_vision:
+          Value: true
         head:
           Value: true
         l_base_link:
@@ -595,6 +603,14 @@ Visualization Manager:
                                     R6:
                                       r_tool:
                                         {}
+                  box_obstacle_top_center:
+                    {}
+                  deep_frame_center:
+                    {}
+                  deep_frame_top_center:
+                    {}
+                  deep_frame_vision:
+                    {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Marker
@@ -640,25 +656,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 6.632602691650391
+      Distance: 2.8338561058044434
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.9236972332000732
-        Y: 1.8932244777679443
-        Z: -0.3507393002510071
+        X: 1.1600068807601929
+        Y: 0.27314189076423645
+        Z: 0.2555025815963745
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.3197951018810272
+      Pitch: 0.2147950977087021
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 4.703627109527588
+      Yaw: 4.668615341186523
     Saved: ~
 Window Geometry:
   Displays:

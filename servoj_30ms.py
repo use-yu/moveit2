@@ -137,7 +137,6 @@ RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 # TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 87.0)
 DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 82.0)
 TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 124.0)
-FT_SENSOR_ONLINE_TIMEOUT_SEC = 5.0
 FEEDBACK_FRAME_SIZE = MyType.itemsize
 FEEDBACK_TEST_VALUE = 0x0123456789ABCDEF
 FEEDBACK_TEST_VALUE_OFFSET = MyType.fields["test_value"][1]
@@ -483,76 +482,6 @@ def joint(feed_v, side, state_node):
             FT_sensor[side] = []
 
         # feed() 本身按控制器约 8 ms 的反馈周期阻塞，不再额外 sleep，避免旧帧积压。
-
-def wait_ft_sensor_online(
-    feed_v,
-    dashboard_client,
-    name,
-    side,
-    state_node,
-    timeout=FT_SENSOR_ONLINE_TIMEOUT_SEC,
-):
-    """
-    先读取力传感器状态；不在线时使能并等待有效六维力反馈。
-
-    只有 six_force_online=1 时才发布；离线或异常时不发布旧值。
-    这里故意不调用 SixForceHome()，保留传感器当前零点。
-    """
-    topic = f"/g01/{side}/FTSensor"
-    actual = feed_v.feed()
-    if actual != ["NG"]:
-        status = int(actual[5])
-        force = np.asarray(actual[4], dtype=float)
-        if status == 1 and force.shape == (6,) and np.all(np.isfinite(force)):
-            force_values = [float(value) for value in force]
-            state_node.publish_ft_sensor(side, force_values)
-            print(
-                f"{name} 力传感器已在线，无需发送 EnableFTSensor(1)；"
-                f"首帧已发布到 {topic}：{force_values}"
-            )
-            return
-
-    dashboard_command(
-        dashboard_client,
-        "EnableFTSensor(1)",
-        name=name,
-        required=True,
-    )
-    print(f"{name} 力传感器不在线，已发送 EnableFTSensor(1)")
-
-    deadline = time.monotonic() + timeout
-    last_status = None
-    while time.monotonic() < deadline:
-        actual = feed_v.feed()
-        if actual == ["NG"]:
-            time.sleep(0.05)
-            continue
-
-        last_status = int(actual[5])
-        force = np.asarray(actual[4], dtype=float)
-        force_valid = force.shape == (6,) and bool(np.all(np.isfinite(force)))
-
-        if not force_valid:
-            time.sleep(0.05)
-            continue
-
-        force_values = [float(value) for value in force]
-
-        if last_status == 1:
-            state_node.publish_ft_sensor(side, force_values)
-            print(
-                f"{name} 力传感器已在线：six_force_online=1，"
-                f"首帧已发布到 {topic}：{force_values}"
-            )
-            return
-
-        # 状态为 0/2 时即使数值字段仍保留上一帧，也不能发布。
-        time.sleep(0.05)
-
-    raise RuntimeError(
-        f"{name} 力传感器在 {timeout:.1f}s 内未上线，"
-        f"six_force_online={last_status}"
-    )
 
 def setup_logger(log_file='app.log'):
     # 创建日志记录器
@@ -939,20 +868,11 @@ try:
             raise RuntimeError(f"{arm_name} SetPayload 失败，返回码：{payload_result}")
 
     feedback_connections = {}
-    for index, (ip, side, client_socket) in enumerate(
-        zip(SERVER_ADDRESSES, ["left", "right"], client_sockets), start=1
-    ):
+    for ip, side in zip(SERVER_ADDRESSES, ["left", "right"]):
         feed_v = fankuis(ip, 30004)
-        wait_ft_sensor_online(
-            feed_v,
-            client_socket,
-            f'第{index}个机械臂',
-            side,
-            state_node,
-        )
         feedback_connections[side] = feed_v
 
-    print("左右力传感器均已在线，开始给双臂末端下电")
+    print("力传感器无需在初始化时在线，开始给双臂末端下电")
     for index, client_socket in enumerate(client_sockets, start=1):
         dashboard_command(
             client_socket,
