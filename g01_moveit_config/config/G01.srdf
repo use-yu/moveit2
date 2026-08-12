@@ -11,6 +11,11 @@
     <!--SUBGROUPS: Groups can also be formed by referencing to already defined group names-->
     <!-- 底盘+躯干：分别对应 base_controller、lift_controller、waist_controller -->
 
+    <group name="body">
+        <joint name="body_joint1"/>
+        <joint name="body_joint2"/>
+    </group>
+
     <group name="robot">
         <joint name="virtual_joint"/>
         <joint name="world_to_base_footprint"/>

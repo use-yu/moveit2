@@ -180,6 +180,10 @@ JOINT_TARGETS = {
         "r_arm_joint5": -0 * math.pi,
         "r_arm_joint6": -0 * math.pi / 180,
     },
+    "body": {
+        "body_joint1": 0.0,
+        "body_joint2": 0.0,
+    },
     "dual_arm_body": {
         "body_joint1": 0.0,
         "body_joint2": 1.313,
@@ -350,35 +354,27 @@ GRASP_Q1 = [
     1.672852,
     0.588477,
 ]
-# 下料流程识别物料台前的预备构型，顺序与 dual_arm_body 一致。
-# 前两项是 body_joint1/body_joint2，后面为左右臂各 6 个关节。
+# 下料流程识别物料台前的预备构型，只控制升降和腰部。
+# 顺序为 body_joint1/body_joint2，双臂保持当前位置。
 UNLOAD_TABLE_VISION_PREP_Q = [
     0.05,
     0 * math.pi / 180,
-    -1.57,
-    -0.15,
-    -1.578090,
-    -1.370549,
-    -1.672852,
-    -0.588477,
-    1.57,
-    0.15,
-    1.578090,
-    1.370549,
-    1.672852,
-    0.588477,
 ]
 for q1_name, q1_values in (
     ("MOVE_TO_GRASP_RESET_Q", MOVE_TO_GRASP_RESET_Q),
     ("框_Q1", 框_Q1),
     ("GRASP_Q1", GRASP_Q1),
-    ("UNLOAD_TABLE_VISION_PREP_Q", UNLOAD_TABLE_VISION_PREP_Q),
 ):
     if len(q1_values) != len(JOINT_TARGETS["dual_arm_body"]):
         raise ValueError(
             f"{q1_name} 长度 {len(q1_values)} 与 dual_arm_body 关节数 "
             f"{len(JOINT_TARGETS['dual_arm_body'])} 不一致"
         )
+if len(UNLOAD_TABLE_VISION_PREP_Q) != len(JOINT_TARGETS["body"]):
+    raise ValueError(
+        f"UNLOAD_TABLE_VISION_PREP_Q 长度 {len(UNLOAD_TABLE_VISION_PREP_Q)} "
+        f"与 body 关节数 {len(JOINT_TARGETS['body'])} 不一致"
+    )
 
 
 # 规划器
@@ -575,37 +571,37 @@ UNLOAD_OBSTACLE_SIZE = (1.0, 0.1, 2.5)
 UNLOAD_OBSTACLE_Y_OFFSET = 0.95
 UNLOAD_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=0.85)
 UNLOAD_APPROACH_DISTANCE = 0.1
-UNLOAD_PLACE_DESCENT_DISTANCE = 0.16
+UNLOAD_PLACE_DESCENT_DISTANCE = 0.13
 # 上料放置位抓取
 UNLOAD_EXTRA_APPROACH_BY_SLOT = {
-    "sw1": 0.003,  # 右臂：多降 4 mm
-    "sw2": 0.001,  # 左臂：多降 1 mm
-    "sw3": 0.003,  # 左臂：多降 4 mm
-    "sw4": 0.005,  # 右臂：多降 8 mm
+    "sw1": 0.001,  # 右臂：多降 4 mm
+    "sw2": -0.001,  # 左臂：多降 1 mm
+    "sw3": 0.001,  # 左臂：多降 4 mm
+    "sw4": 0.003,  # 右臂：多降 8 mm
 }
 # 物料台放置点：相对视觉识别点 recognition_pose 的局部 xyz 偏移 [m]
 # 和局部旋转，不再叠加 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL。
 UNLOAD_PLACE_LOCAL_PITCH = math.pi
 UNLOAD_PLACE_LOCAL_YAWS = {
-    1: math.radians(204.5),
-    2: math.radians(204.5),
-    3: math.radians(204.5),
-    4: math.radians(204.5),
-    11: math.radians(204.5),
-    12: math.radians(204.5),
-    13: math.radians(204.5),
-    14: math.radians(204.5),
+    1: math.radians(158),
+    2: math.radians(155),
+    3: math.radians(154),
+    4: math.radians(155),
+    11: math.radians(158),
+    12: math.radians(155),
+    13: math.radians(154),
+    14: math.radians(155),
 }
 # 注意这里八个物料台点编号和机器人 SW 编号不一样。
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    11: (0.0, 0.45, 0.1),
-    12: (0.0, 0.25, 0.1),
-    13: (0.0, 0.0, 0.1),
-    14: (0.0, -0.2, 0.1),
-    1: (-0.2, 0.45, 0.1),
-    2: (-0.2, 0.25, 0.1),
-    3: (-0.2, 0.0, 0.1),
-    4: (-0.2, -0.2, 0.1),
+    11: (0.0-0.0065, 0.45-0.004, 0.146),
+    12: (0.0-0.0015, 0.25-0.0015, 0.146),
+    13: (0.0+0.002, 0.0-0.006, 0.152),
+    14: (0.0+0.002, -0.2-0.004, 0.152),
+    1: (-0.2-0.0065, 0.45-0.004, 0.146),
+    2: (-0.2-0.0015, 0.25-0.0015, 0.146),
+    3: (-0.2+0.002, 0.0-0.006, 0.152),
+    4: (-0.2+0.002, -0.2-0.004, 0.152),
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
@@ -634,9 +630,7 @@ UNLOAD_CARTESIAN_AVOID_COLLISIONS = False
 UNLOAD_SYNC_SAMPLE_PERIOD = 0.005
 UNLOAD_TOOL_SETTLE_SEC = 1.0
 
-WAIST_BODY_GROUP = "body"
-WAIST_BODY_JOINT = "body_joint2"
-WAIST_RESET_ANGLE_RAD = math.radians(30.0)
+BODY_GROUP = "body"
 ACT_MOVE_GROUP = "move_action"
 ACT_EXEC_TRAJ = "execute_trajectory"
 
@@ -2985,41 +2979,6 @@ class G01Demo(Node):
             input()
         except EOFError:
             pass
-
-    def move_body_joint2(self, angle_rad: float, speed_scale: float = 0.5) -> bool:
-        """读取 body 组当前位置，只改变 body_joint2 后做关节空间规划执行。"""
-        log = self.get_logger()
-        if WAIST_BODY_GROUP not in JOINT_TARGETS:
-            log.error(f"未知腰部规划组 {WAIST_BODY_GROUP}")
-            return False
-
-        joint_names = joint_names_for_group(WAIST_BODY_GROUP)
-        if WAIST_BODY_JOINT not in joint_names:
-            log.error(f"{WAIST_BODY_GROUP} 组不包含 {WAIST_BODY_JOINT}")
-            return False
-
-        current = self._get_joints(joint_names, wait_new=True)
-        if current is None:
-            log.error(f"[waist] 读取 {WAIST_BODY_GROUP} 当前关节失败")
-            return False
-
-        target = dict(current)
-        target[WAIST_BODY_JOINT] = float(angle_rad)
-        log.info(
-            f"[waist] {WAIST_BODY_GROUP} 关节空间规划: "
-            f"{WAIST_BODY_JOINT} {current[WAIST_BODY_JOINT]:.6f} -> {angle_rad:.6f} rad "
-            f"({math.degrees(angle_rad):.2f} deg), speed_scale={_clamp01(speed_scale):.2f}"
-        )
-        ok, used_ms, _ = self.plan_joint_motion(
-            WAIST_BODY_GROUP,
-            target,
-            joint_names=joint_names,
-            start_joints=current,
-            speed_scale=speed_scale,
-            execute=True,
-        )
-        log.info(f"[waist] move body_joint2: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
-        return ok
 
     def _on_js(self, msg: JointState):
         """每次收到 joint_states 更新缓存并递增计数（用于检测「新帧」）。"""
@@ -5542,8 +5501,6 @@ class G01Demo(Node):
         place_speed_scale: float = PLACE_SPEED_SCALE,
         cutoff_joint_names: Sequence[str] | None = None,
         first_return_mode: int = FIRST_RETURN_MODE,
-        waist_moved: bool = False,
-        waist_reset_angle: float = WAIST_RESET_ANGLE_RAD,
         prevalidated_pair: tuple[
             dict[str, float],
             dict[str, float],
@@ -5563,8 +5520,6 @@ class G01Demo(Node):
             place_speed_scale : 放置段的速度缩放（0~1）
             cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
             first_return_mode : 1=使用 *_j 并交换；2=使用普通放置点；0 兼容旧普通模式
-            waist_moved       : 抓取前是否为了可达性移动过腰部；若移动过，放置/交换前先回 30°
-            waist_reset_angle : 腰部回正角度 [rad]
             prevalidated_pair : 可达性验证已选出的 (q_pre, q_target,
                 to_pre_traj, approach_traj)；传入后不再重复执行 100 次
                 IK、OMPL 到 q_pre 规划和 Cartesian 直线预检。
@@ -6354,8 +6309,6 @@ def main(argv: list[str] | None = None) -> int:
         waist_pick_angle = (
             pick_q_target.get("body_joint2") if isinstance(pick_q_target, dict) else None
         )
-        waist_moved = False
-
         if waist_pick_angle is not None and pick_group not in ("left_arm", "right_arm"):
             log.info(
                 f"可达性选中 {pick_group}，后续直接使用该 body 组规划抓取，"
@@ -6388,7 +6341,6 @@ def main(argv: list[str] | None = None) -> int:
             place_speed_scale=0.4,
             cutoff_joint_names=joint_names,
             first_return_mode=first_return_mode,
-            waist_moved=waist_moved,
             prevalidated_pair=(
                 reachable["pick_q_pre"],
                 reachable["pick_q_target"],
@@ -7391,11 +7343,12 @@ def main(argv: list[str] | None = None) -> int:
             right_point,
         ) = selected
 
-        vision_prep_group = "dual_arm_body"
+        vision_prep_group = BODY_GROUP
         vision_prep_joint_names = joint_names_for_group(vision_prep_group)
         log.info(
             f"[unload] 物料台识别前，{vision_prep_group} 先通过 OMPL "
-            "运动到 UNLOAD_TABLE_VISION_PREP_Q"
+            "只运动 body_joint1/body_joint2 到 "
+            "UNLOAD_TABLE_VISION_PREP_Q，双臂保持当前位置"
         )
         if not node.plan_execute_joint_waypoints(
             vision_prep_group,
