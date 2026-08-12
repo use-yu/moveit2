@@ -353,7 +353,7 @@ GRASP_Q1 = [
 # 下料流程识别物料台前的预备构型，顺序与 dual_arm_body 一致。
 # 前两项是 body_joint1/body_joint2，后面为左右臂各 6 个关节。
 UNLOAD_TABLE_VISION_PREP_Q = [
-    0.0,
+    0.05,
     0 * math.pi / 180,
     -1.57,
     -0.15,
@@ -539,7 +539,7 @@ DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 # 格式：(右臂 SW, 左臂 SW, 左臂物料台点, 右臂物料台点)
 #   SW1 + SW3 只能放物料台点 1/3：SW3→点1，SW1→点3
 #   SW2 + SW4 只能放物料台点 2/4：SW2→点2，SW4→点4
-UNLOAD_TRIGGER_COMMAND = "p,8"
+UNLOAD_TRIGGER_COMMAND = "p,4"
 UNLOAD_VISION_POSE_KEY = "right_body"
 UNLOAD_VISION_TF_FRAME = "material_table_vision"
 UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"

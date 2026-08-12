@@ -214,8 +214,8 @@ Visualization Manager:
         Goal State Color: 250; 128; 0
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
-        Planning Group: waist
-        Query Goal State: false
+        Planning Group: left_body
+        Query Goal State: true
         Query Start State: false
         Show Workspace: false
         Start State Alpha: 1
@@ -559,6 +559,18 @@ Visualization Manager:
           Value: true
         map:
           Value: true
+        material_table_place_point_1:
+          Value: false
+        material_table_place_point_2:
+          Value: false
+        material_table_place_point_3:
+          Value: false
+        material_table_place_point_4:
+          Value: false
+        material_table_top:
+          Value: true
+        material_table_vision:
+          Value: true
         moveit_base_link:
           Value: true
         r_base_link:
@@ -574,8 +586,6 @@ Visualization Manager:
       Show Names: false
       Tree:
         map:
-          base_link:
-            {}
           world:
             base_footprint:
               base_x_link:
@@ -610,6 +620,18 @@ Visualization Manager:
                   deep_frame_top_center:
                     {}
                   deep_frame_vision:
+                    {}
+                  material_table_place_point_1:
+                    {}
+                  material_table_place_point_2:
+                    {}
+                  material_table_place_point_3:
+                    {}
+                  material_table_place_point_4:
+                    {}
+                  material_table_top:
+                    {}
+                  material_table_vision:
                     {}
       Update Interval: 0
       Value: true
@@ -656,25 +678,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2.8338561058044434
+      Distance: 5.340865135192871
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 1.1600068807601929
-        Y: 0.27314189076423645
-        Z: 0.2555025815963745
+        X: 1.2954871654510498
+        Y: 0.39506518840789795
+        Z: 0.8142877817153931
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.2147950977087021
+      Pitch: 0.45979443192481995
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 4.668615341186523
+      Yaw: 5.048630237579346
     Saved: ~
 Window Geometry:
   Displays:
