@@ -536,9 +536,13 @@ ALL_PLACE_SLOTS_MATERIAL_SIGNAL = 0x00
 DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 
 # 下料流程：双臂成对取料，并把每对上料位固定绑定到物料台放置点。
+# 先放满第一组 1/2/3/4，再使用第二组 11/12/13/14；已经成功放置的点
+# 在本次程序运行期间不会再次使用。
 # 格式：(右臂 SW, 左臂 SW, 左臂物料台点, 右臂物料台点)
 #   SW1 + SW3 只能放物料台点 1/3：SW3→点1，SW1→点3
 #   SW2 + SW4 只能放物料台点 2/4：SW2→点2，SW4→点4
+#   SW1 + SW3 只能放物料台点 11/13：SW3→点11，SW1→点13
+#   SW2 + SW4 只能放物料台点 12/14：SW2→点12，SW4→点14
 UNLOAD_TRIGGER_COMMAND = "p,4"
 UNLOAD_VISION_POSE_KEY = "right_body"
 UNLOAD_VISION_TF_FRAME = "material_table_vision"
@@ -547,19 +551,29 @@ UNLOAD_PLACE_TF_FRAME_PREFIX = "material_table_place_point_"
 UNLOAD_PAIR_ROUTES = (
     ("sw1", "sw3", 1, 3),
     ("sw4", "sw2", 2, 4),
+    ("sw1", "sw3", 11, 13),
+    ("sw4", "sw2", 12, 14),
+)
+UNLOAD_MAX_PAIRS_PER_RUN = 2
+UNLOAD_PLACE_POINT_LAYERS = (
+    frozenset((1, 2, 3, 4)),
+    frozenset((11, 12, 13, 14)),
 )
 UNLOAD_TABLE_ID = "unload_table"
-UNLOAD_TABLE_SIZE = (0.64, 1.2, 0.98)
+UNLOAD_TABLE_SIZE = (0.6, 1.7, 1.0)
 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL = (
-    0.0,
-    0.1125,
-    0.09+0.15,
+    -0.1,
+    0.125,
+    0.06,
 )
 UNLOAD_TABLE_LOCAL_RPY = (0.0, 0.0, 0.0)
 UNLOAD_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
-# 仅用于清理旧版本可能残留在 MoveIt 场景中的物体。
+# 仅用于清理旧版本可能残留在 MoveIt 场景中的桌面薄盒。
 UNLOAD_TABLE_TOP_BOX_ID = "unload_table_top_box"
 UNLOAD_OBSTACLE_ID = "unload_vision_y_obstacle"
+UNLOAD_OBSTACLE_SIZE = (1.0, 0.1, 2.5)
+UNLOAD_OBSTACLE_Y_OFFSET = 0.95
+UNLOAD_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=0.85)
 UNLOAD_APPROACH_DISTANCE = 0.1
 UNLOAD_PLACE_DESCENT_DISTANCE = 0.16
 # 上料放置位抓取
@@ -569,21 +583,29 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
     "sw3": 0.003,  # 左臂：多降 4 mm
     "sw4": 0.005,  # 右臂：多降 8 mm
 }
-# 注意是相对于桌子坐标系
-# 物料台放置点：在 material_table_top 桌子坐标系下的 xyz 偏移 [m] 和局部旋转。
+# 物料台放置点：相对视觉识别点 recognition_pose 的局部 xyz 偏移 [m]
+# 和局部旋转，不再叠加 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL。
 UNLOAD_PLACE_LOCAL_PITCH = math.pi
 UNLOAD_PLACE_LOCAL_YAWS = {
-    1: math.radians(204.5+112),
-    2: math.radians(204.5+112),
-    3: math.radians(204.5+112),
-    4: math.radians(204.5+112),
+    1: math.radians(204.5),
+    2: math.radians(204.5),
+    3: math.radians(204.5),
+    4: math.radians(204.5),
+    11: math.radians(204.5),
+    12: math.radians(204.5),
+    13: math.radians(204.5),
+    14: math.radians(204.5),
 }
-# 注意这里1234和机器人sw不一样
+# 注意这里八个物料台点编号和机器人 SW 编号不一样。
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    1: (0.0-0.012, 0.225+0.1125-0.0015, 0.1-0.015),
-    2: (0.0-0.009, 0.1125-0.0025, 0.1-0.014),
-    3: (0.0-0.0045, -0.1125-0.001, 0.1),
-    4: (0.0-0.0015, -0.225-0.001 - 0.1125, 0.1),
+    11: (0.0, 0.45, 0.1),
+    12: (0.0, 0.25, 0.1),
+    13: (0.0, 0.0, 0.1),
+    14: (0.0, -0.2, 0.1),
+    1: (-0.2, 0.45, 0.1),
+    2: (-0.2, 0.25, 0.1),
+    3: (-0.2, 0.0, 0.1),
+    4: (-0.2, -0.2, 0.1),
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
@@ -1761,12 +1783,36 @@ def make_unload_table(recognition_pose: Pose) -> CollisionObject:
     return obj
 
 
-def make_unload_place_poses(recognition_pose: Pose) -> dict[int, Pose]:
-    """以桌面为基准，按各点偏移和局部 pitch/yaw 生成四个放置位姿。"""
+def make_unload_obstacle(recognition_pose: Pose) -> CollisionObject:
+    """沿物料台局部 +Y 平移，在地面上建立竖直墙状障碍物。"""
     table_top_pose = make_unload_table_top_pose(recognition_pose)
+    center_pose = pose_offset_local(
+        table_top_pose,
+        0.0,
+        UNLOAD_OBSTACLE_Y_OFFSET,
+        0.0,
+    )
+    # 障碍物从 moveit_base_link 的地面向上延伸，故中心高度为半高。
+    center_pose.position.z = UNLOAD_OBSTACLE_SIZE[2] / 2.0
+
+    primitive = SolidPrimitive()
+    primitive.type = SolidPrimitive.BOX
+    primitive.dimensions = list(UNLOAD_OBSTACLE_SIZE)
+
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = UNLOAD_OBSTACLE_ID
+    obj.operation = CollisionObject.ADD
+    obj.primitives.append(primitive)
+    obj.primitive_poses.append(center_pose)
+    return obj
+
+
+def make_unload_place_poses(recognition_pose: Pose) -> dict[int, Pose]:
+    """以视觉识别点为基准，生成八个局部偏移后的放置位姿。"""
     return {
         point_index: pose_rotate_local_rpy(
-            pose_offset_local(table_top_pose, *local_offset),
+            pose_offset_local(recognition_pose, *local_offset),
             0.0,
             UNLOAD_PLACE_LOCAL_PITCH,
             UNLOAD_PLACE_LOCAL_YAWS[point_index],
@@ -3389,13 +3435,15 @@ class G01Demo(Node):
         )
 
     def add_unload_scene(self, recognition_pose: Pose) -> bool:
-        """添加视觉识别得到的料台。"""
+        """添加视觉识别得到的料台及其局部 +Y 方向墙状障碍物。"""
         colors = [
             ObjectColor(id=UNLOAD_TABLE_ID, color=UNLOAD_TABLE_COLOR),
+            ObjectColor(id=UNLOAD_OBSTACLE_ID, color=UNLOAD_OBSTACLE_COLOR),
         ]
         return self._apply_scene(
             [
                 make_unload_table(recognition_pose),
+                make_unload_obstacle(recognition_pose),
             ],
             colors,
         )
@@ -3437,7 +3485,7 @@ class G01Demo(Node):
         )
 
     def publish_unload_place_tfs(self, place_poses: dict[int, Pose]) -> None:
-        """发布物料台四个放置点的固定 TF，位姿与下料规划目标一致。"""
+        """发布物料台八个放置点的固定 TF，位姿与下料规划目标一致。"""
         stamp = self.get_clock().now().to_msg()
         transforms: list[TransformStamped] = []
         for point_index, pose in sorted(place_poses.items()):
@@ -6100,6 +6148,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     code = 1
     frame_added = False
+    # 跨多次 /place_cmd 保留本进程内已经实际放料的物料台点。
+    # 一对目标开始成功释放后即整体锁定，避免异常重试碰撞已放置物料。
+    used_unload_place_points: set[int] = set()
 
     def cleanup_grasp_display(remove_scene_objects: bool = True) -> None:
         node.remove_cylinder_at_pose()
@@ -6423,14 +6474,28 @@ def main(argv: list[str] | None = None) -> int:
             if node._place_slot_has_material(slot_name)
         ]
 
-    def select_unload_pair(
-        start_index: int = 0,
-    ) -> tuple[int, str, str, int, int] | None:
-        """选择完整料对，返回索引、左右 SW 及与该料对绑定的左右放置点。"""
-        for pair_index in range(max(0, start_index), len(UNLOAD_PAIR_ROUTES)):
+    def current_unload_place_layer() -> frozenset[int] | None:
+        """返回尚未放满的第一层；1~4 未满时不会提前使用 11~14。"""
+        for layer_points in UNLOAD_PLACE_POINT_LAYERS:
+            if not layer_points.issubset(used_unload_place_points):
+                return layer_points
+        return None
+
+    def select_unload_pair() -> tuple[int, str, str, int, int] | None:
+        """从当前层选择有料且目标点未占用的完整料对。"""
+        layer_points = current_unload_place_layer()
+        if layer_points is None:
+            return None
+
+        for pair_index, route in enumerate(UNLOAD_PAIR_ROUTES):
             right_slot, left_slot, left_point, right_point = (
-                UNLOAD_PAIR_ROUTES[pair_index]
+                route
             )
+            route_points = {left_point, right_point}
+            if not route_points.issubset(layer_points):
+                continue
+            if route_points & used_unload_place_points:
+                continue
             if (
                 node._place_slot_has_material(right_slot)
                 and node._place_slot_has_material(left_slot)
@@ -6454,6 +6519,29 @@ def main(argv: list[str] | None = None) -> int:
             log.error(f"[unload] {stage}：右臂工具{action}失败")
             return False
         print(f"{GREEN}[unload] {stage}：左右末端{action}成功{RESET}")
+        return True
+
+    def release_unload_pair(left_point: int, right_point: int) -> bool:
+        """逐臂释放物料，并在开始成功释放后锁定整对放置点。"""
+        if not node.set_tool_power("left", 0):
+            log.error(f"[unload] 物料台左点{left_point}放置：左臂工具下电失败")
+            return False
+        # 左点已经实际放料后，这对目标不能再整体重试；同时预留右点，避免
+        # 右臂下电异常时下次重试撞到已经放在左点的物料。
+        used_unload_place_points.update((left_point, right_point))
+        log.info(f"[unload] 左点{left_point}已放料，标记为不可再次使用")
+
+        if not node.set_tool_power("right", 0):
+            log.error(
+                f"[unload] 物料台右点{right_point}放置：右臂工具下电失败；"
+                f"为避免碰撞，左点{left_point}/右点{right_point}均保持锁定"
+            )
+            return False
+        log.info(f"[unload] 右点{right_point}已放料，标记为不可再次使用")
+        print(
+            f"{GREEN}[unload] 物料台左点{left_point}/右点{right_point}放置："
+            f"左右末端下电成功{RESET}"
+        )
         return True
 
     def execute_unload_pick_pair(right_slot: str, left_slot: str) -> bool:
@@ -6919,10 +7007,7 @@ def main(argv: list[str] | None = None) -> int:
             except EOFError:
                 pass
 
-            if not set_unload_tool_power(
-                0,
-                f"物料台左点{left_point}/右点{right_point}放置",
-            ):
+            if not release_unload_pair(left_point, right_point):
                 return False
             time.sleep(UNLOAD_TOOL_SETTLE_SEC)
 
@@ -7260,7 +7345,20 @@ def main(argv: list[str] | None = None) -> int:
         return False
 
     def run_one_unload() -> bool:
-        """最多取两对料，每个料对只使用其固定绑定的物料台放置点。"""
+        """每次最多取两对料，按 1~4、11~14 的分层顺序使用空闲点。"""
+        active_layer = current_unload_place_layer()
+        if active_layer is None:
+            log.info(
+                "[unload] 物料台 8 个放置点均已使用，"
+                "不再执行取料和放置"
+            )
+            return True
+
+        remaining_points = sorted(active_layer - used_unload_place_points)
+        log.info(
+            f"[unload] 当前优先层剩余可用点：{remaining_points}；"
+            f"已使用点：{sorted(used_unload_place_points)}"
+        )
         log.info("[unload] 开始下料前先给左右末端下电")
         if not set_unload_tool_power(0, "下料开始"):
             log.error("[unload] 双臂未全部下电，禁止执行后续动作")
@@ -7279,12 +7377,14 @@ def main(argv: list[str] | None = None) -> int:
         selected = select_unload_pair()
         if selected is None:
             log.warning(
-                "[unload] 没有可供双臂成对取料的组合："
-                "需要 SW1+SW3 或 SW2+SW4 同时有料，本轮不取"
+                f"[unload] 当前优先层剩余点 "
+                f"{sorted(active_layer - used_unload_place_points)} "
+                "没有对应的完整料对：需要 SW1+SW3 或 "
+                "SW2+SW4 同时有料，本轮不取"
             )
             return True
         (
-            pair_cursor,
+            _route_index,
             right_slot,
             left_slot,
             left_point,
@@ -7309,7 +7409,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return False
 
-        # 物料台识别姿态同时用于构造场景和四个局部放置点。
+        # 物料台识别姿态同时用于构造场景和八个局部放置点。
         vision_result = read_vision_object_pose(
             node,
             log,
@@ -7341,7 +7441,7 @@ def main(argv: list[str] | None = None) -> int:
             local_pitch_deg = math.degrees(UNLOAD_PLACE_LOCAL_PITCH)
             local_yaw_deg = math.degrees(UNLOAD_PLACE_LOCAL_YAWS[point_index])
             log.info(
-                f"[unload] 物料台点{point_index} table_local={local_offset}, "
+                f"[unload] 物料台点{point_index} vision_local={local_offset}, "
                 f"local_rpy=(0.0, {local_pitch_deg:.1f}, "
                 f"{local_yaw_deg:.1f}) deg, "
                 f"base=({point_pose.position.x:.4f}, "
@@ -7351,7 +7451,7 @@ def main(argv: list[str] | None = None) -> int:
         unload_scene_added = False
         try:
             if not node.add_unload_scene(recognition_pose):
-                log.error("[unload] 添加料台失败")
+                log.error("[unload] 添加料台/墙状障碍物失败")
                 return False
             unload_scene_added = True
             table_top_pose = make_unload_table_top_pose(recognition_pose)
@@ -7363,14 +7463,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"top_center=({table_top_pose.position.x:.4f}, "
                 f"{table_top_pose.position.y:.4f}, "
                 f"{table_top_pose.position.z:.4f})，"
-                f"table_local_rpy_deg={table_rpy_deg}"
+                f"table_local_rpy_deg={table_rpy_deg}；"
+                f"障碍物 size={UNLOAD_OBSTACLE_SIZE} m，"
+                f"沿料台局部 +Y 偏移 {UNLOAD_OBSTACLE_Y_OFFSET:.3f} m"
             )
             try:
                 input()
             except EOFError:
                 pass
 
-            for batch_index in range(len(UNLOAD_PAIR_ROUTES)):
+            for batch_index in range(UNLOAD_MAX_PAIRS_PER_RUN):
                 if batch_index > 0:
                     if not node._wait_for_driver_signal(require_new=True):
                         return False
@@ -7381,18 +7483,25 @@ def main(argv: list[str] | None = None) -> int:
                         else "无"
                     )
                     print(
-                        f"{GREEN}[unload] 第一轮放置后仍有料位置: "
+                        f"{GREEN}[unload] 上一轮放置后仍有料位置: "
                         f"{material_text}{RESET}"
                     )
-                    selected = select_unload_pair(pair_cursor + 1)
+                    selected = select_unload_pair()
                     if selected is None:
+                        active_layer = current_unload_place_layer()
+                        if active_layer is None:
+                            log.info(
+                                "[unload] 物料台 8 个放置点均已使用"
+                            )
+                            return True
                         log.info(
-                            "[unload] 第一轮完成后没有下一组完整料对，"
-                            "不执行第二轮取料"
+                            f"[unload] 当前优先层剩余点 "
+                            f"{sorted(active_layer - used_unload_place_points)} "
+                            "没有下一组完整料对，结束本次下料"
                         )
                         return True
                     (
-                        pair_cursor,
+                        _route_index,
                         right_slot,
                         left_slot,
                         left_point,
@@ -7417,7 +7526,8 @@ def main(argv: list[str] | None = None) -> int:
                 log.info(
                     f"[unload] 第 {batch_index + 1} 轮放置完成："
                     f"左臂点{left_point}、右臂点{right_point}，"
-                    "双臂直线返回放置预备位"
+                    "双臂直线返回放置预备位；"
+                    f"已使用点={sorted(used_unload_place_points)}"
                 )
 
             return True

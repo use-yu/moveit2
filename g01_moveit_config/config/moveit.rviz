@@ -560,13 +560,21 @@ Visualization Manager:
         map:
           Value: true
         material_table_place_point_1:
-          Value: false
+          Value: true
+        material_table_place_point_11:
+          Value: true
+        material_table_place_point_12:
+          Value: true
+        material_table_place_point_13:
+          Value: true
+        material_table_place_point_14:
+          Value: true
         material_table_place_point_2:
-          Value: false
+          Value: true
         material_table_place_point_3:
-          Value: false
+          Value: true
         material_table_place_point_4:
-          Value: false
+          Value: true
         material_table_top:
           Value: true
         material_table_vision:
@@ -623,6 +631,14 @@ Visualization Manager:
                     {}
                   material_table_place_point_1:
                     {}
+                  material_table_place_point_11:
+                    {}
+                  material_table_place_point_12:
+                    {}
+                  material_table_place_point_13:
+                    {}
+                  material_table_place_point_14:
+                    {}
                   material_table_place_point_2:
                     {}
                   material_table_place_point_3:
@@ -678,25 +694,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 5.340865135192871
+      Distance: 5.090707302093506
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 1.2954871654510498
-        Y: 0.39506518840789795
-        Z: 0.8142877817153931
+        X: 1.2170734405517578
+        Y: 0.06790164113044739
+        Z: 1.2109737396240234
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.45979443192481995
+      Pitch: 0.049793872982263565
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 5.048630237579346
+      Yaw: 4.433615684509277
     Saved: ~
 Window Geometry:
   Displays:
