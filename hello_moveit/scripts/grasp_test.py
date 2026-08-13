@@ -5820,6 +5820,29 @@ class G01Demo(Node):
             self.last_pick_failure_reason = "force_sensor_timeout"
             if not self.set_tool_power(tool_side, 0):
                 log.error(f"[pick] 取消抓取时{tool_label}工具下电失败")
+                return False
+
+            reset_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
+            log.info(
+                f"[pick] {tool_label}力传感器可能离线；工具已下电，"
+                "dual_arm_body 开始复位到 MOVE_TO_GRASP_RESET_Q"
+            )
+            if not self.plan_execute_joint_waypoints(
+                "dual_arm_body",
+                0.2,
+                reset_joint_names,
+                [MOVE_TO_GRASP_RESET_Q],
+                num_attempts=30,
+                planning_time_sec=10.0,
+            ):
+                log.error(
+                    "[pick] 力传感器离线后复位到 "
+                    "MOVE_TO_GRASP_RESET_Q 失败"
+                )
+                return False
+            log.info(
+                "[pick] 力传感器离线后已复位到 MOVE_TO_GRASP_RESET_Q"
+            )
             return False
 
         log.info(

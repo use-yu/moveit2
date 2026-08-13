@@ -21,6 +21,8 @@
 # → 不发送 ServoJ
 # /g01/servoj_control 可按臂 stop/resume；停止时关闭指令入口并清轨迹缓存，
 # 处理结果发布到 /g01/servoj_control_state。
+# /g01/left/ft_sensor_commands 和 /g01/right/ft_sensor_commands 使用
+# dobot_msgs_v4/srv/EnableFTSensor，通过 status=1/0 开启/关闭对应力传感器。
 import json
 import socket
 from time import sleep
@@ -34,7 +36,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray, String
-from dobot_msgs_v4.srv import SetToolPower
+from dobot_msgs_v4.srv import EnableFTSensor, SetToolPower
 
 MyType = np.dtype([('len', np.int64,), ('digital_input_bits', np.uint64,), ('digital_output_bits',
                                                                             np.uint64,), ('robot_mode', np.uint64,),
@@ -133,6 +135,8 @@ SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
 SERVOJ_RESUME_GUARD_SEC = 0.1
 LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
+LEFT_FT_SENSOR_COMMAND_SERVICE = "/g01/left/ft_sensor_commands"
+RIGHT_FT_SENSOR_COMMAND_SERVICE = "/g01/right/ft_sensor_commands"
 # DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 45.0)
 # TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 87.0)
 DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 82.0)
@@ -248,6 +252,16 @@ class ArmRosBridge(Node):
         self.create_timer(SERVOJ_SEND_PERIOD_SEC, self._send_latest_joint_commands)
         self.create_service(SetToolPower, LEFT_TOOL_COMMAND_SERVICE, self._on_left_tool_command)
         self.create_service(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE, self._on_right_tool_command)
+        self.create_service(
+            EnableFTSensor,
+            LEFT_FT_SENSOR_COMMAND_SERVICE,
+            self._on_left_ft_sensor_command,
+        )
+        self.create_service(
+            EnableFTSensor,
+            RIGHT_FT_SENSOR_COMMAND_SERVICE,
+            self._on_right_ft_sensor_command,
+        )
 
     def publish_arm_state(self, side, q):
         msg = Float32MultiArray()
@@ -429,6 +443,48 @@ class ArmRosBridge(Node):
     def _on_right_tool_command(self, request, response):
         return self._on_tool_command(request, response, "right", self.arm_clients[1])
 
+    def _on_ft_sensor_command(self, request, response, side, client):
+        """通过对应机械臂的 29999 端口开启或关闭六维力传感器。"""
+        status = int(request.status)
+        if status not in (0, 1):
+            response.res = -1
+            self.get_logger().error(
+                f"EnableFTSensor status 非法：{status}，只允许 0/1"
+            )
+            return response
+
+        try:
+            response.res = send_enable_ft_sensor(client, status)
+        except OSError as exc:
+            response.res = -1
+            self.get_logger().error(
+                f"/g01/{side}/ft_sensor_commands: "
+                f"EnableFTSensor({status}) 发送失败：{exc}"
+            )
+            return response
+
+        self.get_logger().info(
+            f"/g01/{side}/ft_sensor_commands: "
+            f"EnableFTSensor({status}), res={response.res}"
+        )
+        return response
+
+    def _on_left_ft_sensor_command(self, request, response):
+        return self._on_ft_sensor_command(
+            request,
+            response,
+            "left",
+            self.arm_clients[0],
+        )
+
+    def _on_right_ft_sensor_command(self, request, response):
+        return self._on_ft_sensor_command(
+            request,
+            response,
+            "right",
+            self.arm_clients[1],
+        )
+
 
 q_actual = {"left": [], "right": []}
 i_actual = {"left": [], "right": []}
@@ -517,6 +573,11 @@ def send_set_tool_power(client, status):
     tcp_command = "SetToolPower(%d)" % int(status)
     tcp_command = tcp_command.encode()
     client.sendall(tcp_command)
+    return 0
+
+def send_enable_ft_sensor(client, status):
+    tcp_command = "EnableFTSensor(%d)" % int(status)
+    client.sendall(tcp_command.encode())
     return 0
 
 DASHBOARD_COMMAND_TIMEOUT = 5.0
