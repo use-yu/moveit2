@@ -215,7 +215,7 @@ Visualization Manager:
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
         Planning Group: left_body
-        Query Goal State: true
+        Query Goal State: false
         Query Start State: false
         Show Workspace: false
         Start State Alpha: 1
@@ -536,13 +536,13 @@ Visualization Manager:
         YB:
           Value: true
         base_footprint:
-          Value: true
+          Value: false
         base_link:
           Value: false
         base_sj:
           Value: true
         base_x_link:
-          Value: true
+          Value: false
         box_obstacle_top_center:
           Value: true
         deep_frame_center:
@@ -558,35 +558,15 @@ Visualization Manager:
         l_tool:
           Value: true
         map:
-          Value: true
-        material_table_place_point_1:
-          Value: true
-        material_table_place_point_11:
-          Value: true
-        material_table_place_point_12:
-          Value: true
-        material_table_place_point_13:
-          Value: true
-        material_table_place_point_14:
-          Value: true
-        material_table_place_point_2:
-          Value: true
-        material_table_place_point_3:
-          Value: true
-        material_table_place_point_4:
-          Value: true
-        material_table_top:
-          Value: true
-        material_table_vision:
-          Value: true
+          Value: false
         moveit_base_link:
-          Value: true
+          Value: false
         r_base_link:
           Value: true
         r_tool:
           Value: true
         world:
-          Value: true
+          Value: false
       Marker Scale: 1
       Name: TF
       Show Arrows: true
@@ -594,6 +574,8 @@ Visualization Manager:
       Show Names: false
       Tree:
         map:
+          base_link:
+            {}
           world:
             base_footprint:
               base_x_link:
@@ -628,26 +610,6 @@ Visualization Manager:
                   deep_frame_top_center:
                     {}
                   deep_frame_vision:
-                    {}
-                  material_table_place_point_1:
-                    {}
-                  material_table_place_point_11:
-                    {}
-                  material_table_place_point_12:
-                    {}
-                  material_table_place_point_13:
-                    {}
-                  material_table_place_point_14:
-                    {}
-                  material_table_place_point_2:
-                    {}
-                  material_table_place_point_3:
-                    {}
-                  material_table_place_point_4:
-                    {}
-                  material_table_top:
-                    {}
-                  material_table_vision:
                     {}
       Update Interval: 0
       Value: true
@@ -694,25 +656,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 5.090707302093506
+      Distance: 3.052873373031616
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 1.2170734405517578
-        Y: 0.06790164113044739
-        Z: 1.2109737396240234
+        X: 0.7189623713493347
+        Y: -0.5415764451026917
+        Z: 0.9265252947807312
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.049793872982263565
+      Pitch: 0.05979384481906891
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 4.433615684509277
+      Yaw: 4.4936137199401855
     Saved: ~
 Window Geometry:
   Displays:
