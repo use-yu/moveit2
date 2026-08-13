@@ -30,8 +30,9 @@ G01 MoveIt 演示脚本
     双臂分别计算末端 +Z 10cm 的 IK/Cartesian 路径，合成一条 12 关节轨迹，一次执行。
     两个末端上电后，反向同一轨迹直线复位。
     吸附完成后先做物料台放置可达性验证：纯臂 IK 优先；必要时先求
-    left_body，再固定该腰部/升降状态求右臂 IK。左右下降分别预检且不考虑
-    碰撞，通过后缓存 OMPL 和同步下降轨迹，执行阶段不重新规划。
+    left_body，再固定该腰部/升降状态求右臂 IK。左右下降分别预检：忽略
+    world 物体碰撞，但保留机器人自碰撞检查；通过后缓存 OMPL 和同步下降
+    轨迹，执行阶段不重新规划。
     优先 SW1+SW3，目标按 (1,3)→(11,13) 循环；SW2+SW4 按
     (2,4)→(12,14) 循环，不记录已经放过的位置。
 8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
@@ -103,6 +104,7 @@ from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     BoundingVolume,
     CollisionObject,
+    ContactInformation,
     Constraints,
     JointConstraint,
     MoveItErrorCodes,
@@ -120,6 +122,7 @@ from moveit_msgs.srv import (
     GetPlanningScene,
     GetPositionFK,
     GetPositionIK,
+    GetStateValidity,
 )
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -444,6 +447,7 @@ SVC_GET_PLANNING_SCENE = "get_planning_scene"
 SVC_CARTESIAN_PATH = "compute_cartesian_path"
 SVC_COMPUTE_IK = "compute_ik"
 SVC_COMPUTE_FK = "compute_fk"
+SVC_STATE_VALIDITY = "check_state_validity"
 # 启动清理先等待 move_group 的场景查询服务；服务一就绪就立即继续。
 STARTUP_SCENE_CLEAR_SERVICE_WAIT_SEC = 5.0
 SCENE_CLEAR_RESPONSE_TIMEOUT_SEC = 5.0
@@ -613,27 +617,27 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
 # 和局部旋转，不再叠加 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL。
 UNLOAD_PLACE_LOCAL_PITCH = math.pi
 UNLOAD_PLACE_LOCAL_YAWS = {
-    11: math.radians(151),
-    12: math.radians(159),
-    13: math.radians(153),
-    14: math.radians(158),
+    1: math.radians(151),
+    2: math.radians(159),
+    3: math.radians(153),
+    4: math.radians(158),
 
-    1: math.radians(158),
-    2: math.radians(155),
-    3: math.radians(154),
-    4: math.radians(155),
+    11: math.radians(158),
+    12: math.radians(155),
+    13: math.radians(154),
+    14: math.radians(155),
 }
 # 注意这里八个物料台点编号和机器人 SW 编号不一样。
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    11: (0.0-0.0065, 0.45-0.0025, 0.146),
-    12: (0.0-0.0035, 0.25-0.0015, 0.146),
-    13: (0.0+0.001, 0.0-0.0055, 0.152),
-    14: (0.0+0.0015, -0.2-0.004, 0.152),
+    1: (0.0-0.0065, 0.45-0.0025, 0.146),
+    2: (0.0-0.0035, 0.25-0.0015, 0.146),
+    3: (0.0+0.001, 0.0-0.0055, 0.152),
+    4: (0.0+0.0015, -0.2-0.004, 0.152),
 
-    1: (-0.2-0.0065, 0.45-0.004, 0.146),
-    2: (-0.2-0.0015, 0.25-0.0015, 0.146),
-    3: (-0.2+0.002, 0.0-0.006, 0.152),
-    4: (-0.2+0.002, -0.2-0.004, 0.152),
+    11: (-0.2-0.0065, 0.45-0.004, 0.146),
+    12: (-0.2-0.0015, 0.25-0.0015, 0.146),
+    13: (-0.2+0.002, 0.0-0.006, 0.152),
+    14: (-0.2+0.002, -0.2-0.004, 0.152),
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
@@ -660,6 +664,9 @@ ARM_JOINT_LIMITS_BY_INDEX = {
 UNLOAD_CARTESIAN_SPEED = 0.2
 UNLOAD_CARTESIAN_AVOID_COLLISIONS = False
 UNLOAD_SYNC_SAMPLE_PERIOD = 0.005
+# 放置同步轨迹按 20 ms 抽样做整机自碰撞检查，并始终检查首末点。
+# 单臂下降仍检查 compute_cartesian_path 返回的每一个离散点。
+UNLOAD_PLACE_SELF_COLLISION_SAMPLE_PERIOD = 0.02
 UNLOAD_TOOL_SETTLE_SEC = 1.0
 
 BODY_GROUP = "body"
@@ -2272,6 +2279,40 @@ def _trajectory_duration_seconds(point: JointTrajectoryPoint) -> float:
     return point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
 
 
+def _trajectory_validation_indices(
+    points: Sequence[JointTrajectoryPoint],
+    sample_period: float | None,
+) -> list[int]:
+    """返回轨迹碰撞检查下标；始终包含首末点，None 表示逐点检查。"""
+    if not points:
+        return []
+    if sample_period is None or sample_period <= 0.0:
+        return list(range(len(points)))
+
+    indices = [0]
+    next_sample_time = float(sample_period)
+    for index, point in enumerate(points[1:-1], start=1):
+        point_time = _trajectory_duration_seconds(point)
+        if point_time + 1e-12 < next_sample_time:
+            continue
+        indices.append(index)
+        while next_sample_time <= point_time + 1e-12:
+            next_sample_time += sample_period
+
+    last_index = len(points) - 1
+    if indices[-1] != last_index:
+        indices.append(last_index)
+    return indices
+
+
+def _is_robot_self_contact(contact: ContactInformation) -> bool:
+    """仅把 robot link 与 robot link 的接触认定为机器人自碰撞。"""
+    return (
+        contact.body_type_1 == ContactInformation.ROBOT_LINK
+        and contact.body_type_2 == ContactInformation.ROBOT_LINK
+    )
+
+
 def _trajectory_positions_at_phase(
     trajectory: RobotTrajectory,
     phase: float,
@@ -2371,6 +2412,10 @@ class G01Demo(Node):
         self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
         self._ik_cli = self.create_client(GetPositionIK, SVC_COMPUTE_IK)
         self._fk_cli = self.create_client(GetPositionFK, SVC_COMPUTE_FK)
+        self._validity_cli = self.create_client(
+            GetStateValidity,
+            SVC_STATE_VALIDITY,
+        )
         self._left_tool_cli = self.create_client(SetToolPower, LEFT_TOOL_COMMAND_SERVICE)
         self._right_tool_cli = self.create_client(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE)
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
@@ -3450,7 +3495,7 @@ class G01Demo(Node):
             f"[unload] 已发布物料台放置点 TF: {frame_names}"
         )
 
-    def remove_unload_scene(self) -> bool:
+    def remove_unload_scene(self, *, report_error: bool = True) -> bool:
         """移除料台及旧版本可能残留的场景物体。"""
         objects = [
             CollisionObject(
@@ -3466,7 +3511,7 @@ class G01Demo(Node):
                 operation=CollisionObject.REMOVE,
             ),
         ]
-        return self._apply_scene(objects)
+        return self._apply_scene(objects, report_error=report_error)
 
     def add_frame_cutoff_for_pose(
         self,
@@ -4407,6 +4452,120 @@ class G01Demo(Node):
                 ]
 
         return trajectory
+
+    def validate_trajectory_self_collision(
+        self,
+        trajectory: RobotTrajectory,
+        *,
+        group: str,
+        base_state: Mapping[str, float] | None = None,
+        sample_period: float | None = None,
+        label: str = "轨迹",
+    ) -> bool:
+        """只校验轨迹的机器人自碰撞，忽略与 world/attached 物体的接触。
+
+        ``compute_cartesian_path(avoid_collisions=False)`` 会同时跳过自碰撞和
+        场景物体碰撞。这里把轨迹状态提交给 ``check_state_validity``，只拒绝
+        ``ROBOT_LINK <-> ROBOT_LINK`` 接触；涉及 ``WORLD_OBJECT`` 或
+        ``ROBOT_ATTACHED`` 的接触均不影响结果。
+
+        ``base_state`` 用于补全轨迹没有携带的腰部、升降和另一只手臂状态。
+        这对尚未执行的候选构型尤其重要，不能依赖 move_group 的当前状态。
+        """
+        log = self.get_logger()
+        points = trajectory.joint_trajectory.points
+        trajectory_names = list(trajectory.joint_trajectory.joint_names)
+        if not points or not trajectory_names:
+            log.error(f"[self-collision] {label} 为空，无法检查")
+            return False
+        if not self._validity_cli.wait_for_service(timeout_sec=10.0):
+            log.error(f"服务 {SVC_STATE_VALIDITY} 不可用，禁止执行未校验轨迹")
+            return False
+
+        indices = _trajectory_validation_indices(points, sample_period)
+        ignored_object_pairs: set[tuple[str, str]] = set()
+        for index in indices:
+            state = dict(base_state or {})
+            state.update(zip(trajectory_names, points[index].positions))
+
+            request = GetStateValidity.Request()
+            request.group_name = group
+            request.robot_state = RobotState()
+            request.robot_state.is_diff = True
+            request.robot_state.joint_state.name = list(state.keys())
+            request.robot_state.joint_state.position = list(state.values())
+            future = self._validity_cli.call_async(request)
+            if not self._spin_until(future, 5.0):
+                future.cancel()
+                log.error(
+                    f"[self-collision] {label} 状态检查超时: point={index}"
+                )
+                return False
+            try:
+                response = future.result()
+            except Exception as exc:
+                log.error(
+                    f"[self-collision] {label} 状态检查失败: "
+                    f"point={index}, {exc}"
+                )
+                return False
+            if response is None:
+                log.error(
+                    f"[self-collision] {label} 未收到状态检查结果: point={index}"
+                )
+                return False
+
+            self_contacts = [
+                contact
+                for contact in response.contacts
+                if _is_robot_self_contact(contact)
+            ]
+            if self_contacts:
+                details = ", ".join(
+                    f"{contact.contact_body_1}<->{contact.contact_body_2}"
+                    for contact in self_contacts[:5]
+                )
+                log.info(
+                    f"[self-collision] {label} 存在机器人自碰撞: "
+                    f"point={index}, {details}"
+                )
+                return False
+
+            # GetStateValidity 的 valid=False 还可能仅表示 world/attached 物体
+            # 接触；这些接触按放料需求忽略，但保留汇总日志便于现场排查。
+            for contact in response.contacts:
+                ignored_object_pairs.add(
+                    tuple(
+                        sorted(
+                            (
+                                contact.contact_body_1,
+                                contact.contact_body_2,
+                            )
+                        )
+                    )
+                )
+            if not response.valid and not response.contacts:
+                log.error(
+                    f"[self-collision] {label} 状态无效但没有 contact 详情，"
+                    f"无法确认是否仅为物体碰撞: point={index}"
+                )
+                return False
+
+        ignored_text = ""
+        if ignored_object_pairs:
+            preview = ", ".join(
+                f"{first}<->{second}"
+                for first, second in sorted(ignored_object_pairs)[:5]
+            )
+            ignored_text = (
+                f"；已忽略 {len(ignored_object_pairs)} 组物体接触"
+                f"（{preview}）"
+            )
+        log.info(
+            f"[self-collision] {label} 通过: group={group}, "
+            f"检查 {len(indices)}/{len(points)} 个状态{ignored_text}"
+        )
+        return True
 
     def _execute_traj(self, traj, timeout: float = 60.0) -> bool:
         """直接把一条 RobotTrajectory 发给 execute_trajectory action。
@@ -5641,12 +5800,11 @@ class G01Demo(Node):
             log.error("[pick] 执行已验证的 OMPL 到 q_pre 轨迹失败")
             self.last_pick_failure_reason = "q_pre"
             return False
-        
+
         time.sleep(2)
-        try:
-            input()
-        except EOFError:
-            pass
+        self.wait_for_operator(
+            f"[pick] 1/9  已到 q_pre，按回车给{tool_label}工具上电 …"
+        )
         log.info(
             f"[pick] 2/9  已到 q_pre，{tool_label}工具上电并读取吸附前 Fz 基准"
         )
@@ -6641,9 +6799,9 @@ def main(argv: list[str] | None = None) -> int:
 
         先保持身体不动分别求左右纯臂 IK；若任一侧无解或所有纯臂组合未
         通过后续验证，再由 ``left_body`` 联合求左臂、腰部和升降，并在每个
-        候选身体状态下求右纯臂 IK。所有 IK 都保留碰撞检测；每个单臂 IK 解
-        的下降直线只验证一次且不检查碰撞，最终再验证到预备位的 OMPL 路径。
-        执行阶段不重新规划。
+        候选身体状态下求右纯臂 IK。所有 IK 都保留完整碰撞检测；每个单臂
+        IK 解的下降直线只验证一次，忽略场景物体碰撞但保留机器人自碰撞检查，
+        最终再验证到预备位的 OMPL 路径。执行阶段不重新规划。
         """
         left_joint_names = joint_names_for_group("left_arm")
         right_joint_names = joint_names_for_group("right_arm")
@@ -6683,8 +6841,9 @@ def main(argv: list[str] | None = None) -> int:
             ``endpoint_state`` 是尚未执行的放置预备位完整关节状态，因此 FK
             和 Cartesian waypoint 必须统一表达在固定的 ``SCENE_FRAME``。
             不得使用 l/r_base_link，否则 MoveIt 会用机器人当前 TF 而不是该
-            候选 body 状态转换 waypoint。下降明确关闭碰撞检查，返回轨迹会
-            一直缓存到执行阶段。
+            候选 body 状态转换 waypoint。Cartesian 服务先关闭完整碰撞检查，
+            随后逐点只检查机器人自碰撞；world/attached 物体接触被忽略。返回
+            轨迹会一直缓存到执行阶段。
             """
             if side == "left":
                 group = "left_arm"
@@ -6731,6 +6890,14 @@ def main(argv: list[str] | None = None) -> int:
                     f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 不可达"
                 )
                 return None
+            if not node.validate_trajectory_self_collision(
+                descent,
+                group=group,
+                base_state=endpoint_state,
+                sample_period=None,
+                label=f"[unload] {label} {side_text}放置直线",
+            ):
+                return None
             return descent
 
         def plan_place_descent(
@@ -6757,6 +6924,8 @@ def main(argv: list[str] | None = None) -> int:
                 left_descent,
                 right_descent,
                 label,
+                endpoint_state,
+                "dual_arm_body",
             )
             if merged is None:
                 return None
@@ -6766,8 +6935,10 @@ def main(argv: list[str] | None = None) -> int:
             left_descent: RobotTrajectory,
             right_descent: RobotTrajectory,
             label: str,
+            endpoint_state: Mapping[str, float],
+            collision_group: str,
         ) -> RobotTrajectory | None:
-            """把已经分别验证通过的左右下降轨迹合成为同步执行轨迹。"""
+            """合并左右下降轨迹，并检查同步运动时的双臂自碰撞。"""
             try:
                 merged = merge_dual_arm_cartesian_trajectories(
                     left_descent,
@@ -6780,8 +6951,21 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return None
 
+            if not node.validate_trajectory_self_collision(
+                merged,
+                group=collision_group,
+                base_state=endpoint_state,
+                sample_period=UNLOAD_PLACE_SELF_COLLISION_SAMPLE_PERIOD,
+                label=f"[unload] {label} 双臂同步放置直线",
+            ):
+                log.info(
+                    f"[unload] {label}：同步下降存在机器人自碰撞，换下一构型"
+                )
+                return None
+
             log.info(
-                f"[unload] {label}：左右直线均通过并已缓存同步轨迹"
+                f"[unload] {label}：左右直线和同步自碰撞检查均通过，"
+                "已缓存同步轨迹"
             )
             return merged
 
@@ -6795,15 +6979,19 @@ def main(argv: list[str] | None = None) -> int:
         ) -> tuple[RobotTrajectory, RobotTrajectory] | None:
             """验证一个 IK 组合并缓存到预备位和直线下降轨迹。
 
-            验证顺序为：左右臂分别验证无碰撞检查的 Cartesian 下降，再用
+            验证顺序为：左右臂分别验证仅考虑自碰撞的 Cartesian 下降，再用
             OMPL 验证从当前状态到放置预备位。成功时返回
             ``(to_place_trajectory, merged_descent_trajectory)``；本函数绝不执行
             运动，因此可以安全地继续尝试其他 IK 构型。
             """
+            candidate_state = dict(current_full)
+            candidate_state.update(target)
             merged_descent = merge_place_descents(
                 left_descent,
                 right_descent,
                 label,
+                candidate_state,
+                group,
             )
             if merged_descent is None:
                 return None
@@ -6840,8 +7028,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
 
-            candidate_state = dict(current_full)
-            candidate_state.update(target)
             endpoint_delta = max(
                 (
                     abs(endpoint_state[name] - candidate_state[name])
@@ -6886,14 +7072,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"按回车执行双臂末端局部 +Z "
                 f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 同步下降: "
             )
-            try:
-                input()
-            except EOFError:
-                pass
             log.info(
                 "[unload] 直接执行缓存的双臂同步放置直线："
                 f"左右末端局部 +Z {UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m"
-                "（avoid_collisions=False）"
+                "（检查机器人自碰撞，忽略物体碰撞）"
             )
             if not node._execute_traj(descent):
                 log.error("[unload] 双臂同步直线下降放置失败")
@@ -6903,11 +7085,6 @@ def main(argv: list[str] | None = None) -> int:
                 f"已下降到物料台左点{left_point}/右点{right_point}，"
                 "按回车给双臂下电: "
             )
-
-            try:
-                input()
-            except EOFError:
-                pass
 
             if not release_unload_pair(left_point, right_point):
                 return False
@@ -6945,7 +7122,7 @@ def main(argv: list[str] | None = None) -> int:
             log.info(
                 f"[unload] {label_prefix}：{side_text}下降直线 "
                 f"{len(reachable)}/{len(solutions)} 组可行"
-                "（avoid_collisions=False）"
+                "（检查机器人自碰撞，忽略物体碰撞）"
             )
             return reachable
 
@@ -7258,10 +7435,14 @@ def main(argv: list[str] | None = None) -> int:
             frame_added = False
         if unload_scene_added:
             log.info("[unload] 移除旧物料台碰撞模型后重新识别")
-            if not node.remove_unload_scene():
-                log.error("[unload] 移除旧物料台碰撞模型失败")
-                return False
-            unload_scene_added = False
+            if node.remove_unload_scene(report_error=False):
+                unload_scene_added = False
+            else:
+                log.warning(
+                    "[unload] 移除旧物料台碰撞模型失败，继续重新识别；"
+                    "后续将用相同 object ID 覆盖旧模型"
+                )
+            # 刷新流程一旦开始就丢弃旧放置点，避免后续步骤误用旧识别结果。
             unload_place_poses = None
 
         vision_prep_group = BODY_GROUP

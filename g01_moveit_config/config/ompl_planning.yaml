@@ -8,7 +8,8 @@ request_adapters: >-
   default_planner_request_adapters/FixStartStateBounds
   default_planner_request_adapters/FixStartStateCollision
   default_planner_request_adapters/FixStartStatePathConstraints
-
+# TOTG 的速度/加速度时间参数化。
+path_tolerance: 0.002
 # 不显式写顶层 planner_configs：MoveItConfigsBuilder 会自动注入
 # moveit_configs_utils/default_configs/ompl_defaults.yaml 中的全部 planner
 # （含 RRTConnect、RRTstar、PRM 等），group 里直接按名引用即可。
@@ -18,64 +19,64 @@ request_adapters: >-
 # 在 8 自由度大幅运动 + 薄壁障碍物（如本场景的 2 cm 深框墙）场景下，
 # 容易"擦过"墙体而 OMPL 未检测到，最终在 postprocessing 重检时报
 # INVALID_MOTION_PLAN（错误码 -2）。
-# 这里统一收紧到 0.005，规划时间略增但能有效避免漏检。
+# 这里统一收紧到 0.003，规划时间略增但能有效避免漏检。
 
 dual_arm:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(l_arm_joint1,r_arm_joint1)
 
 dual_arm_waist:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(l_arm_joint1,r_arm_joint1)
 
 dual_arm_body:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(l_arm_joint1,r_arm_joint1)
 
 left:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(body_joint1,body_joint2)
 
 left_body:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(l_arm_joint1,l_arm_joint2)
 
 left_arm:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(l_arm_joint1,l_arm_joint2)
 
 left_waist:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(l_arm_joint1,l_arm_joint2)
 
 right_waist:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(r_arm_joint1,r_arm_joint2)
 
 right:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(body_joint1,body_joint2)
 
 right_body:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(r_arm_joint1,r_arm_joint2)
 
 right_arm:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(r_arm_joint1,r_arm_joint2)
 
 body:
   default_planner_config: RRTConnect
-  longest_valid_segment_fraction: 0.005
+  longest_valid_segment_fraction: 0.003
   projection_evaluator: joints(base_joint1,body_joint1)
