@@ -144,6 +144,7 @@ TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 124.0)
 FEEDBACK_FRAME_SIZE = MyType.itemsize
 FEEDBACK_TEST_VALUE = 0x0123456789ABCDEF
 FEEDBACK_TEST_VALUE_OFFSET = MyType.fields["test_value"][1]
+FT_SENSOR_STARTUP_TIMEOUT_SEC = 10.0
 
 
 class fankuis():
@@ -580,6 +581,78 @@ def send_enable_ft_sensor(client, status):
     client.sendall(tcp_command.encode())
     return 0
 
+def set_both_tool_power(client_sockets, status):
+    """依次向双臂发送末端电源命令，并确保两侧都得到执行机会。"""
+    action = "上电" if status == 1 else "下电"
+    failures = []
+    for index, client_socket in enumerate(client_sockets, start=1):
+        arm_name = f'第{index}个机械臂'
+        try:
+            dashboard_command(
+                client_socket,
+                f"SetToolPower({status})",
+                name=arm_name,
+                required=True,
+            )
+        except (ConnectionError, TimeoutError, OSError, RuntimeError) as exc:
+            failures.append(f"{arm_name}: {exc}")
+
+    if failures:
+        raise RuntimeError(f"双臂末端{action}失败：" + "；".join(failures))
+    print(f"左右机械臂末端已{action}")
+
+def wait_for_ft_sensors_online(feedback_connections, timeout):
+    """等待双臂六维力传感器均在线且返回有效六维数据。"""
+    pending_sides = set(feedback_connections)
+    deadline = time.monotonic() + timeout
+
+    while pending_sides and time.monotonic() < deadline:
+        for side in tuple(pending_sides):
+            actual = feedback_connections[side].feed()
+            if actual == ["NG"]:
+                continue
+
+            force_values = [float(value) for value in actual[4]]
+            force_valid = len(force_values) == 6 and all(
+                math.isfinite(value) for value in force_values
+            )
+            if int(actual[5]) == 1 and force_valid:
+                pending_sides.remove(side)
+                print(f"{side} 力传感器已在线")
+
+    if pending_sides:
+        pending_text = ", ".join(sorted(pending_sides))
+        raise TimeoutError(
+            f"等待力传感器上线超时（{timeout:.1f}s），未上线：{pending_text}"
+        )
+
+def initialize_ft_sensor_power(client_sockets, feedback_connections):
+    """短暂给双臂末端上电确认力传感器在线，完成后保证尝试双侧下电。"""
+    startup_error = None
+    try:
+        print("开始给双臂末端上电，等待力传感器上线")
+        set_both_tool_power(client_sockets, 1)
+        wait_for_ft_sensors_online(
+            feedback_connections,
+            timeout=FT_SENSOR_STARTUP_TIMEOUT_SEC,
+        )
+        print("左右力传感器均已在线，开始给双臂末端下电")
+    except Exception as exc:
+        startup_error = exc
+
+    try:
+        set_both_tool_power(client_sockets, 0)
+    except Exception as power_off_error:
+        if startup_error is not None:
+            raise RuntimeError(
+                f"力传感器初始化失败：{startup_error}；"
+                f"随后末端下电也失败：{power_off_error}"
+            ) from power_off_error
+        raise
+
+    if startup_error is not None:
+        raise startup_error
+
 DASHBOARD_COMMAND_TIMEOUT = 5.0
 DASHBOARD_POWERON_TIMEOUT = 15.0
 DASHBOARD_RECV_BUFFERS = {}
@@ -933,15 +1006,7 @@ try:
         feed_v = fankuis(ip, 30004)
         feedback_connections[side] = feed_v
 
-    print("力传感器无需在初始化时在线，开始给双臂末端下电")
-    for index, client_socket in enumerate(client_sockets, start=1):
-        dashboard_command(
-            client_socket,
-            "SetToolPower(0)",
-            name=f'第{index}个机械臂',
-            required=True,
-        )
-    print("左右机械臂末端已下电")
+    initialize_ft_sensor_power(client_sockets, feedback_connections)
 
     for side in ["left", "right"]:
         feed_thread1 = threading.Thread(
