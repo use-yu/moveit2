@@ -34,7 +34,8 @@ G01 MoveIt 演示脚本
     world 物体碰撞，但保留机器人自碰撞检查；通过后缓存 OMPL 和同步下降
     轨迹，执行阶段不重新规划。
     优先 SW1+SW3，目标按 (1,3)→(11,13) 循环；SW2+SW4 按
-    (2,4)→(12,14) 循环，不记录已经放过的位置。
+    (2,4)→(12,14) 循环，不记录已经放过的位置。循环正常结束后，
+    dual_arm_body 复位到 MOVE_TO_GRASP_RESET_Q。
 8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
 
 上位机步骤映射：
@@ -617,27 +618,27 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
 # 和局部旋转，不再叠加 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL。
 UNLOAD_PLACE_LOCAL_PITCH = math.pi
 UNLOAD_PLACE_LOCAL_YAWS = {
-    1: math.radians(151),
-    2: math.radians(159),
-    3: math.radians(153),
-    4: math.radians(158),
+    11: math.radians(151),
+    12: math.radians(159),
+    13: math.radians(153),
+    14: math.radians(158),
 
-    11: math.radians(158),
-    12: math.radians(155),
-    13: math.radians(154),
-    14: math.radians(155),
+    1: math.radians(158),
+    2: math.radians(155),
+    3: math.radians(154),
+    4: math.radians(155),
 }
 # 注意这里八个物料台点编号和机器人 SW 编号不一样。
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    1: (0.0-0.0065, 0.45-0.0025, 0.146),
-    2: (0.0-0.0035, 0.25-0.0015, 0.146),
-    3: (0.0+0.001, 0.0-0.0055, 0.152),
-    4: (0.0+0.0015, -0.2-0.004, 0.152),
+    11: (0.0-0.0065, 0.45-0.0025, 0.146),
+    12: (0.0-0.0035, 0.25-0.0015, 0.146),
+    13: (0.0+0.001, 0.0-0.0055, 0.152),
+    14: (0.0+0.0015, -0.2-0.004, 0.152),
 
-    11: (-0.2-0.0065, 0.45-0.004, 0.146),
-    12: (-0.2-0.0015, 0.25-0.0015, 0.146),
-    13: (-0.2+0.002, 0.0-0.006, 0.152),
-    14: (-0.2+0.002, -0.2-0.004, 0.152),
+    1: (-0.2-0.0065, 0.45-0.004, 0.146),
+    2: (-0.2-0.0015, 0.25-0.0015, 0.146),
+    3: (-0.2+0.002, 0.0-0.006, 0.152),
+    4: (-0.2+0.002, -0.2-0.004, 0.152),
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
@@ -7526,10 +7527,33 @@ def main(argv: list[str] | None = None) -> int:
         return True
 
     def run_unload_cycle() -> bool:
-        """步骤 7：最多放置两对料，并在两组目标之间独立循环。"""
+        """步骤 7：最多放置两对料，正常结束后复位双臂和身体。"""
         if not unload_scene_added or unload_place_poses is None:
             log.error("[unload] 尚未执行步骤 6，缺少物料台碰撞模型和放置位")
             return False
+
+        reset_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
+
+        def reset_after_unload_cycle() -> bool:
+            """正常完成本次 SW 循环后复位到抓取流程初始构型。"""
+            log.info(
+                "[unload] SW 优先级循环放置结束，dual_arm_body "
+                "复位到 MOVE_TO_GRASP_RESET_Q"
+            )
+            if not node.plan_execute_joint_waypoints(
+                "dual_arm_body",
+                UNLOAD_JOINT_SPEED,
+                reset_joint_names,
+                [MOVE_TO_GRASP_RESET_Q],
+                num_attempts=30,
+                planning_time_sec=10.0,
+            ):
+                log.error(
+                    "[unload] 循环结束后复位到 MOVE_TO_GRASP_RESET_Q 失败"
+                )
+                return False
+            log.info("[unload] 已复位到 MOVE_TO_GRASP_RESET_Q")
+            return True
 
         log.info("[unload] 开始放置前先给左右末端下电")
         if not set_unload_tool_power(0, "放置开始"):
@@ -7551,9 +7575,9 @@ def main(argv: list[str] | None = None) -> int:
             if selected is None:
                 log.info(
                     "[unload] 没有完整料对（需要 SW1+SW3 或 SW2+SW4），"
-                    "结束本次循环放置"
+                    "结束本次循环放置并复位"
                 )
-                return True
+                return reset_after_unload_cycle()
 
             (
                 cycle_index,
@@ -7586,7 +7610,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"该料对下次循环目标=({next_left}, {next_right})"
             )
 
-        return True
+        return reset_after_unload_cycle()
 
     def remove_cached_unload_scene() -> bool:
         """移除步骤 6 创建的场景，并清空对应缓存。"""
