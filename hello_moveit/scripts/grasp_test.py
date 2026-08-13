@@ -4,13 +4,11 @@
 """
 G01 MoveIt 演示脚本
 
-功能（由上位机话题分阶段触发）：
-/move_to_grasp_pose_cmd：dual_arm_body 先运动到复位位姿，导航到深框工位，
-        然后关节空间运动到 框_Q1，
-        再发送 p,4 识别深框，
-        按识别坐标重建深框障碍物，
-        再以 20Hz 发布 [0.1, 0.0] 3.5s 并停车，
-/grasp_cmd：持续上料，直到 SW1~SW4 没有空位：
+功能按 1~8 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
+1. 导航到深框识别位置。
+2. 运动到深框识别构型，识别深框并添加碰撞模型。
+3. 直接导航到抓取位置；其 map.x 比识别位置大 0.29 m。
+4. 持续上料，直到 SW1~SW4 没有空位：
     机器人先到初始位
     → 读取视觉点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
@@ -23,19 +21,24 @@ G01 MoveIt 演示脚本
     → 根据 first_return_mode：
     ├─ mode=1：双臂交换 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
-/move_to_place_pose_cmd：导航到物料台工位，导航结束发布对应 result。
-/place_cmd：执行下料：
+5. 导航到物料台工位。
+6. 运动到物料台识别预备构型，识别并添加碰撞模型。
+7. 循环下料：
     下料读取最新 SW 信号，0=有料。
     优先取右臂 SW1 + 左臂 SW3，其次右臂 SW4 + 左臂 SW2；必须整对有料。
-    发送 p,8 识别。
-    添加 0.64×1.2×0.98m 取料台。
     拼接对应 SW 的 yubei，腰部、升降均设为 0。
     双臂分别计算末端 +Z 10cm 的 IK/Cartesian 路径，合成一条 12 关节轨迹，一次执行。
     两个末端上电后，反向同一轨迹直线复位。
     吸附完成后先做物料台放置可达性验证：纯臂 IK 优先；必要时先求
     left_body，再固定该腰部/升降状态求右臂 IK。左右下降分别预检且不考虑
     碰撞，通过后缓存 OMPL 和同步下降轨迹，执行阶段不重新规划。
-/return_init_pose：导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)，不发布 result。
+    优先 SW1+SW3，目标按 (1,3)→(11,13) 循环；SW2+SW4 按
+    (2,4)→(12,14) 循环，不记录已经放过的位置。
+8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
+
+上位机步骤映射：
+  /move_to_grasp_pose_cmd = 1~3，/grasp_cmd = 4，
+  /move_to_place_pose_cmd = 5~6，/place_cmd = 7~8。
 前提：
   - 已启动 move_group： ros2 launch g01_moveit_config demo.launch.py
   - 本节点与 move_group 在同一 ROS 域
@@ -122,7 +125,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import ColorRGBA, Float32MultiArray, Float64MultiArray, String, UInt8
+from std_msgs.msg import ColorRGBA, Float32MultiArray, String, UInt8
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker
@@ -463,14 +466,11 @@ RETURN_INIT_POSE_TOPIC = "/return_init_pose"
 DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
 NAV_GOAL_TOPIC = "/goal_pose"
 NAV_RESULT_TOPIC = "/nav_result"
-AGV_AUTO_CONTROL_SPEED_TOPIC = "/agv_auto_control_speed"
-AGV_FORWARD_SPEED_MPS = 0.1
-AGV_ROTATION_SPEED_RADPS = 0.0
-AGV_SPEED_PUBLISH_HZ = 20.0
-AGV_FORWARD_DURATION_SEC = 3.5
+NAV_TARGET_FRAME_RECOGNITION = "frame_recognition"
 NAV_TARGET_GRASP = "grasp"
 NAV_TARGET_PLACE = "place"
 NAV_TARGET_INIT = "init"
+GRASP_NAV_X_OFFSET_FROM_RECOGNITION = 0.29
 UPPER_COMMAND_EXPECTED_TYPES = {
     MOVE_TO_GRASP_POSE_CMD_TOPIC: 1,
     GRASP_CMD_TOPIC: 1,
@@ -483,10 +483,41 @@ UPPER_COMMAND_RESULT_TOPICS = {
     MOVE_TO_PLACE_POSE_CMD_TOPIC: MOVE_TO_PLACE_POSE_RESULT_TOPIC,
     PLACE_CMD_TOPIC: PLACE_CMD_RESULT_TOPIC,
 }
+UPPER_COMMAND_STEPS = {
+    MOVE_TO_GRASP_POSE_CMD_TOPIC: (1, 2, 3),
+    GRASP_CMD_TOPIC: (4,),
+    MOVE_TO_PLACE_POSE_CMD_TOPIC: (5, 6),
+    PLACE_CMD_TOPIC: (7, 8),
+    # 保留旧接口，便于单独请求返回起点；不发布结果。
+    RETURN_INIT_POSE_TOPIC: (8,),
+}
+STEP_DESCRIPTIONS = {
+    1: "导航到深框识别位置",
+    2: "识别深框并添加碰撞模型",
+    3: "导航到抓取位置（识别位置 x + 0.29 m）",
+    4: "抓满四个放置位",
+    5: "导航到物料台位置",
+    6: "物料台预备构型、识别并添加碰撞模型",
+    7: "按 SW 优先级循环放置",
+    8: "导航回起点",
+}
 NAV_GOAL_POSES = {
-    NAV_TARGET_GRASP: {
+    NAV_TARGET_FRAME_RECOGNITION: {
         "position": (
             1.8139628171920776,
+            -1.5662699937820435,
+            0.038682736456394196,
+        ),
+        "orientation": (
+            -0.005365730728954077,
+            0.013535164296627045,
+            0.9996762275695801,
+            0.015394207090139389,
+        ),
+    },
+    NAV_TARGET_GRASP: {
+        "position": (
+            1.8139628171920776 + GRASP_NAV_X_OFFSET_FROM_RECOGNITION,
             -1.5662699937820435,
             0.038682736456394196,
         ),
@@ -531,30 +562,20 @@ ALL_PLACE_SLOTS_EMPTY_SIGNAL = (
 ALL_PLACE_SLOTS_MATERIAL_SIGNAL = 0x00
 DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 
-# 下料流程：双臂成对取料，并把每对上料位固定绑定到物料台放置点。
-# 先放满第一组 1/2/3/4，再使用第二组 11/12/13/14；已经成功放置的点
-# 在本次程序运行期间不会再次使用。
-# 格式：(右臂 SW, 左臂 SW, 左臂物料台点, 右臂物料台点)
-#   SW1 + SW3 只能放物料台点 1/3：SW3→点1，SW1→点3
-#   SW2 + SW4 只能放物料台点 2/4：SW2→点2，SW4→点4
-#   SW1 + SW3 只能放物料台点 11/13：SW3→点11，SW1→点13
-#   SW2 + SW4 只能放物料台点 12/14：SW2→点12，SW4→点14
+# 下料流程：优先选择 SW1+SW3；两组目标各自循环，不记录已放置点。
+# 格式：(右臂 SW, 左臂 SW, ((左臂点, 右臂点), ...))
+#   SW1+SW3: (1,3) → (11,13) → (1,3) → ...
+#   SW2+SW4: (2,4) → (12,14) → (2,4) → ...
 UNLOAD_TRIGGER_COMMAND = "p,4"
 UNLOAD_VISION_POSE_KEY = "right_body"
 UNLOAD_VISION_TF_FRAME = "material_table_vision"
 UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
 UNLOAD_PLACE_TF_FRAME_PREFIX = "material_table_place_point_"
-UNLOAD_PAIR_ROUTES = (
-    ("sw1", "sw3", 1, 3),
-    ("sw4", "sw2", 2, 4),
-    ("sw1", "sw3", 11, 13),
-    ("sw4", "sw2", 12, 14),
+UNLOAD_PAIR_CYCLES = (
+    ("sw1", "sw3", ((1, 3), (11, 13))),
+    ("sw4", "sw2", ((2, 4), (12, 14))),
 )
 UNLOAD_MAX_PAIRS_PER_RUN = 2
-UNLOAD_PLACE_POINT_LAYERS = (
-    frozenset((1, 2, 3, 4)),
-    frozenset((11, 12, 13, 14)),
-)
 UNLOAD_TABLE_ID = "unload_table"
 UNLOAD_TABLE_SIZE = (0.6, 1.7, 1.0)
 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL = (
@@ -583,27 +604,27 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
 # 和局部旋转，不再叠加 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL。
 UNLOAD_PLACE_LOCAL_PITCH = math.pi
 UNLOAD_PLACE_LOCAL_YAWS = {
-    1: math.radians(151),
-    2: math.radians(159),
-    3: math.radians(153),
-    4: math.radians(158),
+    11: math.radians(151),
+    12: math.radians(159),
+    13: math.radians(153),
+    14: math.radians(158),
 
-    11: math.radians(158),
-    12: math.radians(155),
-    13: math.radians(154),
-    14: math.radians(155),
+    1: math.radians(158),
+    2: math.radians(155),
+    3: math.radians(154),
+    4: math.radians(155),
 }
 # 注意这里八个物料台点编号和机器人 SW 编号不一样。
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    1: (0.0-0.0065, 0.45-0.0025, 0.146),
-    2: (0.0-0.0035, 0.25-0.0015, 0.146),
-    3: (0.0+0.001, 0.0-0.0055, 0.152),
-    4: (0.0+0.0015, -0.2-0.004, 0.152),
+    11: (0.0-0.0065, 0.45-0.0025, 0.146),
+    12: (0.0-0.0035, 0.25-0.0015, 0.146),
+    13: (0.0+0.001, 0.0-0.0055, 0.152),
+    14: (0.0+0.0015, -0.2-0.004, 0.152),
 
-    11: (-0.2-0.0065, 0.45-0.004, 0.146),
-    12: (-0.2-0.0015, 0.25-0.0015, 0.146),
-    13: (-0.2+0.002, 0.0-0.006, 0.152),
-    14: (-0.2+0.002, -0.2-0.004, 0.152),
+    1: (-0.2-0.0065, 0.45-0.004, 0.146),
+    2: (-0.2-0.0015, 0.25-0.0015, 0.146),
+    3: (-0.2+0.002, 0.0-0.006, 0.152),
+    4: (-0.2+0.002, -0.2-0.004, 0.152),
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
@@ -2372,7 +2393,7 @@ class G01Demo(Node):
         self.last_pick_failure_reason: str | None = None
         # UInt8 会在回调中显式限制到 uint8 范围。真实模式在收到首帧前为未知，
         # 未知状态按“没有安全空位”处理；仿真默认四个 SW 均为空。
-        # 键盘模式选择 2 时会重置为全空，选择 4 时会重置为全满；
+        # 键盘模式执行步骤 4 时会重置为全空，步骤 7 时会重置为全满；
         # 进入具体流程后再由上料/下料动作实时更新对应 SW。
         self._driver_signal: int | None = (
             ALL_PLACE_SLOTS_EMPTY_SIGNAL if self.sim_mode else None
@@ -2428,11 +2449,6 @@ class G01Demo(Node):
         self._nav_goal_pub = self.create_publisher(
             PoseStamped,
             NAV_GOAL_TOPIC,
-            10,
-        )
-        self._agv_speed_pub = self.create_publisher(
-            Float64MultiArray,
-            AGV_AUTO_CONTROL_SPEED_TOPIC,
             10,
         )
         self._upper_result_pubs = {
@@ -2537,53 +2553,6 @@ class G01Demo(Node):
             return False
 
         return False
-
-    def move_agv_after_deep_frame_recognition(self) -> bool:
-        """深框识别后匀速前进一小段，并在结束时明确发送停车指令。"""
-        period_sec = 1.0 / AGV_SPEED_PUBLISH_HZ
-        sample_count = max(
-            1,
-            int(round(AGV_FORWARD_DURATION_SEC * AGV_SPEED_PUBLISH_HZ)),
-        )
-        speed_command = Float64MultiArray(
-            data=[AGV_FORWARD_SPEED_MPS, AGV_ROTATION_SPEED_RADPS]
-        )
-        stop_command = Float64MultiArray(data=[0.0, 0.0])
-        start_time = time.monotonic()
-        completed = False
-
-        self.get_logger().info(
-            f"[frame-vision][agv] 向 {AGV_AUTO_CONTROL_SPEED_TOPIC} 以 "
-            f"{AGV_SPEED_PUBLISH_HZ:g} Hz 发布 "
-            f"[{AGV_FORWARD_SPEED_MPS:.3f}, {AGV_ROTATION_SPEED_RADPS:.3f}]，"
-            f"持续 {AGV_FORWARD_DURATION_SEC:.3f} s"
-        )
-        try:
-            for sample_index in range(sample_count):
-                publish_time = start_time + sample_index * period_sec
-                while rclpy.ok():
-                    remaining = publish_time - time.monotonic()
-                    if remaining <= 0.0:
-                        break
-                    rclpy.spin_once(self, timeout_sec=min(remaining, period_sec))
-                if not rclpy.ok():
-                    return False
-                self._agv_speed_pub.publish(speed_command)
-
-            end_time = start_time + AGV_FORWARD_DURATION_SEC
-            while rclpy.ok():
-                remaining = end_time - time.monotonic()
-                if remaining <= 0.0:
-                    break
-                rclpy.spin_once(self, timeout_sec=min(remaining, period_sec))
-            completed = rclpy.ok()
-            return completed
-        finally:
-            self._agv_speed_pub.publish(stop_command)
-            self.get_logger().info(
-                f"[frame-vision][agv] 已向 {AGV_AUTO_CONTROL_SPEED_TOPIC} 发布 "
-                f"[0.0, 0.0]；速度段{'完成' if completed else '中止'}"
-            )
 
     def _on_driver_signal(self, msg: UInt8):
         """缓存驱动板 UInt8 信号；SW 位非 0=空，SW 位为 0=已有物体。"""
@@ -6041,42 +6010,35 @@ def split_runtime_args(
     return sim_mode, upper_control_mode, keyboard_control_mode, ros_args
 
 
-def wait_for_keyboard_command() -> tuple[str, dict] | None:
-    """显示数字菜单并返回与上位机命令相同格式的本地流程命令。
-
-    数字直接映射到现有五个命令话题，因此主循环后面的业务分支只保留一份，
-    键盘模式和上位机模式执行完全相同的流程。输入 ``0``/``q``，收到 EOF，
-    或按 Ctrl+C 时返回 None，让主循环退出并进入统一清理逻辑。
-    """
-    options = {
-        "1": (MOVE_TO_GRASP_POSE_CMD_TOPIC, "移动到抓取工位并识别深框"),
-        "2": (GRASP_CMD_TOPIC, "执行连续抓取"),
-        "3": (MOVE_TO_PLACE_POSE_CMD_TOPIC, "移动到下料工位"),
-        "4": (PLACE_CMD_TOPIC, "执行下料"),
-        "5": (RETURN_INIT_POSE_TOPIC, "返回导航初始位置"),
-    }
-
+def wait_for_keyboard_steps() -> tuple[int, ...] | None:
+    """读取单步或连续区间，例如 ``1``、``1-3``、``5-8``。"""
     while rclpy.ok():
         print("\n========== 键盘流程选择 ==========")
-        for number, (_, description) in options.items():
+        for number, description in STEP_DESCRIPTIONS.items():
             print(f"  {number}. {description}")
         print("  0. 退出程序")
         try:
-            choice = input("请输入流程编号: ").strip().lower()
+            choice = input("请输入步骤或区间（如 1、1-3）: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\n键盘输入结束，退出程序。")
             return None
 
         if choice in {"0", "q", "quit", "exit"}:
             return None
-        selected = options.get(choice)
-        if selected is None:
-            print(f"无效编号 {choice!r}，请输入 0~5。")
+        match = re.fullmatch(r"([1-8])(?:\s*-\s*([1-8]))?", choice)
+        if match is None:
+            print(f"无效输入 {choice!r}，请输入 1~8 或正向区间（如 1-3）。")
             continue
 
-        command_topic, description = selected
-        print(f"{GREEN}[keyboard] 已选择：{description}{RESET}")
-        return command_topic, {"source": "keyboard", "choice": int(choice)}
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start > end:
+            print("区间必须从小到大，例如 1-3。")
+            continue
+
+        steps = tuple(range(start, end + 1))
+        print(f"{GREEN}[keyboard] 将顺序执行步骤: {steps}{RESET}")
+        return steps
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -6095,19 +6057,20 @@ def main(argv: list[str] | None = None) -> int:
     if sim_mode:
         log.info(
             "[sim] 仿真模式：跳过工具电源服务，视觉使用固定 viewer pose，"
-            "SW1~SW4 默认为空；键盘选择 2 时重置为全空(0x78)，"
-            "选择 4 时重置为全满(0x00)"
+            "SW1~SW4 默认为空；键盘步骤 4 重置为全空(0x78)，"
+            "步骤 7 重置为全满(0x00)"
         )
     if keyboard_control_mode:
         log.info(
             "[keyboard] 已启用键盘流程选择；主循环不等待上位机命令。"
-            "输入 1~5 执行流程，输入 0 退出"
+            "输入 1~8 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
         )
     code = 1
     frame_added = False
-    # 跨多次 /place_cmd 保留本进程内已经实际放料的物料台点。
-    # 一对目标开始成功释放后即整体锁定，避免异常重试碰撞已放置物料。
-    used_unload_place_points: set[int] = set()
+    unload_scene_added = False
+    unload_place_poses: dict[int, Pose] | None = None
+    # 两组 SW 各自轮换两个目标对；成功放置后才推进对应游标。
+    unload_cycle_indices = [0] * len(UNLOAD_PAIR_CYCLES)
 
     def cleanup_grasp_display(remove_scene_objects: bool = True) -> None:
         node.remove_cylinder_at_pose()
@@ -6125,26 +6088,16 @@ def main(argv: list[str] | None = None) -> int:
             return False
 
     def report_flow_result(command_topic: str, result: bool) -> None:
-        """上位机模式发布结果；键盘模式只在终端打印，避免发布无请求结果。"""
-        if not keyboard_control_mode:
-            node.publish_upper_result(command_topic, result)
-            return
-
-        result_text = "成功" if result else "失败"
-        message = f"[keyboard] 流程 {command_topic} 执行{result_text}"
-        if result:
-            log.info(message)
-            print(f"{GREEN}{message}{RESET}")
-        else:
-            log.error(message)
-            print(message)
+        """发布一组上位机步骤的最终结果。"""
+        node.publish_upper_result(command_topic, result)
 
     def recognize_and_add_deep_frame() -> bool:
-        """先运动到 框_Q1，再发送 p,4 并用识别结果重建深框碰撞场景。"""
+        """先运动到 框_Q1，再识别并重建深框碰撞场景。"""
         nonlocal frame_added
         q1_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
         log.info(
-            "[frame-vision] p,4 识别前，dual_arm_body 先关节空间运动到 框_Q1"
+            f"[frame-vision] {FRAME_VISION_TRIGGER_COMMAND} 识别前，"
+            "dual_arm_body 先关节空间运动到 框_Q1"
         )
         if not node.plan_execute_joint_waypoints(
             "dual_arm_body",
@@ -6152,7 +6105,10 @@ def main(argv: list[str] | None = None) -> int:
             q1_joint_names,
             [框_Q1],
         ):
-            log.error("[frame-vision] 运动到 框_Q1 失败，不发送 p,4")
+            log.error(
+                "[frame-vision] 运动到 框_Q1 失败，不发送 "
+                f"{FRAME_VISION_TRIGGER_COMMAND}"
+            )
             return False
 
         vision_result = read_vision_object_pose(
@@ -6167,7 +6123,7 @@ def main(argv: list[str] | None = None) -> int:
         _, all_xyz_rpy = vision_result
         if not all_xyz_rpy or FRAME_VISION_POSE_KEY not in all_xyz_rpy[0]:
             log.error(
-                f"[frame-vision] p,4 视觉结果缺少 "
+                f"[frame-vision] {FRAME_VISION_TRIGGER_COMMAND} 视觉结果缺少 "
                 f"{FRAME_VISION_POSE_KEY!r}"
             )
             return False
@@ -6193,7 +6149,8 @@ def main(argv: list[str] | None = None) -> int:
         frame_top_rpy = pose_to_xyz_rpy(frame_top_pose)[3:]
         frame_rpy = pose_to_xyz_rpy(frame_pose)[3:]
         log.info(
-            f"[frame-vision] p,4 识别点 @ {SCENE_FRAME}: "
+            f"[frame-vision] {FRAME_VISION_TRIGGER_COMMAND} 识别点 "
+            f"@ {SCENE_FRAME}: "
             f"pos=({recognition_pose.position.x:.4f}, "
             f"{recognition_pose.position.y:.4f}, "
             f"{recognition_pose.position.z:.4f}), "
@@ -6237,7 +6194,10 @@ def main(argv: list[str] | None = None) -> int:
             frame_added = False
 
         node.configure_deep_frame_from_recognition(recognition_pose)
-        log.info(f"[frame-vision] 按 p,4 识别位姿添加「{FRAME_ID}」 …")
+        log.info(
+            f"[frame-vision] 按 {FRAME_VISION_TRIGGER_COMMAND} 识别位姿"
+            f"添加「{FRAME_ID}」 …"
+        )
         if not node.add_frame():
             log.error("[frame-vision] 添加动态深框场景失败")
             return False
@@ -6428,34 +6388,18 @@ def main(argv: list[str] | None = None) -> int:
             if node._place_slot_has_material(slot_name)
         ]
 
-    def current_unload_place_layer() -> frozenset[int] | None:
-        """返回尚未放满的第一层；1~4 未满时不会提前使用 11~14。"""
-        for layer_points in UNLOAD_PLACE_POINT_LAYERS:
-            if not layer_points.issubset(used_unload_place_points):
-                return layer_points
-        return None
-
     def select_unload_pair() -> tuple[int, str, str, int, int] | None:
-        """从当前层选择有料且目标点未占用的完整料对。"""
-        layer_points = current_unload_place_layer()
-        if layer_points is None:
-            return None
-
-        for pair_index, route in enumerate(UNLOAD_PAIR_ROUTES):
-            right_slot, left_slot, left_point, right_point = (
-                route
-            )
-            route_points = {left_point, right_point}
-            if not route_points.issubset(layer_points):
-                continue
-            if route_points & used_unload_place_points:
-                continue
+        """优先 SW1+SW3，并返回该料对当前循环对应的放置目标。"""
+        for cycle_index, cycle in enumerate(UNLOAD_PAIR_CYCLES):
+            right_slot, left_slot, point_pairs = cycle
             if (
                 node._place_slot_has_material(right_slot)
                 and node._place_slot_has_material(left_slot)
             ):
+                pair_index = unload_cycle_indices[cycle_index] % len(point_pairs)
+                left_point, right_point = point_pairs[pair_index]
                 return (
-                    pair_index,
+                    cycle_index,
                     right_slot,
                     left_slot,
                     left_point,
@@ -6476,22 +6420,17 @@ def main(argv: list[str] | None = None) -> int:
         return True
 
     def release_unload_pair(left_point: int, right_point: int) -> bool:
-        """逐臂释放物料，并在开始成功释放后锁定整对放置点。"""
+        """逐臂释放物料；循环模式不记录已经使用过的目标点。"""
         if not node.set_tool_power("left", 0):
             log.error(f"[unload] 物料台左点{left_point}放置：左臂工具下电失败")
             return False
-        # 左点已经实际放料后，这对目标不能再整体重试；同时预留右点，避免
-        # 右臂下电异常时下次重试撞到已经放在左点的物料。
-        used_unload_place_points.update((left_point, right_point))
-        log.info(f"[unload] 左点{left_point}已放料，标记为不可再次使用")
 
         if not node.set_tool_power("right", 0):
             log.error(
                 f"[unload] 物料台右点{right_point}放置：右臂工具下电失败；"
-                f"为避免碰撞，左点{left_point}/右点{right_point}均保持锁定"
+                f"左点{left_point}已释放"
             )
             return False
-        log.info(f"[unload] 右点{right_point}已放料，标记为不可再次使用")
         print(
             f"{GREEN}[unload] 物料台左点{left_point}/右点{right_point}放置："
             f"左右末端下电成功{RESET}"
@@ -7298,52 +7237,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         return False
 
-    def run_one_unload() -> bool:
-        """每次最多取两对料，按 1~4、11~14 的分层顺序使用空闲点。"""
-        active_layer = current_unload_place_layer()
-        if active_layer is None:
-            log.info(
-                "[unload] 物料台 8 个放置点均已使用，"
-                "不再执行取料和放置"
-            )
-            return True
+    def prepare_unload_scene() -> bool:
+        """步骤 6：运动到识别预备构型，识别物料台并缓存碰撞场景。"""
+        nonlocal frame_added, unload_scene_added, unload_place_poses
 
-        remaining_points = sorted(active_layer - used_unload_place_points)
-        log.info(
-            f"[unload] 当前优先层剩余可用点：{remaining_points}；"
-            f"已使用点：{sorted(used_unload_place_points)}"
-        )
-        log.info("[unload] 开始下料前先给左右末端下电")
-        if not set_unload_tool_power(0, "下料开始"):
-            log.error("[unload] 双臂未全部下电，禁止执行后续动作")
-            return False
-
-        if not node._wait_for_driver_signal(require_new=True):
-            return False
-        material_slots = unload_material_slots()
-        material_text = (
-            ", ".join(slot.upper() for slot in material_slots)
-            if material_slots
-            else "无"
-        )
-        print(f"{GREEN}[unload] 当前有料位置: {material_text}{RESET}")
-
-        selected = select_unload_pair()
-        if selected is None:
-            log.warning(
-                f"[unload] 当前优先层剩余点 "
-                f"{sorted(active_layer - used_unload_place_points)} "
-                "没有对应的完整料对：需要 SW1+SW3 或 "
-                "SW2+SW4 同时有料，本轮不取"
-            )
-            return True
-        (
-            _route_index,
-            right_slot,
-            left_slot,
-            left_point,
-            right_point,
-        ) = selected
+        if frame_added:
+            log.info(f"[unload] 移除上料碰撞体「{FRAME_ID}」")
+            if not node.remove_frame():
+                log.error("[unload] 移除上料碰撞体失败")
+                return False
+            frame_added = False
+        if unload_scene_added:
+            log.info("[unload] 移除旧物料台碰撞模型后重新识别")
+            if not node.remove_unload_scene():
+                log.error("[unload] 移除旧物料台碰撞模型失败")
+                return False
+            unload_scene_added = False
+            unload_place_poses = None
 
         vision_prep_group = BODY_GROUP
         vision_prep_joint_names = joint_names_for_group(vision_prep_group)
@@ -7364,7 +7274,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return False
 
-        # 物料台识别姿态同时用于构造场景和八个局部放置点。
+        # 识别姿态同时用于构造场景和八个局部放置点。
         vision_result = read_vision_object_pose(
             node,
             log,
@@ -7376,7 +7286,8 @@ def main(argv: list[str] | None = None) -> int:
         _, all_xyz_rpy = vision_result
         if not all_xyz_rpy or UNLOAD_VISION_POSE_KEY not in all_xyz_rpy[0]:
             log.error(
-                f"[unload] p,8 视觉结果缺少 {UNLOAD_VISION_POSE_KEY!r}"
+                f"[unload] {UNLOAD_TRIGGER_COMMAND} 视觉结果缺少 "
+                f"{UNLOAD_VISION_POSE_KEY!r}"
             )
             return False
         recognition_values = all_xyz_rpy[0][UNLOAD_VISION_POSE_KEY]
@@ -7386,7 +7297,7 @@ def main(argv: list[str] | None = None) -> int:
         place_poses = make_unload_place_poses(recognition_pose)
         node.publish_unload_place_tfs(place_poses)
         log.info(
-            f"[unload] p,8 识别点 @ {SCENE_FRAME}: "
+            f"[unload] {UNLOAD_TRIGGER_COMMAND} 识别点 @ {SCENE_FRAME}: "
             f"({recognition_pose.position.x:.4f}, "
             f"{recognition_pose.position.y:.4f}, "
             f"{recognition_pose.position.z:.4f})"
@@ -7403,92 +7314,152 @@ def main(argv: list[str] | None = None) -> int:
                 f"{point_pose.position.y:.4f}, {point_pose.position.z:.4f})"
             )
 
-        unload_scene_added = False
-        try:
-            if not node.add_unload_scene(recognition_pose):
-                log.error("[unload] 添加料台/墙状障碍物失败")
+        if not node.add_unload_scene(recognition_pose):
+            log.error("[unload] 添加料台/墙状障碍物失败")
+            return False
+
+        unload_scene_added = True
+        unload_place_poses = place_poses
+        table_top_pose = make_unload_table_top_pose(recognition_pose)
+        table_rpy_deg = tuple(
+            math.degrees(value) for value in UNLOAD_TABLE_LOCAL_RPY
+        )
+        log.info(
+            f"[unload] 已添加取料台 size={UNLOAD_TABLE_SIZE} m, "
+            f"top_center=({table_top_pose.position.x:.4f}, "
+            f"{table_top_pose.position.y:.4f}, "
+            f"{table_top_pose.position.z:.4f})，"
+            f"table_local_rpy_deg={table_rpy_deg}；"
+            f"障碍物 size={UNLOAD_OBSTACLE_SIZE} m，"
+            f"沿料台局部 +Y 偏移 {UNLOAD_OBSTACLE_Y_OFFSET:.3f} m"
+        )
+        return True
+
+    def run_unload_cycle() -> bool:
+        """步骤 7：最多放置两对料，并在两组目标之间独立循环。"""
+        if not unload_scene_added or unload_place_poses is None:
+            log.error("[unload] 尚未执行步骤 6，缺少物料台碰撞模型和放置位")
+            return False
+
+        log.info("[unload] 开始放置前先给左右末端下电")
+        if not set_unload_tool_power(0, "放置开始"):
+            log.error("[unload] 双臂未全部下电，禁止执行后续动作")
+            return False
+
+        for batch_index in range(UNLOAD_MAX_PAIRS_PER_RUN):
+            if not node._wait_for_driver_signal(require_new=True):
                 return False
-            unload_scene_added = True
-            table_top_pose = make_unload_table_top_pose(recognition_pose)
-            table_rpy_deg = tuple(
-                math.degrees(value) for value in UNLOAD_TABLE_LOCAL_RPY
+            material_slots = unload_material_slots()
+            material_text = (
+                ", ".join(slot.upper() for slot in material_slots)
+                if material_slots
+                else "无"
             )
+            print(f"{GREEN}[unload] 当前有料位置: {material_text}{RESET}")
+
+            selected = select_unload_pair()
+            if selected is None:
+                log.info(
+                    "[unload] 没有完整料对（需要 SW1+SW3 或 SW2+SW4），"
+                    "结束本次循环放置"
+                )
+                return True
+
+            (
+                cycle_index,
+                right_slot,
+                left_slot,
+                left_point,
+                right_point,
+            ) = selected
             log.info(
-                f"[unload] 已添加取料台 size={UNLOAD_TABLE_SIZE} m, "
-                f"top_center=({table_top_pose.position.x:.4f}, "
-                f"{table_top_pose.position.y:.4f}, "
-                f"{table_top_pose.position.z:.4f})，"
-                f"table_local_rpy_deg={table_rpy_deg}；"
-                f"障碍物 size={UNLOAD_OBSTACLE_SIZE} m，"
-                f"沿料台局部 +Y 偏移 {UNLOAD_OBSTACLE_Y_OFFSET:.3f} m"
+                f"[unload] 第 {batch_index + 1} 轮："
+                f"右臂 {right_slot.upper()}→物料台点{right_point}，"
+                f"左臂 {left_slot.upper()}→物料台点{left_point}"
             )
-            try:
-                input()
-            except EOFError:
-                pass
+            if not execute_unload_pick_pair(right_slot, left_slot):
+                return False
+            if not move_unload_pair_to_place(
+                unload_place_poses,
+                left_point,
+                right_point,
+            ):
+                return False
 
-            for batch_index in range(UNLOAD_MAX_PAIRS_PER_RUN):
-                if batch_index > 0:
-                    if not node._wait_for_driver_signal(require_new=True):
-                        return False
-                    material_slots = unload_material_slots()
-                    material_text = (
-                        ", ".join(slot.upper() for slot in material_slots)
-                        if material_slots
-                        else "无"
-                    )
-                    print(
-                        f"{GREEN}[unload] 上一轮放置后仍有料位置: "
-                        f"{material_text}{RESET}"
-                    )
-                    selected = select_unload_pair()
-                    if selected is None:
-                        active_layer = current_unload_place_layer()
-                        if active_layer is None:
-                            log.info(
-                                "[unload] 物料台 8 个放置点均已使用"
-                            )
-                            return True
-                        log.info(
-                            f"[unload] 当前优先层剩余点 "
-                            f"{sorted(active_layer - used_unload_place_points)} "
-                            "没有下一组完整料对，结束本次下料"
-                        )
-                        return True
-                    (
-                        _route_index,
-                        right_slot,
-                        left_slot,
-                        left_point,
-                        right_point,
-                    ) = selected
+            point_pairs = UNLOAD_PAIR_CYCLES[cycle_index][2]
+            unload_cycle_indices[cycle_index] = (
+                unload_cycle_indices[cycle_index] + 1
+            ) % len(point_pairs)
+            next_left, next_right = point_pairs[unload_cycle_indices[cycle_index]]
+            log.info(
+                f"[unload] 第 {batch_index + 1} 轮完成；"
+                f"该料对下次循环目标=({next_left}, {next_right})"
+            )
 
-                log.info(
-                    f"[unload] 第 {batch_index + 1} 轮："
-                    f"右臂 {right_slot.upper()}→物料台点{right_point}，"
-                    f"左臂 {left_slot.upper()}→物料台点{left_point}"
-                )
-                if not execute_unload_pick_pair(right_slot, left_slot):
-                    return False
+        return True
 
-                if not move_unload_pair_to_place(
-                    place_poses,
-                    left_point,
-                    right_point,
-                ):
-                    return False
-
-                log.info(
-                    f"[unload] 第 {batch_index + 1} 轮放置完成："
-                    f"左臂点{left_point}、右臂点{right_point}，"
-                    "双臂直线返回放置预备位；"
-                    f"已使用点={sorted(used_unload_place_points)}"
-                )
-
+    def remove_cached_unload_scene() -> bool:
+        """移除步骤 6 创建的场景，并清空对应缓存。"""
+        nonlocal unload_scene_added, unload_place_poses
+        if not unload_scene_added:
+            unload_place_poses = None
             return True
-        finally:
-            if unload_scene_added and not node.remove_unload_scene():
-                log.error("[unload] 移除料台失败")
+        if not node.remove_unload_scene():
+            log.error("[unload] 移除物料台碰撞模型失败")
+            return False
+        unload_scene_added = False
+        unload_place_poses = None
+        return True
+
+    def execute_step(step: int, source: str, payload: dict) -> bool:
+        """执行一个独立步骤；区间和上位机流程均复用此入口。"""
+        nonlocal frame_added
+        log.info(f"[{source}][步骤 {step}] {STEP_DESCRIPTIONS[step]}")
+
+        if sim_mode and source == "keyboard":
+            if step == 4:
+                node._update_simulated_place_slots(
+                    list(PLACE_SLOT_MASKS),
+                    has_material=False,
+                    reason="键盘执行步骤 4，初始化四个空位",
+                )
+            elif step == 7:
+                node._update_simulated_place_slots(
+                    list(PLACE_SLOT_MASKS),
+                    has_material=True,
+                    reason="键盘执行步骤 7，初始化四个有料位",
+                )
+
+        if step == 1:
+            return node.navigate_and_wait(NAV_TARGET_FRAME_RECOGNITION)
+        if step == 2:
+            return recognize_and_add_deep_frame()
+        if step == 3:
+            log.info(
+                "[nav] 抓取位置直接使用深框识别位置的 "
+                f"map.x + {GRASP_NAV_X_OFFSET_FROM_RECOGNITION:.2f} m"
+            )
+            return node.navigate_and_wait(NAV_TARGET_GRASP)
+        if step == 4:
+            log.info(
+                "[pick] 开始抓满四个放置位；命令参数="
+                f"{json.dumps(payload, ensure_ascii=False)}"
+            )
+            return run_grasps_until_no_empty_slot() is True
+        if step == 5:
+            return node.navigate_and_wait(NAV_TARGET_PLACE)
+        if step == 6:
+            return prepare_unload_scene()
+        if step == 7:
+            return run_unload_cycle()
+        if step == 8:
+            # 碰撞模型清理失败不阻止底盘回起点，但会令本步骤返回失败。
+            scene_ok = remove_cached_unload_scene()
+            nav_ok = node.navigate_and_wait(NAV_TARGET_INIT)
+            return scene_ok and nav_ok
+
+        log.error(f"未知步骤: {step}")
+        return False
 
     try:
         control_source = "键盘" if keyboard_control_mode else "上位机"
@@ -7501,104 +7472,43 @@ def main(argv: list[str] | None = None) -> int:
         code = 0
 
         while rclpy.ok():
-            queued_command = (
-                wait_for_keyboard_command()
-                if keyboard_control_mode
-                else node.wait_for_upper_command()
-            )
-            if queued_command is None:
-                break
-            command_topic, payload = queued_command
-            command_source = "keyboard" if keyboard_control_mode else "upper"
+            if keyboard_control_mode:
+                steps = wait_for_keyboard_steps()
+                if steps is None:
+                    break
+                command_topic = None
+                payload = {"source": "keyboard", "steps": list(steps)}
+                command_source = "keyboard"
+            else:
+                queued_command = node.wait_for_upper_command()
+                if queued_command is None:
+                    break
+                command_topic, payload = queued_command
+                steps = UPPER_COMMAND_STEPS.get(command_topic)
+                if steps is None:
+                    log.error(f"未处理的上位机命令话题: {command_topic}")
+                    continue
+                command_source = "upper"
 
-            # 键盘仿真每次进入高层流程前都给定明确的物料初态：
-            #   2=上料/抓取，四个 SW 先全部置空；
-            #   4=下料，四个 SW 先全部置为有料。
-            # 只在 --sim --keyboard 下执行，不影响真机话题信号。
-            if sim_mode and keyboard_control_mode:
-                if command_topic == GRASP_CMD_TOPIC:
-                    node._update_simulated_place_slots(
-                        list(PLACE_SLOT_MASKS),
-                        has_material=False,
-                        reason="键盘选择 2，初始化抓取/上料流程",
-                    )
-                elif command_topic == PLACE_CMD_TOPIC:
-                    node._update_simulated_place_slots(
-                        list(PLACE_SLOT_MASKS),
-                        has_material=True,
-                        reason="键盘选择 4，初始化下料流程",
-                    )
+            workflow_ok = True
+            for step in steps:
+                if not execute_step(step, command_source, payload):
+                    workflow_ok = False
+                    log.error(f"[{command_source}] 步骤 {step} 失败，停止后续步骤")
+                    break
+                log.info(f"[{command_source}] 步骤 {step} 完成")
 
-            if command_topic == MOVE_TO_GRASP_POSE_CMD_TOPIC:
-                reset_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
-                log.info(
-                    f"[{command_source}] move_to_grasp_pose 第一步："
-                    "dual_arm_body 运动到复位位姿"
-                )
-                # move_to_grasp_ok = node.plan_execute_joint_waypoints(
-                #     "dual_arm_body",
-                #     0.2,
-                #     reset_joint_names,
-                #     [MOVE_TO_GRASP_RESET_Q],
-                # )
-                # if not move_to_grasp_ok:
-                #     log.error(
-                #         "[upper] dual_arm_body 复位失败，"
-                #         "不再继续导航和深框识别"
-                #     )
-                # if move_to_grasp_ok:
-                    # move_to_grasp_ok = node.navigate_and_wait(NAV_TARGET_GRASP)
-                move_to_grasp_ok = True
-                if move_to_grasp_ok:
-                    move_to_grasp_ok = recognize_and_add_deep_frame()
-                # if move_to_grasp_ok:
-                #     move_to_grasp_ok = (
-                #         node.move_agv_after_deep_frame_recognition()
-                #     )
-                report_flow_result(command_topic, move_to_grasp_ok)
-                continue
-
-            if command_topic == GRASP_CMD_TOPIC:
-                log.info(
-                    f"[{command_source}] 开始抓满四个放置位；命令参数="
-                    f"{json.dumps(payload, ensure_ascii=False)}"
-                )
-                grasp_ok = run_grasps_until_no_empty_slot() is True
-                report_flow_result(command_topic, grasp_ok)
-                continue
-
-            if command_topic == MOVE_TO_PLACE_POSE_CMD_TOPIC:
-                nav_ok = node.navigate_and_wait(NAV_TARGET_PLACE)
-                report_flow_result(command_topic, nav_ok)
-                continue
-
-            if command_topic == PLACE_CMD_TOPIC:
-                # 下料使用 p,8 识别得到的物料台场景，不保留上料深框。
-                scene_ok = True
-                if frame_added:
-                    log.info(f"切换下料，移除上料碰撞体「{FRAME_ID}」…")
-                    scene_ok = node.remove_frame()
-                    if scene_ok:
-                        frame_added = False
-                    else:
-                        log.error("切换下料时移除上料碰撞体失败")
-                place_ok = run_one_unload() if scene_ok else False
-                report_flow_result(command_topic, place_ok)
-                continue
-
-            if command_topic == RETURN_INIT_POSE_TOPIC:
-                log.info(
-                    f"[{command_source}] 收到 return_init_pose，导航到 map 起点 "
-                    "(0, 0, 0, 0, 0, 0, 1)；按协议不发布结果"
-                )
-                if not node.navigate_and_wait(NAV_TARGET_INIT):
-                    log.error("[upper] 返回起点导航失败（按协议不发布结果）")
-                continue
-
-            log.error(f"未处理的上位机命令话题: {command_topic}")
+            if command_topic is not None:
+                if command_topic in UPPER_COMMAND_RESULT_TOPICS:
+                    report_flow_result(command_topic, workflow_ok)
+            else:
+                result_text = "成功" if workflow_ok else "失败"
+                print(f"{GREEN if workflow_ok else ''}[keyboard] {steps} 执行{result_text}{RESET}")
 
     finally:
         cleanup_grasp_display(remove_scene_objects=frame_added)
+        if unload_scene_added and not remove_cached_unload_scene():
+            code = 1
         if frame_added:
             log.info(f"移除「{FRAME_ID}」…")
             if not node.remove_frame():
