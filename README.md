@@ -16,6 +16,10 @@ g01实际部署：
 启动腰部控制通信：
     python3 waist.py
 
+双臂掉使能
+ros2 service call /g01/dual_arm/disable_robot \
+  dobot_msgs_v4/srv/DisableRobot "{}"
+
 ros2 topic pub -r 50 /driver_report/taihu_motor_info pkg_msg_define/msg/MotorRuntimeInfo "{state: 0, error_code: 0, reserved: 0, position: 0.523598, speed: 0.0}"
 
 启动moveit：

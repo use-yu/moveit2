@@ -25,6 +25,8 @@
 # dobot_msgs_v4/srv/EnableFTSensor，通过 status=1/0 开启/关闭对应力传感器。
 # /g01/left/clear_error 和 /g01/right/clear_error 使用
 # dobot_msgs_v4/srv/ClearError，在现有 Dashboard 连接上清错并恢复 ENABLE。
+# /g01/dual_arm/disable_robot 使用 dobot_msgs_v4/srv/DisableRobot，一次调用
+# 同时关闭双臂 ServoJ 指令入口、清缓存并让左右机械臂掉使能。
 import json
 import socket
 from time import sleep
@@ -38,7 +40,12 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray, String
-from dobot_msgs_v4.srv import ClearError, EnableFTSensor, SetToolPower
+from dobot_msgs_v4.srv import (
+    ClearError,
+    DisableRobot,
+    EnableFTSensor,
+    SetToolPower,
+)
 
 MyType = np.dtype([('len', np.int64,), ('digital_input_bits', np.uint64,), ('digital_output_bits',
                                                                             np.uint64,), ('robot_mode', np.uint64,),
@@ -141,6 +148,7 @@ LEFT_FT_SENSOR_COMMAND_SERVICE = "/g01/left/ft_sensor_commands"
 RIGHT_FT_SENSOR_COMMAND_SERVICE = "/g01/right/ft_sensor_commands"
 LEFT_CLEAR_ERROR_SERVICE = "/g01/left/clear_error"
 RIGHT_CLEAR_ERROR_SERVICE = "/g01/right/clear_error"
+DUAL_ARM_DISABLE_ROBOT_SERVICE = "/g01/dual_arm/disable_robot"
 # DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 45.0)
 # TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 87.0)
 DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 82.0)
@@ -276,6 +284,11 @@ class ArmRosBridge(Node):
             ClearError,
             RIGHT_CLEAR_ERROR_SERVICE,
             self._on_right_clear_error,
+        )
+        self.create_service(
+            DisableRobot,
+            DUAL_ARM_DISABLE_ROBOT_SERVICE,
+            self._on_dual_arm_disable_robot,
         )
 
     def publish_arm_state(self, side, q):
@@ -524,6 +537,31 @@ class ArmRosBridge(Node):
     def _on_right_clear_error(self, _request, response):
         return self._on_clear_error(response, "right", self.arm_clients[1])
 
+    def _on_dual_arm_disable_robot(self, _request, response):
+        """关闭指令入口并让左右机械臂同时掉使能。"""
+        with self._arm_command_lock:
+            for side in ("left", "right"):
+                self._arm_paused[side] = True
+                self._latest_arm_commands[side] = None
+                self._new_arm_commands[side] = False
+
+        try:
+            disable_both_robots(self.arm_clients)
+        except (ConnectionError, TimeoutError, OSError, RuntimeError) as exc:
+            response.res = -1
+            self.get_logger().error(
+                f"{DUAL_ARM_DISABLE_ROBOT_SERVICE} 执行失败：{exc}；"
+                "双臂 ServoJ 指令入口保持关闭"
+            )
+            return response
+
+        response.res = 0
+        self.get_logger().warning(
+            f"{DUAL_ARM_DISABLE_ROBOT_SERVICE} 执行成功："
+            "左右机械臂已掉使能，ServoJ 指令入口保持关闭"
+        )
+        return response
+
 
 q_actual = {"left": [], "right": []}
 i_actual = {"left": [], "right": []}
@@ -640,7 +678,7 @@ def set_both_tool_power(client_sockets, status):
     print(f"左右机械臂末端已{action}")
 
 def wait_for_ft_sensors_online(feedback_connections, timeout):
-    """等待双臂六维力传感器均在线且返回有效六维数据。"""
+    """等待双臂六维力传感器上线；超时只打印信息，不中止程序。"""
     pending_sides = set(feedback_connections)
     deadline = time.monotonic() + timeout
 
@@ -660,9 +698,12 @@ def wait_for_ft_sensors_online(feedback_connections, timeout):
 
     if pending_sides:
         pending_text = ", ".join(sorted(pending_sides))
-        raise TimeoutError(
-            f"等待力传感器上线超时（{timeout:.1f}s），未上线：{pending_text}"
+        print(
+            f"警告：等待力传感器上线超时（{timeout:.1f}s），"
+            f"未上线：{pending_text}；程序继续运行，离线侧暂不发布力数据"
         )
+        return False
+    return True
 
 def initialize_ft_sensor_power(client_sockets, feedback_connections):
     """短暂给双臂末端上电确认力传感器在线，完成后保证尝试双侧下电。"""
@@ -670,11 +711,14 @@ def initialize_ft_sensor_power(client_sockets, feedback_connections):
     try:
         print("开始给双臂末端上电，等待力传感器上线")
         set_both_tool_power(client_sockets, 1)
-        wait_for_ft_sensors_online(
+        sensors_online = wait_for_ft_sensors_online(
             feedback_connections,
             timeout=FT_SENSOR_STARTUP_TIMEOUT_SEC,
         )
-        print("左右力传感器均已在线，开始给双臂末端下电")
+        if sensors_online:
+            print("左右力传感器均已在线，开始给双臂末端下电")
+        else:
+            print("力传感器未全部在线，仍开始给双臂末端下电并继续启动")
     except Exception as exc:
         startup_error = exc
 
@@ -1031,6 +1075,98 @@ def prepare_robot_for_servoj(client, name):
 
     mode = wait_robot_mode(client, name, expected_mode=5, timeout=3.0)
     print(f"{name} 初始化完成：RobotMode={robot_mode_text(mode)}")
+
+def get_runtime_robot_mode(client, name):
+    """通过 worker 转交的运行期 Dashboard 返回读取 RobotMode。"""
+    _result, response_text = runtime_dashboard_command(
+        client,
+        "RobotMode()",
+        name=name,
+        required=True,
+    )
+    payload = parse_dashboard_payload(response_text)
+    try:
+        return int(payload.split(",", 1)[0].strip())
+    except (ValueError, IndexError) as exc:
+        raise RuntimeError(
+            f"{name} RobotMode 返回解析失败：{response_text}"
+        ) from exc
+
+def disable_robot_runtime(client, name):
+    """停止当前运动，发送 DisableRobot 并确认机械臂已不处于使能状态。"""
+    runtime_dashboard_command(
+        client,
+        "Stop()",
+        name=name,
+        required=False,
+    )
+    result, response_text = runtime_dashboard_command(
+        client,
+        "DisableRobot()",
+        name=name,
+        required=False,
+    )
+
+    deadline = time.monotonic() + 5.0
+    last_mode = None
+    while time.monotonic() < deadline:
+        last_mode = get_runtime_robot_mode(client, name)
+        if last_mode in (3, 4):
+            print(
+                f"{name} 已掉使能：RobotMode={robot_mode_text(last_mode)}"
+            )
+            return
+        if result != 0:
+            raise RuntimeError(
+                f"{name} DisableRobot() 失败：{response_text}，"
+                f"当前 RobotMode={robot_mode_text(last_mode)}"
+            )
+        time.sleep(0.2)
+
+    raise TimeoutError(
+        f"{name} DisableRobot() 后 5s 内未进入 DISABLED/POWEROFF，"
+        f"最后 RobotMode={robot_mode_text(last_mode) if last_mode is not None else 'unknown'}"
+    )
+
+def disable_both_robots(client_sockets):
+    """并行向左右机械臂发送掉使能命令，并汇总两侧结果。"""
+    if len(client_sockets) != 2:
+        raise RuntimeError(
+            f"双臂掉使能要求两个 Dashboard 连接，当前={len(client_sockets)}"
+        )
+
+    failures = {}
+    failures_lock = threading.Lock()
+
+    def disable_one(side, client, name):
+        try:
+            disable_robot_runtime(client, name)
+        except (ConnectionError, TimeoutError, OSError, RuntimeError) as exc:
+            with failures_lock:
+                failures[side] = str(exc)
+
+    threads = []
+    for side, client, name in zip(
+        ("left", "right"),
+        client_sockets,
+        ("左臂", "右臂"),
+    ):
+        thread = threading.Thread(
+            target=disable_one,
+            args=(side, client, name),
+        )
+        thread.start()
+        threads.append(thread)
+
+    for thread in threads:
+        thread.join()
+
+    if failures:
+        details = "；".join(
+            f"{side}: {message}"
+            for side, message in sorted(failures.items())
+        )
+        raise RuntimeError(f"双臂掉使能未全部成功：{details}")
 
 def recover_robot_alarm(client, name):
     """清除运行期报警，按当前状态补做上电/使能并确认 ENABLE(5)。"""
