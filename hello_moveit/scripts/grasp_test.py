@@ -9,6 +9,7 @@ G01 MoveIt 演示脚本
 2. 运动到深框识别构型，识别深框并添加碰撞模型。
 3. 直接导航到抓取位置；其 map.x 比识别位置大 0.29 m。
 4. 持续上料，直到 SW1~SW4 没有空位：
+    批次开始前双臂工具上电，确认左右力传感器均能读取新帧，再双臂下电
     机器人先到初始位
     → 读取视觉点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
@@ -6506,8 +6507,58 @@ def main(argv: list[str] | None = None) -> int:
 
         return True
 
+    def prepare_force_sensors_for_grasp_batch() -> bool:
+        """双臂上电验证力数据，并在抓取批次开始前恢复下电。"""
+        sides = (("left", "左臂"), ("right", "右臂"))
+        log.info("[pick][sensor-check] 抓满四个放置位前，先给双臂工具上电")
+
+        power_on_results = {
+            side: node.set_tool_power(side, 1) for side, _label in sides
+        }
+        sensor_values: dict[str, float] = {}
+        if all(power_on_results.values()):
+            for side, label in sides:
+                force_z = node.wait_for_ft_sensor_z(side)
+                if force_z is None:
+                    log.error(
+                        f"[pick][sensor-check] {label}力传感器无法读取新数据"
+                    )
+                    break
+                sensor_values[side] = force_z
+        else:
+            log.error(
+                "[pick][sensor-check] 双臂工具未全部上电："
+                f"left={power_on_results['left']}, "
+                f"right={power_on_results['right']}"
+            )
+
+        log.info("[pick][sensor-check] 力传感器读取完成，抓取前给双臂工具下电")
+        power_off_results = {
+            side: node.set_tool_power(side, 0) for side, _label in sides
+        }
+        if not all(power_off_results.values()):
+            log.error(
+                "[pick][sensor-check] 双臂工具未全部下电，禁止开始抓取："
+                f"left={power_off_results['left']}, "
+                f"right={power_off_results['right']}"
+            )
+            return False
+        if len(sensor_values) != len(sides):
+            log.error("[pick][sensor-check] 双臂力传感器自检失败，禁止开始抓取")
+            return False
+
+        log.info(
+            "[pick][sensor-check] 双臂力传感器自检通过且已下电："
+            f"左臂 Fz={sensor_values['left']:.6f} N，"
+            f"右臂 Fz={sensor_values['right']:.6f} N"
+        )
+        return True
+
     def run_grasps_until_no_empty_slot() -> bool | None:
         """持续执行抓取；检测到 SW1~SW4 均无空位时正常结束。"""
+        if not prepare_force_sensors_for_grasp_batch():
+            return False
+
         success_count = 0
         grasp_index = 0
         while rclpy.ok():
