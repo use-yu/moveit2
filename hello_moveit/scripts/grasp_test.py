@@ -7906,12 +7906,6 @@ def main(argv: list[str] | None = None) -> int:
         return False
 
     try:
-        control_source = "键盘" if keyboard_control_mode else "上位机"
-        log.info(
-            f"[startup] {control_source}控制模式启动前先清空 "
-            "MoveIt world collision objects …"
-        )
-        node.clear_world_scene_objects()
         frame_added = False
         code = 0
 
