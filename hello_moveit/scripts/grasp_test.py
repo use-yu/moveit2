@@ -497,12 +497,12 @@ UPPER_COMMAND_RESULT_TOPICS = {
     PLACE_CMD_TOPIC: PLACE_CMD_RESULT_TOPIC,
 }
 UPPER_COMMAND_STEPS = {
-    MOVE_TO_GRASP_POSE_CMD_TOPIC: (1, 2, 3),
-    GRASP_CMD_TOPIC: (4,),
-    MOVE_TO_PLACE_POSE_CMD_TOPIC: (5, 6),
-    PLACE_CMD_TOPIC: (7, 8),
-    # 保留旧接口，便于单独请求返回起点；不发布结果。
-    RETURN_INIT_POSE_TOPIC: (8,),
+    MOVE_TO_GRASP_POSE_CMD_TOPIC: (1, 2, 3,4,5,6,7,8),
+    GRASP_CMD_TOPIC: (),
+    MOVE_TO_PLACE_POSE_CMD_TOPIC: (5,6,7,8),
+    PLACE_CMD_TOPIC: (),
+    # 保留旧接口的订阅，但收到后不执行任何步骤，也不发布结果。
+    RETURN_INIT_POSE_TOPIC: (),
 }
 STEP_DESCRIPTIONS = {
     1: "导航到深框识别位置",
