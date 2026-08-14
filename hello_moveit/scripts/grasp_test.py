@@ -4083,7 +4083,8 @@ class G01Demo(Node):
         这一步放在 IK 和 Cartesian approach 通过之后。使用 ``plan_only``，只
         验证完整路径而不移动机器人；规划结束后无论成功与否都恢复临时场景。
         成功时返回已通过碰撞检查和时间参数化的轨迹，供后续直接执行；
-        失败或临时场景未能恢复时返回 ``None``。
+        规划失败时返回 ``None``。临时场景移除失败只告警，不再丢弃已经
+        验证成功的轨迹。
         """
         log = self.get_logger()
         current = self._get_joints(list(joint_names), wait_new=True)
@@ -4104,7 +4105,6 @@ class G01Demo(Node):
             return None
 
         planned_trajectory: RobotTrajectory | None = None
-        removed = False
         try:
             ok, _, trajectory = self.plan_joint_motion(
                 group,
@@ -4123,10 +4123,12 @@ class G01Demo(Node):
             ):
                 planned_trajectory = trajectory
         finally:
-            removed = self.remove_frame_cutoff()
-            if not removed:
-                log.error("[grasp-select] 移除关节空间预检碰撞体失败")
-        return planned_trajectory if removed else None
+            if not self.remove_frame_cutoff():
+                log.warning(
+                    "[grasp-select] 移除关节空间预检碰撞体失败，"
+                    "忽略该清理失败并继续"
+                )
+        return planned_trajectory
 
     def _cylinder_marker_numeric_id(self, object_id: str) -> int:
         if object_id not in self._cylinder_marker_ids:
@@ -6227,8 +6229,7 @@ class G01Demo(Node):
         used_ms = (time.monotonic() - execute_started) * 1000.0
         log.info(f"[pick] 缓存轨迹 → q_pre: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
         if not cutoff_removed:
-            log.error("[pick] 移除 q_pre OMPL 隔板失败")
-            return False
+            log.warning("[pick] 移除 q_pre OMPL 隔板失败，忽略并继续后续抓取流程")
         if not ok:
             log.error("[pick] 执行已验证的 OMPL 到 q_pre 轨迹失败")
             self.last_pick_failure_reason = "q_pre"
@@ -6810,10 +6811,13 @@ def main(argv: list[str] | None = None) -> int:
 
         if frame_added:
             log.info(f"[frame-vision] 移除旧碰撞体「{FRAME_ID}」，等待到抓取点重建 …")
-            if not node.remove_frame():
-                log.error("[frame-vision] 移除旧深框场景失败")
-                return False
-            frame_added = False
+            if node.remove_frame():
+                frame_added = False
+            else:
+                log.warning(
+                    "[frame-vision] 移除旧深框场景失败，"
+                    "忽略该清理失败并继续保存识别结果"
+                )
 
         pending_frame_recognition_pose = copy.deepcopy(recognition_pose)
         frame_recognition_odom = recognition_odom
@@ -7016,51 +7020,71 @@ def main(argv: list[str] | None = None) -> int:
         return True
 
     def prepare_force_sensors_for_grasp_batch() -> bool:
-        """双臂上电验证力数据，并在抓取批次开始前恢复下电。"""
+        """双臂上电验证力数据；首轮无新帧时重新上电再验证一次。"""
         sides = (("left", "左臂"), ("right", "右臂"))
-        log.info("[pick][sensor-check] 抓满四个放置位前，先给双臂工具上电")
+        max_attempts = 2
 
-        power_on_results = {
-            side: node.set_tool_power(side, 1) for side, _label in sides
-        }
-        sensor_values: dict[str, float] = {}
-        if all(power_on_results.values()):
-            for side, label in sides:
-                force_z = node.wait_for_ft_sensor_z(side)
-                if force_z is None:
-                    log.error(
-                        f"[pick][sensor-check] {label}力传感器无法读取新数据"
-                    )
-                    break
-                sensor_values[side] = force_z
-        else:
-            log.error(
-                "[pick][sensor-check] 双臂工具未全部上电："
-                f"left={power_on_results['left']}, "
-                f"right={power_on_results['right']}"
+        for attempt in range(1, max_attempts + 1):
+            log.info(
+                f"[pick][sensor-check] 第 {attempt}/{max_attempts} 次："
+                "给双臂工具上电并等待力传感器新帧"
             )
+            power_on_results = {
+                side: node.set_tool_power(side, 1) for side, _label in sides
+            }
+            sensor_values: dict[str, float] = {}
+            if all(power_on_results.values()):
+                for side, label in sides:
+                    force_z = node.wait_for_ft_sensor_z(side)
+                    if force_z is None:
+                        log.error(
+                            f"[pick][sensor-check] 第 {attempt}/{max_attempts} 次 "
+                            f"{label}力传感器无法读取新数据"
+                        )
+                        break
+                    sensor_values[side] = force_z
+            else:
+                log.error(
+                    f"[pick][sensor-check] 第 {attempt}/{max_attempts} 次 "
+                    "双臂工具未全部上电："
+                    f"left={power_on_results['left']}, "
+                    f"right={power_on_results['right']}"
+                )
 
-        log.info("[pick][sensor-check] 力传感器读取完成，抓取前给双臂工具下电")
-        power_off_results = {
-            side: node.set_tool_power(side, 0) for side, _label in sides
-        }
-        if not all(power_off_results.values()):
-            log.error(
-                "[pick][sensor-check] 双臂工具未全部下电，禁止开始抓取："
-                f"left={power_off_results['left']}, "
-                f"right={power_off_results['right']}"
+            log.info(
+                f"[pick][sensor-check] 第 {attempt}/{max_attempts} 次读取结束，"
+                "给双臂工具下电"
             )
-            return False
-        if len(sensor_values) != len(sides):
-            log.error("[pick][sensor-check] 双臂力传感器自检失败，禁止开始抓取")
-            return False
+            power_off_results = {
+                side: node.set_tool_power(side, 0) for side, _label in sides
+            }
+            if not all(power_off_results.values()):
+                log.error(
+                    "[pick][sensor-check] 双臂工具未全部下电，禁止开始抓取："
+                    f"left={power_off_results['left']}, "
+                    f"right={power_off_results['right']}"
+                )
+                return False
 
-        log.info(
-            "[pick][sensor-check] 双臂力传感器自检通过且已下电："
-            f"左臂 Fz={sensor_values['left']:.6f} N，"
-            f"右臂 Fz={sensor_values['right']:.6f} N"
+            if len(sensor_values) == len(sides):
+                log.info(
+                    "[pick][sensor-check] 双臂力传感器自检通过且已下电："
+                    f"左臂 Fz={sensor_values['left']:.6f} N，"
+                    f"右臂 Fz={sensor_values['right']:.6f} N"
+                )
+                return True
+
+            if attempt < max_attempts:
+                log.warning(
+                    "[pick][sensor-check] 首次自检未收到完整的新力数据，"
+                    "重新给双臂工具上电并读取一次"
+                )
+
+        log.error(
+            "[pick][sensor-check] 两次上电均未收到完整的新力数据，"
+            "禁止开始抓取"
         )
-        return True
+        return False
 
     def run_grasps_until_no_empty_slot() -> bool | None:
         """持续执行抓取；检测到 SW1~SW4 均无空位时正常结束。"""
@@ -8065,10 +8089,13 @@ def main(argv: list[str] | None = None) -> int:
 
         if frame_added:
             log.info(f"[unload] 移除上料碰撞体「{FRAME_ID}」")
-            if not node.remove_frame():
-                log.error("[unload] 移除上料碰撞体失败")
-                return False
-            frame_added = False
+            if node.remove_frame():
+                frame_added = False
+            else:
+                log.warning(
+                    "[unload] 移除上料碰撞体失败，"
+                    "忽略该清理失败并继续物料台识别"
+                )
         if unload_scene_added:
             log.info("[unload] 移除旧物料台碰撞模型后重新识别")
             if node.remove_unload_scene(report_error=False):
@@ -8254,7 +8281,10 @@ def main(argv: list[str] | None = None) -> int:
             unload_place_poses = None
             return True
         if not node.remove_unload_scene():
-            log.error("[unload] 移除物料台碰撞模型失败")
+            log.warning(
+                "[unload] 移除物料台碰撞模型失败，"
+                "保留场景缓存以便稍后重试并继续当前流程"
+            )
             return False
         unload_scene_added = False
         unload_place_poses = None
@@ -8298,10 +8328,9 @@ def main(argv: list[str] | None = None) -> int:
         if step == 7:
             return run_unload_cycle()
         if step == 8:
-            # 碰撞模型清理失败不阻止底盘回起点，但会令本步骤返回失败。
-            scene_ok = remove_cached_unload_scene()
-            nav_ok = node.navigate_and_wait(NAV_TARGET_INIT)
-            return scene_ok and nav_ok
+            # 碰撞模型清理是尽力而为；失败既不阻止导航，也不令步骤失败。
+            remove_cached_unload_scene()
+            return node.navigate_and_wait(NAV_TARGET_INIT)
 
         log.error(f"未知步骤: {step}")
         return False
@@ -8343,12 +8372,12 @@ def main(argv: list[str] | None = None) -> int:
 
     finally:
         cleanup_grasp_display(remove_scene_objects=frame_added)
-        if unload_scene_added and not remove_cached_unload_scene():
-            code = 1
+        if unload_scene_added:
+            remove_cached_unload_scene()
         if frame_added:
             log.info(f"移除「{FRAME_ID}」…")
             if not node.remove_frame():
-                code = 1
+                log.warning(f"移除「{FRAME_ID}」失败，忽略该退出清理失败")
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
