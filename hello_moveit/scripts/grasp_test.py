@@ -24,6 +24,8 @@ G01 MoveIt 演示脚本
     → 根据 first_return_mode：
     ├─ mode=1：双臂交换 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
+    SW 放置直线去程/回程若因机械臂报警失败，程序等待键盘输入 1，调用
+    servoj_30ms 清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
 5. 导航到物料台工位。
 6. 运动到物料台识别预备构型，识别并添加碰撞模型。
 7. 循环下料：
@@ -39,6 +41,8 @@ G01 MoveIt 演示脚本
     优先 SW1+SW3，目标按 (1,3)→(11,13) 循环；SW2+SW4 按
     (2,4)→(12,14) 循环，不记录已经放过的位置。循环正常结束后，
     dual_arm_body 复位到 MOVE_TO_GRASP_RESET_Q。
+    八点放置直线去程/回程报警时同样等待输入 1；双臂清错、末端下电后，
+    从实测位置同步直退，忽略场景物体碰撞但保留机器人自碰撞检查。
 8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
 
 上位机步骤映射：
@@ -137,7 +141,7 @@ from std_msgs.msg import ColorRGBA, Float32MultiArray, String, UInt8
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker
-from dobot_msgs_v4.srv import SetToolPower
+from dobot_msgs_v4.srv import ClearError, SetToolPower
 
 # =============================================================================
 # 用户可调参数（改这里即可，无需动下面逻辑）
@@ -461,6 +465,8 @@ LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 LEFT_FT_SENSOR_TOPIC = "/g01/left/FTSensor"
 RIGHT_FT_SENSOR_TOPIC = "/g01/right/FTSensor"
+LEFT_CLEAR_ERROR_SERVICE = "/g01/left/clear_error"
+RIGHT_CLEAR_ERROR_SERVICE = "/g01/right/clear_error"
 SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
 SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
 MOTOR_COMMAND_TOPIC = "/g01/motor_commands"
@@ -2446,6 +2452,14 @@ class G01Demo(Node):
         )
         self._left_tool_cli = self.create_client(SetToolPower, LEFT_TOOL_COMMAND_SERVICE)
         self._right_tool_cli = self.create_client(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE)
+        self._left_clear_error_cli = self.create_client(
+            ClearError,
+            LEFT_CLEAR_ERROR_SERVICE,
+        )
+        self._right_clear_error_cli = self.create_client(
+            ClearError,
+            RIGHT_CLEAR_ERROR_SERVICE,
+        )
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
         self._exec_cli = ActionClient(self, ExecuteTrajectory, ACT_EXEC_TRAJ)
         self._vision_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -3300,6 +3314,289 @@ class G01Demo(Node):
             return False
         log.info(f"{service_name} SetToolPower({status}) 成功")
         return True
+
+    def clear_arm_alarm(self, side: str, timeout: float = 60.0) -> bool:
+        """请求 servoj_30ms 使用其现有 Dashboard 连接清错并恢复使能。"""
+        log = self.get_logger()
+        if self.sim_mode:
+            log.info(f"[sim][alarm-recovery] 跳过 {side} 臂清错服务")
+            return True
+
+        if side == "left":
+            cli = self._left_clear_error_cli
+            service_name = LEFT_CLEAR_ERROR_SERVICE
+        elif side == "right":
+            cli = self._right_clear_error_cli
+            service_name = RIGHT_CLEAR_ERROR_SERVICE
+        else:
+            log.error(f"[alarm-recovery] 未知机械臂 side={side}")
+            return False
+
+        if not cli.wait_for_service(timeout_sec=timeout):
+            log.error(
+                f"[alarm-recovery] 服务 {service_name} 不可用；"
+                "请重启包含清错服务的 servoj_30ms.py"
+            )
+            return False
+        future = cli.call_async(ClearError.Request())
+        if not self._spin_until(future, timeout):
+            log.error(f"[alarm-recovery] {service_name} 调用超时")
+            return False
+        try:
+            response = future.result()
+        except Exception as exc:
+            log.error(f"[alarm-recovery] {service_name} 调用异常：{exc}")
+            return False
+        if response is None or response.res != 0:
+            result = None if response is None else response.res
+            log.error(
+                f"[alarm-recovery] {service_name} 清错失败：res={result}"
+            )
+            return False
+        log.info(f"[alarm-recovery] {service_name} 清错并恢复 ENABLE 成功")
+        return True
+
+    def wait_for_alarm_clear_by_keyboard(
+        self,
+        sides: Sequence[str],
+        stage: str,
+    ) -> bool:
+        """输入 1 后先关闭 ServoJ 指令入口并清缓存，再请求对应臂清错。"""
+        normalized_sides = tuple(dict.fromkeys(str(side) for side in sides))
+        side_text = "、".join(
+            "左臂" if side == "left" else "右臂"
+            for side in normalized_sides
+        )
+        while rclpy.ok():
+            try:
+                choice = input(
+                    f"\n[alarm-recovery] {stage}运动失败，"
+                    f"请确认{side_text}现场安全；输入 1 清除报警并退回: "
+                ).strip()
+            except EOFError:
+                self.get_logger().error(
+                    "[alarm-recovery] 键盘输入已关闭，无法执行人工确认清错"
+                )
+                return False
+            if choice != "1":
+                self.get_logger().warning(
+                    f"[alarm-recovery] 收到 {choice!r}，未清错；请输入 1"
+                )
+                continue
+
+            stop_results = {}
+            for side in normalized_sides:
+                request_id = self._send_servoj_control(side, "stop")
+                stop_results[side] = self._wait_for_servoj_control_state(
+                    side,
+                    "stop",
+                    request_id,
+                )
+            if not all(stop_results.values()):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：无法关闭全部 ServoJ 指令入口 "
+                    f"{stop_results}；保持停止并再次输入 1 重试"
+                )
+                continue
+
+            results = {
+                side: self.clear_arm_alarm(side)
+                for side in normalized_sides
+            }
+            if all(results.values()):
+                return True
+            failed = ", ".join(
+                side for side, success in results.items() if not success
+            )
+            self.get_logger().error(
+                f"[alarm-recovery] 清错未全部成功：{failed}；"
+                "处理现场报警后再次输入 1"
+            )
+        return False
+
+    def recover_single_arm_linear_after_alarm(
+        self,
+        *,
+        side: str,
+        group: str,
+        link: str,
+        return_pose: Pose,
+        joint_names: Sequence[str],
+        plan_frame: str,
+        speed_scale: float,
+        avoid_collisions: bool,
+        stage: str,
+    ) -> bool:
+        """人工确认清错、末端下电，再从实测位置直线退到阶段起点。"""
+        joint_names = list(joint_names)
+        while rclpy.ok():
+            if not self.wait_for_alarm_clear_by_keyboard((side,), stage):
+                return False
+            if not self.set_tool_power(side, 0):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：{side} 末端下电失败，"
+                    "不允许执行退回；再次输入 1 重试"
+                )
+                continue
+
+            current = self._get_joints(joint_names, wait_new=True)
+            if current is None:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：无法读取清错后的实测关节，"
+                    "再次输入 1 重试"
+                )
+                continue
+            resume_request_id = self._send_servoj_control(side, "resume")
+            if not self._wait_for_servoj_control_state(
+                side,
+                "resume",
+                resume_request_id,
+            ):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：ServoJ 指令入口恢复失败，"
+                    "不允许执行退回；再次输入 1 重试"
+                )
+                continue
+            retreat = self.plan_cartesian_line(
+                group,
+                link,
+                return_pose,
+                speed_scale=speed_scale,
+                avoid_collisions=avoid_collisions,
+                start_joints=current,
+                joint_names=joint_names,
+                plan_frame=plan_frame,
+            )
+            if retreat is None:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：无法从实测位置规划直线退回，"
+                    "再次输入 1 重试"
+                )
+                continue
+            if self._execute_traj(retreat):
+                self.get_logger().warning(
+                    f"[alarm-recovery] {stage}：已清错、末端下电并从实测位置直线退回"
+                )
+                return True
+            self.get_logger().error(
+                f"[alarm-recovery] {stage}：直线退回执行失败，"
+                "程序保持运行；处理报警后再次输入 1"
+            )
+        return False
+
+    def recover_dual_arm_linear_after_alarm(
+        self,
+        *,
+        left_return_pose: Pose,
+        right_return_pose: Pose,
+        full_joint_names: Sequence[str],
+        collision_group: str,
+        speed_scale: float,
+        stage: str,
+    ) -> bool:
+        """双臂八点放置报警恢复：忽略物体碰撞，但保留自碰撞检查。"""
+        left_joint_names = joint_names_for_group("left_arm")
+        right_joint_names = joint_names_for_group("right_arm")
+        full_joint_names = list(full_joint_names)
+        while rclpy.ok():
+            if not self.wait_for_alarm_clear_by_keyboard(
+                ("left", "right"),
+                stage,
+            ):
+                return False
+
+            power_off_results = {
+                side: self.set_tool_power(side, 0)
+                for side in ("left", "right")
+            }
+            if not all(power_off_results.values()):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：双臂末端未全部下电 "
+                    f"{power_off_results}，不允许执行退回；再次输入 1 重试"
+                )
+                continue
+
+            current = self._get_joints(full_joint_names, wait_new=True)
+            if current is None:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：无法读取双臂实测关节，"
+                    "再次输入 1 重试"
+                )
+                continue
+            resume_results = {}
+            for side in ("left", "right"):
+                request_id = self._send_servoj_control(side, "resume")
+                resume_results[side] = self._wait_for_servoj_control_state(
+                    side,
+                    "resume",
+                    request_id,
+                )
+            if not all(resume_results.values()):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：双臂 ServoJ 指令入口未全部恢复 "
+                    f"{resume_results}；不允许执行退回，再次输入 1 重试"
+                )
+                continue
+            left_retreat = self.plan_cartesian_line(
+                "left_arm",
+                "l_tool",
+                left_return_pose,
+                speed_scale=speed_scale,
+                avoid_collisions=False,
+                start_joints=current,
+                joint_names=left_joint_names,
+                plan_frame=SCENE_FRAME,
+            )
+            right_retreat = self.plan_cartesian_line(
+                "right_arm",
+                "r_tool",
+                right_return_pose,
+                speed_scale=speed_scale,
+                avoid_collisions=False,
+                start_joints=current,
+                joint_names=right_joint_names,
+                plan_frame=SCENE_FRAME,
+            )
+            if left_retreat is None or right_retreat is None:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：至少一侧无法从实测位置"
+                    "规划直线退回；再次输入 1 重试"
+                )
+                continue
+            try:
+                retreat = merge_dual_arm_cartesian_trajectories(
+                    left_retreat,
+                    right_retreat,
+                )
+            except ValueError as exc:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：合并双臂直线退回失败 "
+                    f"({exc})；再次输入 1 重试"
+                )
+                continue
+            if not self.validate_trajectory_self_collision(
+                retreat,
+                group=collision_group,
+                base_state=current,
+                sample_period=UNLOAD_PLACE_SELF_COLLISION_SAMPLE_PERIOD,
+                label=f"[alarm-recovery] {stage} 双臂直线退回",
+            ):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：双臂直线退回存在自碰撞或无法验证，"
+                    "再次输入 1 重试"
+                )
+                continue
+            if self._execute_traj(retreat):
+                self.get_logger().warning(
+                    f"[alarm-recovery] {stage}：已清错、双末端下电并从实测位置"
+                    "同步直线退回（忽略物体碰撞，保留自碰撞检查）"
+                )
+                return True
+            self.get_logger().error(
+                f"[alarm-recovery] {stage}：同步直线退回执行失败，"
+                "程序保持运行；处理报警后再次输入 1"
+            )
+        return False
 
     def _apply_scene(
         self,
@@ -5598,6 +5895,15 @@ class G01Demo(Node):
         if current is None:
             log.error("[pick] 读取当前手臂关节失败")
             return False
+        yubei_return_pose = self._get_link_pose_fk(
+            link,
+            joints=current,
+            joint_names=arm_joint_names,
+            plan_frame=arm_plan_frame,
+        )
+        if yubei_return_pose is None:
+            log.error(f"[pick] 无法记录 {yubei_name} 处末端位姿用于报警退回")
+            return False
         fang_pose = self._get_link_pose_fk(
             link,
             joints=dict(zip(arm_joint_names, fang_joints)),
@@ -5619,55 +5925,96 @@ class G01Demo(Node):
         if to_fang_traj is None:
             log.error(f"[pick] 直线运动到 {place_name} 规划失败")
             return False
+        alarm_recovered = False
         if not self._execute_traj(to_fang_traj):
-            log.error(f"[pick] 直线运动到 {place_name} 执行失败")
-            return False
-        log.info(
-            f"[pick] {place_name} 关节: "
-            + ", ".join(f"{n}={v:.3f}" for n, v in zip(arm_joint_names, fang_joints))
-        )
-
-        self.wait_for_operator()
-
-        tool_side = tool_side_for_link(link)
-        if tool_side is None:
-            log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
-            return False
-        tool_label = "左臂" if tool_side == "left" else "右臂"
-        if slot_name is not None and not self._place_slot_is_empty(slot_name):
             log.error(
-                f"[pick] 放置前复查发现 {slot_name} 已有物体，保持工具上电并中止放置"
+                f"[pick] 直线运动到 {place_name} 执行失败，"
+                "进入人工清错和实测位置直线退回"
             )
-            return False
-        if slot_name is None and not self._has_any_empty_place_slot():
-            log.error("[pick] 放置前复查发现 SW1~SW4 均有物体，保持工具上电并中止放置")
-            return False
-        log.info(f"[pick] 7/9  {tool_label}工具下电，放置到 {place_name}")
-        if not self.set_tool_power(tool_side, 0):
-            log.error(f"[pick] {tool_label}工具下电失败")
-            return False
-        print(f"\033[32m{tool_label}下电成功\033[0m")
-        if self.sim_mode:
-            if slot_name is None:
+            tool_side = tool_side_for_link(link)
+            if tool_side is None:
                 log.error(
-                    "[sim][SW] 当前放置配置没有对应的 SW 名称，"
-                    "无法模拟上料后的占用状态"
+                    f"[pick] link={link} 不是 l_tool 或 r_tool，无法执行报警恢复"
                 )
                 return False
-            if not self._update_simulated_place_slots(
-                [slot_name],
-                has_material=True,
-                reason=f"{tool_label}完成上料",
+            if not self.recover_single_arm_linear_after_alarm(
+                side=tool_side,
+                group=arm_group,
+                link=link,
+                return_pose=yubei_return_pose,
+                joint_names=arm_joint_names,
+                plan_frame=arm_plan_frame,
+                speed_scale=speed,
+                avoid_collisions=False,
+                stage=f"抓取后放到 {place_name}",
             ):
                 return False
+            alarm_recovered = True
 
-        log.info(
-            f"[pick] 8/9  反向播放到 {place_name} 的轨迹原路返回 "
-            f"（{len(to_fang_traj.joint_trajectory.points)} 点）"
-        )
-        if not self._execute_traj(self._reverse_trajectory(to_fang_traj)):
-            log.error("[pick] 8/9 原路返回失败")
-            return False
+        if not alarm_recovered:
+            log.info(
+                f"[pick] {place_name} 关节: "
+                + ", ".join(
+                    f"{n}={v:.3f}"
+                    for n, v in zip(arm_joint_names, fang_joints)
+                )
+            )
+
+            self.wait_for_operator()
+
+            tool_side = tool_side_for_link(link)
+            if tool_side is None:
+                log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
+                return False
+            tool_label = "左臂" if tool_side == "left" else "右臂"
+            if slot_name is not None and not self._place_slot_is_empty(slot_name):
+                log.error(
+                    f"[pick] 放置前复查发现 {slot_name} 已有物体，保持工具上电并中止放置"
+                )
+                return False
+            if slot_name is None and not self._has_any_empty_place_slot():
+                log.error("[pick] 放置前复查发现 SW1~SW4 均有物体，保持工具上电并中止放置")
+                return False
+            log.info(f"[pick] 7/9  {tool_label}工具下电，放置到 {place_name}")
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] {tool_label}工具下电失败")
+                return False
+            print(f"\033[32m{tool_label}下电成功\033[0m")
+            if self.sim_mode:
+                if slot_name is None:
+                    log.error(
+                        "[sim][SW] 当前放置配置没有对应的 SW 名称，"
+                        "无法模拟上料后的占用状态"
+                    )
+                    return False
+                if not self._update_simulated_place_slots(
+                    [slot_name],
+                    has_material=True,
+                    reason=f"{tool_label}完成上料",
+                ):
+                    return False
+
+            log.info(
+                f"[pick] 8/9  反向播放到 {place_name} 的轨迹原路返回 "
+                f"（{len(to_fang_traj.joint_trajectory.points)} 点）"
+            )
+            if not self._execute_traj(self._reverse_trajectory(to_fang_traj)):
+                log.error(
+                    "[pick] 8/9 原路返回失败，"
+                    "进入人工清错和实测位置直线退回"
+                )
+                if not self.recover_single_arm_linear_after_alarm(
+                    side=tool_side,
+                    group=arm_group,
+                    link=link,
+                    return_pose=yubei_return_pose,
+                    joint_names=arm_joint_names,
+                    plan_frame=arm_plan_frame,
+                    speed_scale=speed,
+                    avoid_collisions=False,
+                    stage=f"{place_name} 放置后返回",
+                ):
+                    return False
 
         q1_count = len(arm_joint_names)
         if arm_group == "left_arm":
@@ -5712,6 +6059,15 @@ class G01Demo(Node):
             "[pick] Q1 固定点返回完成: "
             + ", ".join(f"{n}={v:.3f}" for n, v in zip(arm_joint_names, q1_joints))
         )
+        if alarm_recovered:
+            # 去程中断时物体可能尚未真正进入 SW，不计作一次成功放置；下一轮
+            # 重新读取真实 SW 信号后继续抓取，避免软件擅自占用该槽位。
+            self.last_pick_failure_reason = "place_alarm_recovered"
+            log.warning(
+                f"[pick] {place_name} 去程报警已恢复并返回 Q1；"
+                "本次不计为成功放置，下一轮按最新 SW 信号继续抓取"
+            )
+            return False
         return True
 
     def pick_and_return(
@@ -6756,12 +7112,18 @@ def main(argv: list[str] | None = None) -> int:
                 and node.last_pick_failure_reason in (
                     "suction_failed",
                     "approach_obstacle",
+                    "place_alarm_recovered",
                 )
             ):
                 if node.last_pick_failure_reason == "approach_obstacle":
                     log.warning(
                         f"[frame-batch] 第 {grasp_index} 次接近中途碰到障碍物，"
                         "已退回 pre；直接进入下一次 Q1 复位和视觉识别"
+                    )
+                elif node.last_pick_failure_reason == "place_alarm_recovered":
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次 SW 放置去程报警，"
+                        "已清错、下电并直退；按最新 SW 信号继续下一次抓取"
                     )
                 else:
                     log.warning(
@@ -7302,6 +7664,33 @@ def main(argv: list[str] | None = None) -> int:
                 log.error(f"[unload] {label} 联合轨迹执行失败")
                 return False
 
+            return_state = node._get_joints(
+                dual_body_joint_names,
+                wait_new=True,
+            )
+            if return_state is None:
+                log.error(
+                    f"[unload] {label} 无法记录放置预备位实测关节，"
+                    "禁止执行下降"
+                )
+                return False
+            left_return_pose = node._get_link_pose_fk(
+                "l_tool",
+                joints=return_state,
+                plan_frame=SCENE_FRAME,
+            )
+            right_return_pose = node._get_link_pose_fk(
+                "r_tool",
+                joints=return_state,
+                plan_frame=SCENE_FRAME,
+            )
+            if left_return_pose is None or right_return_pose is None:
+                log.error(
+                    f"[unload] {label} 无法记录放置预备位双臂末端位姿，"
+                    "禁止执行下降"
+                )
+                return False
+
             node.wait_for_operator(
                 f"已到物料台左点{left_point}/右点{right_point}，"
                 f"按回车执行双臂末端局部 +Z "
@@ -7313,8 +7702,18 @@ def main(argv: list[str] | None = None) -> int:
                 "（检查机器人自碰撞，忽略物体碰撞）"
             )
             if not node._execute_traj(descent):
-                log.error("[unload] 双臂同步直线下降放置失败")
-                return False
+                log.error(
+                    "[unload] 双臂同步直线下降放置失败，"
+                    "进入人工清错和实测位置直线退回"
+                )
+                return node.recover_dual_arm_linear_after_alarm(
+                    left_return_pose=left_return_pose,
+                    right_return_pose=right_return_pose,
+                    full_joint_names=dual_body_joint_names,
+                    collision_group=group,
+                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    stage=f"物料台左点{left_point}/右点{right_point}下降放置",
+                )
 
             node.wait_for_operator(
                 f"已下降到物料台左点{left_point}/右点{right_point}，"
@@ -7327,8 +7726,18 @@ def main(argv: list[str] | None = None) -> int:
 
             log.info("[unload] 双臂已下电，反向执行同一条同步直线原路返回")
             if not node._execute_traj(node._reverse_trajectory(descent)):
-                log.error("[unload] 放置后双臂同步直线复位失败")
-                return False
+                log.error(
+                    "[unload] 放置后双臂同步直线复位失败，"
+                    "进入人工清错和实测位置直线退回"
+                )
+                return node.recover_dual_arm_linear_after_alarm(
+                    left_return_pose=left_return_pose,
+                    right_return_pose=right_return_pose,
+                    full_joint_names=dual_body_joint_names,
+                    collision_group=group,
+                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    stage=f"物料台左点{left_point}/右点{right_point}放置后返回",
+                )
             return True
 
         def prevalidate_arm_solutions(

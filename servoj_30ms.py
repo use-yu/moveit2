@@ -23,6 +23,8 @@
 # 处理结果发布到 /g01/servoj_control_state。
 # /g01/left/ft_sensor_commands 和 /g01/right/ft_sensor_commands 使用
 # dobot_msgs_v4/srv/EnableFTSensor，通过 status=1/0 开启/关闭对应力传感器。
+# /g01/left/clear_error 和 /g01/right/clear_error 使用
+# dobot_msgs_v4/srv/ClearError，在现有 Dashboard 连接上清错并恢复 ENABLE。
 import json
 import socket
 from time import sleep
@@ -36,7 +38,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray, String
-from dobot_msgs_v4.srv import EnableFTSensor, SetToolPower
+from dobot_msgs_v4.srv import ClearError, EnableFTSensor, SetToolPower
 
 MyType = np.dtype([('len', np.int64,), ('digital_input_bits', np.uint64,), ('digital_output_bits',
                                                                             np.uint64,), ('robot_mode', np.uint64,),
@@ -137,6 +139,8 @@ LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
 LEFT_FT_SENSOR_COMMAND_SERVICE = "/g01/left/ft_sensor_commands"
 RIGHT_FT_SENSOR_COMMAND_SERVICE = "/g01/right/ft_sensor_commands"
+LEFT_CLEAR_ERROR_SERVICE = "/g01/left/clear_error"
+RIGHT_CLEAR_ERROR_SERVICE = "/g01/right/clear_error"
 # DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 45.0)
 # TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 87.0)
 DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 82.0)
@@ -262,6 +266,16 @@ class ArmRosBridge(Node):
             EnableFTSensor,
             RIGHT_FT_SENSOR_COMMAND_SERVICE,
             self._on_right_ft_sensor_command,
+        )
+        self.create_service(
+            ClearError,
+            LEFT_CLEAR_ERROR_SERVICE,
+            self._on_left_clear_error,
+        )
+        self.create_service(
+            ClearError,
+            RIGHT_CLEAR_ERROR_SERVICE,
+            self._on_right_clear_error,
         )
 
     def publish_arm_state(self, side, q):
@@ -486,6 +500,30 @@ class ArmRosBridge(Node):
             self.arm_clients[1],
         )
 
+    def _on_clear_error(self, response, side, client):
+        """在本进程持有的 Dashboard 连接上清错并恢复到 ENABLE。"""
+        arm_name = "左臂" if side == "left" else "右臂"
+        try:
+            recover_robot_alarm(client, arm_name)
+        except (ConnectionError, TimeoutError, OSError, RuntimeError) as exc:
+            response.res = -1
+            self.get_logger().error(
+                f"/g01/{side}/clear_error 清错恢复失败：{exc}"
+            )
+            return response
+
+        response.res = 0
+        self.get_logger().info(
+            f"/g01/{side}/clear_error 清错完成，机械臂已恢复 ENABLE(5)"
+        )
+        return response
+
+    def _on_left_clear_error(self, _request, response):
+        return self._on_clear_error(response, "left", self.arm_clients[0])
+
+    def _on_right_clear_error(self, _request, response):
+        return self._on_clear_error(response, "right", self.arm_clients[1])
+
 
 q_actual = {"left": [], "right": []}
 i_actual = {"left": [], "right": []}
@@ -656,6 +694,12 @@ def initialize_ft_sensor_power(client_sockets, feedback_connections):
 DASHBOARD_COMMAND_TIMEOUT = 5.0
 DASHBOARD_POWERON_TIMEOUT = 15.0
 DASHBOARD_RECV_BUFFERS = {}
+# 初始化完成后由 worker() 独占 Dashboard socket 的 recv。ROS 服务若需要
+# 等待指定命令的返回，通过这里把返回按命令名转交给等待线程，避免两个线程
+# 同时 recv 同一个 socket。
+DASHBOARD_RUNTIME_SEND_LOCKS = {}
+DASHBOARD_RUNTIME_PENDING = {}
+DASHBOARD_RUNTIME_PENDING_LOCK = threading.Lock()
 
 def send_set_payload(client, load, x, y, z, wait_response=False):
     tcp_command = "SetPayload(%s,%s,%s,%s)" % (
@@ -711,10 +755,71 @@ def dashboard_response_matches(response_text, command):
     response_command = dashboard_response_command(response_text)
     return response_command.startswith(f"{expected_name}(")
 
+def deliver_runtime_dashboard_response(client, response_text):
+    """由 worker() 把匹配的 Dashboard 返回交给正在等待的 ROS 服务。"""
+    with DASHBOARD_RUNTIME_PENDING_LOCK:
+        pending = DASHBOARD_RUNTIME_PENDING.get(client)
+        if pending is None or not dashboard_response_matches(
+            response_text,
+            pending["command"],
+        ):
+            return False
+        pending["response"] = response_text
+        pending["event"].set()
+        return True
+
 def dashboard_timeout_for(command):
     if dashboard_command_name(command) == "PowerOn":
         return DASHBOARD_POWERON_TIMEOUT
     return DASHBOARD_COMMAND_TIMEOUT
+
+def runtime_dashboard_command(
+    client,
+    command,
+    name="",
+    required=False,
+    timeout=None,
+):
+    """在 worker() 已启动后发送命令，并等待 worker 转交对应返回。"""
+    if timeout is None:
+        timeout = dashboard_timeout_for(command)
+    send_lock = DASHBOARD_RUNTIME_SEND_LOCKS.setdefault(
+        client,
+        threading.Lock(),
+    )
+    pending = {
+        "command": command,
+        "response": None,
+        "event": threading.Event(),
+    }
+    with send_lock:
+        with DASHBOARD_RUNTIME_PENDING_LOCK:
+            if client in DASHBOARD_RUNTIME_PENDING:
+                raise RuntimeError("同一机械臂已有 Dashboard 命令正在等待返回")
+            DASHBOARD_RUNTIME_PENDING[client] = pending
+        try:
+            client.sendall(command.encode())
+            if not pending["event"].wait(timeout):
+                raise TimeoutError(
+                    f"等待 {command} 的 Dashboard 返回超时（{timeout:.1f}s）"
+                )
+            response_text = pending["response"]
+        finally:
+            with DASHBOARD_RUNTIME_PENDING_LOCK:
+                if DASHBOARD_RUNTIME_PENDING.get(client) is pending:
+                    del DASHBOARD_RUNTIME_PENDING[client]
+
+    if response_text is None:
+        raise RuntimeError(f"{command} 已唤醒等待线程但没有返回内容")
+    result = parse_dashboard_result(response_text)
+    prefix = f"{name} " if name else ""
+    print(f"{prefix}{command} 恢复命令返回：{response_text}")
+    if required and result != 0:
+        raise RuntimeError(
+            f"{prefix}{command} 失败：{response_text}，"
+            f"{dashboard_error_hint(result)}"
+        )
+    return result, response_text
 
 def recv_dashboard_response(client, timeout=DASHBOARD_COMMAND_TIMEOUT, expected_command=None, name=""):
     old_timeout = client.gettimeout()
@@ -927,6 +1032,78 @@ def prepare_robot_for_servoj(client, name):
     mode = wait_robot_mode(client, name, expected_mode=5, timeout=3.0)
     print(f"{name} 初始化完成：RobotMode={robot_mode_text(mode)}")
 
+def recover_robot_alarm(client, name):
+    """清除运行期报警，按当前状态补做上电/使能并确认 ENABLE(5)。"""
+    # 报警可能发生在脚本仍被控制器标记为运行时。Stop 失败不阻止后续
+    # ClearError；其返回仍会被打印，便于现场判断真实控制器状态。
+    runtime_dashboard_command(
+        client,
+        "Stop()",
+        name=name,
+        required=False,
+    )
+    runtime_dashboard_command(
+        client,
+        "ClearError()",
+        name=name,
+        required=True,
+    )
+
+    deadline = time.monotonic() + 15.0
+    power_on_sent = False
+    enable_sent = False
+    last_mode = None
+    while time.monotonic() < deadline:
+        _result, response_text = runtime_dashboard_command(
+            client,
+            "RobotMode()",
+            name=name,
+            required=True,
+        )
+        payload = parse_dashboard_payload(response_text)
+        try:
+            mode = int(payload.split(",", 1)[0].strip())
+        except (ValueError, IndexError) as exc:
+            raise RuntimeError(
+                f"{name} RobotMode 返回解析失败：{response_text}"
+            ) from exc
+        last_mode = mode
+
+        if mode == 5:
+            print(f"{name} 报警恢复完成：RobotMode={robot_mode_text(mode)}")
+            return
+        if mode == 3 and not power_on_sent:
+            runtime_dashboard_command(
+                client,
+                "PowerOn()",
+                name=name,
+                required=True,
+            )
+            power_on_sent = True
+        elif mode == 4 and not enable_sent:
+            runtime_dashboard_command(
+                client,
+                "EnableRobot()",
+                name=name,
+                required=True,
+            )
+            enable_sent = True
+        elif mode in (1, 2, 3, 4):
+            # INIT/BRAKE_OPEN 以及刚发送 PowerOn/EnableRobot 后都需要等待
+            # 控制器完成异步状态切换。
+            pass
+        else:
+            raise RuntimeError(
+                f"{name} ClearError 后无法恢复，"
+                f"RobotMode={robot_mode_text(mode)}"
+            )
+        time.sleep(0.25)
+
+    raise TimeoutError(
+        f"{name} 清错后 15s 内未恢复 ENABLE(5)，"
+        f"最后 RobotMode={robot_mode_text(last_mode) if last_mode is not None else 'unknown'}"
+    )
+
 def iter_dashboard_responses(text):
     for chunk in text.split(";"):
         chunk = chunk.strip()
@@ -971,16 +1148,23 @@ def worker(client_socket, name):  #子线程接受模式
                 responses = recv_buffer.split(";")
                 recv_buffer = responses.pop()
                 for result, response_text in iter_dashboard_responses(";".join(responses)):
+                    if deliver_runtime_dashboard_response(
+                        client_socket,
+                        response_text,
+                    ):
+                        continue
                     print(f'{name} 返回：{response_text};')
                     if result != 0:
-                        stop = False
-                        print(f'{name} 返回异常({result})：{response_text};，停止运动')
-                        break
+                        # 运动报警会令 ServoJ 返回非零。保留 ROS 节点、反馈线程
+                        # 和 Dashboard 接收线程，等待 clear_error 服务恢复；真正的
+                        # socket 断开仍在下面停止整个桥接程序。
+                        print(
+                            f'{name} 返回异常({result})：{response_text};，'
+                            '保持连接并等待清错服务'
+                        )
             else:
                 stop = False
                 print(f'{name} 连接断开，停止运动')
-                break
-            if not stop:
                 break
         except BlockingIOError:
             time.sleep(0.001)
