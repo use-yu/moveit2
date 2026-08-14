@@ -399,8 +399,9 @@ DEFAULT_SPEED_SCALE = 0.5
 # 深框障碍物（相对于 moveit_base_link 发布）
 SCENE_FRAME = "moveit_base_link"
 FRAME_ID = "深框"
-FRAME_SIZE = (0.795, 0.795, 0.565)  # 深框整体外尺寸：长×宽×高 [m]
+FRAME_SIZE = (0.86, 0.86, 0.6)  # 深框整体外尺寸：长×宽×高 [m]0.8, 0.8, 0.71
 WALL_T = 0.06  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
+FRAME_Y_OUTER_THICKNESS = 0.05  # 局部 ±Y 两侧向外附加的厚度 [m]
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 相对于 moveit_base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
@@ -414,9 +415,9 @@ FRAME_TOP_CENTER_TF_FRAME = "deep_frame_top_center"
 FRAME_CENTER_TF_FRAME = "deep_frame_center"
 FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0 *0
 FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
-    0.3975-0.29,
+    0.43,
     0.0,
-    0.1,
+    0.11, #0.06
 )
 # 长方体上表面中心相对深框顶部空心区域中心的局部平移。
 BOX_OBSTACLE_ID = "长方体障碍物"
@@ -1731,10 +1732,10 @@ def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
 
 def make_deep_frame(frame_pose: Pose | None = None) -> CollisionObject:
     """
-    深框 = 1 块底板 + 4 块侧墙（BOX  primitive），顶部无盖。
+    深框 = 1 块底板 + 4 块侧墙 + 局部 ±Y 外侧加厚块，顶部无盖。
     FRAME_SIZE 为深框整体外尺寸；frame_pose 为外轮廓中心位姿。
     frame_pose=None 时使用静态 FRAME_CENTER / FRAME_RPY_DEG。
-    WALL_T 只向内部收缩，外轮廓保持 L × W × H。
+    WALL_T 只向内部收缩；附加块仅沿局部 ±Y 向外延伸。
     """
     L, W, H = FRAME_SIZE
     t = WALL_T
@@ -1763,6 +1764,10 @@ def make_deep_frame(frame_pose: Pose | None = None) -> CollisionObject:
     add_box(t, W, wall_h, -(L / 2 - t / 2), 0, wall_z)        # -X 侧墙
     add_box(L - 2 * t, t, wall_h, 0, W / 2 - t / 2, wall_z)   # +Y 侧墙
     add_box(L - 2 * t, t, wall_h, 0, -(W / 2 - t / 2), wall_z)  # -Y 侧墙
+    outer_t = FRAME_Y_OUTER_THICKNESS
+    outer_y = W / 2 + outer_t / 2
+    add_box(L - 2 * t, outer_t, wall_h, 0, outer_y, wall_z)    # +Y 外侧加厚
+    add_box(L - 2 * t, outer_t, wall_h, 0, -outer_y, wall_z)   # -Y 外侧加厚
     return obj
 
 
