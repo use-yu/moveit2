@@ -24,8 +24,8 @@ G01 MoveIt 演示脚本
     → 根据 first_return_mode：
     ├─ mode=1：双臂交换 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
-    SW 放置直线去程/回程若因机械臂报警失败，程序等待键盘输入 1，调用
-    servoj_30ms 清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
+    SW 放置直线去程/回程若因机械臂报警失败，程序自动调用 servoj_30ms
+    清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
 5. 导航到物料台工位。
 6. 运动到物料台识别预备构型，识别并添加碰撞模型。
 7. 循环下料：
@@ -41,7 +41,7 @@ G01 MoveIt 演示脚本
     优先 SW1+SW3，目标按 (1,3)→(11,13) 循环；SW2+SW4 按
     (2,4)→(12,14) 循环，不记录已经放过的位置。循环正常结束后，
     dual_arm_body 复位到 MOVE_TO_GRASP_RESET_Q。
-    八点放置直线去程/回程报警时同样等待输入 1；双臂清错、末端下电后，
+    八点放置直线去程/回程报警时同样自动恢复；双臂清错、末端下电后，
     从实测位置同步直退，忽略场景物体碰撞但保留机器人自碰撞检查。
 8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
 
@@ -3356,62 +3356,40 @@ class G01Demo(Node):
         log.info(f"[alarm-recovery] {service_name} 清错并恢复 ENABLE 成功")
         return True
 
-    def wait_for_alarm_clear_by_keyboard(
+    def clear_arm_alarms_for_recovery(
         self,
         sides: Sequence[str],
         stage: str,
     ) -> bool:
-        """输入 1 后先关闭 ServoJ 指令入口并清缓存，再请求对应臂清错。"""
+        """自动关闭 ServoJ 指令入口并清缓存，再请求对应机械臂清错。"""
         normalized_sides = tuple(dict.fromkeys(str(side) for side in sides))
-        side_text = "、".join(
-            "左臂" if side == "left" else "右臂"
-            for side in normalized_sides
-        )
-        while rclpy.ok():
-            try:
-                choice = input(
-                    f"\n[alarm-recovery] {stage}运动失败，"
-                    f"请确认{side_text}现场安全；输入 1 清除报警并退回: "
-                ).strip()
-            except EOFError:
-                self.get_logger().error(
-                    "[alarm-recovery] 键盘输入已关闭，无法执行人工确认清错"
-                )
-                return False
-            if choice != "1":
-                self.get_logger().warning(
-                    f"[alarm-recovery] 收到 {choice!r}，未清错；请输入 1"
-                )
-                continue
-
-            stop_results = {}
-            for side in normalized_sides:
-                request_id = self._send_servoj_control(side, "stop")
-                stop_results[side] = self._wait_for_servoj_control_state(
-                    side,
-                    "stop",
-                    request_id,
-                )
-            if not all(stop_results.values()):
-                self.get_logger().error(
-                    f"[alarm-recovery] {stage}：无法关闭全部 ServoJ 指令入口 "
-                    f"{stop_results}；保持停止并再次输入 1 重试"
-                )
-                continue
-
-            results = {
-                side: self.clear_arm_alarm(side)
-                for side in normalized_sides
-            }
-            if all(results.values()):
-                return True
-            failed = ", ".join(
-                side for side, success in results.items() if not success
+        stop_results = {}
+        for side in normalized_sides:
+            request_id = self._send_servoj_control(side, "stop")
+            stop_results[side] = self._wait_for_servoj_control_state(
+                side,
+                "stop",
+                request_id,
             )
+        if not all(stop_results.values()):
             self.get_logger().error(
-                f"[alarm-recovery] 清错未全部成功：{failed}；"
-                "处理现场报警后再次输入 1"
+                f"[alarm-recovery] {stage}：无法关闭全部 ServoJ 指令入口 "
+                f"{stop_results}；保持停止并自动重试"
             )
+            return False
+
+        results = {
+            side: self.clear_arm_alarm(side)
+            for side in normalized_sides
+        }
+        if all(results.values()):
+            return True
+        failed = ", ".join(
+            side for side, success in results.items() if not success
+        )
+        self.get_logger().error(
+            f"[alarm-recovery] {stage}：清错未全部成功：{failed}；自动重试"
+        )
         return False
 
     def recover_single_arm_linear_after_alarm(
@@ -3427,24 +3405,27 @@ class G01Demo(Node):
         avoid_collisions: bool,
         stage: str,
     ) -> bool:
-        """人工确认清错、末端下电，再从实测位置直线退到阶段起点。"""
+        """自动清错、末端下电，再从实测位置直线退到阶段起点。"""
         joint_names = list(joint_names)
         while rclpy.ok():
-            if not self.wait_for_alarm_clear_by_keyboard((side,), stage):
-                return False
+            if not self.clear_arm_alarms_for_recovery((side,), stage):
+                time.sleep(0.5)
+                continue
             if not self.set_tool_power(side, 0):
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：{side} 末端下电失败，"
-                    "不允许执行退回；再次输入 1 重试"
+                    "不允许执行退回；自动重试"
                 )
+                time.sleep(0.5)
                 continue
 
             current = self._get_joints(joint_names, wait_new=True)
             if current is None:
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：无法读取清错后的实测关节，"
-                    "再次输入 1 重试"
+                    "自动重试"
                 )
+                time.sleep(0.5)
                 continue
             resume_request_id = self._send_servoj_control(side, "resume")
             if not self._wait_for_servoj_control_state(
@@ -3454,8 +3435,9 @@ class G01Demo(Node):
             ):
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：ServoJ 指令入口恢复失败，"
-                    "不允许执行退回；再次输入 1 重试"
+                    "不允许执行退回；自动重试"
                 )
+                time.sleep(0.5)
                 continue
             retreat = self.plan_cartesian_line(
                 group,
@@ -3470,8 +3452,9 @@ class G01Demo(Node):
             if retreat is None:
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：无法从实测位置规划直线退回，"
-                    "再次输入 1 重试"
+                    "自动重试"
                 )
+                time.sleep(0.5)
                 continue
             if self._execute_traj(retreat):
                 self.get_logger().warning(
@@ -3480,8 +3463,9 @@ class G01Demo(Node):
                 return True
             self.get_logger().error(
                 f"[alarm-recovery] {stage}：直线退回执行失败，"
-                "程序保持运行；处理报警后再次输入 1"
+                "程序保持运行并自动重新清错、退回"
             )
+            time.sleep(0.5)
         return False
 
     def recover_dual_arm_linear_after_alarm(
@@ -3499,11 +3483,12 @@ class G01Demo(Node):
         right_joint_names = joint_names_for_group("right_arm")
         full_joint_names = list(full_joint_names)
         while rclpy.ok():
-            if not self.wait_for_alarm_clear_by_keyboard(
+            if not self.clear_arm_alarms_for_recovery(
                 ("left", "right"),
                 stage,
             ):
-                return False
+                time.sleep(0.5)
+                continue
 
             power_off_results = {
                 side: self.set_tool_power(side, 0)
@@ -3512,16 +3497,18 @@ class G01Demo(Node):
             if not all(power_off_results.values()):
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：双臂末端未全部下电 "
-                    f"{power_off_results}，不允许执行退回；再次输入 1 重试"
+                    f"{power_off_results}，不允许执行退回；自动重试"
                 )
+                time.sleep(0.5)
                 continue
 
             current = self._get_joints(full_joint_names, wait_new=True)
             if current is None:
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：无法读取双臂实测关节，"
-                    "再次输入 1 重试"
+                    "自动重试"
                 )
+                time.sleep(0.5)
                 continue
             resume_results = {}
             for side in ("left", "right"):
@@ -3534,8 +3521,9 @@ class G01Demo(Node):
             if not all(resume_results.values()):
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：双臂 ServoJ 指令入口未全部恢复 "
-                    f"{resume_results}；不允许执行退回，再次输入 1 重试"
+                    f"{resume_results}；不允许执行退回，自动重试"
                 )
+                time.sleep(0.5)
                 continue
             left_retreat = self.plan_cartesian_line(
                 "left_arm",
@@ -3560,8 +3548,9 @@ class G01Demo(Node):
             if left_retreat is None or right_retreat is None:
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：至少一侧无法从实测位置"
-                    "规划直线退回；再次输入 1 重试"
+                    "规划直线退回；自动重试"
                 )
+                time.sleep(0.5)
                 continue
             try:
                 retreat = merge_dual_arm_cartesian_trajectories(
@@ -3571,8 +3560,9 @@ class G01Demo(Node):
             except ValueError as exc:
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：合并双臂直线退回失败 "
-                    f"({exc})；再次输入 1 重试"
+                    f"({exc})；自动重试"
                 )
+                time.sleep(0.5)
                 continue
             if not self.validate_trajectory_self_collision(
                 retreat,
@@ -3583,8 +3573,9 @@ class G01Demo(Node):
             ):
                 self.get_logger().error(
                     f"[alarm-recovery] {stage}：双臂直线退回存在自碰撞或无法验证，"
-                    "再次输入 1 重试"
+                    "自动重试"
                 )
+                time.sleep(0.5)
                 continue
             if self._execute_traj(retreat):
                 self.get_logger().warning(
@@ -3594,8 +3585,9 @@ class G01Demo(Node):
                 return True
             self.get_logger().error(
                 f"[alarm-recovery] {stage}：同步直线退回执行失败，"
-                "程序保持运行；处理报警后再次输入 1"
+                "程序保持运行并自动重新清错、退回"
             )
+            time.sleep(0.5)
         return False
 
     def _apply_scene(
