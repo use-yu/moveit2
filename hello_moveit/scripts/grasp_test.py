@@ -465,13 +465,9 @@ SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
 SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
 MOTOR_COMMAND_TOPIC = "/g01/motor_commands"
 MOVE_TO_GRASP_POSE_CMD_TOPIC = "/move_to_grasp_pose_cmd"
-MOVE_TO_GRASP_POSE_RESULT_TOPIC = "/move_to_grasp_pose_cmd_result"
 GRASP_CMD_TOPIC = "/grasp_cmd"
-GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
 MOVE_TO_PLACE_POSE_CMD_TOPIC = "/move_to_place_pose_cmd"
-MOVE_TO_PLACE_POSE_RESULT_TOPIC = "/move_to_place_pose_cmd_result"
 PLACE_CMD_TOPIC = "/place_cmd"
-PLACE_CMD_RESULT_TOPIC = "/place_cmd_result"
 RETURN_INIT_POSE_TOPIC = "/return_init_pose"
 DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
 NAV_GOAL_TOPIC = "/goal_pose"
@@ -489,12 +485,6 @@ UPPER_COMMAND_EXPECTED_TYPES = {
     GRASP_CMD_TOPIC: 1,
     MOVE_TO_PLACE_POSE_CMD_TOPIC: 1,
     PLACE_CMD_TOPIC: 1,
-}
-UPPER_COMMAND_RESULT_TOPICS = {
-    MOVE_TO_GRASP_POSE_CMD_TOPIC: MOVE_TO_GRASP_POSE_RESULT_TOPIC,
-    GRASP_CMD_TOPIC: GRASP_CMD_RESULT_TOPIC,
-    MOVE_TO_PLACE_POSE_CMD_TOPIC: MOVE_TO_PLACE_POSE_RESULT_TOPIC,
-    PLACE_CMD_TOPIC: PLACE_CMD_RESULT_TOPIC,
 }
 UPPER_COMMAND_STEPS = {
     MOVE_TO_GRASP_POSE_CMD_TOPIC: (1, 2, 3,4,5,6,7,8),
@@ -2547,10 +2537,6 @@ class G01Demo(Node):
             NAV_GOAL_TOPIC,
             10,
         )
-        self._upper_result_pubs = {
-            result_topic: self.create_publisher(String, result_topic, 10)
-            for result_topic in UPPER_COMMAND_RESULT_TOPICS.values()
-        }
         self._servoj_control_pub = self.create_publisher(
             String,
             SERVOJ_CONTROL_TOPIC,
@@ -3051,13 +3037,10 @@ class G01Demo(Node):
                     log.error(
                         f"{command_topic} JSON 解析失败: {exc}; data={msg.data!r}"
                     )
-                    self.publish_upper_result(command_topic, False)
                     return
             else:
                 if not isinstance(decoded, dict):
                     log.error(f"{command_topic} JSON 必须是 object: {msg.data!r}")
-                    if command_topic != RETURN_INIT_POSE_TOPIC:
-                        self.publish_upper_result(command_topic, False)
                     return
                 payload = decoded
 
@@ -3069,14 +3052,12 @@ class G01Demo(Node):
                 log.error(
                     f"{command_topic} cmd_type 类型错误: {exc}; data={msg.data!r}"
                 )
-                self.publish_upper_result(command_topic, False)
                 return
             if cmd_type != expected_cmd_type:
                 log.error(
                     f"{command_topic} cmd_type={cmd_type}，"
                     f"期望 {expected_cmd_type}"
                 )
-                self.publish_upper_result(command_topic, False)
                 return
 
         self._latest_upper_command = (command_topic, payload)
@@ -3098,18 +3079,6 @@ class G01Demo(Node):
                 return latest_command
             rclpy.spin_once(self, timeout_sec=0.1)
         return None
-
-    def publish_upper_result(self, command_topic: str, result: bool) -> None:
-        """四个阶段结果统一发布 JSON String：{"result": bool}。"""
-        result_topic = UPPER_COMMAND_RESULT_TOPICS.get(command_topic)
-        publisher = self._upper_result_pubs.get(result_topic or "")
-        if publisher is None:
-            self.get_logger().error(f"命令 {command_topic} 没有结果话题")
-            return
-        msg = String()
-        msg.data = json.dumps({"result": bool(result)}, ensure_ascii=False)
-        publisher.publish(msg)
-        self.get_logger().info(f"发布阶段结果 {result_topic}: {msg.data}")
 
     def wait_for_operator(self, message: str = "按回车继续 …") -> None:
         """上位机模式不阻塞；--interactive 调试模式保留人工确认。"""
@@ -6395,10 +6364,6 @@ def main(argv: list[str] | None = None) -> int:
         except EOFError:
             return False
 
-    def report_flow_result(command_topic: str, result: bool) -> None:
-        """发布一组上位机步骤的最终结果。"""
-        node.publish_upper_result(command_topic, result)
-
     def recognize_and_record_deep_frame() -> bool:
         """识别深框，并同步记录识别工位的机器人实际位姿。"""
         nonlocal frame_added, pending_frame_recognition_pose, frame_recognition_odom
@@ -7977,10 +7942,7 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 log.info(f"[{command_source}] 步骤 {step} 完成")
 
-            if command_topic is not None:
-                if command_topic in UPPER_COMMAND_RESULT_TOPICS:
-                    report_flow_result(command_topic, workflow_ok)
-            else:
+            if command_topic is None:
                 result_text = "成功" if workflow_ok else "失败"
                 print(f"{GREEN if workflow_ok else ''}[keyboard] {steps} 执行{result_text}{RESET}")
 
