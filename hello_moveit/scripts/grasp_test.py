@@ -6,8 +6,10 @@ G01 MoveIt 演示脚本
 
 功能按 1~8 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
 1. 导航到深框识别位置。
-2. 运动到深框识别构型，识别深框并添加碰撞模型。
+2. 运动到深框识别构型，识别深框，并记录当时 /lio/odom 实际位姿。
 3. 直接导航到抓取位置；其 map.x 比识别位置大 0.29 m。
+   导航后再记录 /lio/odom，将识别位置下的深框位姿转换到
+   抓取位置的 moveit_base_link 后再添加碰撞模型。
 4. 持续上料，直到 SW1~SW4 没有空位：
     批次开始前双臂工具上电，确认左右力传感器均能读取新帧，再双臂下电
     机器人先到初始位
@@ -126,6 +128,7 @@ from moveit_msgs.srv import (
     GetPositionIK,
     GetStateValidity,
 )
+from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -473,6 +476,9 @@ RETURN_INIT_POSE_TOPIC = "/return_init_pose"
 DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
 NAV_GOAL_TOPIC = "/goal_pose"
 NAV_RESULT_TOPIC = "/nav_result"
+ODOM_TOPIC = "/lio/odom"
+ODOM_QUEUE_DEPTH = 100
+ODOM_WAIT_TIMEOUT_SEC = 10.0
 NAV_TARGET_FRAME_RECOGNITION = "frame_recognition"
 NAV_TARGET_GRASP = "grasp"
 NAV_TARGET_PLACE = "place"
@@ -500,8 +506,8 @@ UPPER_COMMAND_STEPS = {
 }
 STEP_DESCRIPTIONS = {
     1: "导航到深框识别位置",
-    2: "识别深框并添加碰撞模型",
-    3: "导航到抓取位置（识别位置 x + 0.29 m）",
+    2: "识别深框并记录识别位置的实际里程计位姿",
+    3: "导航到抓取位置，转换并添加深框碰撞模型",
     4: "抓满四个放置位",
     5: "导航到物料台位置",
     6: "物料台预备构型、识别并添加碰撞模型",
@@ -593,7 +599,7 @@ UNLOAD_PAIR_CYCLES = (
 )
 UNLOAD_MAX_PAIRS_PER_RUN = 2
 UNLOAD_TABLE_ID = "unload_table"
-UNLOAD_TABLE_SIZE = (0.6, 1.7, 1.0)
+UNLOAD_TABLE_SIZE = (0.57, 1.7, 1.0) #0.5
 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL = (
     -0.1,
     0.125,
@@ -1213,6 +1219,31 @@ def pose_to_matrix(pose: Pose) -> list[list[float]]:
 def pose_to_xyz_rpy(pose: Pose) -> tuple[float, float, float, float, float, float]:
     """geometry_msgs/Pose 转 xyz+rpy。"""
     return matrix_to_xyz_rpy(pose_to_matrix(pose))
+
+
+def transform_pose_between_robot_positions(
+    local_pose_at_source: Pose,
+    source_robot_pose_in_odom: Pose,
+    target_robot_pose_in_odom: Pose,
+) -> Pose:
+    """用机器人的两次里程计位姿换算局部位姿。
+
+    ``local_pose_at_source`` 是识别时在机器人局部坐标系下的位姿。
+    返回值是同一个物体在机器人到达抓取点后的局部坐标系下的
+    位姿：T_target_object = inv(T_odom_target) * T_odom_source *
+    T_source_object。
+
+    这里要求 /lio/odom child_frame_id 与 moveit_base_link 采用相同的
+    机器人基座原点和轴向。
+    """
+    t_odom_source = pose_to_matrix(source_robot_pose_in_odom)
+    t_odom_target = pose_to_matrix(target_robot_pose_in_odom)
+    t_source_object = pose_to_matrix(local_pose_at_source)
+    t_target_object = matmul4(
+        invert_transform4(t_odom_target),
+        matmul4(t_odom_source, t_source_object),
+    )
+    return xyz_rpy_to_pose(matrix_to_xyz_rpy(t_target_object))
 
 
 def transform_vision_pose(
@@ -2463,6 +2494,10 @@ class G01Demo(Node):
         self._nav_result_count = 0
         self._latest_nav_success: bool | None = None
         self._latest_nav_message = ""
+        # 深框识别成功后才延迟创建 /lio/odom 订阅。订阅保持存活，
+        # 但非采样期间的消息直接丢弃，不在节点中缓存“最新里程计”。
+        self._odom_subscription = None
+        self._odom_sample_request: dict[str, Odometry | None] | None = None
         self._ft_sensor_z: dict[str, float | None] = {
             "left": None,
             "right": None,
@@ -2529,6 +2564,80 @@ class G01Demo(Node):
         self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
+
+    def _on_odom(self, msg: Odometry) -> None:
+        """仅向当前采样请求交付一帧；其余里程计消息直接丢弃。"""
+        request = self._odom_sample_request
+        if request is not None:
+            request["snapshot"] = copy.deepcopy(msg)
+
+    def start_odom_subscription(self) -> None:
+        """首次深框识别成功后启动里程计订阅。"""
+        if self._odom_subscription is not None or self.sim_mode:
+            return
+        self._odom_subscription = self.create_subscription(
+            Odometry,
+            ODOM_TOPIC,
+            self._on_odom,
+            ODOM_QUEUE_DEPTH,
+        )
+        self.get_logger().info(
+            f"[frame-odom] 已订阅 {ODOM_TOPIC}，queue depth={ODOM_QUEUE_DEPTH}"
+        )
+
+    def wait_for_odom_snapshot(
+        self,
+        stage_label: str,
+        timeout_sec: float = ODOM_WAIT_TIMEOUT_SEC,
+    ) -> Odometry | None:
+        """等待调用后的一帧里程计，并记录该阶段机器人实际位姿。"""
+        if self.sim_mode:
+            snapshot = Odometry()
+            snapshot.header.frame_id = "sim_odom"
+            snapshot.child_frame_id = SCENE_FRAME
+            snapshot.pose.pose.orientation.w = 1.0
+            self.get_logger().info(
+                f"[sim][frame-odom] {stage_label}：使用单位位姿"
+            )
+            return snapshot
+
+        self.start_odom_subscription()
+        request: dict[str, Odometry | None] = {"snapshot": None}
+        self._odom_sample_request = request
+        try:
+            deadline = time.monotonic() + max(0.0, float(timeout_sec))
+            while rclpy.ok() and time.monotonic() < deadline:
+                rclpy.spin_once(
+                    self,
+                    timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
+                )
+                snapshot = request["snapshot"]
+                if snapshot is None:
+                    continue
+                try:
+                    x, y, z, roll, pitch, yaw = pose_to_xyz_rpy(snapshot.pose.pose)
+                except ValueError as exc:
+                    self.get_logger().error(
+                        f"[frame-odom] {stage_label}：{ODOM_TOPIC} 位姿无效: {exc}"
+                    )
+                    return None
+                self.get_logger().info(
+                    f"[frame-odom] {stage_label}机器人实际位姿: "
+                    f"frame={snapshot.header.frame_id!r}, "
+                    f"child={snapshot.child_frame_id!r}, "
+                    f"pos=({x:.6f}, {y:.6f}, {z:.6f}), "
+                    f"rpy=({roll:.6f}, {pitch:.6f}, {yaw:.6f})"
+                )
+                return snapshot
+
+            self.get_logger().error(
+                f"[frame-odom] {stage_label}：{timeout_sec:.1f}s 内未收到 "
+                f"{ODOM_TOPIC} 当前新帧，无法安全转换深框位姿"
+            )
+            return None
+        finally:
+            # 订阅不销毁；只清除本次采样请求和其临时消息。
+            self._odom_sample_request = None
 
     def _on_nav_result(self, msg: String):
         """缓存格式为 {"message": "...", "success": true} 的导航结果。"""
@@ -6264,6 +6373,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     code = 1
     frame_added = False
+    pending_frame_recognition_pose: Pose | None = None
+    frame_recognition_odom: Odometry | None = None
     unload_scene_added = False
     unload_place_poses: dict[int, Pose] | None = None
     # 两组 SW 各自轮换两个目标对；成功放置后才推进对应游标。
@@ -6288,9 +6399,12 @@ def main(argv: list[str] | None = None) -> int:
         """发布一组上位机步骤的最终结果。"""
         node.publish_upper_result(command_topic, result)
 
-    def recognize_and_add_deep_frame() -> bool:
-        """先运动到 框_Q1，再识别并重建深框碰撞场景。"""
-        nonlocal frame_added
+    def recognize_and_record_deep_frame() -> bool:
+        """识别深框，并同步记录识别工位的机器人实际位姿。"""
+        nonlocal frame_added, pending_frame_recognition_pose, frame_recognition_odom
+        # 一旦开始新识别，旧的待转换数据不再允许被步骤 3 误用。
+        pending_frame_recognition_pose = None
+        frame_recognition_odom = None
         q1_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
         log.info(
             f"[frame-vision] {FRAME_VISION_TRIGGER_COMMAND} 识别前，"
@@ -6326,6 +6440,10 @@ def main(argv: list[str] | None = None) -> int:
             return False
 
         recognition_pose = make_pose(*all_xyz_rpy[0][FRAME_VISION_POSE_KEY])
+        recognition_odom = node.wait_for_odom_snapshot("深框识别位置")
+        if recognition_odom is None:
+            return False
+
         frame_top_pose, frame_pose = deep_frame_poses_from_recognition(
             recognition_pose
         )
@@ -6335,12 +6453,6 @@ def main(argv: list[str] | None = None) -> int:
             0.0,
             0.0,
             -BOX_OBSTACLE_SIZE[2] / 2.0,
-        )
-        node.publish_deep_frame_vision_tf(
-            recognition_pose,
-            frame_top_pose,
-            frame_pose,
-            box_top_pose,
         )
         recognition_rpy = pose_to_xyz_rpy(recognition_pose)[3:]
         frame_top_rpy = pose_to_xyz_rpy(frame_top_pose)[3:]
@@ -6384,21 +6496,99 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         if frame_added:
-            log.info(f"[frame-vision] 移除旧碰撞体「{FRAME_ID}」后更新场景 …")
+            log.info(f"[frame-vision] 移除旧碰撞体「{FRAME_ID}」，等待到抓取点重建 …")
             if not node.remove_frame():
                 log.error("[frame-vision] 移除旧深框场景失败")
                 return False
             frame_added = False
 
-        node.configure_deep_frame_from_recognition(recognition_pose)
+        pending_frame_recognition_pose = copy.deepcopy(recognition_pose)
+        frame_recognition_odom = recognition_odom
         log.info(
-            f"[frame-vision] 按 {FRAME_VISION_TRIGGER_COMMAND} 识别位姿"
-            f"添加「{FRAME_ID}」 …"
+            f"[frame-vision] 已保存 {FRAME_VISION_TRIGGER_COMMAND} 识别位姿和"
+            f"识别工位 {ODOM_TOPIC} 实际位姿；"
+            "导航到抓取点后再转换并添加深框"
         )
-        if not node.add_frame():
-            log.error("[frame-vision] 添加动态深框场景失败")
+        return True
+
+    def navigate_to_grasp_and_add_deep_frame() -> bool:
+        """导航到抓取点，用两次里程计实际位姿换算深框后添加场景。"""
+        nonlocal frame_added, pending_frame_recognition_pose, frame_recognition_odom
+        if pending_frame_recognition_pose is None or frame_recognition_odom is None:
+            log.error(
+                "[frame-odom] 没有可用的深框识别位姿/识别工位里程计记录，"
+                "请先成功执行步骤 2"
+            )
             return False
+
+        log.info(
+            "[nav] 抓取位置直接使用深框识别位置的 "
+            f"map.x + {GRASP_NAV_X_OFFSET_FROM_RECOGNITION:.2f} m"
+        )
+        if not node.navigate_and_wait(NAV_TARGET_GRASP):
+            return False
+
+        grasp_odom = node.wait_for_odom_snapshot("深框抓取位置")
+        if grasp_odom is None:
+            return False
+
+        recognition_frame = frame_recognition_odom.header.frame_id
+        grasp_frame = grasp_odom.header.frame_id
+        recognition_child = frame_recognition_odom.child_frame_id
+        grasp_child = grasp_odom.child_frame_id
+        if recognition_frame != grasp_frame or recognition_child != grasp_child:
+            log.error(
+                f"[frame-odom] 两次 {ODOM_TOPIC} 坐标系不一致："
+                f"识别点 frame={recognition_frame!r}, child={recognition_child!r}；"
+                f"抓取点 frame={grasp_frame!r}, child={grasp_child!r}"
+            )
+            return False
+        if grasp_child != SCENE_FRAME:
+            log.warning(
+                f"[frame-odom] {ODOM_TOPIC} child_frame_id={grasp_child!r}，"
+                f"本换算假定它与 {SCENE_FRAME!r} 的原点和轴向一致"
+            )
+
+        try:
+            grasp_recognition_pose = transform_pose_between_robot_positions(
+                pending_frame_recognition_pose,
+                frame_recognition_odom.pose.pose,
+                grasp_odom.pose.pose,
+            )
+        except ValueError as exc:
+            log.error(f"[frame-odom] 深框位姿转换失败: {exc}")
+            return False
+
+        frame_top_pose, frame_pose = deep_frame_poses_from_recognition(
+            grasp_recognition_pose
+        )
+        box_top_pose = box_obstacle_top_pose_from_frame_top(frame_top_pose)
+        source_values = pose_to_xyz_rpy(pending_frame_recognition_pose)
+        target_values = pose_to_xyz_rpy(grasp_recognition_pose)
+        log.info(
+            f"[frame-odom] 深框识别基准已从识别工位转到抓取工位 "
+            f"{SCENE_FRAME}: pos "
+            f"({source_values[0]:.4f}, {source_values[1]:.4f}, {source_values[2]:.4f}) "
+            f"-> ({target_values[0]:.4f}, {target_values[1]:.4f}, {target_values[2]:.4f}), "
+            f"rpy ({source_values[3]:.4f}, {source_values[4]:.4f}, {source_values[5]:.4f}) "
+            f"-> ({target_values[3]:.4f}, {target_values[4]:.4f}, {target_values[5]:.4f})"
+        )
+
+        node.configure_deep_frame_from_recognition(grasp_recognition_pose)
+        node.publish_deep_frame_vision_tf(
+            grasp_recognition_pose,
+            frame_top_pose,
+            frame_pose,
+            box_top_pose,
+        )
+        log.info(f"[frame-vision] 在抓取工位添加转换后的「{FRAME_ID}」 …")
+        if not node.add_frame():
+            log.error("[frame-vision] 添加转换后的深框场景失败")
+            return False
+
         frame_added = True
+        pending_frame_recognition_pose = None
+        frame_recognition_odom = None
         return True
 
     def run_one_grasp() -> bool | None:
@@ -7726,13 +7916,9 @@ def main(argv: list[str] | None = None) -> int:
         if step == 1:
             return node.navigate_and_wait(NAV_TARGET_FRAME_RECOGNITION)
         if step == 2:
-            return recognize_and_add_deep_frame()
+            return recognize_and_record_deep_frame()
         if step == 3:
-            log.info(
-                "[nav] 抓取位置直接使用深框识别位置的 "
-                f"map.x + {GRASP_NAV_X_OFFSET_FROM_RECOGNITION:.2f} m"
-            )
-            return node.navigate_and_wait(NAV_TARGET_GRASP)
+            return navigate_to_grasp_and_add_deep_frame()
         if step == 4:
             log.info(
                 "[pick] 开始抓满四个放置位；命令参数="
