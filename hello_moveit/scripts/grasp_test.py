@@ -6,7 +6,8 @@ G01 MoveIt 演示脚本
 
 功能按 1~8 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
 1. 导航到深框识别位置。
-2. 运动到深框识别构型，识别深框，并记录当时 /lio/odom 实际位姿。
+2. 运动到深框识别构型，识别深框，并记录当时 /lio/odom 实际位姿；
+   未收到有效视觉数据时最多重复发送识别命令 5 次。
 3. 直接导航到抓取位置；其 map.x 比识别位置大 0.29 m。
    导航后再记录 /lio/odom，将识别位置下的深框位姿转换到
    抓取位置的 moveit_base_link 后再添加碰撞模型。
@@ -27,7 +28,8 @@ G01 MoveIt 演示脚本
     SW 放置直线去程/回程若因机械臂报警失败，程序自动调用 servoj_30ms
     清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
 5. 导航到物料台工位。
-6. 运动到物料台识别预备构型，识别并添加碰撞模型。
+6. 运动到物料台识别预备构型，识别并添加碰撞模型；未收到有效视觉数据时
+   最多重复发送识别命令 5 次。
 7. 循环下料：
     下料读取最新 SW 信号，0=有料。
     优先取右臂 SW1 + 左臂 SW3，其次右臂 SW4 + 左臂 SW2；必须整对有料。
@@ -426,12 +428,27 @@ FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
     0.0,
     0.11, #0.06
 )
-# 长方体上表面中心相对深框顶部空心区域中心的局部平移。
+# 深框局部 -Y（右侧）的墙状障碍物：其靠近深框的一面与深框最外沿净距 0.60 m，
+# 底面与深框底面齐平。FRAME_Y_OUTER_THICKNESS 计入“深框最外沿”。
 BOX_OBSTACLE_ID = "长方体障碍物"
-BOX_OBSTACLE_SIZE = (0.9, 1.0, 0.965)  # X × Y × Z [m]
-BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL = (0.0, 1.65, 0.4)
+BOX_OBSTACLE_SIZE = (1.7, 0.02, 0.96)  # X × Y × Z [m]
+BOX_OBSTACLE_GAP_FROM_FRAME_NEG_Y_EDGE = 0.60
+BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL = (
+    0.0,
+    -(
+        FRAME_SIZE[1] / 2.0
+        + FRAME_Y_OUTER_THICKNESS
+        + BOX_OBSTACLE_GAP_FROM_FRAME_NEG_Y_EDGE
+        + BOX_OBSTACLE_SIZE[1] / 2.0
+    ),
+    BOX_OBSTACLE_SIZE[2] - FRAME_SIZE[2],
+)
 BOX_OBSTACLE_TOP_TF_FRAME = "box_obstacle_top_center"
 BOX_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=1.0)
+
+# 深框局部 +X 为前侧；薄板贴住前表面，底部与框底齐平，顶部高出框顶 0.50 m。
+FRAME_FRONT_GUARD_THICKNESS = 0.01
+FRAME_FRONT_GUARD_ABOVE_TOP = 0.50
 
 FRAME_CUTOFF_ID = "深框隔离面"
 FRAME_CUTOFF_THICKNESS = 0.01  # 水平隔离面厚度 [m]，沿深框局部 z 轴
@@ -513,54 +530,54 @@ STEP_DESCRIPTIONS = {
 NAV_GOAL_POSES = {
     NAV_TARGET_FRAME_RECOGNITION: {
         "position": (
-            2.3820741176605225,
-            -0.09354162216186523,
-            -0.1215100884437561,
+            0.8504335737228394,
+            -1.8267271518707275,
+            0.008707658387720585,
         ),
         "orientation": (
-            0.011597591452300549,
-            0.03882015123963356,
-            -0.030322067439556122,
-            0.9991190433502197,
+            0.00019895298464689404,
+            0.019973255693912506,
+            -0.023509342223405838,
+            0.999586284160614,
         ),
     },
     NAV_TARGET_GRASP: {
         "position": (
-            2.674704074859619,
-            -0.1238652914762497,
-            -0.13677044212818146,
+            1.1234335899353027,
+            -1.8266260623931885,
+            0.006524985656142235,
         ),
         "orientation": (
-            0.011315305717289448,
-            0.03851937875151634,
-            -0.038679152727127075,
-            0.9988424777984619,
+            0.001097095082513988,
+            0.018254628404974937,
+            -0.015559877268970013,
+            0.9997493028640747,
         ),
     },
     NAV_TARGET_PLACE: {
         "position": (
-            2.682279109954834,
-            1.6601369380950928,
-            -0.12310574948787689,
+            1.138094186782837,
+            -0.17763198912143707,
+            -0.011970894411206245,
         ),
         "orientation": (
-            0.010055333375930786,
-            0.0392378531396389,
-            -0.03837629780173302,
-            0.9988393187522888,
+            0.0003095660940743983,
+            0.019110221415758133,
+            -0.017986131832003593,
+            0.9997509717941284,
         ),
     },
     NAV_TARGET_INIT: {
         "position": (
-            0.6152034401893616,
-            -0.04239977151155472,
-            -0.02155032753944397,
+            0.07150157541036606,
+            0.03893263265490532,
+            0.0061722020618617535,
         ),
         "orientation": (
-            0.011965271085500717,
-            0.037677470594644547,
-            -0.07040002942085266,
-            0.9971321821212769,
+            0.004296987317502499,
+            0.01700747199356556,
+            -0.0035338185261934996,
+            0.9999462366104126,
         ),
     },
 }
@@ -902,6 +919,8 @@ VISION_PORT = 50000
 VISION_TRIGGER_COMMAND = "p,1"
 VISION_CONNECT_TIMEOUT = 3.0
 VISION_RECV_TIMEOUT = 30.0
+# 步骤 2 深框识别和步骤 6 物料台识别的总尝试次数（包含首次）。
+SCENE_VISION_MAX_ATTEMPTS = 5
 # 正则表达式，用来匹配字符串里的数字：
 NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
@@ -1382,6 +1401,54 @@ def read_vision_object_pose(
         close_vision(vision_sock, log)
 
 
+def read_scene_vision_object_pose_with_retry(
+    node,
+    log,
+    *,
+    sim_mode: bool,
+    trigger_command: str,
+    required_pose_key: str,
+    scene_label: str,
+    max_attempts: int = SCENE_VISION_MAX_ATTEMPTS,
+):
+    """场景识别失败时重新发送命令，返回首个包含所需位姿的数据。"""
+    max_attempts = max(1, int(max_attempts))
+    for attempt in range(1, max_attempts + 1):
+        log.info(
+            f"[{scene_label}] 发送视觉识别命令 {trigger_command} "
+            f"（第 {attempt}/{max_attempts} 次）"
+        )
+        vision_result = read_vision_object_pose(
+            node,
+            log,
+            sim_mode=sim_mode,
+            trigger_command=trigger_command,
+        )
+        if vision_result is not None:
+            first_return_modes, all_xyz_rpy = vision_result
+            if all_xyz_rpy and required_pose_key in all_xyz_rpy[0]:
+                if attempt > 1:
+                    log.info(
+                        f"[{scene_label}] 第 {attempt}/{max_attempts} 次识别成功"
+                    )
+                return first_return_modes, all_xyz_rpy
+            log.error(
+                f"[{scene_label}] {trigger_command} 视觉结果缺少 "
+                f"{required_pose_key!r}"
+            )
+
+        if attempt < max_attempts:
+            log.warning(
+                f"[{scene_label}] 第 {attempt}/{max_attempts} 次未收到有效数据，"
+                "重新发送识别命令"
+            )
+
+    log.error(
+        f"[{scene_label}] 连续 {max_attempts} 次未收到有效视觉数据，识别失败"
+    )
+    return None
+
+
 def quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
     """固定轴 XYZ：欧拉角 → 四元数 (x, y, z, w)。"""
     cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
@@ -1759,7 +1826,8 @@ def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
 
 def make_deep_frame(frame_pose: Pose | None = None) -> CollisionObject:
     """
-    深框 = 1 块底板 + 4 块侧墙 + 局部 ±Y 外侧加厚块，顶部无盖。
+    深框 = 1 块底板 + 4 块侧墙 + 局部 ±Y 外侧加厚块
+    + 紧贴局部 +X 前表面的加高薄板，顶部无盖。
     FRAME_SIZE 为深框整体外尺寸；frame_pose 为外轮廓中心位姿。
     frame_pose=None 时使用静态 FRAME_CENTER / FRAME_RPY_DEG。
     WALL_T 只向内部收缩；附加块仅沿局部 ±Y 向外延伸。
@@ -1795,6 +1863,17 @@ def make_deep_frame(frame_pose: Pose | None = None) -> CollisionObject:
     outer_y = W / 2 + outer_t / 2
     add_box(L - 2 * t, outer_t, wall_h, 0, outer_y, wall_z)    # +Y 外侧加厚
     add_box(L - 2 * t, outer_t, wall_h, 0, -outer_y, wall_z)   # -Y 外侧加厚
+    front_guard_h = H + FRAME_FRONT_GUARD_ABOVE_TOP
+    front_guard_x = L / 2 + FRAME_FRONT_GUARD_THICKNESS / 2
+    front_guard_z = -H / 2 + front_guard_h / 2
+    add_box(
+        FRAME_FRONT_GUARD_THICKNESS,
+        W,
+        front_guard_h,
+        front_guard_x,
+        0.0,
+        front_guard_z,
+    )  # +X 前侧薄板：贴住框前面，顶部高出 0.50 m
     return obj
 
 
@@ -6736,22 +6815,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             return False
 
-        vision_result = read_vision_object_pose(
+        vision_result = read_scene_vision_object_pose_with_retry(
             node,
             log,
             sim_mode=sim_mode,
             trigger_command=FRAME_VISION_TRIGGER_COMMAND,
+            required_pose_key=FRAME_VISION_POSE_KEY,
+            scene_label="frame-vision",
         )
         if vision_result is None:
             return False
 
         _, all_xyz_rpy = vision_result
-        if not all_xyz_rpy or FRAME_VISION_POSE_KEY not in all_xyz_rpy[0]:
-            log.error(
-                f"[frame-vision] {FRAME_VISION_TRIGGER_COMMAND} 视觉结果缺少 "
-                f"{FRAME_VISION_POSE_KEY!r}"
-            )
-            return False
 
         recognition_pose = make_pose(*all_xyz_rpy[0][FRAME_VISION_POSE_KEY])
         recognition_odom = node.wait_for_odom_snapshot("深框识别位置")
@@ -8128,21 +8203,17 @@ def main(argv: list[str] | None = None) -> int:
             return False
 
         # 识别姿态同时用于构造场景和八个局部放置点。
-        vision_result = read_vision_object_pose(
+        vision_result = read_scene_vision_object_pose_with_retry(
             node,
             log,
             sim_mode=sim_mode,
             trigger_command=UNLOAD_TRIGGER_COMMAND,
+            required_pose_key=UNLOAD_VISION_POSE_KEY,
+            scene_label="unload",
         )
         if vision_result is None:
             return False
         _, all_xyz_rpy = vision_result
-        if not all_xyz_rpy or UNLOAD_VISION_POSE_KEY not in all_xyz_rpy[0]:
-            log.error(
-                f"[unload] {UNLOAD_TRIGGER_COMMAND} 视觉结果缺少 "
-                f"{UNLOAD_VISION_POSE_KEY!r}"
-            )
-            return False
         recognition_values = all_xyz_rpy[0][UNLOAD_VISION_POSE_KEY]
         recognition_pose = make_pose(*recognition_values)
         node.publish_unload_vision_tf(recognition_pose)
