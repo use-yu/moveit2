@@ -23,7 +23,8 @@ G01 MoveIt 演示脚本
       200N 监测中途接触，触发后停止 ServoJ、取消轨迹并从当前位置直退 q_pre
     → 反向 Cartesian 回 q_pre，再读取 Z 值判断是否吸附成功
     → 根据 first_return_mode：
-    ├─ mode=1：双臂交换 → 接物臂放置
+    ├─ mode=1：双臂交换 → 放置规划前检查当前双臂自碰撞；若碰撞，原抓取
+    │  空载臂沿末端局部 -Z 无碰撞检查直移 2cm → 读取新状态 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
     SW 放置直线去程/回程若因机械臂报警失败，程序自动调用 servoj_30ms
     清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
@@ -428,23 +429,30 @@ FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
     0.0,
     0.11, #0.06
 )
-# 深框局部 -Y（右侧）的墙状障碍物：其靠近深框的一面与深框最外沿净距 0.60 m，
-# 底面与深框底面齐平。FRAME_Y_OUTER_THICKNESS 计入“深框最外沿”。
+# 原有的深框局部 +Y 大长方体障碍物。
 BOX_OBSTACLE_ID = "长方体障碍物"
-BOX_OBSTACLE_SIZE = (1.7, 0.02, 0.96)  # X × Y × Z [m]
-BOX_OBSTACLE_GAP_FROM_FRAME_NEG_Y_EDGE = 0.60
-BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL = (
+BOX_OBSTACLE_SIZE = (0.9, 1.0, 0.965)  # X × Y × Z [m]
+BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL = (0.0, 1.6, 0.4)
+BOX_OBSTACLE_TOP_TF_FRAME = "box_obstacle_top_center"
+BOX_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=1.0)
+
+# 新增的深框局部 -Y（右侧）墙状障碍物：靠近深框的一面与深框最外沿
+# 净距 0.60 m，底面与深框底面齐平。FRAME_Y_OUTER_THICKNESS 计入最外沿。
+FRAME_NEG_Y_OBSTACLE_ID = "深框负Y障碍物"
+FRAME_NEG_Y_OBSTACLE_SIZE = (1.7, 0.02, 0.96)  # X × Y × Z [m]
+FRAME_NEG_Y_OBSTACLE_GAP = 0.60
+FRAME_NEG_Y_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL = (
     0.0,
     -(
         FRAME_SIZE[1] / 2.0
         + FRAME_Y_OUTER_THICKNESS
-        + BOX_OBSTACLE_GAP_FROM_FRAME_NEG_Y_EDGE
-        + BOX_OBSTACLE_SIZE[1] / 2.0
+        + FRAME_NEG_Y_OBSTACLE_GAP
+        + FRAME_NEG_Y_OBSTACLE_SIZE[1] / 2.0
     ),
-    BOX_OBSTACLE_SIZE[2] - FRAME_SIZE[2],
+    FRAME_NEG_Y_OBSTACLE_SIZE[2] - FRAME_SIZE[2],
 )
-BOX_OBSTACLE_TOP_TF_FRAME = "box_obstacle_top_center"
-BOX_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=1.0)
+FRAME_NEG_Y_OBSTACLE_TOP_TF_FRAME = "frame_neg_y_obstacle_top_center"
+FRAME_NEG_Y_OBSTACLE_COLOR = ColorRGBA(r=0.35, g=0.35, b=0.35, a=1.0)
 
 # 深框局部 +X 为前侧；薄板贴住前表面，底部与框底齐平，顶部高出框顶 0.50 m。
 FRAME_FRONT_GUARD_THICKNESS = 0.01
@@ -880,6 +888,8 @@ SERVOJ_CONTROL_ACK_TIMEOUT_SEC = 2.0
 APPROACH_CANCEL_TIMEOUT_SEC = 5.0
 SERVOJ_RECOVERY_SETTLE_SEC = 0.12
 PLACE_SPEED_SCALE = 0.5     # 5/9~9/9 放置与返回的速度缩放
+# 交换后若当前双臂存在自碰撞，原抓取空载臂沿末端局部 -Z 避让的距离。
+EXCHANGE_PLACE_EMPTY_ARM_LOCAL_Z_OFFSET = -0.02
 FIRST_RETURN_MODE = 2       # 1: 只反向直线回到 q_pre；2: 直线+OMPL 回到 1/9 初始位置
 EXCHANGE_Q1 = [
     -1.57, -0.15, -1.578090, -1.370549, -1.672852, -0.588477,
@@ -1746,6 +1756,14 @@ def box_obstacle_top_pose_from_frame_top(frame_top_pose: Pose) -> Pose:
     )
 
 
+def frame_neg_y_obstacle_top_pose_from_frame_top(frame_top_pose: Pose) -> Pose:
+    """由深框顶部中心计算局部 -Y 墙状障碍物的上表面中心。"""
+    return pose_offset_local(
+        frame_top_pose,
+        *FRAME_NEG_Y_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL,
+    )
+
+
 def pose_rotate_local_rpy(
     pose: Pose,
     roll: float,
@@ -1877,23 +1895,28 @@ def make_deep_frame(frame_pose: Pose | None = None) -> CollisionObject:
     return obj
 
 
-def make_box_obstacle(box_top_pose: Pose) -> CollisionObject:
+def make_box_obstacle(
+    box_top_pose: Pose,
+    *,
+    object_id: str = BOX_OBSTACLE_ID,
+    size: Sequence[float] = BOX_OBSTACLE_SIZE,
+) -> CollisionObject:
     """由长方体上表面中心向自身 -Z 下移半高，创建实体碰撞体。"""
     obj = CollisionObject()
     obj.header.frame_id = SCENE_FRAME
-    obj.id = BOX_OBSTACLE_ID
+    obj.id = object_id
     obj.operation = CollisionObject.ADD
 
     prim = SolidPrimitive()
     prim.type = SolidPrimitive.BOX
-    prim.dimensions = list(BOX_OBSTACLE_SIZE)
+    prim.dimensions = list(size)
     obj.primitives.append(prim)
     obj.primitive_poses.append(
         pose_offset_local(
             box_top_pose,
             0.0,
             0.0,
-            -BOX_OBSTACLE_SIZE[2] / 2.0,
+            -size[2] / 2.0,
         )
     )
     return obj
@@ -3709,24 +3732,40 @@ class G01Demo(Node):
         return True
 
     def add_frame(self) -> bool:
-        """按当前动态深框姿态添加深框和长方体障碍物。"""
+        """添加深框、原有 +Y 大长方体和新增 -Y 墙状障碍物。"""
+        neg_y_obstacle_top_pose = (
+            frame_neg_y_obstacle_top_pose_from_frame_top(self._frame_top_pose)
+        )
         colors = [
             ObjectColor(id=FRAME_ID, color=FRAME_COLOR),
             ObjectColor(id=BOX_OBSTACLE_ID, color=BOX_OBSTACLE_COLOR),
+            ObjectColor(
+                id=FRAME_NEG_Y_OBSTACLE_ID,
+                color=FRAME_NEG_Y_OBSTACLE_COLOR,
+            ),
         ]
         return self._apply_scene(
             [
                 make_deep_frame(self._frame_pose),
                 make_box_obstacle(self._box_obstacle_top_pose),
+                make_box_obstacle(
+                    neg_y_obstacle_top_pose,
+                    object_id=FRAME_NEG_Y_OBSTACLE_ID,
+                    size=FRAME_NEG_Y_OBSTACLE_SIZE,
+                ),
             ],
             colors,
         )
 
     def remove_frame(self) -> bool:
-        """同时从场景中删除深框和长方体障碍物。"""
+        """同时删除深框及其 +Y/-Y 两个独立障碍物。"""
         objects = [
             CollisionObject(id=FRAME_ID, operation=CollisionObject.REMOVE),
             CollisionObject(id=BOX_OBSTACLE_ID, operation=CollisionObject.REMOVE),
+            CollisionObject(
+                id=FRAME_NEG_Y_OBSTACLE_ID,
+                operation=CollisionObject.REMOVE,
+            ),
         ]
         return self._apply_scene(objects)
 
@@ -3847,13 +3886,20 @@ class G01Demo(Node):
         frame_pose: Pose,
         box_top_pose: Pose,
     ) -> None:
-        """发布 p,4、深框顶部/实体中心和长方体上表面中心坐标系。"""
+        """发布识别点、深框和 +Y/-Y 障碍物的基准坐标系。"""
+        neg_y_obstacle_top_pose = (
+            frame_neg_y_obstacle_top_pose_from_frame_top(frame_top_pose)
+        )
         transforms = []
         for child_frame, pose in (
             (FRAME_VISION_TF_FRAME, recognition_pose),
             (FRAME_TOP_CENTER_TF_FRAME, frame_top_pose),
             (FRAME_CENTER_TF_FRAME, frame_pose),
             (BOX_OBSTACLE_TOP_TF_FRAME, box_top_pose),
+            (
+                FRAME_NEG_Y_OBSTACLE_TOP_TF_FRAME,
+                neg_y_obstacle_top_pose,
+            ),
         ):
             transform = TransformStamped()
             transform.header.frame_id = SCENE_FRAME
@@ -3868,7 +3914,8 @@ class G01Demo(Node):
         self.get_logger().info(
             f"[frame-vision] 已发布 TF: {SCENE_FRAME} → "
             f"{FRAME_VISION_TF_FRAME}、{FRAME_TOP_CENTER_TF_FRAME}、"
-            f"{FRAME_CENTER_TF_FRAME}、{BOX_OBSTACLE_TOP_TF_FRAME}"
+            f"{FRAME_CENTER_TF_FRAME}、{BOX_OBSTACLE_TOP_TF_FRAME}、"
+            f"{FRAME_NEG_Y_OBSTACLE_TOP_TF_FRAME}"
         )
 
     def add_unload_scene(self, recognition_pose: Pose) -> bool:
@@ -5852,6 +5899,142 @@ class G01Demo(Node):
         configured = yubei_config is not None and fang_config is not None
         return configured and self._has_any_empty_place_slot(), None
 
+    def _current_dual_arm_self_collision(self) -> bool | None:
+        """检查当前双臂/身体实测状态；碰撞=True，无碰撞=False，检查失败=None。"""
+        log = self.get_logger()
+        group = "dual_arm_body"
+        joint_names = joint_names_for_group(group)
+        current = self._get_joints(joint_names, wait_new=True)
+        if current is None:
+            log.error("[pick][exchange-place] 读取当前双臂状态失败，无法检查自碰撞")
+            return None
+        if not self._validity_cli.wait_for_service(timeout_sec=10.0):
+            log.error(f"服务 {SVC_STATE_VALIDITY} 不可用，无法检查当前双臂自碰撞")
+            return None
+
+        request = GetStateValidity.Request()
+        request.group_name = group
+        request.robot_state = RobotState()
+        request.robot_state.is_diff = True
+        request.robot_state.joint_state.name = list(current)
+        request.robot_state.joint_state.position = list(current.values())
+        future = self._validity_cli.call_async(request)
+        if not self._spin_until(future, 5.0):
+            future.cancel()
+            log.error("[pick][exchange-place] 当前双臂自碰撞检查超时")
+            return None
+        try:
+            response = future.result()
+        except Exception as exc:
+            log.error(f"[pick][exchange-place] 当前双臂自碰撞检查失败: {exc}")
+            return None
+        if response is None:
+            log.error("[pick][exchange-place] 当前双臂自碰撞检查未返回结果")
+            return None
+
+        self_contacts = [
+            contact
+            for contact in response.contacts
+            if _is_robot_self_contact(contact)
+        ]
+        if self_contacts:
+            details = ", ".join(
+                f"{contact.contact_body_1}<->{contact.contact_body_2}"
+                for contact in self_contacts[:5]
+            )
+            log.warning(
+                "[pick][exchange-place] 放置规划前检测到当前双臂自碰撞: "
+                f"{details}"
+            )
+            return True
+
+        if not response.valid and not response.contacts:
+            log.error(
+                "[pick][exchange-place] 当前状态无效但没有 contact 详情，"
+                "无法确认双臂是否碰撞"
+            )
+            return None
+
+        ignored_contacts = len(response.contacts)
+        ignored_text = (
+            f"；忽略 {ignored_contacts} 个非机器人自碰撞接触"
+            if ignored_contacts
+            else ""
+        )
+        log.info(
+            "[pick][exchange-place] 放置规划前当前双臂无自碰撞"
+            f"{ignored_text}"
+        )
+        return False
+
+    def _move_exchange_empty_arm_for_place_clearance(
+        self,
+        holding_arm_group: str,
+        speed_scale: float,
+    ) -> bool:
+        """让交换后的空载原抓取臂沿末端局部 -Z 直线避让 2 cm。"""
+        log = self.get_logger()
+        if holding_arm_group == "left_arm":
+            empty_group = "right_arm"
+            empty_link = "r_tool"
+            empty_plan_frame = "r_base_link"
+            empty_label = "右臂"
+        elif holding_arm_group == "right_arm":
+            empty_group = "left_arm"
+            empty_link = "l_tool"
+            empty_plan_frame = "l_base_link"
+            empty_label = "左臂"
+        else:
+            log.error(
+                f"[pick][exchange-place] 持物臂 group={holding_arm_group} 无法确定空载臂"
+            )
+            return False
+
+        empty_joint_names = joint_names_for_group(empty_group)
+        current = self._get_joints(empty_joint_names, wait_new=True)
+        if current is None:
+            log.error(f"[pick][exchange-place] 读取空载{empty_label}当前位置失败")
+            return False
+        current_pose = self._get_link_pose_fk(
+            empty_link,
+            joints=current,
+            joint_names=empty_joint_names,
+            plan_frame=empty_plan_frame,
+        )
+        if current_pose is None:
+            log.error(f"[pick][exchange-place] 读取空载{empty_label}末端位姿失败")
+            return False
+
+        target_pose = pose_offset_local_z(
+            current_pose,
+            EXCHANGE_PLACE_EMPTY_ARM_LOCAL_Z_OFFSET,
+        )
+        log.warning(
+            f"[pick][exchange-place] 空载{empty_label}沿 {empty_link} 末端局部 -Z "
+            f"直线移动 {abs(EXCHANGE_PLACE_EMPTY_ARM_LOCAL_Z_OFFSET):.3f} m "
+            "（按要求不检查碰撞）"
+        )
+        trajectory = self.plan_cartesian_line(
+            empty_group,
+            empty_link,
+            target_pose,
+            speed_scale=speed_scale,
+            avoid_collisions=False,
+            start_joints=current,
+            joint_names=empty_joint_names,
+            plan_frame=empty_plan_frame,
+        )
+        if trajectory is None or not trajectory.joint_trajectory.points:
+            log.error(f"[pick][exchange-place] 空载{empty_label}避让直线规划失败")
+            return False
+        if not self._execute_traj(trajectory):
+            log.error(f"[pick][exchange-place] 空载{empty_label}避让直线执行失败")
+            return False
+        log.info(
+            f"[pick][exchange-place] 空载{empty_label}已沿末端局部 -Z 避让 2 cm"
+        )
+        return True
+
     def _place_and_return(
         self,
         speed: float,
@@ -5941,10 +6124,29 @@ class G01Demo(Node):
         yubei_name = f"{yubei_key}.{slot_name}" if slot_name else yubei_key
         place_name = f"{fang_key}.{slot_name}" if slot_name else fang_key
 
+        clearance_moved = False
+        if first_return_mode == 1:
+            current_collision = self._current_dual_arm_self_collision()
+            if current_collision is None:
+                log.error("[pick] 放置规划前无法确认当前双臂碰撞状态，停止流程")
+                return False
+            if current_collision:
+                if not self._move_exchange_empty_arm_for_place_clearance(
+                    arm_group,
+                    speed,
+                ):
+                    return False
+                clearance_moved = True
+
         log.info(f"[pick] 5/9  {body_group} OMPL → {yubei_name}")
-        current = self._get_joints(body_joint_names, wait_new=True)
+        start_joint_names = (
+            joint_names_for_group("dual_arm_body")
+            if clearance_moved
+            else body_joint_names
+        )
+        current = self._get_joints(start_joint_names, wait_new=True)
         if current is None:
-            log.error("[pick] 读取当前 body+手臂关节失败")
+            log.error("[pick] 读取放置规划当前实测关节状态失败")
             return False
         ok, used_ms, _to_yubei_traj = self.plan_joint_motion(
             body_group,
@@ -6837,11 +7039,20 @@ def main(argv: list[str] | None = None) -> int:
             recognition_pose
         )
         box_top_pose = box_obstacle_top_pose_from_frame_top(frame_top_pose)
+        neg_y_obstacle_top_pose = (
+            frame_neg_y_obstacle_top_pose_from_frame_top(frame_top_pose)
+        )
         box_center_pose = pose_offset_local(
             box_top_pose,
             0.0,
             0.0,
             -BOX_OBSTACLE_SIZE[2] / 2.0,
+        )
+        neg_y_obstacle_center_pose = pose_offset_local(
+            neg_y_obstacle_top_pose,
+            0.0,
+            0.0,
+            -FRAME_NEG_Y_OBSTACLE_SIZE[2] / 2.0,
         )
         recognition_rpy = pose_to_xyz_rpy(recognition_pose)[3:]
         frame_top_rpy = pose_to_xyz_rpy(frame_top_pose)[3:]
@@ -6882,6 +7093,16 @@ def main(argv: list[str] | None = None) -> int:
             f"碰撞体中心=({box_center_pose.position.x:.4f}, "
             f"{box_center_pose.position.y:.4f}, "
             f"{box_center_pose.position.z:.4f})"
+        )
+        log.info(
+            f"[frame-vision] -Y 障碍物上表面中心（相对深框顶部 local offset="
+            f"{FRAME_NEG_Y_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL} m）: "
+            f"pos=({neg_y_obstacle_top_pose.position.x:.4f}, "
+            f"{neg_y_obstacle_top_pose.position.y:.4f}, "
+            f"{neg_y_obstacle_top_pose.position.z:.4f}); "
+            f"碰撞体中心=({neg_y_obstacle_center_pose.position.x:.4f}, "
+            f"{neg_y_obstacle_center_pose.position.y:.4f}, "
+            f"{neg_y_obstacle_center_pose.position.z:.4f})"
         )
 
         if frame_added:
