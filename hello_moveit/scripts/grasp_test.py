@@ -6270,6 +6270,27 @@ class G01Demo(Node):
 
         self.wait_for_operator()
 
+        log.info(f"[pick] 6/9  下降前读取新 SW 信号并复查 {place_name}")
+        if not self._wait_for_driver_signal(require_new=True):
+            log.error(
+                f"[pick] 下降前未收到新 SW 信号，"
+                f"无法确认 {place_name} 是否可用；"
+                "保持工具上电并中止放置"
+            )
+            return False
+        if slot_name is not None and not self._place_slot_is_empty(slot_name):
+            log.error(
+                f"[pick] 下降前复查发现 {slot_name} 已有物体，"
+                "保持工具上电并中止放置"
+            )
+            return False
+        if slot_name is None and not self._has_any_empty_place_slot():
+            log.error(
+                "[pick] 下降前复查发现 SW1~SW4 均有物体，"
+                "保持工具上电并中止放置"
+            )
+            return False
+
         log.info(f"[pick] 6/9  {arm_group} 笛卡尔直线 → {place_name}（不考虑碰撞）")
         current = self._get_joints(arm_joint_names, wait_new=True)
         if current is None:
@@ -6347,14 +6368,6 @@ class G01Demo(Node):
                 log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
                 return False
             tool_label = "左臂" if tool_side == "left" else "右臂"
-            if slot_name is not None and not self._place_slot_is_empty(slot_name):
-                log.error(
-                    f"[pick] 放置前复查发现 {slot_name} 已有物体，保持工具上电并中止放置"
-                )
-                return False
-            if slot_name is None and not self._has_any_empty_place_slot():
-                log.error("[pick] 放置前复查发现 SW1~SW4 均有物体，保持工具上电并中止放置")
-                return False
             log.info(f"[pick] 7/9  {tool_label}工具下电，放置到 {place_name}")
             if not self.set_tool_power(tool_side, 0):
                 log.error(f"[pick] {tool_label}工具下电失败")
