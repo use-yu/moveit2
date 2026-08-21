@@ -15,6 +15,7 @@ G01 MoveIt 演示脚本
     批次开始前双臂工具上电，确认左右力传感器均能读取新帧，再双臂下电
     机器人先到初始位
     → 读取视觉点
+    → 过滤本批次已验证不可抓或实际抓取失败的重复点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
     → 按视觉点和 group 顺序做可达性验证
     → 选中“有无碰撞 IK + 直线 approach 可行 + OMPL 可到 q_pre”的候选
@@ -880,6 +881,15 @@ PLACE_JOINTS = {
 # 抓取流程默认参数力传感器抓取失败判断参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
 GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增量阈值 [N]
+# 步骤 4 内不可抓点按 SJ 坐标系 xyz 去重；容差用于吸收多次视觉的小幅抖动。
+# 缓存在步骤 4 每次执行结束后清空，不影响下一批次。
+UNGRASPABLE_POINT_DISTANCE_TOLERANCE = 0.01
+# 这两类失败说明已选中的物体点本身不宜再尝试。
+# 放置报警、力传感器或工具故障属于系统问题，不将物体点拉黑。
+UNGRASPABLE_POINT_GRASP_FAILURE_REASONS = frozenset({
+    "approach_obstacle",
+    "suction_failed",
+})
 FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
 APPROACH_FORCE_GUARD_DISTANCE = 0.07  # 从 q_pre 起前 9 cm 使用小阈值 [m]
 APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 60.0  # 前 9 cm 的 Fz 减小阈值 [N]
@@ -1534,6 +1544,59 @@ def _side_order_from_xyz_rpy(xyz_rpy: dict) -> tuple[str, str]:
     return ("left", "right") if xyz_rpy["sj"][1] > 0.0 else ("right", "left")
 
 
+def grasp_point_sj_position(xyz_rpy: Mapping) -> tuple[float, float, float] | None:
+    """取出用于跨次视觉匹配的 SJ.xyz；非法点返回 None。"""
+    values = xyz_rpy.get("sj")
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        return None
+    if len(values) < 3:
+        return None
+    try:
+        position = tuple(float(values[index]) for index in range(3))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in position):
+        return None
+    return position
+
+
+def find_ungraspable_point_match(
+    position: Sequence[float],
+    ungraspable_points: Sequence[Sequence[float]],
+    distance_tolerance: float = UNGRASPABLE_POINT_DISTANCE_TOLERANCE,
+) -> tuple[int, float] | None:
+    """返回容差内最近的已缓存不可抓点及距离。"""
+    nearest: tuple[int, float] | None = None
+    for cache_index, cached_position in enumerate(ungraspable_points):
+        if len(cached_position) < 3:
+            continue
+        distance = math.dist(position[:3], cached_position[:3])
+        if distance > distance_tolerance:
+            continue
+        if nearest is None or distance < nearest[1]:
+            nearest = cache_index, distance
+    return nearest
+
+
+def remember_ungraspable_point(
+    xyz_rpy: Mapping,
+    ungraspable_points: list[tuple[float, float, float]],
+    distance_tolerance: float = UNGRASPABLE_POINT_DISTANCE_TOLERANCE,
+) -> tuple[tuple[float, float, float] | None, bool]:
+    """缓存一个不可抓点；已有容差内点时不重复添加。"""
+    position = grasp_point_sj_position(xyz_rpy)
+    if position is None:
+        return None, False
+    if find_ungraspable_point_match(
+        position,
+        ungraspable_points,
+        distance_tolerance,
+    ) is not None:
+        return position, False
+    ungraspable_points.append(position)
+    return position, True
+
+
 def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
     """依次验证纯臂、腰+臂、身体+臂，每层均按物体侧向决定左右顺序。"""
     side_order = _side_order_from_xyz_rpy(xyz_rpy)
@@ -1588,14 +1651,35 @@ def validate_reachable_grasp(
     all_xyz_rpy: list[dict],
     speed_scale: float = 0.2,
     cutoff_joint_names: Sequence[str] | None = None,
+    ungraspable_points: list[tuple[float, float, float]] | None = None,
 ):
-    """依次验证无碰撞 IK、Cartesian approach 和 OMPL 到 q_pre。"""
+    """过滤本批次失败点，再验证 IK、Cartesian approach 和 OMPL。"""
     log = node.get_logger()
     if not all_xyz_rpy:
         log.error("[reach] 没有可验证的视觉点")
         return None
 
+    filtered_count = 0
+    tested_count = 0
     for point_index, xyz_rpy in enumerate(all_xyz_rpy):
+        point_position = grasp_point_sj_position(xyz_rpy)
+        cached_match = (
+            find_ungraspable_point_match(point_position, ungraspable_points)
+            if point_position is not None and ungraspable_points is not None
+            else None
+        )
+        if cached_match is not None:
+            cache_index, distance = cached_match
+            filtered_count += 1
+            log.info(
+                f"[reach-cache] 过滤点 {point_index + 1}/{len(all_xyz_rpy)}: "
+                f"SJ.xyz=({point_position[0]:.4f}, {point_position[1]:.4f}, "
+                f"{point_position[2]:.4f}) 命中失败点 #{cache_index + 1}，"
+                f"距离={distance * 1000.0:.1f} mm，不再调用 IK/路径规划"
+            )
+            continue
+
+        tested_count += 1
         attempts = _reachability_attempts_for_point(xyz_rpy)
         order_text = " → ".join(item["group"] for item in attempts)
         log.info(
@@ -1661,7 +1745,28 @@ def validate_reachable_grasp(
                 "pick_approach_traj": approach_traj,
             }
 
-    log.error("[reach] 所有视觉点的所有候选 group 均不可达")
+        if ungraspable_points is not None:
+            position, added = remember_ungraspable_point(
+                xyz_rpy,
+                ungraspable_points,
+            )
+            if position is None:
+                log.warning(
+                    f"[reach-cache] 点 {point_index + 1} 全部候选不可达，"
+                    "但缺少有效 SJ.xyz，无法加入失败点缓存"
+                )
+            elif added:
+                log.warning(
+                    f"[reach-cache] 点 {point_index + 1} 全部候选不可达，"
+                    f"已记录失败点 SJ.xyz=({position[0]:.4f}, "
+                    f"{position[1]:.4f}, {position[2]:.4f})；"
+                    f"本批次共 {len(ungraspable_points)} 个"
+                )
+
+    log.error(
+        "[reach] 未找到可抓点："
+        f"实际验证 {tested_count} 个，缓存过滤 {filtered_count} 个"
+    )
     return None
 
 
@@ -7204,7 +7309,9 @@ def main(argv: list[str] | None = None) -> int:
         frame_recognition_odom = None
         return True
 
-    def run_one_grasp() -> bool | None:
+    def run_one_grasp(
+        ungraspable_points: list[tuple[float, float, float]],
+    ) -> bool | None:
         """执行一轮抓取；True=成功，False=失败，None=用户选择退出。"""
         node.last_pick_failure_reason = None
         # 在机器人运动和视觉识别之前先确认放置区，避免无空位时仍触发识别。
@@ -7251,6 +7358,7 @@ def main(argv: list[str] | None = None) -> int:
             all_xyz_rpy,
             speed_scale=0.4,
             cutoff_joint_names=joint_names,
+            ungraspable_points=ungraspable_points,
         )
         if reachable is None:
             log.error(
@@ -7310,6 +7418,27 @@ def main(argv: list[str] | None = None) -> int:
                 reachable["pick_approach_traj"],
             ),
         ):
+            failure_reason = node.last_pick_failure_reason
+            if failure_reason in UNGRASPABLE_POINT_GRASP_FAILURE_REASONS:
+                position, added = remember_ungraspable_point(
+                    all_xyz_rpy[point_index],
+                    ungraspable_points,
+                )
+                if position is None:
+                    log.warning(
+                        f"[reach-cache] {pick_label}抓取失败 "
+                        f"(reason={failure_reason})，但选中点缺少有效 "
+                        "SJ.xyz，无法加入失败点缓存"
+                    )
+                else:
+                    cache_action = "已记录" if added else "已在缓存中"
+                    log.warning(
+                        f"[reach-cache] {pick_label}抓取失败 "
+                        f"(reason={failure_reason})，{cache_action}失败点 "
+                        f"SJ.xyz=({position[0]:.4f}, {position[1]:.4f}, "
+                        f"{position[2]:.4f})；本批次共 "
+                        f"{len(ungraspable_points)} 个"
+                    )
             log.error(f"{pick_label}抓取失败")
             return False
 
@@ -7382,8 +7511,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return False
 
-    def run_grasps_until_no_empty_slot() -> bool | None:
-        """持续执行抓取；检测到 SW1~SW4 均无空位时正常结束。"""
+    def _run_grasps_until_no_empty_slot(
+        ungraspable_points: list[tuple[float, float, float]],
+    ) -> bool | None:
+        """执行步骤 4 的抓取循环，共享当前批次失败点缓存。"""
         if not prepare_force_sensors_for_grasp_batch():
             return False
 
@@ -7396,7 +7527,7 @@ def main(argv: list[str] | None = None) -> int:
                 "抓取前读取最新 SW 空位状态"
             )
             try:
-                grasp_result = run_one_grasp()
+                grasp_result = run_one_grasp(ungraspable_points)
             finally:
                 cleanup_grasp_display(
                     remove_scene_objects=(
@@ -7455,6 +7586,25 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         return None
+
+    def run_grasps_until_no_empty_slot() -> bool | None:
+        """持续抓取直到四个放置位填满；退出阶段时刷新失败点。"""
+        ungraspable_points: list[tuple[float, float, float]] = []
+        log.info(
+            "[reach-cache] 开始新的步骤 4 批次，"
+            f"失败点缓存已初始化，匹配容差="
+            f"{UNGRASPABLE_POINT_DISTANCE_TOLERANCE * 1000.0:.1f} mm"
+        )
+        try:
+            return _run_grasps_until_no_empty_slot(ungraspable_points)
+        finally:
+            cached_count = len(ungraspable_points)
+            ungraspable_points.clear()
+            log.info(
+                "[reach-cache] 步骤 4 已结束，"
+                f"已刷新 {cached_count} 个失败点，"
+                "下一批次将重新验证"
+            )
 
     def unload_material_slots() -> list[str]:
         """返回当前实时信号中有料的 SW 名称。"""
