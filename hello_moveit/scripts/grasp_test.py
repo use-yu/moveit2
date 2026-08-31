@@ -22,6 +22,7 @@ G01 MoveIt 演示脚本
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
     → 按视觉点和 group 顺序做可达性验证
     → 选中“有无碰撞 IK + 直线 approach 可行 + OMPL 可到 q_pre”的候选
+    → 当前腰角全部点不可抓时，按 20°→30°→40°→50° 重新执行识别与验证
     → OMPL 到 q_pre，工具上电并读取该臂力传感器 Z 基准值
     → Cartesian approach 到抓取点；以前 9cm/Fz 减小 20N、整段/Fz 减小
       200N 监测中途接触，触发后停止 ServoJ、取消轨迹并从当前位置直退 q_pre
@@ -359,10 +360,16 @@ MOVE_TO_GRASP_RESET_Q = [
     0.588477,
 ]
 
-# 每轮抓取使用的预备构型。
+# 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
+# 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
+GRASP_VISION_WAIST_ANGLES_DEG = (20, 30, 40, 50)
+GRASP_Q1_WAIST_JOINT_INDEX = list(JOINT_TARGETS["dual_arm_body"]).index(
+    "body_joint2"
+)
+# 每轮抓取使用的预备构型；body_joint2 由上述重试序列动态覆盖。
 GRASP_Q1 = [
     0.0,
-    25 * math.pi / 180,
+    GRASP_VISION_WAIST_ANGLES_DEG[0] * math.pi / 180,
     -1.57,
     -0.15,
     -1.578090,
@@ -1672,8 +1679,9 @@ def validate_reachable_grasp(
     speed_scale: float = 0.2,
     cutoff_joint_names: Sequence[str] | None = None,
     ungraspable_points: list[tuple[float, float, float]] | None = None,
+    scene_grasp_object_poses: Sequence[Pose] | None = None,
 ):
-    """过滤本批次失败点，再验证 IK、Cartesian approach 和 OMPL。"""
+    """过滤失败点，再验证 IK、Cartesian approach 和带全部物体的 OMPL。"""
     log = node.get_logger()
     if not all_xyz_rpy:
         log.error("[reach] 没有可验证的视觉点")
@@ -1735,6 +1743,7 @@ def validate_reachable_grasp(
                 speed_scale=speed_scale,
                 plan_frame=pick_frame,
                 cutoff_joint_names=cutoff_joint_names,
+                scene_grasp_object_poses=scene_grasp_object_poses,
             )
             if picked is None:
                 log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
@@ -2159,18 +2168,19 @@ def make_deep_frame_cutoff(
     return obj
 
 
-def make_grasp_object_collision(pose: Pose) -> CollisionObject:
-    """创建与 RViz 圆柱 Marker 同尺寸、同位姿的 MoveIt 碰撞体。"""
+def make_grasp_objects_collision(poses: Sequence[Pose]) -> CollisionObject:
+    """把全部视觉圆柱作为同一 MoveIt 碰撞对象的多个 primitive。"""
     obj = CollisionObject()
     obj.header.frame_id = SCENE_FRAME
     obj.id = GRASP_OBJECT_COLLISION_ID
     obj.operation = CollisionObject.ADD
 
-    prim = SolidPrimitive()
-    prim.type = SolidPrimitive.CYLINDER
-    prim.dimensions = [CYLINDER_HEIGHT, CYLINDER_DIAMETER / 2.0]
-    obj.primitives.append(prim)
-    obj.primitive_poses.append(copy.deepcopy(pose))
+    for pose in poses:
+        prim = SolidPrimitive()
+        prim.type = SolidPrimitive.CYLINDER
+        prim.dimensions = [CYLINDER_HEIGHT, CYLINDER_DIAMETER / 2.0]
+        obj.primitives.append(prim)
+        obj.primitive_poses.append(copy.deepcopy(pose))
     return obj
 
 
@@ -4148,8 +4158,13 @@ class G01Demo(Node):
         tangent_link: str | None = None,
         tangent_joints: dict[str, float] | None = None,
         verbose: bool = True,
+        scene_grasp_object_poses: Sequence[Pose] | None = None,
     ) -> bool:
-        """添加隔板和临时物体；传入 link 时，隔板低于其 collision 最低面 1 cm。"""
+        """添加隔板和全部视觉物体；传入 link 时隔板低 1 cm。
+
+        ``scene_grasp_object_poses`` 中的位姿必须已在 ``target_frame``
+        下表达。未传入时保留兼容行为，只添加 ``pose`` 对应的圆柱。
+        """
         scene_pose = self._pose_in_frame(
             pose,
             source_frame=source_frame,
@@ -4158,6 +4173,15 @@ class G01Demo(Node):
         )
         if scene_pose is None:
             self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
+            return False
+
+        collision_poses = (
+            [copy.deepcopy(item) for item in scene_grasp_object_poses]
+            if scene_grasp_object_poses is not None
+            else [scene_pose]
+        )
+        if not collision_poses:
+            self.get_logger().error("视觉物体碰撞位姿为空，无法添加临时场景")
             return False
 
         if tangent_link:
@@ -4191,13 +4215,14 @@ class G01Demo(Node):
             self.get_logger().info(
                 f"添加碰撞体「{FRAME_CUTOFF_ID}」+"
                 f"「{GRASP_OBJECT_COLLISION_ID}」到 {target_frame}: "
+                f"包含 {len(collision_poses)} 个视觉圆柱, "
                 f"隔板以{tangent_desc}为基准, "
                 f"隔板上表面 z={scene_z:.3f} m"
             )
         return self._apply_scene(
             [
                 make_deep_frame_cutoff(scene_z, self._frame_pose),
-                make_grasp_object_collision(scene_pose),
+                make_grasp_objects_collision(collision_poses),
             ],
             # [make_deep_frame_cutoff(scene_z)],
             colors,
@@ -4329,8 +4354,9 @@ class G01Demo(Node):
         joint_names: Sequence[str],
         state_joint_names: Sequence[str],
         speed_scale: float,
+        scene_grasp_object_poses: Sequence[Pose] | None = None,
     ) -> RobotTrajectory | None:
-        """临时加入抓取碰撞体，规划当前位置到 q_pre 的 OMPL 路径。
+        """临时加入全部视觉碰撞体，规划当前位置到 q_pre 的 OMPL 路径。
 
         这一步放在 IK 和 Cartesian approach 通过之后。使用 ``plan_only``，只
         验证完整路径而不移动机器人；规划结束后无论成功与否都恢复临时场景。
@@ -4352,6 +4378,7 @@ class G01Demo(Node):
             tangent_link=link,
             tangent_joints=q_pre,
             verbose=False,
+            scene_grasp_object_poses=scene_grasp_object_poses,
         ):
             log.error("[grasp-select] 添加关节空间预检碰撞体失败")
             return None
@@ -5819,12 +5846,13 @@ class G01Demo(Node):
         plan_frame: str = PLAN_FRAME,
         target_seeds: Sequence[dict[str, float]] | None = None,
         cutoff_joint_names: Sequence[str] | None = None,
+        scene_grasp_object_poses: Sequence[Pose] | None = None,
     ):
         """从 target_pose 的多个 IK 解里挑可用的一组。
 
         target_seeds 不为 None 时，只用这些 seed 求 IK，不做当前关节/随机 seed 枚举。
         筛选顺序固定为：碰撞 IK → Cartesian approach → OMPL 到 q_pre。
-        cutoff_joint_names 不为 None 时，OMPL 预检会临时加入隔离面和待抓物体，
+        cutoff_joint_names 不为 None 时，OMPL 预检会临时加入隔离面和全部视觉物体，
         使验证条件与后续实际执行一致。
         返回 (q_pre, q_target, to_pre_traj, approach_traj) 四元组；
         找不到返回 None。to_pre_traj 是当前位置到 q_pre 的 OMPL 轨迹，
@@ -5925,6 +5953,7 @@ class G01Demo(Node):
                     joint_names,
                     cutoff_joint_names,
                     speed_scale,
+                    scene_grasp_object_poses=scene_grasp_object_poses,
                 )
                 if ompl_trajectory is None:
                     continue
@@ -6513,6 +6542,7 @@ class G01Demo(Node):
         place_speed_scale: float = PLACE_SPEED_SCALE,
         cutoff_joint_names: Sequence[str] | None = None,
         first_return_mode: int = FIRST_RETURN_MODE,
+        scene_grasp_object_poses: Sequence[Pose] | None = None,
         prevalidated_pair: tuple[
             dict[str, float],
             dict[str, float],
@@ -6532,6 +6562,7 @@ class G01Demo(Node):
             place_speed_scale : 放置段的速度缩放（0~1）
             cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
             first_return_mode : 1=使用 *_j 并交换；2=使用普通放置点；0 兼容旧普通模式
+            scene_grasp_object_poses: 本轮视觉识别到的全部圆柱，已在 SCENE_FRAME 下表达
             prevalidated_pair : 可达性验证已选出的 (q_pre, q_target,
                 to_pre_traj, approach_traj)；传入后不再重复执行 100 次
                 IK、OMPL 到 q_pre 规划和 Cartesian 直线预检。
@@ -6615,6 +6646,7 @@ class G01Demo(Node):
                 speed_scale=speed_scale,
                 plan_frame=plan_frame,
                 cutoff_joint_names=cutoff_joint_names,
+                scene_grasp_object_poses=scene_grasp_object_poses,
             )
         else:
             log.info(
@@ -6654,14 +6686,19 @@ class G01Demo(Node):
                 joint_names=cutoff_joint_names,
                 tangent_link=link,
                 tangent_joints=q_pre,
+                scene_grasp_object_poses=scene_grasp_object_poses,
             ):
-                log.error("[pick] 添加 q_pre OMPL 隔板失败")
+                log.error("[pick] 添加 q_pre OMPL 隔板/全部视觉圆柱失败")
                 return False
             cutoff_added = True
             ok = self._execute_traj(to_pre_traj)
         finally:
             if cutoff_added:
-                log.info(f"[pick] 移除「{FRAME_CUTOFF_ID}」，后续直线 approach 不使用隔板")
+                log.info(
+                    f"[pick] 移除「{FRAME_CUTOFF_ID}」/"
+                    f"「{GRASP_OBJECT_COLLISION_ID}」，"
+                    "后续直线 approach 不使用临时碰撞体"
+                )
                 cutoff_removed = self.remove_frame_cutoff()
 
         used_ms = (time.monotonic() - execute_started) * 1000.0
@@ -6830,15 +6867,18 @@ class G01Demo(Node):
 
         self.wait_for_operator()
 
-        if not self.add_frame_cutoff_only_for_pose(
+        # 抓取后的交换/放置运动继续保留本轮全部视觉圆柱，
+        # 与隔离面一起参与后续启用碰撞检查的 OMPL 规划。
+        if not self.add_frame_cutoff_for_pose(
             target_pose,
             source_frame=plan_frame,
             target_frame=SCENE_FRAME,
             joint_names=cutoff_joint_names,
             tangent_link=link,
             tangent_joints=q_pre,
+            scene_grasp_object_poses=scene_grasp_object_poses,
         ):
-            log.error("[pick] 第一段复位后添加隔板失败")
+            log.error("[pick] 第一段复位后添加隔板/全部视觉圆柱失败")
             return False
 
         if first_return_mode == 1:
@@ -7560,7 +7600,7 @@ def main(argv: list[str] | None = None) -> int:
     def run_one_grasp(
         ungraspable_points: list[tuple[float, float, float]],
     ) -> bool | None:
-        """执行一轮抓取；True=成功，False=失败，None=用户选择退出。"""
+        """执行一轮抓取；全点不可抓时按 20/30/40/50° 重新识别。"""
         node.last_pick_failure_reason = None
         # 在机器人运动和视觉识别之前先确认放置区，避免无空位时仍触发识别。
         if not node._wait_for_driver_signal(require_new=True):
@@ -7578,53 +7618,105 @@ def main(argv: list[str] | None = None) -> int:
             log.info("[pick] SW1~SW4 均无空位，结束连续抓取，不执行视觉识别")
             return False
 
-        # --- 2. 关节空间运动 ---
+        # --- 2. 腰部多角度 Q1 + 视觉 + 可达性验证 ---
         targets = JOINT_TARGETS["dual_arm_body"]
         joint_names = list(targets.keys())
-        waypoints = [GRASP_Q1]  # 需要多点时：继续 waypoints.append(q3) ...
+        reachable = None
+        selected_waist_deg: int | None = None
+        first_return_modes: list[int] = []
+        all_xyz_rpy: list[dict] = []
+        scene_grasp_object_poses: list[Pose] = []
 
-        if not node.plan_execute_joint_waypoints(
-            "dual_arm_body",
-            0.2,
-            joint_names,
-            waypoints,
-        ):
-            log.error("关节规划/执行失败")
-            return False
+        for waist_attempt, waist_deg in enumerate(GRASP_VISION_WAIST_ANGLES_DEG):
+            q1_for_waist = list(GRASP_Q1)
+            q1_for_waist[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(waist_deg)
+            log.info(
+                f"[pick-waist] 第 {waist_attempt + 1}/"
+                f"{len(GRASP_VISION_WAIST_ANGLES_DEG)} 个角度："
+                f"腰部 body_joint2 → {waist_deg}°，然后重新视觉和验证"
+            )
+            if not node.plan_execute_joint_waypoints(
+                "dual_arm_body",
+                0.2,
+                joint_names,
+                [q1_for_waist],
+            ):
+                node.last_pick_failure_reason = "waist_retry_motion_failed"
+                log.error(f"[pick-waist] 运动到 {waist_deg}° 识别构型失败")
+                return False
 
-        time.sleep(1)
+            time.sleep(1)
+            vision_pose = read_vision_object_pose(node, log, sim_mode=sim_mode)
+            if vision_pose is None:
+                node.last_pick_failure_reason = "vision_failed"
+                return False
+            first_return_modes, all_xyz_rpy = vision_pose
 
-        # 视觉识别
-        vision_pose = read_vision_object_pose(node, log, sim_mode=sim_mode)
-        if vision_pose is None:
-            return False
-        first_return_modes, all_xyz_rpy = vision_pose
+            # 失败点在全部腰角间共享：20° 不可抓的点在
+            # 30/40/50° 重新识别到时显示为黑色并直接跳过 IK。
+            first_return_modes, all_xyz_rpy = prioritize_center_grasp_points(
+                first_return_modes,
+                all_xyz_rpy,
+                ungraspable_points,
+            )
 
-        # 排序后的列表会同时用于 Marker 编号/颜色、失败点过滤和 IK，
-        # 保证实际验证与抓取顺序就是“中心优先，再按高度”。
-        first_return_modes, all_xyz_rpy = prioritize_center_grasp_points(
-            first_return_modes,
-            all_xyz_rpy,
-            ungraspable_points,
-        )
+            # PlanningScene 使用公共 moveit_base_link 表达的全部视觉圆柱。
+            scene_grasp_object_poses = []
+            for point_index, xyz_rpy in enumerate(all_xyz_rpy):
+                pose_values = xyz_rpy.get("right_body")
+                if pose_values is None:
+                    node.last_pick_failure_reason = "vision_pose_missing"
+                    log.error(
+                        f"[pick-collision] 视觉物体 {point_index} 缺少 right_body，"
+                        "无法建立全量碰撞模型"
+                    )
+                    return False
+                scene_grasp_object_poses.append(xyz_rpy_to_pose(pose_values))
+            if not scene_grasp_object_poses:
+                node.last_pick_failure_reason = "vision_no_objects"
+                log.error("[pick-collision] 没有视觉圆柱，无法建立临时碰撞模型")
+                return False
+            log.info(
+                f"[pick-collision][waist={waist_deg}°] 已准备 "
+                f"{len(scene_grasp_object_poses)} 个视觉圆柱"
+            )
 
-        # 可视化必须早于 IK/路径可达性验证；显示全部候选，
-        # 但后续 PlanningScene 仍只临时添加当前验证的那一个圆柱和隔离面。
-        show_all_grasp_vision_markers(all_xyz_rpy, ungraspable_points)
+            show_all_grasp_vision_markers(
+                all_xyz_rpy,
+                ungraspable_points,
+            )
+            reachable = validate_reachable_grasp(
+                node,
+                all_xyz_rpy,
+                speed_scale=0.4,
+                cutoff_joint_names=joint_names,
+                ungraspable_points=ungraspable_points,
+                scene_grasp_object_poses=scene_grasp_object_poses,
+            )
+            if reachable is not None:
+                selected_waist_deg = waist_deg
+                log.info(f"[pick-waist] {waist_deg}° 找到可抓点，停止切换腰角")
+                break
 
-        # 可达性验证：按视觉点顺序，依次验证 arm、waist、body。
-        reachable = validate_reachable_grasp(
-            node,
-            all_xyz_rpy,
-            speed_scale=0.4,
-            cutoff_joint_names=joint_names,
-            ungraspable_points=ungraspable_points,
-        )
+            cleanup_grasp_display()
+            if waist_attempt + 1 < len(GRASP_VISION_WAIST_ANGLES_DEG):
+                next_waist_deg = GRASP_VISION_WAIST_ANGLES_DEG[waist_attempt + 1]
+                log.warning(
+                    f"[pick-waist] {waist_deg}° 下所有视觉点均不可抓，"
+                    f"切换到 {next_waist_deg}° 重新执行 Q1/视觉/排序/IK"
+                )
+
         if reachable is None:
+            node.last_pick_failure_reason = "all_waist_angles_unreachable"
             log.error(
-                "没有找到无碰撞 IK、Cartesian approach、"
+                "[pick-waist] 20°/30°/40°/50° 全部尝试完成，"
+                "仍没有无碰撞 IK、Cartesian approach、"
                 "OMPL 到 q_pre 均可行的视觉点"
             )
+            return False
+        if selected_waist_deg is None:
+            node.last_pick_failure_reason = "waist_retry_state_invalid"
+            log.error("[pick-waist] 找到可抓点但腰角重试状态不完整")
             return False
 
         point_index = reachable["point_index"]
@@ -7649,6 +7741,7 @@ def main(argv: list[str] | None = None) -> int:
 
         selected_msg = (
             f"可达性选中: 点 {point_index + 1}/{len(all_xyz_rpy)}, "
+            f"vision_waist={selected_waist_deg}°, "
             f"mode={first_return_mode}, group={pick_group}, "
             f"link={pick_link}, frame={pick_frame}"
         )
@@ -7669,6 +7762,7 @@ def main(argv: list[str] | None = None) -> int:
             place_speed_scale=0.4,
             cutoff_joint_names=joint_names,
             first_return_mode=first_return_mode,
+            scene_grasp_object_poses=scene_grasp_object_poses,
             prevalidated_pair=(
                 reachable["pick_q_pre"],
                 reachable["pick_q_target"],
@@ -7694,7 +7788,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"[reach-cache] {pick_label}抓取失败 "
                         f"(reason={failure_reason})，{cache_action}失败点 "
                         f"SJ.xyz=({position[0]:.4f}, {position[1]:.4f}, "
-                        f"{position[2]:.4f})；本批次共 "
+                        f"{position[2]:.4f})；本批次跨腰角缓存共 "
                         f"{len(ungraspable_points)} 个"
                     )
             log.error(f"{pick_label}抓取失败")
@@ -7772,7 +7866,7 @@ def main(argv: list[str] | None = None) -> int:
     def _run_grasps_until_no_empty_slot(
         ungraspable_points: list[tuple[float, float, float]],
     ) -> bool | None:
-        """执行步骤 4 的抓取循环，共享当前批次失败点缓存。"""
+        """执行步骤 4 的抓取循环，所有腰角共用当前批次失败点缓存。"""
         if not prepare_force_sensors_for_grasp_batch():
             return False
 
@@ -7850,7 +7944,8 @@ def main(argv: list[str] | None = None) -> int:
         ungraspable_points: list[tuple[float, float, float]] = []
         log.info(
             "[reach-cache] 开始新的步骤 4 批次，"
-            f"失败点缓存已初始化，匹配容差="
+            "20°/30°/40°/50° 共用失败点缓存已初始化，"
+            f"匹配容差="
             f"{UNGRASPABLE_POINT_DISTANCE_TOLERANCE * 1000.0:.1f} mm"
         )
         try:
@@ -7860,7 +7955,7 @@ def main(argv: list[str] | None = None) -> int:
             ungraspable_points.clear()
             log.info(
                 "[reach-cache] 步骤 4 已结束，"
-                f"已刷新 {cached_count} 个失败点，"
+                f"已刷新 {cached_count} 个跨腰角失败点，"
                 "下一批次将重新验证"
             )
 
