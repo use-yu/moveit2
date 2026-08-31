@@ -15,8 +15,8 @@ G01 MoveIt 演示脚本
     批次开始前双臂工具上电，确认左右力传感器均能读取新帧，再双臂下电
     机器人先到初始位
     → 读取视觉点
-    → 命中本批次不可抓缓存的点保留原顺序并用黑色显示，不参与空间排序
-    → 其余点按深框中心 0.4m×0.4m 优先，中心/外围各自按局部 Z 从上到下排序
+    → 命中本批次不可抓缓存的点保留原顺序并用黑色显示，不参与姿态排序
+    → 其余点按局部 +Z 与 moveit_base_link +Z 的偏离角从小到大排序
     → 用两种颜色显示所有视觉圆柱及各自的局部 +Z 方向
     → 过滤本批次已验证不可抓或实际抓取失败的重复点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
@@ -426,9 +426,6 @@ FRAME_Y_OUTER_THICKNESS = 0.05  # 局部 ±Y 两侧向外附加的厚度 [m]
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 相对于 moveit_base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
-# 步骤 4 抓取排序的中心优先区，尺寸沿深框局部 X/Y。
-GRASP_CENTER_PRIORITY_SIZE = (0.4, 0.4)
-
 # p,4 识别位姿先绕自身 Z 轴 +90°，再沿旋转后的自身坐标平移，
 # 得到深框顶部空心区域中心；该坐标点位于开口中，不落在框壁实体上。
 FRAME_VISION_TRIGGER_COMMAND = "p,5"
@@ -1321,8 +1318,13 @@ def read_vision_object_pose(
     log,
     sim_mode: bool = False,
     trigger_command: str = VISION_TRIGGER_COMMAND,
+    sort_by_sj_z: bool = True,
 ):
-    """视觉识别封装：返回所有点的模式码和 xyz_rpy。"""
+    """视觉识别封装：返回所有点的模式码和 xyz_rpy。
+
+    ``sort_by_sj_z=False`` 时保留 viewer 原始顺序，供步骤 4
+    后续仅按姿态排序，避免高度成为隐式的并列破平规则。
+    """
     vision_sock = None
     if sim_mode:
         first_return_mode, pose = sim_vision_result_for_trigger(trigger_command)
@@ -1428,15 +1430,19 @@ def read_vision_object_pose(
             all_xyz_rpy.append(xyz_rpy)
             raw_poses.append(pose)
 
-        sorted_results = sorted(
-            zip(first_return_modes, all_xyz_rpy, raw_poses),
-            key=lambda item: item[1]["sj"][2],
-            reverse=True,
-        )
-        first_return_modes = [mode for mode, _, _ in sorted_results]
-        all_xyz_rpy = [xyz_rpy for _, xyz_rpy, _ in sorted_results]
+        ordered_results = list(zip(first_return_modes, all_xyz_rpy, raw_poses))
+        if sort_by_sj_z:
+            ordered_results.sort(
+                key=lambda item: item[1]["sj"][2],
+                reverse=True,
+            )
+        first_return_modes = [mode for mode, _, _ in ordered_results]
+        all_xyz_rpy = [xyz_rpy for _, xyz_rpy, _ in ordered_results]
 
-        for point_index, (first_return_mode, xyz_rpy, pose) in enumerate(sorted_results, start=1):
+        for point_index, (first_return_mode, xyz_rpy, pose) in enumerate(
+            ordered_results,
+            start=1,
+        ):
             print(
                 f"\033[32mviewer point {point_index}: "
                 f"first_return_mode = {first_return_mode}, pose = {pose}\033[0m"
@@ -7184,14 +7190,15 @@ def main(argv: list[str] | None = None) -> int:
         if remove_scene_objects and not node.remove_frame_cutoff():
             log.warning(f"清理「{FRAME_CUTOFF_ID}」/「{GRASP_OBJECT_COLLISION_ID}」失败")
 
-    def prioritize_center_grasp_points(
+    def prioritize_upright_grasp_points(
         first_return_modes: Sequence[int],
         all_xyz_rpy: Sequence[dict],
         ungraspable_points: Sequence[Sequence[float]],
     ) -> tuple[list[int], list[dict]]:
-        """只排序未缓存点：中心优先且各区局部 Z 降序。
+        """只排序未缓存点：物体局部 +Z 越接近竖直向上越优先。
 
-        命中不可抓缓存的点不做空间排序，按它们在本次视觉结果中的
+        偏离角在 moveit_base_link 下计算；不再使用深框中心区域
+        或位置高度。命中不可抓缓存的点不做姿态排序，按它们在本次视觉结果中的
         原始相对顺序放到可抓候选之后。
         """
         if len(first_return_modes) != len(all_xyz_rpy):
@@ -7201,8 +7208,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             return list(first_return_modes), list(all_xyz_rpy)
 
-        half_x = GRASP_CENTER_PRIORITY_SIZE[0] / 2.0
-        half_y = GRASP_CENTER_PRIORITY_SIZE[1] / 2.0
         ranked_points = []
         for original_index, (first_return_mode, xyz_rpy) in enumerate(
             zip(first_return_modes, all_xyz_rpy)
@@ -7215,53 +7220,54 @@ def main(argv: list[str] | None = None) -> int:
             )
             pose_values = xyz_rpy.get("right_body")
             if cached_match is not None:
-                local_pose = (
-                    pose_relative_to_frame(
-                        xyz_rpy_to_pose(pose_values),
-                        node._frame_pose,
-                    )
-                    if pose_values is not None
-                    else None
-                )
-                # 区域级别 3 使缓存点放在可抓候选之后；第二排序键
+                # 类别 2 使缓存点放在可抓候选之后；第二排序键
                 # 使用原索引，仅保留视觉原顺序，不使用位置或高度排序。
                 ranked_points.append(
                     (
-                        3,
+                        2,
                         float(original_index),
                         original_index,
                         first_return_mode,
                         xyz_rpy,
-                        local_pose,
+                        None,
                         cached_match,
                     )
                 )
                 continue
 
             if pose_values is None:
-                # 正常抓取视觉一定包含 right_body；异常点放到最后，
+                # 正常抓取视觉一定包含 right_body；异常点放到可抓候选之后，
                 # 仍保留给后续校验输出明确错误，不在这里静默丢弃。
                 ranked_points.append(
-                    (2, 0.0, original_index, first_return_mode, xyz_rpy, None, None)
+                    (1, 0.0, original_index, first_return_mode, xyz_rpy, None, None)
                 )
                 continue
 
-            pose_in_frame = pose_relative_to_frame(
-                xyz_rpy_to_pose(pose_values),
-                node._frame_pose,
+            object_pose = xyz_rpy_to_pose(pose_values)
+            q = object_pose.orientation
+            axis_x, axis_y, axis_z = rotate_xyz_by_quat(
+                0.0,
+                0.0,
+                1.0,
+                q.x,
+                q.y,
+                q.z,
+                q.w,
             )
-            x = pose_in_frame.position.x
-            y = pose_in_frame.position.y
-            z = pose_in_frame.position.z
-            in_center = abs(x) <= half_x and abs(y) <= half_y
+            axis_norm = math.sqrt(axis_x * axis_x + axis_y * axis_y + axis_z * axis_z)
+            if axis_norm <= 1e-12:
+                tilt_rad = math.pi
+            else:
+                normalized_axis_z = max(-1.0, min(1.0, axis_z / axis_norm))
+                tilt_rad = math.acos(normalized_axis_z)
             ranked_points.append(
                 (
-                    0 if in_center else 1,
-                    -z,
+                    0,
+                    tilt_rad,
                     original_index,
                     first_return_mode,
                     xyz_rpy,
-                    pose_in_frame,
+                    (axis_x, axis_y, axis_z),
                     None,
                 )
             )
@@ -7272,12 +7278,12 @@ def main(argv: list[str] | None = None) -> int:
         cached_count = 0
         for sorted_index, item in enumerate(ranked_points):
             (
-                area_rank,
-                _,
+                candidate_rank,
+                tilt_or_order,
                 original_index,
                 first_return_mode,
                 xyz_rpy,
-                local_pose,
+                local_z_axis,
                 cached_match,
             ) = item
             sorted_modes.append(first_return_mode)
@@ -7285,37 +7291,30 @@ def main(argv: list[str] | None = None) -> int:
             if cached_match is not None:
                 cached_count += 1
                 cache_index, distance = cached_match
-                local_text = ""
-                if local_pose is not None:
-                    p = local_pose.position
-                    local_text = (
-                        f", deep_frame xyz=({p.x:.4f}, {p.y:.4f}, {p.z:.4f}) m"
-                    )
                 log.info(
                     f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index}, "
                     f"命中不可抓点 #{cache_index + 1}, "
-                    f"距离={distance * 1000.0:.1f} mm，不参与空间排序"
-                    f"{local_text}"
+                    f"距离={distance * 1000.0:.1f} mm，不参与姿态排序"
                 )
                 continue
-            if local_pose is None:
+            if candidate_rank != 0 or local_z_axis is None:
                 log.warning(
                     f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index} "
-                    "缺少 right_body，已排在最后"
+                    "缺少 right_body，已排在可抓候选之后"
                 )
                 continue
-            area_label = "中心区" if area_rank == 0 else "外围区"
-            p = local_pose.position
+            axis_x, axis_y, axis_z = local_z_axis
             log.info(
                 f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index}, "
-                f"{area_label}, deep_frame xyz=({p.x:.4f}, {p.y:.4f}, {p.z:.4f}) m"
+                f"局部 +Z=({axis_x:.4f}, {axis_y:.4f}, {axis_z:.4f}), "
+                f"偏离竖直向上={math.degrees(tilt_or_order):.2f}°"
             )
 
         log.info(
-            "[pick-order] 排序完成：深框局部 "
-            f"|x|≤{half_x:.3f} m 且 |y|≤{half_y:.3f} m 的中心点优先；"
-            "中心区和外围区内部均按局部 z 从大到小；"
-            f"{cached_count} 个缓存不可抓点未参与排序并放在末尾"
+            "[pick-order] 姿态排序完成：未缓存点按物体局部 +Z "
+            "偏离 moveit_base_link +Z 的角度从小到大；"
+            "不使用中心区域或位置高度；"
+            f"{cached_count} 个缓存不可抓点未参与姿态排序并放在末尾"
         )
         return sorted_modes, sorted_xyz_rpy
 
@@ -7646,7 +7645,12 @@ def main(argv: list[str] | None = None) -> int:
                 return False
 
             time.sleep(1)
-            vision_pose = read_vision_object_pose(node, log, sim_mode=sim_mode)
+            vision_pose = read_vision_object_pose(
+                node,
+                log,
+                sim_mode=sim_mode,
+                sort_by_sj_z=False,
+            )
             if vision_pose is None:
                 node.last_pick_failure_reason = "vision_failed"
                 return False
@@ -7654,7 +7658,7 @@ def main(argv: list[str] | None = None) -> int:
 
             # 失败点在全部腰角间共享：20° 不可抓的点在
             # 30/40/50° 重新识别到时显示为黑色并直接跳过 IK。
-            first_return_modes, all_xyz_rpy = prioritize_center_grasp_points(
+            first_return_modes, all_xyz_rpy = prioritize_upright_grasp_points(
                 first_return_modes,
                 all_xyz_rpy,
                 ungraspable_points,
