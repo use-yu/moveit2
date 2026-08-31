@@ -15,6 +15,7 @@ G01 MoveIt 演示脚本
     批次开始前双臂工具上电，确认左右力传感器均能读取新帧，再双臂下电
     机器人先到初始位
     → 读取视觉点
+    → 用两种颜色显示所有视觉圆柱及各自的局部 +Z 方向
     → 过滤本批次已验证不可抓或实际抓取失败的重复点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
     → 按视觉点和 group 顺序做可达性验证
@@ -471,6 +472,18 @@ CYLINDER_MARKER_TOPIC = "g01_pose_cylinder"
 CYLINDER_DIAMETER = 0.15   # 直径 [m]
 CYLINDER_HEIGHT = 0.06     # 高度 [m]（沿位姿局部 z 轴）
 CYLINDER_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.45)
+# 抓取视觉结果按排序后的物体索引交替取色；物体 0/1 分别为橙/蓝。
+# 圆柱保持半透明，对应的 +Z 箭头使用同色不透明版。
+GRASP_VISION_CYLINDER_COLORS = (
+    ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.45),
+    ColorRGBA(r=0.0, g=0.65, b=1.0, a=0.45),
+)
+GRASP_VISION_Z_AXIS_COLORS = (
+    ColorRGBA(r=1.0, g=0.5, b=0.0, a=1.0),
+    ColorRGBA(r=0.0, g=0.65, b=1.0, a=1.0),
+)
+GRASP_VISION_CYLINDER_MARKER_ID_PREFIX = "grasp_vision_cylinder_"
+GRASP_VISION_Z_AXIS_MARKER_ID_PREFIX = "grasp_vision_z_axis_"
 GRASP_OBJECT_COLLISION_ID = "待抓取物体"
 GRASP_OBJECT_COLLISION_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
 Z_AXIS_MARKER_ID = "ee_pose_z_axis"
@@ -2768,7 +2781,8 @@ class G01Demo(Node):
             MOTOR_COMMAND_TOPIC,
             10,
         )
-        self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 1)
+        # 一次视觉可能连续发布多组圆柱/+Z Marker，保留足够队列深度。
+        self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 20)
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
 
@@ -4401,15 +4415,22 @@ class G01Demo(Node):
         object_id: str = Z_AXIS_MARKER_ID,
         frame_id: str = PLAN_FRAME,
         length: float = Z_AXIS_LENGTH,
+        color: ColorRGBA | None = None,
     ) -> bool:
-        """在 RViz 中用红色箭头显示 pose 的局部 +z 轴方向。"""
+        """在 RViz 中用箭头显示 pose 的局部 +z 轴方向。"""
         p = pose if isinstance(pose, Pose) else pose_from_dict(pose)
         mid = self._cylinder_marker_numeric_id(object_id)
-        marker = make_z_axis_marker(p, mid, frame_id=frame_id, length=length)
+        marker = make_z_axis_marker(
+            p,
+            mid,
+            frame_id=frame_id,
+            length=length,
+            color=color,
+        )
         marker.header.stamp = self.get_clock().now().to_msg()
         self._cylinder_marker_pub.publish(marker)
         self.get_logger().info(
-            f"已发布红色 +z 轴 Marker id={object_id} topic={CYLINDER_MARKER_TOPIC} "
+            f"已发布 +z 轴 Marker id={object_id} topic={CYLINDER_MARKER_TOPIC} "
             f"@ {frame_id} length={length:.3f} m"
         )
         return True
@@ -4430,6 +4451,17 @@ class G01Demo(Node):
         m.action = Marker.DELETE
         self._cylinder_marker_pub.publish(m)
         del self._cylinder_marker_ids[object_id]
+        return True
+
+    def remove_all_pose_markers(self) -> bool:
+        """删除本节点已发布的全部圆柱和 +Z Marker。"""
+        object_ids = list(self._cylinder_marker_ids)
+        for object_id in object_ids:
+            self.remove_cylinder_at_pose(object_id=object_id)
+        if object_ids:
+            self.get_logger().info(
+                f"已删除 {len(object_ids)} 个抓取位姿 Marker"
+            )
         return True
 
     def _move_once(
@@ -6785,6 +6817,9 @@ class G01Demo(Node):
             f"[pick] {tool_label}Fz 增加超过 "
             f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定吸附成功，继续放置"
         )
+        # 全部视觉候选 Marker 仅用于抓取前/抓取中观察；
+        # 吸附确认成功后立即删除，不等到后续放置流程结束。
+        self.remove_all_pose_markers()
 
         self.wait_for_operator()
 
@@ -7098,10 +7133,50 @@ def main(argv: list[str] | None = None) -> int:
     unload_cycle_indices = [0] * len(UNLOAD_PAIR_CYCLES)
 
     def cleanup_grasp_display(remove_scene_objects: bool = True) -> None:
-        node.remove_cylinder_at_pose()
-        node.remove_cylinder_at_pose(object_id=Z_AXIS_MARKER_ID)
+        node.remove_all_pose_markers()
         if remove_scene_objects and not node.remove_frame_cutoff():
             log.warning(f"清理「{FRAME_CUTOFF_ID}」/「{GRASP_OBJECT_COLLISION_ID}」失败")
+
+    def show_all_grasp_vision_markers(all_xyz_rpy: Sequence[dict]) -> None:
+        """在 IK 验证前显示全部视觉抓取圆柱及各自 +Z 方向。
+
+        每个物体只用 right_body 在 moveit_base_link 下的公共表达显示
+        一次；这些 Marker 不进入 PlanningScene，不参与碰撞检测。
+        """
+        node.remove_all_pose_markers()
+        shown_count = 0
+        for point_index, xyz_rpy in enumerate(all_xyz_rpy):
+            pose_values = xyz_rpy.get("right_body")
+            if pose_values is None:
+                log.warning(
+                    f"[pick-display] 物体 {point_index} 缺少 right_body 位姿，"
+                    "跳过显示"
+                )
+                continue
+
+            marker_pose = xyz_rpy_to_pose(pose_values)
+            color_index = point_index % len(GRASP_VISION_CYLINDER_COLORS)
+            cylinder_id = f"{GRASP_VISION_CYLINDER_MARKER_ID_PREFIX}{point_index}"
+            z_axis_id = f"{GRASP_VISION_Z_AXIS_MARKER_ID_PREFIX}{point_index}"
+            node.show_cylinder_at_pose(
+                marker_pose,
+                object_id=cylinder_id,
+                frame_id=SCENE_FRAME,
+                color=GRASP_VISION_CYLINDER_COLORS[color_index],
+            )
+            node.show_z_axis_at_pose(
+                marker_pose,
+                object_id=z_axis_id,
+                frame_id=SCENE_FRAME,
+                color=GRASP_VISION_Z_AXIS_COLORS[color_index],
+            )
+            shown_count += 1
+
+        log.info(
+            f"[pick-display] IK 验证前已显示 {shown_count}/{len(all_xyz_rpy)} "
+            "个视觉物体的圆柱和 +Z 方向；"
+            "物体 0=橙色，物体 1=蓝色"
+        )
 
     def prompt_exit(message: str) -> bool:
         if node.upper_control_mode:
@@ -7365,6 +7440,10 @@ def main(argv: list[str] | None = None) -> int:
             return False
         first_return_modes, all_xyz_rpy = vision_pose
 
+        # 可视化必须早于 IK/路径可达性验证；显示全部候选，
+        # 但后续 PlanningScene 仍只临时添加当前验证的那一个圆柱和隔离面。
+        show_all_grasp_vision_markers(all_xyz_rpy)
+
         # 可达性验证：按视觉点顺序，依次验证 arm、waist、body。
         reachable = validate_reachable_grasp(
             node,
@@ -7408,8 +7487,6 @@ def main(argv: list[str] | None = None) -> int:
         log.info(selected_msg)
         print(f"\033[32m{selected_msg}\033[0m")
 
-        node.show_cylinder_at_pose(pick_target_pose, frame_id=pick_frame)
-        node.show_z_axis_at_pose(pick_target_pose, frame_id=pick_frame)
         if prompt_exit("按回车继续，输入 q 回车退出并移除深框 …"):
             return None
 
