@@ -15,6 +15,8 @@ G01 MoveIt 演示脚本
     批次开始前双臂工具上电，确认左右力传感器均能读取新帧，再双臂下电
     机器人先到初始位
     → 读取视觉点
+    → 命中本批次不可抓缓存的点保留原顺序并用黑色显示，不参与空间排序
+    → 其余点按深框中心 0.4m×0.4m 优先，中心/外围各自按局部 Z 从上到下排序
     → 用两种颜色显示所有视觉圆柱及各自的局部 +Z 方向
     → 过滤本批次已验证不可抓或实际抓取失败的重复点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
@@ -417,6 +419,8 @@ FRAME_Y_OUTER_THICKNESS = 0.05  # 局部 ±Y 两侧向外附加的厚度 [m]
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
 FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 相对于 moveit_base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
+# 步骤 4 抓取排序的中心优先区，尺寸沿深框局部 X/Y。
+GRASP_CENTER_PRIORITY_SIZE = (0.4, 0.4)
 
 # p,4 识别位姿先绕自身 Z 轴 +90°，再沿旋转后的自身坐标平移，
 # 得到深框顶部空心区域中心；该坐标点位于开口中，不落在框壁实体上。
@@ -482,6 +486,9 @@ GRASP_VISION_Z_AXIS_COLORS = (
     ColorRGBA(r=1.0, g=0.5, b=0.0, a=1.0),
     ColorRGBA(r=0.0, g=0.65, b=1.0, a=1.0),
 )
+# 命中本批次不可抓点缓存的物体统一显示为黑色，避免与碰撞体红色混淆。
+UNGRASPABLE_CYLINDER_COLOR = ColorRGBA(r=0.0, g=0.0, b=0.0, a=0.45)
+UNGRASPABLE_Z_AXIS_COLOR = ColorRGBA(r=0.0, g=0.0, b=0.0, a=1.0)
 GRASP_VISION_CYLINDER_MARKER_ID_PREFIX = "grasp_vision_cylinder_"
 GRASP_VISION_Z_AXIS_MARKER_ID_PREFIX = "grasp_vision_z_axis_"
 GRASP_OBJECT_COLLISION_ID = "待抓取物体"
@@ -7137,7 +7144,145 @@ def main(argv: list[str] | None = None) -> int:
         if remove_scene_objects and not node.remove_frame_cutoff():
             log.warning(f"清理「{FRAME_CUTOFF_ID}」/「{GRASP_OBJECT_COLLISION_ID}」失败")
 
-    def show_all_grasp_vision_markers(all_xyz_rpy: Sequence[dict]) -> None:
+    def prioritize_center_grasp_points(
+        first_return_modes: Sequence[int],
+        all_xyz_rpy: Sequence[dict],
+        ungraspable_points: Sequence[Sequence[float]],
+    ) -> tuple[list[int], list[dict]]:
+        """只排序未缓存点：中心优先且各区局部 Z 降序。
+
+        命中不可抓缓存的点不做空间排序，按它们在本次视觉结果中的
+        原始相对顺序放到可抓候选之后。
+        """
+        if len(first_return_modes) != len(all_xyz_rpy):
+            log.error(
+                "[pick-order] first_return_modes 与视觉点数量不一致，"
+                "保留原始顺序"
+            )
+            return list(first_return_modes), list(all_xyz_rpy)
+
+        half_x = GRASP_CENTER_PRIORITY_SIZE[0] / 2.0
+        half_y = GRASP_CENTER_PRIORITY_SIZE[1] / 2.0
+        ranked_points = []
+        for original_index, (first_return_mode, xyz_rpy) in enumerate(
+            zip(first_return_modes, all_xyz_rpy)
+        ):
+            point_position = grasp_point_sj_position(xyz_rpy)
+            cached_match = (
+                find_ungraspable_point_match(point_position, ungraspable_points)
+                if point_position is not None
+                else None
+            )
+            pose_values = xyz_rpy.get("right_body")
+            if cached_match is not None:
+                local_pose = (
+                    pose_relative_to_frame(
+                        xyz_rpy_to_pose(pose_values),
+                        node._frame_pose,
+                    )
+                    if pose_values is not None
+                    else None
+                )
+                # 区域级别 3 使缓存点放在可抓候选之后；第二排序键
+                # 使用原索引，仅保留视觉原顺序，不使用位置或高度排序。
+                ranked_points.append(
+                    (
+                        3,
+                        float(original_index),
+                        original_index,
+                        first_return_mode,
+                        xyz_rpy,
+                        local_pose,
+                        cached_match,
+                    )
+                )
+                continue
+
+            if pose_values is None:
+                # 正常抓取视觉一定包含 right_body；异常点放到最后，
+                # 仍保留给后续校验输出明确错误，不在这里静默丢弃。
+                ranked_points.append(
+                    (2, 0.0, original_index, first_return_mode, xyz_rpy, None, None)
+                )
+                continue
+
+            pose_in_frame = pose_relative_to_frame(
+                xyz_rpy_to_pose(pose_values),
+                node._frame_pose,
+            )
+            x = pose_in_frame.position.x
+            y = pose_in_frame.position.y
+            z = pose_in_frame.position.z
+            in_center = abs(x) <= half_x and abs(y) <= half_y
+            ranked_points.append(
+                (
+                    0 if in_center else 1,
+                    -z,
+                    original_index,
+                    first_return_mode,
+                    xyz_rpy,
+                    pose_in_frame,
+                    None,
+                )
+            )
+
+        ranked_points.sort(key=lambda item: item[:3])
+        sorted_modes: list[int] = []
+        sorted_xyz_rpy: list[dict] = []
+        cached_count = 0
+        for sorted_index, item in enumerate(ranked_points):
+            (
+                area_rank,
+                _,
+                original_index,
+                first_return_mode,
+                xyz_rpy,
+                local_pose,
+                cached_match,
+            ) = item
+            sorted_modes.append(first_return_mode)
+            sorted_xyz_rpy.append(xyz_rpy)
+            if cached_match is not None:
+                cached_count += 1
+                cache_index, distance = cached_match
+                local_text = ""
+                if local_pose is not None:
+                    p = local_pose.position
+                    local_text = (
+                        f", deep_frame xyz=({p.x:.4f}, {p.y:.4f}, {p.z:.4f}) m"
+                    )
+                log.info(
+                    f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index}, "
+                    f"命中不可抓点 #{cache_index + 1}, "
+                    f"距离={distance * 1000.0:.1f} mm，不参与空间排序"
+                    f"{local_text}"
+                )
+                continue
+            if local_pose is None:
+                log.warning(
+                    f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index} "
+                    "缺少 right_body，已排在最后"
+                )
+                continue
+            area_label = "中心区" if area_rank == 0 else "外围区"
+            p = local_pose.position
+            log.info(
+                f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index}, "
+                f"{area_label}, deep_frame xyz=({p.x:.4f}, {p.y:.4f}, {p.z:.4f}) m"
+            )
+
+        log.info(
+            "[pick-order] 排序完成：深框局部 "
+            f"|x|≤{half_x:.3f} m 且 |y|≤{half_y:.3f} m 的中心点优先；"
+            "中心区和外围区内部均按局部 z 从大到小；"
+            f"{cached_count} 个缓存不可抓点未参与排序并放在末尾"
+        )
+        return sorted_modes, sorted_xyz_rpy
+
+    def show_all_grasp_vision_markers(
+        all_xyz_rpy: Sequence[dict],
+        ungraspable_points: Sequence[Sequence[float]],
+    ) -> None:
         """在 IK 验证前显示全部视觉抓取圆柱及各自 +Z 方向。
 
         每个物体只用 right_body 在 moveit_base_link 下的公共表达显示
@@ -7145,6 +7290,7 @@ def main(argv: list[str] | None = None) -> int:
         """
         node.remove_all_pose_markers()
         shown_count = 0
+        cached_count = 0
         for point_index, xyz_rpy in enumerate(all_xyz_rpy):
             pose_values = xyz_rpy.get("right_body")
             if pose_values is None:
@@ -7155,27 +7301,41 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             marker_pose = xyz_rpy_to_pose(pose_values)
-            color_index = point_index % len(GRASP_VISION_CYLINDER_COLORS)
+            point_position = grasp_point_sj_position(xyz_rpy)
+            cached_match = (
+                find_ungraspable_point_match(point_position, ungraspable_points)
+                if point_position is not None
+                else None
+            )
+            if cached_match is not None:
+                cylinder_color = UNGRASPABLE_CYLINDER_COLOR
+                z_axis_color = UNGRASPABLE_Z_AXIS_COLOR
+                cached_count += 1
+            else:
+                color_index = point_index % len(GRASP_VISION_CYLINDER_COLORS)
+                cylinder_color = GRASP_VISION_CYLINDER_COLORS[color_index]
+                z_axis_color = GRASP_VISION_Z_AXIS_COLORS[color_index]
             cylinder_id = f"{GRASP_VISION_CYLINDER_MARKER_ID_PREFIX}{point_index}"
             z_axis_id = f"{GRASP_VISION_Z_AXIS_MARKER_ID_PREFIX}{point_index}"
             node.show_cylinder_at_pose(
                 marker_pose,
                 object_id=cylinder_id,
                 frame_id=SCENE_FRAME,
-                color=GRASP_VISION_CYLINDER_COLORS[color_index],
+                color=cylinder_color,
             )
             node.show_z_axis_at_pose(
                 marker_pose,
                 object_id=z_axis_id,
                 frame_id=SCENE_FRAME,
-                color=GRASP_VISION_Z_AXIS_COLORS[color_index],
+                color=z_axis_color,
             )
             shown_count += 1
 
         log.info(
             f"[pick-display] IK 验证前已显示 {shown_count}/{len(all_xyz_rpy)} "
             "个视觉物体的圆柱和 +Z 方向；"
-            "物体 0=橙色，物体 1=蓝色"
+            "可抓候选交替使用橙/蓝色，"
+            f"缓存不可抓点={cached_count} 个（黑色）"
         )
 
     def prompt_exit(message: str) -> bool:
@@ -7440,9 +7600,17 @@ def main(argv: list[str] | None = None) -> int:
             return False
         first_return_modes, all_xyz_rpy = vision_pose
 
+        # 排序后的列表会同时用于 Marker 编号/颜色、失败点过滤和 IK，
+        # 保证实际验证与抓取顺序就是“中心优先，再按高度”。
+        first_return_modes, all_xyz_rpy = prioritize_center_grasp_points(
+            first_return_modes,
+            all_xyz_rpy,
+            ungraspable_points,
+        )
+
         # 可视化必须早于 IK/路径可达性验证；显示全部候选，
         # 但后续 PlanningScene 仍只临时添加当前验证的那一个圆柱和隔离面。
-        show_all_grasp_vision_markers(all_xyz_rpy)
+        show_all_grasp_vision_markers(all_xyz_rpy, ungraspable_points)
 
         # 可达性验证：按视觉点顺序，依次验证 arm、waist、body。
         reachable = validate_reachable_grasp(
