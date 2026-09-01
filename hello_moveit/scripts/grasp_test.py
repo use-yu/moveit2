@@ -16,7 +16,7 @@ G01 MoveIt 演示脚本
     机器人先到初始位
     → 读取视觉点
     → 命中本批次不可抓缓存的点保留原顺序并用黑色显示，不参与姿态排序
-    → 其余点按局部 +Z 与 moveit_base_link +Z 的偏离角从小到大排序
+    → 其余点按局部 -Z 与 moveit_base_link +Z 的偏离角从小到大排序
     → 用两种颜色显示所有视觉圆柱及各自的局部 +Z 方向
     → 过滤本批次已验证不可抓或实际抓取失败的重复点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
@@ -143,6 +143,7 @@ from moveit_msgs.srv import (
 from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import ColorRGBA, Float32MultiArray, String, UInt8
@@ -495,6 +496,9 @@ UNGRASPABLE_CYLINDER_COLOR = ColorRGBA(r=0.0, g=0.0, b=0.0, a=0.45)
 UNGRASPABLE_Z_AXIS_COLOR = ColorRGBA(r=0.0, g=0.0, b=0.0, a=1.0)
 GRASP_VISION_CYLINDER_MARKER_ID_PREFIX = "grasp_vision_cylinder_"
 GRASP_VISION_Z_AXIS_MARKER_ID_PREFIX = "grasp_vision_z_axis_"
+# 每个视觉点会发布圆柱和 +Z 箭头两条 Marker。大队列避免
+# 一次识别的密集发布把前面的物体从 DDS 历史中挤掉。
+POSE_MARKER_QUEUE_DEPTH = 2048
 GRASP_OBJECT_COLLISION_ID = "待抓取物体"
 GRASP_OBJECT_COLLISION_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
 Z_AXIS_MARKER_ID = "ee_pose_z_axis"
@@ -963,6 +967,16 @@ VISION_PORT = 50000
 VISION_TRIGGER_COMMAND = "p,1"
 VISION_CONNECT_TIMEOUT = 3.0
 VISION_RECV_TIMEOUT = 30.0
+# 视觉返回的首个数字不使用；后续每 8 个数字是一个物体。
+# TCP 无消息长度字段，收到首包后以短时间无新数据作为本次结束。
+VISION_RECV_CHUNK_BYTES = 4096
+VISION_RESPONSE_IDLE_TIMEOUT_SEC = 0.2
+VISION_MAX_POINT_COUNT = 1000
+VISION_MAX_RESPONSE_BYTES = 1024 * 1024
+if POSE_MARKER_QUEUE_DEPTH < 2 * VISION_MAX_POINT_COUNT + 1:
+    raise ValueError(
+        "POSE_MARKER_QUEUE_DEPTH 必须容纳 DELETEALL 和每个视觉点的两条 Marker"
+    )
 # 步骤 2 深框识别和步骤 6 物料台识别的总尝试次数（包含首次）。
 SCENE_VISION_MAX_ATTEMPTS = 5
 # 正则表达式，用来匹配字符串里的数字：
@@ -986,7 +1000,7 @@ SIM_VISION_RESULT = (
 #     [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
 # )
 # 物料台 p,8 仿真视觉数据：
-# 原始协议为 1,x,y,z,qw,qx,qy,qz,mode；首个 1 是点数量，末尾 1 是模式码。
+# 原始协议为 header,x,y,z,qw,qx,qy,qz,mode；header 不使用。
 SIM_UNLOAD_VISION_RESULT = (
     1,
     [-47.2306, -52.774, 621.5524, 0.2655, 0.6732, -0.6395, 0.2594],
@@ -1076,30 +1090,69 @@ def read_vision_pose(
     log,
     trigger_command: str = VISION_TRIGGER_COMMAND,
 ) -> list[tuple[int, list[float]]] | None:
-    """解析视觉数据：第 1 个数忽略，后面每 8 个数为 xyz(mm)+quat(wxyz)+模式码。"""
+    """收齐并解析视觉数据。
+
+    协议是 ``未使用头字段,N * (xyz(mm)+quat(wxyz)+模式码)``。
+    TCP 不保证一次 ``recv`` 收到一条完整消息，因此收到
+    首包后会继续接收，直到短时间无新数据，再跳过首个数字按 8 个一组解析。
+    """
     try:
         t0 = time.monotonic()
         sock.sendall(trigger_command.encode("utf-8"))
         log.info(f"viewer 已发送触发命令: {trigger_command}")
-        raw_text = sock.recv(4096).decode("utf-8", errors="ignore").strip()
+        response = bytearray()
+        original_timeout = sock.gettimeout()
+        try:
+            while True:
+                sock.settimeout(
+                    VISION_RESPONSE_IDLE_TIMEOUT_SEC
+                    if response
+                    else original_timeout
+                )
+                try:
+                    chunk = sock.recv(VISION_RECV_CHUNK_BYTES)
+                except socket.timeout:
+                    if response:
+                        break
+                    raise
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if len(response) > VISION_MAX_RESPONSE_BYTES:
+                    raise ValueError(
+                        f"viewer 返回超过 {VISION_MAX_RESPONSE_BYTES} 字节上限"
+                    )
+        finally:
+            sock.settimeout(original_timeout)
+
+        raw_text = response.decode("utf-8", errors="ignore").strip()
         used_ms = (time.monotonic() - t0) * 1000.0
-        message = f"viewer 发送命令到接收到数字耗时: {used_ms:.3f} ms"
+        message = f"viewer 发送命令到收齐数据耗时: {used_ms:.3f} ms"
         log.info(message)
         print(f"{GREEN}{message}{RESET}")
         print(f"{GREEN}viewer 接收到的数据: {raw_text}{RESET}")
 
         numbers = [float(item) for item in NUMBER_PATTERN.findall(raw_text)]
-        if len(numbers) < 9:
-            message = f"viewer 返回数字不足 9 个，至少需要 1 + 8：{raw_text}"
+        if not numbers:
+            message = f"viewer 返回中没有数字：{raw_text}"
             log.error(message)
             print(message)
             return None
-
         payload = numbers[1:]
         if len(payload) % 8 != 0:
             message = (
-                f"viewer 返回格式错误：忽略第 1 个数后剩余 {len(payload)} 个，"
-                f"不是 8 的整数倍，原始返回：{raw_text}"
+                "viewer 返回格式错误：跳过首个未使用数字后，"
+                f"剩余 {len(payload)} 个数字，不是 8 的整数倍；"
+                f"原始返回：{raw_text}"
+            )
+            log.error(message)
+            print(message)
+            return None
+        point_count = len(payload) // 8
+        if point_count > VISION_MAX_POINT_COUNT:
+            message = (
+                f"viewer 返回 {point_count} 个点，"
+                f"超过上限 {VISION_MAX_POINT_COUNT}"
             )
             log.error(message)
             print(message)
@@ -1124,7 +1177,7 @@ def read_vision_pose(
         print(f"viewer 点个数: {len(poses)}")
         log.info(f"viewer 点个数: {len(poses)}")
         return poses
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         message = f"viewer 获取 pose 失败：{exc}"
         log.error(message)
         print(message)
@@ -1685,9 +1738,12 @@ def validate_reachable_grasp(
     speed_scale: float = 0.2,
     cutoff_joint_names: Sequence[str] | None = None,
     ungraspable_points: list[tuple[float, float, float]] | None = None,
-    scene_grasp_object_poses: Sequence[Pose] | None = None,
 ):
-    """过滤失败点，再验证 IK、Cartesian approach 和带全部物体的 OMPL。"""
+    """过滤失败点，再验证 IK、Cartesian approach 和 OMPL。
+
+    每次验证只把当前候选点对应的一个圆柱与隔离面加入
+    PlanningScene，不加入其他视觉物体。
+    """
     log = node.get_logger()
     if not all_xyz_rpy:
         log.error("[reach] 没有可验证的视觉点")
@@ -1714,6 +1770,15 @@ def validate_reachable_grasp(
             continue
 
         tested_count += 1
+        collision_pose_values = xyz_rpy.get("right_body")
+        if collision_pose_values is None:
+            log.error(
+                f"[reach] 点 {point_index + 1} 缺少 right_body，"
+                "无法创建当前抓取物体的碰撞圆柱"
+            )
+            continue
+        pick_collision_pose = xyz_rpy_to_pose(collision_pose_values)
+        pick_scene_grasp_object_poses = [pick_collision_pose]
         attempts = _reachability_attempts_for_point(xyz_rpy)
         order_text = " → ".join(item["group"] for item in attempts)
         log.info(
@@ -1740,17 +1805,37 @@ def validate_reachable_grasp(
                 f"[reach] 验证点 {point_index + 1}: group={pick_group}, "
                 f"link={pick_link}, frame={pick_frame}, xyz_key={xyz_key}"
             )
-            picked = node._select_feasible_grasp_pair(
-                pick_group,
-                pick_link,
-                pick_target_pose,
-                pre_pose,
-                joint_names=pick_joint_names,
-                speed_scale=speed_scale,
-                plan_frame=pick_frame,
-                cutoff_joint_names=cutoff_joint_names,
-                scene_grasp_object_poses=scene_grasp_object_poses,
+            if not node.add_grasp_objects_collision_only(
+                pick_scene_grasp_object_poses,
+                verbose=False,
+            ):
+                log.error(
+                    f"[reach] 点 {point_index + 1} / {pick_group}: "
+                    "IK 前添加当前候选圆柱失败"
+                )
+                continue
+            log.info(
+                f"[reach-collision] 点 {point_index + 1} / {pick_group}: "
+                "IK 前已只添加当前候选圆柱（1 个）"
             )
+            try:
+                picked = node._select_feasible_grasp_pair(
+                    pick_group,
+                    pick_link,
+                    pick_target_pose,
+                    pre_pose,
+                    joint_names=pick_joint_names,
+                    speed_scale=speed_scale,
+                    plan_frame=pick_frame,
+                    cutoff_joint_names=cutoff_joint_names,
+                    scene_grasp_object_poses=pick_scene_grasp_object_poses,
+                )
+            finally:
+                if not node.remove_frame_cutoff():
+                    log.warning(
+                        f"[reach-collision] 点 {point_index + 1} / {pick_group}: "
+                        "清理当前候选圆柱失败"
+                    )
             if picked is None:
                 log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
                 continue
@@ -1774,6 +1859,7 @@ def validate_reachable_grasp(
                 "pick_xyz_key": xyz_key,
                 "pick_joint_names": pick_joint_names,
                 "pick_target_pose": pick_target_pose,
+                "pick_collision_pose": pick_collision_pose,
                 "pick_q_pre": q_pre,
                 "pick_q_target": q_target,
                 "pick_to_pre_traj": to_pre_traj,
@@ -2175,7 +2261,7 @@ def make_deep_frame_cutoff(
 
 
 def make_grasp_objects_collision(poses: Sequence[Pose]) -> CollisionObject:
-    """把全部视觉圆柱作为同一 MoveIt 碰撞对象的多个 primitive。"""
+    """把传入的圆柱作为同一 MoveIt 碰撞对象的多个 primitive。"""
     obj = CollisionObject()
     obj.header.frame_id = SCENE_FRAME
     obj.id = GRASP_OBJECT_COLLISION_ID
@@ -2804,8 +2890,17 @@ class G01Demo(Node):
             MOTOR_COMMAND_TOPIC,
             10,
         )
-        # 一次视觉可能连续发布多组圆柱/+Z Marker，保留足够队列深度。
-        self._cylinder_marker_pub = self.create_publisher(Marker, CYLINDER_MARKER_TOPIC, 20)
+        # 步骤 4 会在极短时间内为每个视觉点发布圆柱/+Z 两条
+        # Marker。使用大队列 + reliable + transient-local，既防止密集
+        # 发布丢掉前面的点，也允许 RViz 重连后收到当前显示。
+        marker_qos = QoSProfile(depth=POSE_MARKER_QUEUE_DEPTH)
+        marker_qos.reliability = ReliabilityPolicy.RELIABLE
+        marker_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self._cylinder_marker_pub = self.create_publisher(
+            Marker,
+            CYLINDER_MARKER_TOPIC,
+            marker_qos,
+        )
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
 
@@ -4155,6 +4250,36 @@ class G01Demo(Node):
         ]
         return self._apply_scene(objects, report_error=report_error)
 
+    def add_grasp_objects_collision_only(
+        self,
+        poses: Sequence[Pose],
+        *,
+        verbose: bool = True,
+    ) -> bool:
+        """只添加传入的抓取圆柱，不添加隔离面。
+
+        候选点 IK/Cartesian 验证前使用；位姿必须已在
+        ``SCENE_FRAME`` 下表达。
+        """
+        collision_poses = [copy.deepcopy(pose) for pose in poses]
+        if not collision_poses:
+            self.get_logger().error("抓取圆柱位姿为空，无法添加候选点碰撞体")
+            return False
+        if verbose:
+            self.get_logger().info(
+                f"只添加「{GRASP_OBJECT_COLLISION_ID}」："
+                f"{len(collision_poses)} 个当前候选圆柱"
+            )
+        return self._apply_scene(
+            [make_grasp_objects_collision(collision_poses)],
+            [
+                ObjectColor(
+                    id=GRASP_OBJECT_COLLISION_ID,
+                    color=GRASP_OBJECT_COLLISION_COLOR,
+                )
+            ],
+        )
+
     def add_frame_cutoff_for_pose(
         self,
         pose: Pose | dict,
@@ -4166,7 +4291,7 @@ class G01Demo(Node):
         verbose: bool = True,
         scene_grasp_object_poses: Sequence[Pose] | None = None,
     ) -> bool:
-        """添加隔板和全部视觉物体；传入 link 时隔板低 1 cm。
+        """添加隔板和传入的视觉物体；传入 link 时隔板低 1 cm。
 
         ``scene_grasp_object_poses`` 中的位姿必须已在 ``target_frame``
         下表达。未传入时保留兼容行为，只添加 ``pose`` 对应的圆柱。
@@ -4362,7 +4487,7 @@ class G01Demo(Node):
         speed_scale: float,
         scene_grasp_object_poses: Sequence[Pose] | None = None,
     ) -> RobotTrajectory | None:
-        """临时加入全部视觉碰撞体，规划当前位置到 q_pre 的 OMPL 路径。
+        """临时加入传入的抓取碰撞体，规划当前位置到 q_pre 的 OMPL 路径。
 
         这一步放在 IK 和 Cartesian approach 通过之后。使用 ``plan_only``，只
         验证完整路径而不移动机器人；规划结束后无论成功与否都恢复临时场景。
@@ -4495,12 +4620,17 @@ class G01Demo(Node):
 
     def remove_all_pose_markers(self) -> bool:
         """删除本节点已发布的全部圆柱和 +Z Marker。"""
-        object_ids = list(self._cylinder_marker_ids)
-        for object_id in object_ids:
-            self.remove_cylinder_at_pose(object_id=object_id)
-        if object_ids:
+        marker_count = len(self._cylinder_marker_ids)
+        if marker_count:
+            marker = Marker()
+            marker.header.frame_id = SCENE_FRAME
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = CYLINDER_MARKER_NS
+            marker.action = Marker.DELETEALL
+            self._cylinder_marker_pub.publish(marker)
+            self._cylinder_marker_ids.clear()
             self.get_logger().info(
-                f"已删除 {len(object_ids)} 个抓取位姿 Marker"
+                f"已用一条 DELETEALL 删除 {marker_count} 个抓取位姿 Marker"
             )
         return True
 
@@ -5858,7 +5988,8 @@ class G01Demo(Node):
 
         target_seeds 不为 None 时，只用这些 seed 求 IK，不做当前关节/随机 seed 枚举。
         筛选顺序固定为：碰撞 IK → Cartesian approach → OMPL 到 q_pre。
-        cutoff_joint_names 不为 None 时，OMPL 预检会临时加入隔离面和全部视觉物体，
+        cutoff_joint_names 不为 None 时，OMPL 预检会临时加入隔离面和
+        ``scene_grasp_object_poses`` 中的抓取物体；步骤 4 只传当前候选圆柱，
         使验证条件与后续实际执行一致。
         返回 (q_pre, q_target, to_pre_traj, approach_traj) 四元组；
         找不到返回 None。to_pre_traj 是当前位置到 q_pre 的 OMPL 轨迹，
@@ -6568,7 +6699,8 @@ class G01Demo(Node):
             place_speed_scale : 放置段的速度缩放（0~1）
             cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
             first_return_mode : 1=使用 *_j 并交换；2=使用普通放置点；0 兼容旧普通模式
-            scene_grasp_object_poses: 本轮视觉识别到的全部圆柱，已在 SCENE_FRAME 下表达
+            scene_grasp_object_poses: 抓取和放置阶段的碰撞圆柱；
+                步骤 4 始终只传选中物体
             prevalidated_pair : 可达性验证已选出的 (q_pre, q_target,
                 to_pre_traj, approach_traj)；传入后不再重复执行 100 次
                 IK、OMPL 到 q_pre 规划和 Cartesian 直线预检。
@@ -6694,7 +6826,7 @@ class G01Demo(Node):
                 tangent_joints=q_pre,
                 scene_grasp_object_poses=scene_grasp_object_poses,
             ):
-                log.error("[pick] 添加 q_pre OMPL 隔板/全部视觉圆柱失败")
+                log.error("[pick] 添加 q_pre OMPL 隔板/选中抓取圆柱失败")
                 return False
             cutoff_added = True
             ok = self._execute_traj(to_pre_traj)
@@ -6873,7 +7005,7 @@ class G01Demo(Node):
 
         self.wait_for_operator()
 
-        # 抓取后的交换/放置运动继续保留本轮全部视觉圆柱，
+        # 抓取后的交换/放置运动也只保留选中的一个圆柱，
         # 与隔离面一起参与后续启用碰撞检查的 OMPL 规划。
         if not self.add_frame_cutoff_for_pose(
             target_pose,
@@ -6884,7 +7016,7 @@ class G01Demo(Node):
             tangent_joints=q_pre,
             scene_grasp_object_poses=scene_grasp_object_poses,
         ):
-            log.error("[pick] 第一段复位后添加隔板/全部视觉圆柱失败")
+            log.error("[pick] 第一段复位后添加隔板/选中抓取圆柱失败")
             return False
 
         if first_return_mode == 1:
@@ -7195,7 +7327,7 @@ def main(argv: list[str] | None = None) -> int:
         all_xyz_rpy: Sequence[dict],
         ungraspable_points: Sequence[Sequence[float]],
     ) -> tuple[list[int], list[dict]]:
-        """只排序未缓存点：物体局部 +Z 越接近竖直向上越优先。
+        """只排序未缓存点：物体局部 -Z 越接近竖直向上越优先。
 
         偏离角在 moveit_base_link 下计算；不再使用深框中心区域
         或位置高度。命中不可抓缓存的点不做姿态排序，按它们在本次视觉结果中的
@@ -7248,7 +7380,7 @@ def main(argv: list[str] | None = None) -> int:
             axis_x, axis_y, axis_z = rotate_xyz_by_quat(
                 0.0,
                 0.0,
-                1.0,
+                -1.0,
                 q.x,
                 q.y,
                 q.z,
@@ -7283,7 +7415,7 @@ def main(argv: list[str] | None = None) -> int:
                 original_index,
                 first_return_mode,
                 xyz_rpy,
-                local_z_axis,
+                local_minus_z_axis,
                 cached_match,
             ) = item
             sorted_modes.append(first_return_mode)
@@ -7297,21 +7429,21 @@ def main(argv: list[str] | None = None) -> int:
                     f"距离={distance * 1000.0:.1f} mm，不参与姿态排序"
                 )
                 continue
-            if candidate_rank != 0 or local_z_axis is None:
+            if candidate_rank != 0 or local_minus_z_axis is None:
                 log.warning(
                     f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index} "
                     "缺少 right_body，已排在可抓候选之后"
                 )
                 continue
-            axis_x, axis_y, axis_z = local_z_axis
+            axis_x, axis_y, axis_z = local_minus_z_axis
             log.info(
                 f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index}, "
-                f"局部 +Z=({axis_x:.4f}, {axis_y:.4f}, {axis_z:.4f}), "
+                f"局部 -Z=({axis_x:.4f}, {axis_y:.4f}, {axis_z:.4f}), "
                 f"偏离竖直向上={math.degrees(tilt_or_order):.2f}°"
             )
 
         log.info(
-            "[pick-order] 姿态排序完成：未缓存点按物体局部 +Z "
+            "[pick-order] 姿态排序完成：未缓存点按物体局部 -Z "
             "偏离 moveit_base_link +Z 的角度从小到大；"
             "不使用中心区域或位置高度；"
             f"{cached_count} 个缓存不可抓点未参与姿态排序并放在末尾"
@@ -7349,11 +7481,13 @@ def main(argv: list[str] | None = None) -> int:
             if cached_match is not None:
                 cylinder_color = UNGRASPABLE_CYLINDER_COLOR
                 z_axis_color = UNGRASPABLE_Z_AXIS_COLOR
+                color_label = "black"
                 cached_count += 1
             else:
                 color_index = point_index % len(GRASP_VISION_CYLINDER_COLORS)
                 cylinder_color = GRASP_VISION_CYLINDER_COLORS[color_index]
                 z_axis_color = GRASP_VISION_Z_AXIS_COLORS[color_index]
+                color_label = str(color_index)
             cylinder_id = f"{GRASP_VISION_CYLINDER_MARKER_ID_PREFIX}{point_index}"
             z_axis_id = f"{GRASP_VISION_Z_AXIS_MARKER_ID_PREFIX}{point_index}"
             node.show_cylinder_at_pose(
@@ -7367,6 +7501,10 @@ def main(argv: list[str] | None = None) -> int:
                 object_id=z_axis_id,
                 frame_id=SCENE_FRAME,
                 color=z_axis_color,
+            )
+            log.info(
+                f"[pick-display] 视觉物体 {point_index}: "
+                f"color={color_label}，圆柱/+Z 已发布"
             )
             shown_count += 1
 
@@ -7624,7 +7762,6 @@ def main(argv: list[str] | None = None) -> int:
         selected_waist_deg: int | None = None
         first_return_modes: list[int] = []
         all_xyz_rpy: list[dict] = []
-        scene_grasp_object_poses: list[Pose] = []
 
         for waist_attempt, waist_deg in enumerate(GRASP_VISION_WAIST_ANGLES_DEG):
             q1_for_waist = list(GRASP_Q1)
@@ -7663,27 +7800,10 @@ def main(argv: list[str] | None = None) -> int:
                 all_xyz_rpy,
                 ungraspable_points,
             )
-
-            # PlanningScene 使用公共 moveit_base_link 表达的全部视觉圆柱。
-            scene_grasp_object_poses = []
-            for point_index, xyz_rpy in enumerate(all_xyz_rpy):
-                pose_values = xyz_rpy.get("right_body")
-                if pose_values is None:
-                    node.last_pick_failure_reason = "vision_pose_missing"
-                    log.error(
-                        f"[pick-collision] 视觉物体 {point_index} 缺少 right_body，"
-                        "无法建立全量碰撞模型"
-                    )
-                    return False
-                scene_grasp_object_poses.append(xyz_rpy_to_pose(pose_values))
-            if not scene_grasp_object_poses:
+            if not all_xyz_rpy:
                 node.last_pick_failure_reason = "vision_no_objects"
-                log.error("[pick-collision] 没有视觉圆柱，无法建立临时碰撞模型")
+                log.error("[pick-collision] 视觉没有返回物体")
                 return False
-            log.info(
-                f"[pick-collision][waist={waist_deg}°] 已准备 "
-                f"{len(scene_grasp_object_poses)} 个视觉圆柱"
-            )
 
             show_all_grasp_vision_markers(
                 all_xyz_rpy,
@@ -7695,7 +7815,6 @@ def main(argv: list[str] | None = None) -> int:
                 speed_scale=0.4,
                 cutoff_joint_names=joint_names,
                 ungraspable_points=ungraspable_points,
-                scene_grasp_object_poses=scene_grasp_object_poses,
             )
             if reachable is not None:
                 selected_waist_deg = waist_deg
@@ -7730,6 +7849,8 @@ def main(argv: list[str] | None = None) -> int:
         pick_frame = reachable["pick_frame"]
         pick_joint_names = reachable["pick_joint_names"]
         pick_target_pose = reachable["pick_target_pose"]
+        pick_collision_pose = reachable["pick_collision_pose"]
+        selected_grasp_object_poses = [pick_collision_pose]
         pick_label = "左臂" if tool_side_for_link(pick_link) == "left" else "右臂"
         pick_q_target = reachable.get("pick_q_target", {})
         waist_pick_angle = (
@@ -7766,7 +7887,7 @@ def main(argv: list[str] | None = None) -> int:
             place_speed_scale=0.4,
             cutoff_joint_names=joint_names,
             first_return_mode=first_return_mode,
-            scene_grasp_object_poses=scene_grasp_object_poses,
+            scene_grasp_object_poses=selected_grasp_object_poses,
             prevalidated_pair=(
                 reachable["pick_q_pre"],
                 reachable["pick_q_target"],

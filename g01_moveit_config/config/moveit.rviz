@@ -214,8 +214,8 @@ Visualization Manager:
         Goal State Color: 250; 128; 0
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
-        Planning Group: left_body
-        Query Goal State: false
+        Planning Group: right_arm
+        Query Goal State: true
         Query Start State: false
         Show Workspace: false
         Start State Alpha: 1
@@ -503,125 +503,28 @@ Visualization Manager:
       Value: true
       Visual Enabled: true
     - Class: rviz_default_plugins/TF
-      Enabled: true
+      Enabled: false
       Frame Timeout: 15
       Frames:
         All Enabled: false
-        L1:
-          Value: true
-        L2:
-          Value: true
-        L3:
-          Value: true
-        L4:
-          Value: true
-        L5:
-          Value: true
-        L6:
-          Value: true
-        R1:
-          Value: true
-        R2:
-          Value: true
-        R3:
-          Value: true
-        R4:
-          Value: true
-        R5:
-          Value: true
-        R6:
-          Value: true
-        SJ:
-          Value: true
-        YB:
-          Value: true
-        base_footprint:
-          Value: false
-        base_link:
-          Value: false
-        base_sj:
-          Value: true
-        base_x_link:
-          Value: false
-        box_obstacle_top_center:
-          Value: true
-        deep_frame_center:
-          Value: false
-        deep_frame_top_center:
-          Value: true
-        deep_frame_vision:
-          Value: true
-        head:
-          Value: true
-        l_base_link:
-          Value: true
-        l_tool:
-          Value: true
-        map:
-          Value: false
-        moveit_base_link:
-          Value: false
-        r_base_link:
-          Value: true
-        r_tool:
-          Value: true
-        world:
-          Value: false
       Marker Scale: 1
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: false
       Tree:
-        map:
-          base_link:
-            {}
-          world:
-            base_footprint:
-              base_x_link:
-                moveit_base_link:
-                  base_sj:
-                    SJ:
-                      YB:
-                        head:
-                          {}
-                        l_base_link:
-                          L1:
-                            L2:
-                              L3:
-                                L4:
-                                  L5:
-                                    L6:
-                                      l_tool:
-                                        {}
-                        r_base_link:
-                          R1:
-                            R2:
-                              R3:
-                                R4:
-                                  R5:
-                                    R6:
-                                      r_tool:
-                                        {}
-                  box_obstacle_top_center:
-                    {}
-                  deep_frame_center:
-                    {}
-                  deep_frame_top_center:
-                    {}
-                  deep_frame_vision:
-                    {}
+        {}
       Update Interval: 0
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/Marker
       Enabled: true
       Name: Pose Cylinder Marker
       Namespaces:
         {}
       Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Filter size: 10
+        Depth: 2048
+        Durability Policy: Transient Local
+        Filter size: 2048
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /g01_pose_cylinder
@@ -656,25 +559,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 3.052873373031616
+      Distance: 3.351773738861084
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.7189623713493347
-        Y: -0.5415764451026917
-        Z: 0.9265252947807312
+        X: 0.5995704531669617
+        Y: 0.08567605912685394
+        Z: 0.8994719386100769
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.05979384481906891
+      Pitch: 0.1247941330075264
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 4.4936137199401855
+      Yaw: 0.27044519782066345
     Saved: ~
 Window Geometry:
   Displays:
