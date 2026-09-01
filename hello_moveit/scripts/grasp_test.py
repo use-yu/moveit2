@@ -1741,8 +1741,9 @@ def validate_reachable_grasp(
 ):
     """过滤失败点，再验证 IK、Cartesian approach 和 OMPL。
 
-    每次验证只把当前候选点对应的一个圆柱与隔离面加入
-    PlanningScene，不加入其他视觉物体。
+    目标 IK 和 Cartesian approach 不加临时视觉碰撞体；只在
+    OMPL 规划当前位置到 q_pre 时，加入当前候选的一个圆柱
+    和隔离面。
     """
     log = node.get_logger()
     if not all_xyz_rpy:
@@ -1805,37 +1806,22 @@ def validate_reachable_grasp(
                 f"[reach] 验证点 {point_index + 1}: group={pick_group}, "
                 f"link={pick_link}, frame={pick_frame}, xyz_key={xyz_key}"
             )
-            if not node.add_grasp_objects_collision_only(
-                pick_scene_grasp_object_poses,
-                verbose=False,
-            ):
-                log.error(
-                    f"[reach] 点 {point_index + 1} / {pick_group}: "
-                    "IK 前添加当前候选圆柱失败"
-                )
-                continue
             log.info(
                 f"[reach-collision] 点 {point_index + 1} / {pick_group}: "
-                "IK 前已只添加当前候选圆柱（1 个）"
+                "目标 IK/Cartesian 不加临时圆柱；"
+                "OMPL 到 q_pre 只加当前候选圆柱（1 个）+隔离面"
             )
-            try:
-                picked = node._select_feasible_grasp_pair(
-                    pick_group,
-                    pick_link,
-                    pick_target_pose,
-                    pre_pose,
-                    joint_names=pick_joint_names,
-                    speed_scale=speed_scale,
-                    plan_frame=pick_frame,
-                    cutoff_joint_names=cutoff_joint_names,
-                    scene_grasp_object_poses=pick_scene_grasp_object_poses,
-                )
-            finally:
-                if not node.remove_frame_cutoff():
-                    log.warning(
-                        f"[reach-collision] 点 {point_index + 1} / {pick_group}: "
-                        "清理当前候选圆柱失败"
-                    )
+            picked = node._select_feasible_grasp_pair(
+                pick_group,
+                pick_link,
+                pick_target_pose,
+                pre_pose,
+                joint_names=pick_joint_names,
+                speed_scale=speed_scale,
+                plan_frame=pick_frame,
+                cutoff_joint_names=cutoff_joint_names,
+                scene_grasp_object_poses=pick_scene_grasp_object_poses,
+            )
             if picked is None:
                 log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
                 continue
