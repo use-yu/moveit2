@@ -363,7 +363,7 @@ MOVE_TO_GRASP_RESET_Q = [
 
 # 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
 # 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
-GRASP_VISION_WAIST_ANGLES_DEG = (20,)
+GRASP_VISION_WAIST_ANGLES_DEG = (30,)
 # 抓取排序的姿态分组阈值：局部 +Z 与 moveit_base_link -Z
 # 的偏离角小于该值时，优先于其他物体抓取。
 GRASP_UPRIGHT_TILT_THRESHOLD_DEG = 30.0
