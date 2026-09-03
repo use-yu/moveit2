@@ -474,7 +474,7 @@ FRAME_FRONT_GUARD_ABOVE_TOP = 0.50
 
 FRAME_CUTOFF_ID = "深框隔离面"
 FRAME_CUTOFF_THICKNESS = 0.01  # 水平隔离面厚度 [m]，沿深框局部 z 轴
-FRAME_CUTOFF_BELOW_COLLISION = 0.01  # 隔离面上表面比 L6/R6 collision 最低点低 [m]
+FRAME_CUTOFF_BELOW_COLLISION = 0.02  # 隔离面上表面比 L6/R6 collision 最低点低 [m]
 FRAME_CUTOFF_COLOR = ColorRGBA(r=1.0, g=0.25, b=0.1, a=1.0)
 
 # 位姿标记圆柱（Marker 保持仅显示；q_pre OMPL 阶段另建同尺寸临时碰撞体）
@@ -6801,38 +6801,12 @@ class G01Demo(Node):
             f"[pick] 1/9  执行已验证的 OMPL 轨迹 → q_pre "
             f"（{len(to_pre_traj.joint_trajectory.points)} 点，免重规划）"
         )
-        # IK 多解与 q_pre → q_target 直线 approach 预检在无隔板场景下完成；
-        # 缓存的 OMPL 轨迹在带隔板场景下规划，执行前恢复相同场景。
-        cutoff_added = False
-        cutoff_removed = True
+        # 缓存的 OMPL 轨迹已在带隔板场景下通过预检，直接执行。
         execute_started = time.monotonic()
-        try:
-            if not self.add_frame_cutoff_for_pose(
-                target_pose,
-                source_frame=plan_frame,
-                target_frame=SCENE_FRAME,
-                joint_names=cutoff_joint_names,
-                tangent_link=link,
-                tangent_joints=q_pre,
-                scene_grasp_object_poses=scene_grasp_object_poses,
-            ):
-                log.error("[pick] 添加 q_pre OMPL 隔板/选中抓取圆柱失败")
-                return False
-            cutoff_added = True
-            ok = self._execute_traj(to_pre_traj)
-        finally:
-            if cutoff_added:
-                log.info(
-                    f"[pick] 移除「{FRAME_CUTOFF_ID}」/"
-                    f"「{GRASP_OBJECT_COLLISION_ID}」，"
-                    "后续直线 approach 不使用临时碰撞体"
-                )
-                cutoff_removed = self.remove_frame_cutoff()
+        ok = self._execute_traj(to_pre_traj)
 
         used_ms = (time.monotonic() - execute_started) * 1000.0
         log.info(f"[pick] 缓存轨迹 → q_pre: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
-        if not cutoff_removed:
-            log.warning("[pick] 移除 q_pre OMPL 隔板失败，忽略并继续后续抓取流程")
         if not ok:
             log.error("[pick] 执行已验证的 OMPL 到 q_pre 轨迹失败")
             self.last_pick_failure_reason = "q_pre"
