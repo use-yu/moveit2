@@ -16,7 +16,7 @@ G01 MoveIt 演示脚本
     机器人先到初始位
     → 读取视觉点
     → 命中本批次不可抓缓存的点保留原顺序并用黑色显示，不参与姿态排序
-    → 其余点按局部 -Z 与 moveit_base_link +Z 的偏离角从小到大排序
+    → 按局部 +Z 偏离 moveit_base_link -Z 的角度分为 <30°/≥30° 两组，组内按 z 从高到低
     → 用两种颜色显示所有视觉圆柱及各自的局部 +Z 方向
     → 过滤本批次已验证不可抓或实际抓取失败的重复点
     → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
@@ -364,6 +364,9 @@ MOVE_TO_GRASP_RESET_Q = [
 # 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
 # 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
 GRASP_VISION_WAIST_ANGLES_DEG = (20, 30, 40, 50)
+# 抓取排序的姿态分组阈值：局部 +Z 与 moveit_base_link -Z
+# 的偏离角小于该值时，优先于其他物体抓取。
+GRASP_UPRIGHT_TILT_THRESHOLD_DEG = 30.0
 GRASP_Q1_WAIST_JOINT_INDEX = list(JOINT_TARGETS["dual_arm_body"]).index(
     "body_joint2"
 )
@@ -1376,7 +1379,7 @@ def read_vision_object_pose(
     """视觉识别封装：返回所有点的模式码和 xyz_rpy。
 
     ``sort_by_sj_z=False`` 时保留 viewer 原始顺序，供步骤 4
-    后续仅按姿态排序，避免高度成为隐式的并列破平规则。
+    后续按姿态分组，再按 moveit_base_link 中的高度排序。
     """
     vision_sock = None
     if sim_mode:
@@ -7313,10 +7316,12 @@ def main(argv: list[str] | None = None) -> int:
         all_xyz_rpy: Sequence[dict],
         ungraspable_points: Sequence[Sequence[float]],
     ) -> tuple[list[int], list[dict]]:
-        """只排序未缓存点：物体局部 -Z 越接近竖直向上越优先。
+        """只排序未缓存点：先按物体局部 +Z 的偏离角分组。
 
-        偏离角在 moveit_base_link 下计算；不再使用深框中心区域
-        或位置高度。命中不可抓缓存的点不做姿态排序，按它们在本次视觉结果中的
+        物体平放时局部 +Z 向下，与 moveit_base_link -Z 的偏离角
+        为 0°。偏离角小于 30° 的点优先，然后是大于等于
+        30° 的点；每组都按 moveit_base_link 中的 z 从高到低排序。
+        命中不可抓缓存的点不参与排序，按它们在本次视觉结果中的
         原始相对顺序放到可抓候选之后。
         """
         if len(first_return_modes) != len(all_xyz_rpy):
@@ -7327,6 +7332,7 @@ def main(argv: list[str] | None = None) -> int:
             return list(first_return_modes), list(all_xyz_rpy)
 
         ranked_points = []
+        tilt_threshold_rad = math.radians(GRASP_UPRIGHT_TILT_THRESHOLD_DEG)
         for original_index, (first_return_mode, xyz_rpy) in enumerate(
             zip(first_return_modes, all_xyz_rpy)
         ):
@@ -7338,15 +7344,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             pose_values = xyz_rpy.get("right_body")
             if cached_match is not None:
-                # 类别 2 使缓存点放在可抓候选之后；第二排序键
+                # 类别 3 使缓存点放在可抓候选之后；第二排序键
                 # 使用原索引，仅保留视觉原顺序，不使用位置或高度排序。
                 ranked_points.append(
                     (
-                        2,
+                        3,
                         float(original_index),
                         original_index,
                         first_return_mode,
                         xyz_rpy,
+                        None,
+                        None,
                         None,
                         cached_match,
                     )
@@ -7357,7 +7365,17 @@ def main(argv: list[str] | None = None) -> int:
                 # 正常抓取视觉一定包含 right_body；异常点放到可抓候选之后，
                 # 仍保留给后续校验输出明确错误，不在这里静默丢弃。
                 ranked_points.append(
-                    (1, 0.0, original_index, first_return_mode, xyz_rpy, None, None)
+                    (
+                        2,
+                        float(original_index),
+                        original_index,
+                        first_return_mode,
+                        xyz_rpy,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
                 )
                 continue
 
@@ -7366,7 +7384,7 @@ def main(argv: list[str] | None = None) -> int:
             axis_x, axis_y, axis_z = rotate_xyz_by_quat(
                 0.0,
                 0.0,
-                -1.0,
+                1.0,
                 q.x,
                 q.y,
                 q.z,
@@ -7376,16 +7394,23 @@ def main(argv: list[str] | None = None) -> int:
             if axis_norm <= 1e-12:
                 tilt_rad = math.pi
             else:
-                normalized_axis_z = max(-1.0, min(1.0, axis_z / axis_norm))
-                tilt_rad = math.acos(normalized_axis_z)
+                # 与基坐标系 -Z 的单位向量 (0, 0, -1) 点积。
+                toward_base_minus_z = max(-1.0, min(1.0, -axis_z / axis_norm))
+                tilt_rad = math.acos(toward_base_minus_z)
+            base_z = float(object_pose.position.z)
+            # 给 30° 边界留极小数值容差，避免 acos/四元数舍入把恰好
+            # 30° 的姿态误分到“<30°”组。
+            posture_group = 0 if tilt_rad + 1e-12 < tilt_threshold_rad else 1
             ranked_points.append(
                 (
-                    0,
-                    tilt_rad,
+                    posture_group,
+                    -base_z,
                     original_index,
                     first_return_mode,
                     xyz_rpy,
                     (axis_x, axis_y, axis_z),
+                    tilt_rad,
+                    base_z,
                     None,
                 )
             )
@@ -7397,11 +7422,13 @@ def main(argv: list[str] | None = None) -> int:
         for sorted_index, item in enumerate(ranked_points):
             (
                 candidate_rank,
-                tilt_or_order,
+                _height_sort_key,
                 original_index,
                 first_return_mode,
                 xyz_rpy,
-                local_minus_z_axis,
+                local_plus_z_axis,
+                tilt_rad,
+                base_z,
                 cached_match,
             ) = item
             sorted_modes.append(first_return_mode)
@@ -7415,23 +7442,31 @@ def main(argv: list[str] | None = None) -> int:
                     f"距离={distance * 1000.0:.1f} mm，不参与姿态排序"
                 )
                 continue
-            if candidate_rank != 0 or local_minus_z_axis is None:
+            if candidate_rank not in (0, 1) or local_plus_z_axis is None:
                 log.warning(
                     f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index} "
                     "缺少 right_body，已排在可抓候选之后"
                 )
                 continue
-            axis_x, axis_y, axis_z = local_minus_z_axis
+            assert tilt_rad is not None and base_z is not None
+            axis_x, axis_y, axis_z = local_plus_z_axis
+            posture_label = (
+                f"<{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}°"
+                if candidate_rank == 0
+                else f"≥{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}°"
+            )
             log.info(
                 f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index}, "
-                f"局部 -Z=({axis_x:.4f}, {axis_y:.4f}, {axis_z:.4f}), "
-                f"偏离竖直向上={math.degrees(tilt_or_order):.2f}°"
+                f"局部 +Z=({axis_x:.4f}, {axis_y:.4f}, {axis_z:.4f}), "
+                f"偏离基坐标 -Z={math.degrees(tilt_rad):.2f}° "
+                f"(姿态组 {posture_label}), 基坐标 z={base_z:.4f} m"
             )
 
         log.info(
-            "[pick-order] 姿态排序完成：未缓存点按物体局部 -Z "
-            "偏离 moveit_base_link +Z 的角度从小到大；"
-            "不使用中心区域或位置高度；"
+            "[pick-order] 排序完成：未缓存点先按物体局部 +Z "
+            f"偏离 moveit_base_link -Z <{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}°/"
+            f"≥{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}° 分组，每组再按 "
+            "moveit_base_link z 从高到低；"
             f"{cached_count} 个缓存不可抓点未参与姿态排序并放在末尾"
         )
         return sorted_modes, sorted_xyz_rpy
