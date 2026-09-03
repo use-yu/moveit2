@@ -363,7 +363,7 @@ MOVE_TO_GRASP_RESET_Q = [
 
 # 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
 # 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
-GRASP_VISION_WAIST_ANGLES_DEG = (20, 30, 40, 50)
+GRASP_VISION_WAIST_ANGLES_DEG = (20,)
 # 抓取排序的姿态分组阈值：局部 +Z 与 moveit_base_link -Z
 # 的偏离角小于该值时，优先于其他物体抓取。
 GRASP_UPRIGHT_TILT_THRESHOLD_DEG = 30.0
@@ -915,10 +915,11 @@ GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增
 # 步骤 4 内不可抓点按 SJ 坐标系 xyz 去重；容差用于吸收多次视觉的小幅抖动。
 # 缓存在步骤 4 每次执行结束后清空，不影响下一批次。
 UNGRASPABLE_POINT_DISTANCE_TOLERANCE = 0.01
-# 这两类失败说明已选中的物体点本身不宜再尝试。
+# 这些失败说明已选中的物体点本身不宜再尝试。
 # 放置报警、力传感器或工具故障属于系统问题，不将物体点拉黑。
 UNGRASPABLE_POINT_GRASP_FAILURE_REASONS = frozenset({
     "approach_obstacle",
+    "q_pre",
     "suction_failed",
 })
 FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
@@ -7917,6 +7918,53 @@ def main(argv: list[str] | None = None) -> int:
             ),
         ):
             failure_reason = node.last_pick_failure_reason
+            if failure_reason == "q_pre":
+                recovery_side = tool_side_for_link(pick_link)
+                recovery_q1 = list(GRASP_Q1)
+                recovery_q1[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(
+                    selected_waist_deg
+                )
+                recovery_stage = "抓取运动到 q_pre 失败"
+                if recovery_side is None:
+                    log.error(
+                        f"[pick][q-pre-recovery] 无法由 link={pick_link} "
+                        "确定需要清错的机械臂"
+                    )
+                elif not node.clear_arm_alarms_for_recovery(
+                    (recovery_side,),
+                    recovery_stage,
+                ):
+                    log.error("[pick][q-pre-recovery] 清除机械臂错误失败")
+                else:
+                    resume_request_id = node._send_servoj_control(
+                        recovery_side,
+                        "resume",
+                    )
+                    resumed = node._wait_for_servoj_control_state(
+                        recovery_side,
+                        "resume",
+                        resume_request_id,
+                    )
+                    reset_ok = resumed and node.plan_execute_joint_waypoints(
+                        "dual_arm_body",
+                        0.2,
+                        joint_names,
+                        [recovery_q1],
+                    )
+                    if reset_ok:
+                        node.last_pick_failure_reason = "q_pre_alarm_recovered"
+                        log.warning(
+                            f"[pick][q-pre-recovery] 已清错并复位到 "
+                            f"{selected_waist_deg}° 识别位置，"
+                            "继续下一轮视觉抓取"
+                        )
+                    else:
+                        log.error(
+                            f"[pick][q-pre-recovery] 清错后复位到 "
+                            f"{selected_waist_deg}° 识别位置失败"
+                        )
+                if node.last_pick_failure_reason != "q_pre_alarm_recovered":
+                    node.last_pick_failure_reason = "q_pre_recovery_failed"
             if failure_reason in UNGRASPABLE_POINT_GRASP_FAILURE_REASONS:
                 position, added = remember_ungraspable_point(
                     all_xyz_rpy[point_index],
@@ -8054,6 +8102,7 @@ def main(argv: list[str] | None = None) -> int:
                     "suction_failed",
                     "approach_obstacle",
                     "place_alarm_recovered",
+                    "q_pre_alarm_recovered",
                 )
             ):
                 if node.last_pick_failure_reason == "approach_obstacle":
@@ -8065,6 +8114,11 @@ def main(argv: list[str] | None = None) -> int:
                     log.warning(
                         f"[frame-batch] 第 {grasp_index} 次 SW 放置去程报警，"
                         "已清错、下电并直退；按最新 SW 信号继续下一次抓取"
+                    )
+                elif node.last_pick_failure_reason == "q_pre_alarm_recovered":
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次运动到 q_pre 失败，"
+                        "已清错并复位到识别位置；继续下一轮"
                     )
                 else:
                     log.warning(
