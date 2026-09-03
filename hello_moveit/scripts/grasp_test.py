@@ -46,6 +46,8 @@ G01 MoveIt 演示脚本
     left_body，再固定该腰部/升降状态求右臂 IK。左右下降分别预检：忽略
     world 物体碰撞，但保留机器人自碰撞检查；通过后缓存 OMPL 和同步下降
     轨迹，执行阶段不重新规划。
+    双臂同步下降前读取左右 Fz；任一侧 Fz 下降超过 210N 时，
+    双末端下电并从实测位置同步直退到放置预备点后继续。
     优先 SW1+SW3，目标按 (1,3)→(11,13) 循环；SW2+SW4 按
     (2,4)→(12,14) 循环，不记录已经放过的位置。循环正常结束后，
     dual_arm_body 复位到 MOVE_TO_GRASP_RESET_Q。
@@ -3151,11 +3153,12 @@ class G01Demo(Node):
             guard is None
             or not guard["monitoring"]
             or guard["contact"]
-            or guard["side"] != side
+            or side not in guard["sides"]
         ):
             return
 
-        force_drop = guard["baseline_force_z"] - force_z
+        baseline_force_z = guard["baseline_force_z_by_side"][side]
+        force_drop = baseline_force_z - force_z
         travelled = guard["progress_fraction"] * guard["total_distance"]
         in_first_zone = travelled <= min(
             APPROACH_FORCE_GUARD_DISTANCE,
@@ -3163,8 +3166,9 @@ class G01Demo(Node):
         )
         whole_path_contact = force_drop > APPROACH_FORCE_Z_DROP_ALL_THRESHOLD
         first_zone_contact = (
-            in_first_zone
-            and force_drop > APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD
+            guard["near_force_drop_threshold"] is not None
+            and in_first_zone
+            and force_drop > guard["near_force_drop_threshold"]
         )
         if not whole_path_contact and not first_zone_contact:
             return
@@ -3173,18 +3177,22 @@ class G01Demo(Node):
         guard["force_z"] = force_z
         guard["force_drop"] = force_drop
         guard["travelled"] = travelled
-        guard["trigger"] = "all" if whole_path_contact else "first_9cm"
+        guard["trigger"] = "all" if whole_path_contact else "first_zone"
         self._motor_command_pub.publish(UInt8(data=1))
-        guard["stop_request_id"] = self._send_servoj_control(side, "stop")
+        guard["contact_side"] = side
+        guard["stop_request_ids"] = {
+            stop_side: self._send_servoj_control(stop_side, "stop")
+            for stop_side in guard["sides"]
+        }
         threshold = (
             APPROACH_FORCE_Z_DROP_ALL_THRESHOLD
             if whole_path_contact
-            else APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD
+            else guard["near_force_drop_threshold"]
         )
         self.get_logger().error(
-            f"[pick][force-guard] {side} 臂直线接近中检测到障碍物："
+            f"[pick][force-guard] {side} 臂{guard['stage_label']}中检测到障碍物："
             f"已行进约 {travelled * 100.0:.2f} cm，"
-            f"q_pre Fz={guard['baseline_force_z']:.6f} N，"
+            f"{guard['baseline_label']} Fz={baseline_force_z:.6f} N，"
             f"当前 Fz={force_z:.6f} N，减小={force_drop:.6f} N > "
             f"{threshold:.3f} N；已发布 {MOTOR_COMMAND_TOPIC}=1 并立即请求 ServoJ 停止"
         )
@@ -3806,15 +3814,15 @@ class G01Demo(Node):
         collision_group: str,
         speed_scale: float,
         stage: str,
+        clear_alarms: bool = True,
     ) -> bool:
         """双臂八点放置报警恢复：忽略物体碰撞，但保留自碰撞检查。"""
         left_joint_names = joint_names_for_group("left_arm")
         right_joint_names = joint_names_for_group("right_arm")
         full_joint_names = list(full_joint_names)
         while rclpy.ok():
-            if not self.clear_arm_alarms_for_recovery(
-                ("left", "right"),
-                stage,
+            if clear_alarms and not self.clear_arm_alarms_for_recovery(
+                ("left", "right"), stage
             ):
                 time.sleep(0.5)
                 continue
@@ -3907,8 +3915,10 @@ class G01Demo(Node):
                 time.sleep(0.5)
                 continue
             if self._execute_traj(retreat):
+                recovery_action = "已清错、" if clear_alarms else ""
                 self.get_logger().warning(
-                    f"[alarm-recovery] {stage}：已清错、双末端下电并从实测位置"
+                    f"[alarm-recovery] {stage}：{recovery_action}"
+                    "双末端下电并从实测位置"
                     "同步直线退回（忽略物体碰撞，保留自碰撞检查）"
                 )
                 return True
@@ -5400,10 +5410,13 @@ class G01Demo(Node):
     def _execute_approach_with_force_guard(
         self,
         traj: RobotTrajectory,
-        side: str,
-        baseline_force_z: float,
+        side: str | Sequence[str],
+        baseline_force_z: float | Mapping[str, float],
         total_distance: float,
         timeout: float = 60.0,
+        near_force_drop_threshold: float | None = APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD,
+        stage_label: str = "直线接近",
+        baseline_label: str = "q_pre",
     ) -> str:
         """执行接近轨迹并实时监测 Fz。
 
@@ -5419,9 +5432,18 @@ class G01Demo(Node):
             log.error(f"动作 {ACT_EXEC_TRAJ} 不可用")
             return "failed"
 
+        sides = (side,) if isinstance(side, str) else tuple(side)
+        baseline_force_z_by_side = (
+            {sides[0]: float(baseline_force_z)}
+            if len(sides) == 1 and not isinstance(baseline_force_z, Mapping)
+            else {name: float(baseline_force_z[name]) for name in sides}
+        )
         guard = {
-            "side": side,
-            "baseline_force_z": float(baseline_force_z),
+            "sides": sides,
+            "baseline_force_z_by_side": baseline_force_z_by_side,
+            "near_force_drop_threshold": near_force_drop_threshold,
+            "stage_label": stage_label,
+            "baseline_label": baseline_label,
             "total_distance": max(0.0, float(total_distance)),
             "trajectory": traj,
             "monitoring": False,
@@ -5431,7 +5453,8 @@ class G01Demo(Node):
             "force_drop": 0.0,
             "travelled": 0.0,
             "trigger": None,
-            "stop_request_id": None,
+            "stop_request_ids": {},
+            "contact_side": None,
             "completion_force_checked": False,
         }
         self._active_approach_guard = guard
@@ -5472,12 +5495,15 @@ class G01Demo(Node):
                                 "[pick][force-guard] MoveIt 未接受直线接近轨迹取消请求"
                             )
 
-                    stop_request_id = guard["stop_request_id"]
-                    stop_confirmed = self._wait_for_servoj_control_state(
-                        side,
-                        "stop",
-                        stop_request_id,
-                    )
+                    stop_results = {
+                        stop_side: self._wait_for_servoj_control_state(
+                            stop_side,
+                            "stop",
+                            guard["stop_request_ids"].get(stop_side),
+                        )
+                        for stop_side in sides
+                    }
+                    stop_confirmed = all(stop_results.values())
                     trajectory_ended = self._spin_until(
                         result_fut,
                         APPROACH_CANCEL_TIMEOUT_SEC,
@@ -5502,12 +5528,16 @@ class G01Demo(Node):
                     if not stop_confirmed or not trajectory_ended:
                         return "safety_failed"
 
-                    resume_request_id = self._send_servoj_control(side, "resume")
-                    if not self._wait_for_servoj_control_state(
-                        side,
-                        "resume",
-                        resume_request_id,
-                    ):
+                    resume_results = {
+                        resume_side: self._wait_for_servoj_control_state(
+                            resume_side,
+                            "resume",
+                            self._send_servoj_control(resume_side, "resume"),
+                        )
+                        for resume_side in sides
+                    }
+                    resume_confirmed = all(resume_results.values())
+                    if not resume_confirmed:
                         log.error(
                             "[pick][force-guard] 未确认 ServoJ 恢复，禁止执行退回 q_pre"
                         )
@@ -5531,12 +5561,19 @@ class G01Demo(Node):
                             # 此时进度置 100%，不会误用“前 9 cm”的 20 N 阈值。
                             guard["completion_force_checked"] = True
                             guard["progress_fraction"] = 1.0
-                            force_count = self._ft_sensor_count[side]
+                            force_counts = {
+                                force_side: self._ft_sensor_count[force_side]
+                                for force_side in sides
+                            }
                             sample_deadline = time.monotonic() + 0.1
                             while (
                                 rclpy.ok()
                                 and not guard["contact"]
-                                and self._ft_sensor_count[side] <= force_count
+                                and not all(
+                                    self._ft_sensor_count[force_side]
+                                    > force_counts[force_side]
+                                    for force_side in sides
+                                )
                                 and time.monotonic() < sample_deadline
                             ):
                                 rclpy.spin_once(
@@ -5570,6 +5607,7 @@ class G01Demo(Node):
         joint_names: Sequence[str],
         plan_frame: str,
         speed_scale: float,
+        return_label: str = "q_pre",
     ) -> bool:
         """ServoJ 恢复后，从实测停止位置重新规划直线退回 pre。"""
         settle_deadline = time.monotonic() + SERVOJ_RECOVERY_SETTLE_SEC
@@ -5597,16 +5635,16 @@ class G01Demo(Node):
         )
         if retreat is None:
             self.get_logger().error(
-                "[pick][force-guard] 无法从停止位置规划直线退回 q_pre"
+                f"[pick][force-guard] 无法从停止位置规划直线退回{return_label}"
             )
             return False
         if not self._execute_traj(retreat):
             self.get_logger().error(
-                "[pick][force-guard] 从停止位置直线退回 q_pre 执行失败"
+                f"[pick][force-guard] 从停止位置直线退回{return_label}执行失败"
             )
             return False
         self.get_logger().info(
-            "[pick][force-guard] 已从中途停止位置直线退回 q_pre"
+            f"[pick][force-guard] 已从中途停止位置直线退回{return_label}"
         )
         return True
 
@@ -6521,18 +6559,61 @@ class G01Demo(Node):
         if to_fang_traj is None:
             log.error(f"[pick] 直线运动到 {place_name} 规划失败")
             return False
+        tool_side = tool_side_for_link(link)
+        if tool_side is None:
+            log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
+            return False
+        tool_label = "左臂" if tool_side == "left" else "右臂"
+        force_z_before_place = self.wait_for_ft_sensor_z(tool_side)
+        if force_z_before_place is None:
+            log.error(f"[pick] {place_name} 下降前无法读取{tool_label} Fz，取消放置")
+            return False
+        log.info(
+            f"[pick] {place_name} 下降前{tool_label} Fz="
+            f"{force_z_before_place:.6f} N，全程下降阈值="
+            f"{APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:.3f} N"
+        )
         alarm_recovered = False
-        if not self._execute_traj(to_fang_traj):
+        place_contact_recovered = False
+        place_result = self._execute_approach_with_force_guard(
+            to_fang_traj,
+            tool_side,
+            force_z_before_place,
+            _pose_distance(yubei_return_pose, fang_pose),
+            near_force_drop_threshold=None,
+            stage_label="放置直线下降",
+            baseline_label="放置预备点",
+        )
+        if place_result == "contact":
+            log.warning(
+                f"[pick] {place_name} 直线下降检测到碰撞；"
+                f"先将{tool_label}工具下电，再从实测位置直线退回放置预备点"
+            )
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] {place_name} 碰撞后{tool_label}工具下电失败")
+                return False
+            if not self._return_to_pre_after_approach_contact(
+                arm_group,
+                link,
+                yubei_return_pose,
+                arm_joint_names,
+                arm_plan_frame,
+                speed,
+                return_label="放置预备点",
+            ):
+                log.error(f"[pick] {place_name} 碰撞后直线退回放置预备点失败")
+                return False
+            place_contact_recovered = True
+        elif place_result == "safety_failed":
+            log.error(f"[pick] {place_name} 碰撞后停止/轨迹终止/恢复确认失败")
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] {place_name} 安全停止失败后{tool_label}工具下电失败")
+            return False
+        elif place_result != "success":
             log.error(
                 f"[pick] 直线运动到 {place_name} 执行失败，"
                 "进入人工清错和实测位置直线退回"
             )
-            tool_side = tool_side_for_link(link)
-            if tool_side is None:
-                log.error(
-                    f"[pick] link={link} 不是 l_tool 或 r_tool，无法执行报警恢复"
-                )
-                return False
             if not self.recover_single_arm_linear_after_alarm(
                 side=tool_side,
                 group=arm_group,
@@ -6547,7 +6628,7 @@ class G01Demo(Node):
                 return False
             alarm_recovered = True
 
-        if not alarm_recovered:
+        if not alarm_recovered and not place_contact_recovered:
             log.info(
                 f"[pick] {place_name} 关节: "
                 + ", ".join(
@@ -6558,11 +6639,6 @@ class G01Demo(Node):
 
             self.wait_for_operator()
 
-            tool_side = tool_side_for_link(link)
-            if tool_side is None:
-                log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
-                return False
-            tool_label = "左臂" if tool_side == "left" else "右臂"
             log.info(f"[pick] 7/9  {tool_label}工具下电，放置到 {place_name}")
             if not self.set_tool_power(tool_side, 0):
                 log.error(f"[pick] {tool_label}工具下电失败")
@@ -6653,6 +6729,13 @@ class G01Demo(Node):
             self.last_pick_failure_reason = "place_alarm_recovered"
             log.warning(
                 f"[pick] {place_name} 去程报警已恢复并返回 Q1；"
+                "本次不计为成功放置，下一轮按最新 SW 信号继续抓取"
+            )
+            return False
+        if place_contact_recovered:
+            self.last_pick_failure_reason = "place_obstacle_recovered"
+            log.warning(
+                f"[pick] {place_name} 下降碰撞后已下电、直退并返回 Q1；"
                 "本次不计为成功放置，下一轮按最新 SW 信号继续抓取"
             )
             return False
@@ -8075,6 +8158,7 @@ def main(argv: list[str] | None = None) -> int:
                 and node.last_pick_failure_reason in (
                     "suction_failed",
                     "approach_obstacle",
+                    "place_obstacle_recovered",
                     "place_alarm_recovered",
                     "q_pre_alarm_recovered",
                 )
@@ -8083,6 +8167,11 @@ def main(argv: list[str] | None = None) -> int:
                     log.warning(
                         f"[frame-batch] 第 {grasp_index} 次接近中途碰到障碍物，"
                         "已退回 pre；直接进入下一次 Q1 复位和视觉识别"
+                    )
+                elif node.last_pick_failure_reason == "place_obstacle_recovered":
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次 SW 放置下降碰到障碍物，"
+                        "已下电、直退并返回 Q1；按最新 SW 信号继续下一次抓取"
                     )
                 elif node.last_pick_failure_reason == "place_alarm_recovered":
                     log.warning(
@@ -8690,7 +8779,44 @@ def main(argv: list[str] | None = None) -> int:
                 f"左右末端局部 +Z {UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m"
                 "（检查机器人自碰撞，忽略物体碰撞）"
             )
-            if not node._execute_traj(descent):
+            left_force_z = node.wait_for_ft_sensor_z("left")
+            right_force_z = node.wait_for_ft_sensor_z("right")
+            if left_force_z is None or right_force_z is None:
+                log.error("[unload] 放置下降前无法读取左右力传感器 Fz，禁止下降")
+                return False
+            log.info(
+                f"[unload] 放置下降前 Fz：左臂={left_force_z:.6f} N，"
+                f"右臂={right_force_z:.6f} N；任一侧全程下降超过 "
+                f"{APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:.3f} N 判定碰撞"
+            )
+            descent_result = node._execute_approach_with_force_guard(
+                descent,
+                ("left", "right"),
+                {"left": left_force_z, "right": right_force_z},
+                UNLOAD_PLACE_DESCENT_DISTANCE,
+                near_force_drop_threshold=None,
+                stage_label="双臂放置直线下降",
+                baseline_label="放置预备点",
+            )
+            if descent_result == "contact":
+                log.warning(
+                    "[unload] 双臂放置下降检测到力碰撞，"
+                    "双末端下电并从实测位置同步直退"
+                )
+                return node.recover_dual_arm_linear_after_alarm(
+                    left_return_pose=left_return_pose,
+                    right_return_pose=right_return_pose,
+                    full_joint_names=dual_body_joint_names,
+                    collision_group=group,
+                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    stage=f"物料台左点{left_point}/右点{right_point}下降力碰撞",
+                    clear_alarms=False,
+                )
+            if descent_result == "safety_failed":
+                log.error("[unload] 双臂放置力碰撞后停止/轨迹终止/恢复确认失败")
+                set_unload_tool_power(0, "放置力碰撞安全停止失败")
+                return False
+            if descent_result != "success":
                 log.error(
                     "[unload] 双臂同步直线下降放置失败，"
                     "进入人工清错和实测位置直线退回"
