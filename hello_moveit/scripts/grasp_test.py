@@ -4516,48 +4516,6 @@ class G01Demo(Node):
 
         planned_trajectory: RobotTrajectory | None = None
         try:
-            q_pre_state = self._get_joints(list(state_joint_names), wait_new=True)
-            if q_pre_state is None:
-                log.error("[grasp-select] 无法读取 q_pre 碰撞检查所需的机器人状态")
-                return None
-            q_pre_state.update(q_pre)
-            if not self._validity_cli.wait_for_service(timeout_sec=10.0):
-                log.error(f"[grasp-select] 服务 {SVC_STATE_VALIDITY} 不可用，无法检查 q_pre")
-                return None
-            request = GetStateValidity.Request()
-            request.group_name = group
-            request.robot_state = RobotState()
-            request.robot_state.is_diff = True
-            request.robot_state.joint_state.name = list(q_pre_state)
-            request.robot_state.joint_state.position = list(q_pre_state.values())
-            future = self._validity_cli.call_async(request)
-            if not self._spin_until(future, 5.0):
-                future.cancel()
-                log.error("[grasp-select] q_pre 位置碰撞检查超时")
-                return None
-            try:
-                response = future.result()
-            except Exception as exc:
-                log.error(f"[grasp-select] q_pre 位置碰撞检查失败: {exc}")
-                return None
-            if response is None:
-                log.error("[grasp-select] q_pre 位置碰撞检查未返回结果")
-                return None
-            if not response.valid:
-                contacts = ", ".join(
-                    f"{contact.contact_body_1}<->{contact.contact_body_2}"
-                    for contact in response.contacts[:8]
-                )
-                contact_text = contacts if contacts else "无 contact 详情"
-                log.info(
-                    f"[grasp-select] q_pre 位置抓取臂与障碍物碰撞："
-                    f"{contact_text}，不继续 OMPL 规划"
-                )
-                return None
-            log.info(
-                f"[grasp-select] q_pre 位置抓取臂无障碍物碰撞，"
-                "继续 OMPL 规划"
-            )
             ok, _, trajectory = self.plan_joint_motion(
                 group,
                 q_pre,
@@ -4568,11 +4526,7 @@ class G01Demo(Node):
                 avoid_collisions=True,
                 execute=False,
             )
-            if (
-                ok
-                and trajectory is not None
-                and trajectory.joint_trajectory.points
-            ):
+            if ok and trajectory is not None and trajectory.joint_trajectory.points:
                 planned_trajectory = trajectory
         finally:
             if not self.remove_frame_cutoff():
