@@ -31,6 +31,10 @@ G01 MoveIt 演示脚本
     ├─ mode=1：双臂交换 → 放置规划前检查当前双臂自碰撞；若碰撞，原抓取
     │  空载臂沿末端局部 -Z 无碰撞检查直移 2cm → 读取新状态 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
+    空位大于 1 时启用流水线：执行抓取轨迹时，独立规划节点
+    同时计算当前物体的直接/交换放置轨迹；抓取后带料到识别位，
+    采集下一物体视觉并后台解算，前台同时放置当前物体；
+    放置后回识别位，有缓存解则直接抓取，未完成则原地等待。
     SW 放置直线去程/回程若因机械臂报警失败，程序自动调用 servoj_30ms
     清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
 5. 导航到物料台工位。
@@ -110,10 +114,11 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -1745,6 +1750,7 @@ def validate_reachable_grasp(
     speed_scale: float = 0.2,
     cutoff_joint_names: Sequence[str] | None = None,
     ungraspable_points: list[tuple[float, float, float]] | None = None,
+    planning_start_joints: Mapping[str, float] | None = None,
 ):
     """过滤失败点，再验证 IK、Cartesian approach 和 OMPL。
 
@@ -1828,6 +1834,7 @@ def validate_reachable_grasp(
                 plan_frame=pick_frame,
                 cutoff_joint_names=cutoff_joint_names,
                 scene_grasp_object_poses=pick_scene_grasp_object_poses,
+                planning_start_joints=planning_start_joints,
             )
             if picked is None:
                 log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
@@ -2776,20 +2783,34 @@ class PlaceTrajectoryPlan:
 class ExchangeTrajectoryPlan:
     exchange_group: str
     exchange_joint_names: list[str]
+    q2_slice_text: str
     source_group: str
+    source_plan_frame: str
     source_link: str
     source_joint_names: list[str]
     source_side: str
     receiver_side: str
+    z_down_distance: float
     to_q2: RobotTrajectory
     down: RobotTrajectory
+
+
+@dataclass
+class PostGraspTrajectoryPlan:
+    exchange: ExchangeTrajectoryPlan | None
+    place: PlaceTrajectoryPlan
 
 
 class G01Demo(Node):
     """封装 apply_planning_scene 与 move_action，对外提供少量高层接口。"""
 
-    def __init__(self, sim_mode: bool = False, upper_control_mode: bool = True):
-        super().__init__("g01_demo")
+    def __init__(
+        self,
+        sim_mode: bool = False,
+        upper_control_mode: bool = True,
+        node_name: str = "g01_demo",
+    ):
+        super().__init__(node_name)
         self.sim_mode = bool(sim_mode)
         self.upper_control_mode = bool(upper_control_mode)
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
@@ -3623,21 +3644,22 @@ class G01Demo(Node):
         source_frame: str,
         target_frame: str,
         joint_names: Sequence[str] | None = None,
+        joints: Mapping[str, float] | None = None,
     ) -> Pose | None:
         """把完整 pose（位置和姿态）从 source_frame 转到 target_frame。"""
         p = pose if isinstance(pose, Pose) else pose_from_dict(pose)
         if source_frame == target_frame:
             return copy.deepcopy(p)
 
-        joints = None
-        if joint_names is not None:
-            joints = self._get_joints(list(joint_names), timeout=2.0)
-            if joints is None:
+        resolved_joints = dict(joints) if joints is not None else None
+        if joint_names is not None and resolved_joints is None:
+            resolved_joints = self._get_joints(list(joint_names), timeout=2.0)
+            if resolved_joints is None:
                 return None
 
         source_pose = self._get_link_pose_fk(
             source_frame,
-            joints=joints,
+            joints=resolved_joints,
             joint_names=joint_names,
             plan_frame=target_frame,
         )
@@ -4323,6 +4345,7 @@ class G01Demo(Node):
         tangent_joints: dict[str, float] | None = None,
         verbose: bool = True,
         scene_grasp_object_poses: Sequence[Pose] | None = None,
+        state_joints: Mapping[str, float] | None = None,
     ) -> bool:
         """添加隔板和传入的视觉物体；传入 link 时隔板低 1 cm。
 
@@ -4334,6 +4357,7 @@ class G01Demo(Node):
             source_frame=source_frame,
             target_frame=target_frame,
             joint_names=joint_names,
+            joints=state_joints,
         )
         if scene_pose is None:
             self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
@@ -4519,6 +4543,7 @@ class G01Demo(Node):
         state_joint_names: Sequence[str],
         speed_scale: float,
         scene_grasp_object_poses: Sequence[Pose] | None = None,
+        planning_start_joints: Mapping[str, float] | None = None,
     ) -> RobotTrajectory | None:
         """临时加入传入的抓取碰撞体，规划当前位置到 q_pre 的 OMPL 路径。
 
@@ -4529,20 +4554,23 @@ class G01Demo(Node):
         验证成功的轨迹。
         """
         log = self.get_logger()
-        current = self._get_joints(list(joint_names), wait_new=True)
+        current = dict(planning_start_joints) if planning_start_joints is not None else self._get_joints(list(joint_names), wait_new=True)
         if current is None:
             log.error("[grasp-select] 读取关节空间规划起点失败")
             return None
 
+        tangent_state = dict(planning_start_joints or {})
+        tangent_state.update(q_pre)
         if not self.add_frame_cutoff_for_pose(
             target_pose,
             source_frame=plan_frame,
             target_frame=SCENE_FRAME,
             joint_names=state_joint_names,
             tangent_link=link,
-            tangent_joints=q_pre,
+            tangent_joints=tangent_state,
             verbose=False,
             scene_grasp_object_poses=scene_grasp_object_poses,
+            state_joints=planning_start_joints,
         ):
             log.error("[grasp-select] 添加关节空间预检碰撞体失败")
             return None
@@ -6040,6 +6068,7 @@ class G01Demo(Node):
         target_seeds: Sequence[dict[str, float]] | None = None,
         cutoff_joint_names: Sequence[str] | None = None,
         scene_grasp_object_poses: Sequence[Pose] | None = None,
+        planning_start_joints: Mapping[str, float] | None = None,
     ):
         """从 target_pose 的多个 IK 解里挑可用的一组。
 
@@ -6148,11 +6177,12 @@ class G01Demo(Node):
                     cutoff_joint_names,
                     speed_scale,
                     scene_grasp_object_poses=scene_grasp_object_poses,
+                    planning_start_joints=planning_start_joints,
                 )
                 if ompl_trajectory is None:
                     continue
             else:
-                current = self._get_joints(list(joint_names), wait_new=True)
+                current = dict(planning_start_joints) if planning_start_joints is not None else self._get_joints(list(joint_names), wait_new=True)
                 if current is None:
                     return None
                 ompl_ok, _, ompl_trajectory = self.plan_joint_motion(
@@ -6487,6 +6517,7 @@ class G01Demo(Node):
         link: str,
         first_return_mode: int,
         selected_slot_name: str | None = None,
+        preplanned: PlaceTrajectoryPlan | None = None,
     ) -> bool:
         """body+手臂到 yubei，再用纯臂放置、原路返回并运动到 Q1。"""
         log = self.get_logger()
@@ -6591,21 +6622,49 @@ class G01Demo(Node):
         if current is None:
             log.error("[pick] 读取放置规划当前实测关节状态失败")
             return False
-        plan = self._plan_place_trajectories(
-            arm_group=arm_group,
-            arm_plan_frame=arm_plan_frame,
-            body_group=body_group,
-            arm_joint_names=arm_joint_names,
-            body_joint_names=body_joint_names,
-            slot_name=slot_name,
-            yubei_name=yubei_name,
-            place_name=place_name,
-            start_joints=current,
-            yubei_joints=yubei_joints,
-            fang_joints=fang_joints,
-            link=link,
-            speed=speed,
-        )
+        plan = preplanned
+        if clearance_moved:
+            plan = None
+        if plan is not None and (
+            plan.arm_group != arm_group or plan.slot_name != slot_name
+        ):
+            log.warning("[pick] 预规划放置缓存与当前臂/SW不匹配，重新规划")
+            plan = None
+        if plan is not None:
+            first_point = plan.to_yubei.joint_trajectory.points[0]
+            start_error = max(
+                (
+                    abs(current[name] - value)
+                    for name, value in zip(
+                        plan.to_yubei.joint_trajectory.joint_names,
+                        first_point.positions,
+                    )
+                    if name in current
+                ),
+                default=0.0,
+            )
+            if start_error > 0.05:
+                log.warning(
+                    f"[pipeline] 放置缓存起点偏差 {start_error:.4f} > 0.05，"
+                    "改用实测状态重新规划"
+                )
+                plan = None
+        if plan is None:
+            plan = self._plan_place_trajectories(
+                arm_group=arm_group,
+                arm_plan_frame=arm_plan_frame,
+                body_group=body_group,
+                arm_joint_names=arm_joint_names,
+                body_joint_names=body_joint_names,
+                slot_name=slot_name,
+                yubei_name=yubei_name,
+                place_name=place_name,
+                start_joints=current,
+                yubei_joints=yubei_joints,
+                fang_joints=fang_joints,
+                link=link,
+                speed=speed,
+            )
         if plan is None:
             log.error(f"[pick] {yubei_name}/{place_name}/Q1 纯规划失败")
             return False
@@ -6842,6 +6901,10 @@ class G01Demo(Node):
             RobotTrajectory,
             RobotTrajectory,
         ] | None = None,
+        background_planner: G01Demo | None = None,
+        planner_pool: ThreadPoolExecutor | None = None,
+        recognition_state: Mapping[str, float] | None = None,
+        start_next_grasp_plan: Callable[[], None] | None = None,
     ) -> bool:
         """抓取流程（IK 多解 + approach 预检 + 放置 + 原路返回）。
 
@@ -6955,6 +7018,26 @@ class G01Demo(Node):
             self.last_pick_failure_reason = "no_ik"
             return False
         q_pre, q_target, to_pre_traj, approach_traj = picked
+        post_grasp_future: Future[PostGraspTrajectoryPlan | None] | None = None
+        post_grasp_start = dict(recognition_state) if recognition_state is not None else None
+        if post_grasp_start is None and background_planner is not None and planner_pool is not None:
+            post_grasp_start = self._get_joints(
+                list(cutoff_joint_names or joint_names), wait_new=True,
+            )
+            if post_grasp_start is not None:
+                post_grasp_start.update(q_pre)
+        if background_planner is not None and planner_pool is not None and post_grasp_start is not None:
+            post_grasp_future = planner_pool.submit(
+                background_planner._plan_post_grasp_trajectories,
+                recognition_state=post_grasp_start,
+                pick_group=group,
+                pick_link=link,
+                first_return_mode=first_return_mode,
+                selected_slot_name=selected_place_slot,
+                place_joint_config=place_joint_config,
+                speed=place_speed_scale,
+            )
+            log.info("[pipeline] 抓取运动开始前已提交当前物体交换/放置后台规划")
         log.info(
             "[pick] 选定 q_pre: "
             + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
@@ -6963,6 +7046,28 @@ class G01Demo(Node):
         if not to_pre_traj.joint_trajectory.points:
             log.error("[pick] 1/9 缓存的 OMPL 到 q_pre 轨迹为空")
             return False
+        actual_start = self._get_joints(list(to_pre_traj.joint_trajectory.joint_names), wait_new=True)
+        first_point = to_pre_traj.joint_trajectory.points[0]
+        start_error = max(
+            (abs(actual_start[name] - value) for name, value in zip(
+                to_pre_traj.joint_trajectory.joint_names, first_point.positions
+            ) if actual_start is not None and name in actual_start),
+            default=float("inf") if actual_start is None else 0.0,
+        )
+        if start_error > 0.05:
+            log.warning(
+                f"[pipeline] 抓取缓存起点偏差 {start_error:.4f} > 0.05，"
+                "改用实测识别位置重新规划到 q_pre"
+            )
+            replanned = self._plan_q_pre_with_temporary_collisions(
+                group, link, target_pose, plan_frame, q_pre, joint_names,
+                cutoff_joint_names or joint_names, speed_scale,
+                scene_grasp_object_poses=scene_grasp_object_poses,
+            )
+            if replanned is None:
+                self.last_pick_failure_reason = "q_pre"
+                return False
+            to_pre_traj = replanned
         log.info(
             f"[pick] 1/9  执行已验证的 OMPL 轨迹 → q_pre "
             f"（{len(to_pre_traj.joint_trajectory.points)} 点，免重规划）"
@@ -7135,6 +7240,25 @@ class G01Demo(Node):
 
         self.wait_for_operator()
 
+        if recognition_state is not None:
+            recognition_names = list(recognition_state)
+            if not self.plan_execute_joint_waypoints(
+                "dual_arm_body", place_speed_scale, recognition_names,
+                [recognition_state], num_attempts=30, planning_time_sec=10.0,
+            ):
+                log.error("[pipeline] 抓取成功后运动到识别位置失败")
+                return False
+            if start_next_grasp_plan is not None:
+                start_next_grasp_plan()
+        try:
+            post_grasp_plan = post_grasp_future.result() if post_grasp_future is not None else None
+        except Exception as exc:
+            log.error(f"[pipeline] 当前物体交换/放置后台规划异常: {exc}")
+            post_grasp_plan = None
+        if post_grasp_future is not None and post_grasp_plan is None:
+            log.error("[pipeline] 当前物体交换/放置后台纯规划失败")
+            return False
+
         # 抓取成功后的交换/放置运动只添加隔板，不添加抓取物体。
         if not self.add_frame_cutoff_only_for_pose(
             target_pose,
@@ -7167,6 +7291,7 @@ class G01Demo(Node):
                 pick_group=group,
                 dual_speed=place_speed_scale,
                 cartesian_speed=speed_scale,
+                preplanned=post_grasp_plan.exchange if post_grasp_plan else None,
             ):
                 return False
 
@@ -7177,6 +7302,7 @@ class G01Demo(Node):
                 link="l_tool" if place_arm_group == "left_arm" else "r_tool",
                 first_return_mode=first_return_mode,
                 selected_slot_name=selected_place_slot,
+                preplanned=post_grasp_plan.place if post_grasp_plan else None,
             ):
                 return False
 
@@ -7188,28 +7314,34 @@ class G01Demo(Node):
                 link=link,
                 first_return_mode=first_return_mode,
                 selected_slot_name=selected_place_slot,
+                preplanned=post_grasp_plan.place if post_grasp_plan else None,
             ):
+                return False
+
+        if recognition_state is not None and start_next_grasp_plan is not None:
+            if not self.plan_execute_joint_waypoints(
+                "dual_arm_body", place_speed_scale, list(recognition_state),
+                [recognition_state], num_attempts=30, planning_time_sec=10.0,
+            ):
+                log.error("[pipeline] 放置后返回识别位置失败")
                 return False
 
         log.info("[pick] 抓取流程完成。")
         return True
 
-    def dual_arm_exchange(
+    def _plan_exchange_trajectories(
         self,
-        q1: Sequence[float],
         q2_by_side: dict[str, Sequence[float]],
         *,
         source_link: str,
         pick_group: str,
-        dual_speed: float = 0.2,
-        cartesian_speed: float = 0.2,
-        z_down_distance: float | None = None,
-    ) -> bool:
-        """双臂交换：Q2 根据抓取 group 选择双臂/+腰/+升降规划组。"""
-        log = self.get_logger()
-        arm_dual_group = "dual_arm"
-        arm_dual_joint_names = joint_names_for_group(arm_dual_group)
-
+        dual_speed: float,
+        cartesian_speed: float,
+        z_down_distance: float | None,
+        start_joints: Mapping[str, float] | None = None,
+    ) -> ExchangeTrajectoryPlan | None:
+        """纯规划交换 Q2 和交接直线，不执行运动或工具命令。"""
+        arm_dual_joint_names = joint_names_for_group("dual_arm")
         if pick_group in ("left_arm", "right_arm"):
             exchange_group = "dual_arm"
             exchange_joint_names = arm_dual_joint_names
@@ -7223,132 +7355,183 @@ class G01Demo(Node):
             exchange_joint_names = ["body_joint1", "body_joint2", *arm_dual_joint_names]
             q2_slice_text = "全部14个"
         else:
-            log.error(f"[exchange] 不支持 pick_group={pick_group}")
-            return False
-
+            self.get_logger().error(f"[exchange] 不支持 pick_group={pick_group}")
+            return None
         source_side = tool_side_for_link(source_link)
-        if source_side is None:
-            log.error(f"[exchange] source_link={source_link} 不是 l_tool 或 r_tool")
-            return False
-        if z_down_distance is None:
-            z_down_distance = -0.1095 if source_side == "right" else -0.1215
+        if source_side is None or source_side not in q2_by_side:
+            self.get_logger().error(f"[exchange] 无法确定 {source_link} 的 Q2 配置")
+            return None
         receiver_side = "left" if source_side == "right" else "right"
-        source_label = "右臂" if source_side == "right" else "左臂"
-        receiver_label = "左臂" if receiver_side == "left" else "右臂"
-
-        if source_side == "right":
-            source_group = "right_arm"
-            source_plan_frame = "r_base_link"
-        else:
-            source_group = "left_arm"
-            source_plan_frame = "l_base_link"
+        source_group = "right_arm" if source_side == "right" else "left_arm"
+        source_plan_frame = "r_base_link" if source_side == "right" else "l_base_link"
         source_joint_names = joint_names_for_group(source_group)
-
-        if source_side not in q2_by_side:
-            log.error(f"[exchange] EXCHANGE_Q2 未配置 {source_side}")
-            return False
         q2_source = list(q2_by_side[source_side])
         if len(q2_source) != 14:
-            log.error(f"[exchange] EXCHANGE_Q2[{source_side!r}] 长度错误: {len(q2_source)} != 14")
-            return False
+            self.get_logger().error(f"[exchange] EXCHANGE_Q2[{source_side!r}] 长度错误")
+            return None
         q2 = q2_source[-len(exchange_joint_names):]
-
-        if not self.set_tool_power(receiver_side, 0):
-            log.error(f"[exchange] {receiver_label}工具下电失败")
-            return False
-
-        if len(q1) != len(arm_dual_joint_names):
-            log.error(f"[exchange] q1 长度错误: {len(q1)} != {len(arm_dual_joint_names)}")
-            return False
-        if len(q2) != len(exchange_joint_names):
-            log.error(f"[exchange] q2 长度错误: {len(q2)} != {len(exchange_joint_names)}")
-            return False
-
-        log.info(
-            f"[exchange] 1/4  {exchange_group} 使用 EXCHANGE_Q2 {q2_slice_text} "
-            f"规划执行到 q2"
+        start = dict(start_joints) if start_joints is not None else self._get_joints(exchange_joint_names)
+        if start is None:
+            return None
+        ok, _, to_q2 = self.plan_joint_motion(
+            exchange_group, q2, joint_names=exchange_joint_names,
+            start_joints=start, speed_scale=dual_speed,
+            num_attempts=50, planning_time_sec=20.0, execute=False,
         )
-        if not self.plan_execute_joint_waypoints(
-            exchange_group,
-            dual_speed,
-            exchange_joint_names,
-            [q2],
-            num_attempts=50,
-            planning_time_sec=20.0,
-        ):
-            log.error(f"[exchange] {exchange_group} 到 q2 失败")
-            return False
-
-        log.info(
-            f"[exchange] 2/4  {source_group} 沿 {source_link} 末端坐标系 -z 轴直线移动 "
-            f"{z_down_distance:.3f} m"
-        )
-
-        self.wait_for_operator()
-
-        current = self._get_joints(source_joint_names, wait_new=True)
-        if current is None:
-            log.error(f"[exchange] 读取 {source_group} 当前关节失败")
-            return False
-
+        if not ok or to_q2 is None:
+            return None
+        q2_state = dict(start)
+        q2_state.update(zip(exchange_joint_names, q2))
         ee_pose = self._get_link_pose_fk(
-            source_link,
-            current,
-            joint_names=source_joint_names,
+            source_link, q2_state, joint_names=source_joint_names,
             plan_frame=source_plan_frame,
         )
         if ee_pose is None:
-            log.error(f"[exchange] FK 读取 {source_group} 当前末端位姿失败")
-            return False
-
-        down_pose = pose_offset_local_z(ee_pose, abs(z_down_distance))
-        down_traj = self.plan_cartesian_line(
-            source_group,
-            source_link,
-            down_pose,
-            speed_scale=cartesian_speed,
-            avoid_collisions=False,
-            joint_names=source_joint_names,
+            return None
+        distance = z_down_distance
+        if distance is None:
+            distance = -0.1095 if source_side == "right" else -0.1215
+        down = self.plan_cartesian_line(
+            source_group, source_link,
+            pose_offset_local_z(ee_pose, abs(distance)),
+            speed_scale=cartesian_speed, avoid_collisions=False,
+            start_joints=q2_state, joint_names=source_joint_names,
             plan_frame=source_plan_frame,
         )
-        if down_traj is None or not down_traj.joint_trajectory.points:
-            log.error(f"[exchange] {source_group} z 向下直线规划失败")
-            return False
-        if not self._execute_traj(down_traj):
-            log.error(f"[exchange] {source_group} z 向下直线执行失败")
-            return False
+        if down is None or not down.joint_trajectory.points:
+            return None
+        return ExchangeTrajectoryPlan(
+            exchange_group, exchange_joint_names, q2_slice_text,
+            source_group, source_plan_frame, source_link, source_joint_names,
+            source_side, receiver_side, distance, to_q2, down,
+        )
 
+    def _execute_exchange_plan(self, plan: ExchangeTrajectoryPlan) -> bool:
+        """只执行已缓存的交换轨迹和工具交接，不调用规划服务。"""
+        log = self.get_logger()
+        source_label = "右臂" if plan.source_side == "right" else "左臂"
+        receiver_label = "左臂" if plan.receiver_side == "left" else "右臂"
+        if not self.set_tool_power(plan.receiver_side, 0):
+            return False
+        log.info(f"[exchange] 1/4 执行缓存轨迹 → Q2（{plan.q2_slice_text}）")
+        if not self._execute_traj(plan.to_q2):
+            return False
         self.wait_for_operator()
-
-        if not self.set_tool_power(source_side, 0):
-            log.error(f"[exchange] {source_label}工具下电失败")
+        log.info(
+            f"[exchange] 2/4 执行缓存直线：{plan.source_group} "
+            f"沿末端 -Z {plan.z_down_distance:.3f} m"
+        )
+        if not self._execute_traj(plan.down):
             return False
-        if not self.set_tool_power(receiver_side, 1):
-            log.error(f"[exchange] {receiver_label}工具上电失败")
+        self.wait_for_operator()
+        if not self.set_tool_power(plan.source_side, 0):
+            return False
+        if not self.set_tool_power(plan.receiver_side, 1):
             return False
         print(f"\033[32m{source_label}下电、{receiver_label}上电成功\033[0m")
-
-
-        log.info(
-            f"[exchange] 3/4  {source_group} 沿刚才直线返回 "
-            f"（{len(down_traj.joint_trajectory.points)} 点）"
-        )
-        if not self._execute_traj(self._reverse_trajectory(down_traj)):
-            log.error(f"[exchange] {source_group} 反向直线返回失败")
+        if not self._execute_traj(self._reverse_trajectory(plan.down)):
             return False
-
-        # log.info(f"[exchange] 4/4  {arm_dual_group} 规划执行到 q1")
-        # if not self.plan_execute_joint_waypoints(
-        #     arm_dual_group,
-        #     dual_speed,
-        #     arm_dual_joint_names,
-        #     [q1],
-        # ):
-        #     log.error(f"[exchange] {arm_dual_group} 到 q1 失败")
-        #     return False
-
         log.info("[exchange] 双臂交换流程完成")
         return True
+
+    def _plan_post_grasp_trajectories(
+        self,
+        *,
+        recognition_state: Mapping[str, float],
+        pick_group: str,
+        pick_link: str,
+        first_return_mode: int,
+        selected_slot_name: str | None,
+        place_joint_config: dict[str, object],
+        speed: float,
+    ) -> PostGraspTrajectoryPlan | None:
+        """从识别位置纯规划当前物体的交换/放置全部轨迹。"""
+        exchange = None
+        place_group = pick_group
+        place_link = pick_link
+        place_start = dict(recognition_state)
+        if first_return_mode == 1:
+            exchange = self._plan_exchange_trajectories(
+                EXCHANGE_Q2, source_link=pick_link, pick_group=pick_group,
+                dual_speed=speed, cartesian_speed=speed,
+                z_down_distance=None, start_joints=recognition_state,
+            )
+            if exchange is None:
+                return None
+            endpoint = exchange.to_q2.joint_trajectory.points[-1]
+            place_start.update(zip(exchange.exchange_joint_names, endpoint.positions))
+            place_group = "left_arm" if exchange.receiver_side == "left" else "right_arm"
+            place_link = "l_tool" if exchange.receiver_side == "left" else "r_tool"
+        arm_context = arm_context_for_group(place_group)
+        if arm_context is None:
+            return None
+        arm_group, arm_plan_frame = arm_context
+        body_group = "left_body" if arm_group == "left_arm" else "right_body"
+        arm_names = joint_names_for_group(arm_group)
+        body_names = joint_names_for_group(body_group)
+        suffix = "_j" if first_return_mode == 1 else ""
+        yubei_config = place_joint_config.get(f"yubei{suffix}")
+        fang_config = place_joint_config.get(f"fang{suffix}")
+        if isinstance(yubei_config, dict) and isinstance(fang_config, dict):
+            if selected_slot_name not in yubei_config or selected_slot_name not in fang_config:
+                return None
+            yubei_values = yubei_config[selected_slot_name]
+            fang_values = fang_config[selected_slot_name]
+        else:
+            yubei_values, fang_values = yubei_config, fang_config
+        if yubei_values is None or fang_values is None:
+            return None
+        slot = selected_slot_name if isinstance(fang_config, dict) else None
+        yubei_name = f"yubei{suffix}.{slot}" if slot else f"yubei{suffix}"
+        place_name = f"fang{suffix}.{slot}" if slot else f"fang{suffix}"
+        place = self._plan_place_trajectories(
+            arm_group=arm_group, arm_plan_frame=arm_plan_frame,
+            body_group=body_group, arm_joint_names=arm_names,
+            body_joint_names=body_names, slot_name=slot,
+            yubei_name=yubei_name, place_name=place_name,
+            start_joints=place_start, yubei_joints=list(yubei_values),
+            fang_joints=list(fang_values), link=place_link, speed=speed,
+        )
+        return None if place is None else PostGraspTrajectoryPlan(exchange, place)
+
+    def dual_arm_exchange(
+        self,
+        q1: Sequence[float],
+        q2_by_side: dict[str, Sequence[float]],
+        *,
+        source_link: str,
+        pick_group: str,
+        dual_speed: float = 0.2,
+        cartesian_speed: float = 0.2,
+        z_down_distance: float | None = None,
+        preplanned: ExchangeTrajectoryPlan | None = None,
+    ) -> bool:
+        """顺序调用交换纯规划和只执行阶段。"""
+        del q1  # 保留旧接口；当前交换流程未执行注释掉的 Q1 段。
+        plan = preplanned
+        if plan is not None:
+            current = self._get_joints(plan.exchange_joint_names, wait_new=True)
+            first = plan.to_q2.joint_trajectory.points[0]
+            start_error = max(
+                (abs(current[name] - value) for name, value in zip(
+                    plan.to_q2.joint_trajectory.joint_names, first.positions
+                ) if current is not None and name in current),
+                default=float("inf") if current is None else 0.0,
+            )
+            if start_error > 0.05:
+                self.get_logger().warning(
+                    f"[pipeline] 交换缓存起点偏差 {start_error:.4f} > 0.05，重新规划"
+                )
+                plan = None
+        plan = plan or self._plan_exchange_trajectories(
+            q2_by_side, source_link=source_link, pick_group=pick_group,
+            dual_speed=dual_speed, cartesian_speed=cartesian_speed,
+            z_down_distance=z_down_distance,
+        )
+        if plan is None:
+            self.get_logger().error("[exchange] 交换纯规划失败")
+            return False
+        return self._execute_exchange_plan(plan)
 
 
 # =============================================================================
@@ -7424,6 +7607,12 @@ def main(argv: list[str] | None = None) -> int:
         sim_mode=sim_mode,
         upper_control_mode=upper_control_mode,
     )
+    planner_node = G01Demo(
+        sim_mode=sim_mode,
+        upper_control_mode=True,
+        node_name="g01_background_planner",
+    )
+    planner_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grasp-plan")
     log = node.get_logger()
     if sim_mode:
         log.info(
@@ -7878,6 +8067,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         node.configure_deep_frame_from_recognition(grasp_recognition_pose)
+        planner_node.configure_deep_frame_from_recognition(grasp_recognition_pose)
         node.publish_deep_frame_vision_tf(
             grasp_recognition_pose,
             frame_top_pose,
@@ -7893,6 +8083,8 @@ def main(argv: list[str] | None = None) -> int:
         pending_frame_recognition_pose = None
         frame_recognition_odom = None
         return True
+
+    next_grasp_cache: dict[str, object] = {"future": None}
 
     def run_one_grasp(
         ungraspable_points: list[tuple[float, float, float]],
@@ -7914,6 +8106,7 @@ def main(argv: list[str] | None = None) -> int:
             node.last_pick_failure_reason = "no_place"
             log.info("[pick] SW1~SW4 均无空位，结束连续抓取，不执行视觉识别")
             return False
+        pipeline_enabled = len(empty_place_slots) > 1
 
         # --- 2. 腰部多角度 Q1 + 视觉 + 可达性验证 ---
         targets = JOINT_TARGETS["dual_arm_body"]
@@ -7922,8 +8115,27 @@ def main(argv: list[str] | None = None) -> int:
         selected_waist_deg: int | None = None
         first_return_modes: list[int] = []
         all_xyz_rpy: list[dict] = []
+        q1_for_waist = list(GRASP_Q1)
+
+        cached_future = next_grasp_cache.pop("future", None)
+        if isinstance(cached_future, Future):
+            log.info("[pipeline] 已回到识别位置，等待下一物体后台解算结果")
+            try:
+                cached_result = cached_future.result()
+            except Exception as exc:
+                log.error(f"[pipeline] 下一物体后台解算异常: {exc}")
+                cached_result = None
+            if cached_result is not None:
+                reachable = cached_result["reachable"]
+                first_return_modes = cached_result["modes"]
+                all_xyz_rpy = cached_result["poses"]
+                selected_waist_deg = cached_result["waist_deg"]
+                q1_for_waist[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(selected_waist_deg)
+                log.info("[pipeline] 下一物体后台解算有解，直接使用缓存抓取轨迹")
 
         for waist_attempt, waist_deg in enumerate(GRASP_VISION_WAIST_ANGLES_DEG):
+            if reachable is not None:
+                break
             q1_for_waist = list(GRASP_Q1)
             q1_for_waist[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(waist_deg)
             log.info(
@@ -8036,6 +8248,36 @@ def main(argv: list[str] | None = None) -> int:
         if prompt_exit("按回车继续，输入 q 回车退出并移除深框 …"):
             return None
 
+        def start_next_grasp_plan() -> None:
+            if sum(node._place_slot_is_empty(name) for name in PLACE_SLOT_MASKS) <= 1:
+                log.info("[pipeline] 当前放置后将无剩余空位，不预解算下一物体")
+                return
+            vision_pose = read_vision_object_pose(
+                node, log, sim_mode=sim_mode, sort_by_sj_z=False,
+            )
+            if vision_pose is None:
+                log.warning("[pipeline] 下一物体视觉失败，下一轮恢复同步识别")
+                return
+            modes, poses = prioritize_upright_grasp_points(
+                vision_pose[0], vision_pose[1], ungraspable_points,
+            )
+            waist_deg = selected_waist_deg
+            start_state = dict(zip(joint_names, q1_for_waist))
+
+            def solve_next() -> dict | None:
+                result = validate_reachable_grasp(
+                    planner_node, poses, speed_scale=0.4,
+                    cutoff_joint_names=joint_names,
+                    ungraspable_points=list(ungraspable_points),
+                    planning_start_joints=start_state,
+                )
+                if result is None:
+                    return None
+                return {"reachable": result, "modes": modes, "poses": poses, "waist_deg": waist_deg}
+
+            next_grasp_cache["future"] = planner_pool.submit(solve_next)
+            log.info("[pipeline] 已提交下一物体后台 IK/Cartesian/OMPL 解算")
+
         log.info(f"开始尝试{pick_label}抓取")
         if not node.pick_and_return(
             target_pose=pick_target_pose,
@@ -8054,6 +8296,12 @@ def main(argv: list[str] | None = None) -> int:
                 reachable["pick_to_pre_traj"],
                 reachable["pick_approach_traj"],
             ),
+            background_planner=planner_node,
+            planner_pool=planner_pool,
+            recognition_state=(
+                dict(zip(joint_names, q1_for_waist)) if pipeline_enabled else None
+            ),
+            start_next_grasp_plan=start_next_grasp_plan if pipeline_enabled else None,
         ):
             failure_reason = node.last_pick_failure_reason
             if failure_reason == "q_pre":
@@ -8213,10 +8461,15 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 grasp_result = run_one_grasp(ungraspable_points)
             finally:
+                pending_next = next_grasp_cache.get("future")
                 cleanup_grasp_display(
                     remove_scene_objects=(
                         node.last_pick_failure_reason
                         not in {"no_place", "no_place_signal"}
+                        and not (
+                            isinstance(pending_next, Future)
+                            and not pending_next.done()
+                        )
                     )
                 )
 
@@ -8295,6 +8548,14 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return _run_grasps_until_no_empty_slot(ungraspable_points)
         finally:
+            stale_future = next_grasp_cache.pop("future", None)
+            if isinstance(stale_future, Future):
+                stale_future.cancel()
+                if not stale_future.cancelled():
+                    try:
+                        stale_future.result()
+                    except Exception as exc:
+                        log.warning(f"[pipeline] 清理后台规划任务时收到异常: {exc}")
             cached_count = len(ungraspable_points)
             ungraspable_points.clear()
             log.info(
@@ -9554,6 +9815,8 @@ def main(argv: list[str] | None = None) -> int:
             log.info(f"移除「{FRAME_ID}」…")
             if not node.remove_frame():
                 log.warning(f"移除「{FRAME_ID}」失败，忽略该退出清理失败")
+        planner_pool.shutdown(wait=True, cancel_futures=True)
+        planner_node.destroy_node()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
