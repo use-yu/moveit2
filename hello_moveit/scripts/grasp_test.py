@@ -110,6 +110,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -2750,6 +2751,38 @@ def merge_dual_arm_cartesian_trajectories(
 # =============================================================================
 # ROS 节点：场景管理 + move_action 调用
 # =============================================================================
+
+
+@dataclass
+class PlaceTrajectoryPlan:
+    arm_group: str
+    arm_plan_frame: str
+    body_group: str
+    arm_joint_names: list[str]
+    body_joint_names: list[str]
+    slot_name: str | None
+    yubei_name: str
+    place_name: str
+    start_joints: dict[str, float]
+    yubei_joints: list[float]
+    fang_joints: list[float]
+    to_yubei: RobotTrajectory
+    descent: RobotTrajectory
+    to_q1: RobotTrajectory
+    yubei_pose: Pose
+
+
+@dataclass
+class ExchangeTrajectoryPlan:
+    exchange_group: str
+    exchange_joint_names: list[str]
+    source_group: str
+    source_link: str
+    source_joint_names: list[str]
+    source_side: str
+    receiver_side: str
+    to_q2: RobotTrajectory
+    down: RobotTrajectory
 
 
 class G01Demo(Node):
@@ -6369,6 +6402,82 @@ class G01Demo(Node):
         )
         return True
 
+    def _plan_place_trajectories(
+        self,
+        *,
+        arm_group: str,
+        arm_plan_frame: str,
+        body_group: str,
+        arm_joint_names: list[str],
+        body_joint_names: list[str],
+        slot_name: str | None,
+        yubei_name: str,
+        place_name: str,
+        start_joints: Mapping[str, float],
+        yubei_joints: list[float],
+        fang_joints: list[float],
+        link: str,
+        speed: float,
+    ) -> PlaceTrajectoryPlan | None:
+        """纯规划放置去程、下降和 Q1 复位轨迹，不执行任何运动。"""
+        ok, _, to_yubei = self.plan_joint_motion(
+            body_group,
+            yubei_joints,
+            joint_names=body_joint_names,
+            start_joints=start_joints,
+            speed_scale=speed,
+            num_attempts=50,
+            planning_time_sec=20.0,
+            execute=False,
+        )
+        if not ok or to_yubei is None:
+            return None
+        yubei_state = dict(start_joints)
+        yubei_state.update(zip(body_joint_names, yubei_joints))
+        yubei_pose = self._get_link_pose_fk(
+            link,
+            joints=yubei_state,
+            joint_names=arm_joint_names,
+            plan_frame=arm_plan_frame,
+        )
+        fang_pose = self._get_link_pose_fk(
+            link,
+            joints=dict(zip(arm_joint_names, fang_joints)),
+            plan_frame=arm_plan_frame,
+        )
+        if yubei_pose is None or fang_pose is None:
+            return None
+        descent = self.plan_cartesian_line(
+            arm_group,
+            link,
+            fang_pose,
+            speed_scale=speed,
+            avoid_collisions=False,
+            start_joints=yubei_state,
+            joint_names=arm_joint_names,
+            plan_frame=arm_plan_frame,
+        )
+        if descent is None:
+            return None
+        q1_source = list(EXCHANGE_Q1[:6] if arm_group == "left_arm" else EXCHANGE_Q1[-6:])
+        q1_joints = q1_source[:len(arm_joint_names)] if arm_group == "left_arm" else q1_source[-len(arm_joint_names):]
+        ok, _, to_q1 = self.plan_joint_motion(
+            arm_group,
+            q1_joints,
+            joint_names=arm_joint_names,
+            start_joints=yubei_state,
+            speed_scale=speed,
+            execute=False,
+        )
+        if not ok or to_q1 is None:
+            return None
+        return PlaceTrajectoryPlan(
+            arm_group, arm_plan_frame, body_group, arm_joint_names,
+            body_joint_names, slot_name, yubei_name, place_name,
+            dict(start_joints), yubei_joints, fang_joints,
+            to_yubei, descent, to_q1, yubei_pose,
+        )
+
     def _place_and_return(
         self,
         speed: float,
@@ -6482,19 +6591,26 @@ class G01Demo(Node):
         if current is None:
             log.error("[pick] 读取放置规划当前实测关节状态失败")
             return False
-        ok, used_ms, _to_yubei_traj = self.plan_joint_motion(
-            body_group,
-            yubei_joints,
-            joint_names=body_joint_names,
+        plan = self._plan_place_trajectories(
+            arm_group=arm_group,
+            arm_plan_frame=arm_plan_frame,
+            body_group=body_group,
+            arm_joint_names=arm_joint_names,
+            body_joint_names=body_joint_names,
+            slot_name=slot_name,
+            yubei_name=yubei_name,
+            place_name=place_name,
             start_joints=current,
-            speed_scale=speed,
-            num_attempts=50,
-            planning_time_sec=20.0,
-            execute=True,
+            yubei_joints=yubei_joints,
+            fang_joints=fang_joints,
+            link=link,
+            speed=speed,
         )
-        log.info(f"[pick] OMPL → {yubei_name}: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
-        if not ok:
-            log.error(f"[pick] 运动到 {yubei_name} 失败")
+        if plan is None:
+            log.error(f"[pick] {yubei_name}/{place_name}/Q1 纯规划失败")
+            return False
+        if not self._execute_traj(plan.to_yubei):
+            log.error(f"[pick] 执行缓存轨迹到 {yubei_name} 失败")
             return False
 
         self.wait_for_operator()
@@ -6534,27 +6650,7 @@ class G01Demo(Node):
         if yubei_return_pose is None:
             log.error(f"[pick] 无法记录 {yubei_name} 处末端位姿用于报警退回")
             return False
-        fang_pose = self._get_link_pose_fk(
-            link,
-            joints=dict(zip(arm_joint_names, fang_joints)),
-            plan_frame=arm_plan_frame,
-        )
-        if fang_pose is None:
-            log.error(f"[pick] 无法由 {place_name} 关节角计算末端位姿")
-            return False
-        to_fang_traj = self.plan_cartesian_line(
-            arm_group,
-            link,
-            fang_pose,
-            speed_scale=speed,
-            avoid_collisions=False,
-            start_joints=current,
-            joint_names=arm_joint_names,
-            plan_frame=arm_plan_frame,
-        )
-        if to_fang_traj is None:
-            log.error(f"[pick] 直线运动到 {place_name} 规划失败")
-            return False
+        to_fang_traj = plan.descent
         tool_side = tool_side_for_link(link)
         if tool_side is None:
             log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
@@ -6575,7 +6671,11 @@ class G01Demo(Node):
             to_fang_traj,
             tool_side,
             force_z_before_place,
-            _pose_distance(yubei_return_pose, fang_pose),
+            _pose_distance(yubei_return_pose, self._get_link_pose_fk(
+                link,
+                joints=dict(zip(arm_joint_names, fang_joints)),
+                plan_frame=arm_plan_frame,
+            ) or yubei_return_pose),
             near_force_drop_threshold=None,
             stage_label="放置直线下降",
             baseline_label="放置预备点",
@@ -6699,21 +6799,8 @@ class G01Demo(Node):
             f"[pick] 9/9  从当前位置运动到 Q1 固定点 "
             f"（{q1_slice_text} 个数，使用 {q1_count} 个关节）"
         )
-        current = self._get_joints(arm_joint_names, wait_new=True)
-        if current is None:
-            log.error("[pick] 9/9 读取当前关节失败")
-            return False
-        ok, used_ms, _to_q1_traj = self.plan_joint_motion(
-            arm_group,
-            q1_joints,
-            joint_names=arm_joint_names,
-            start_joints=current,
-            speed_scale=speed,
-            execute=True,
-        )
-        log.info(f"[pick] OMPL → Q1 固定点: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
-        if not ok:
-            log.error("[pick] 9/9 运动到 Q1 固定点失败")
+        if not self._execute_traj(plan.to_q1):
+            log.error("[pick] 9/9 执行缓存轨迹到 Q1 固定点失败")
             return False
         log.info(
             "[pick] Q1 固定点返回完成: "
