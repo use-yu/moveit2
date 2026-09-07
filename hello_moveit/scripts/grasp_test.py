@@ -4643,6 +4643,14 @@ class G01Demo(Node):
         ]
         return self._apply_scene(removals)
 
+    def remove_frame_cutoff_only(self) -> bool:
+        """只删除深框隔离面。"""
+        removal = CollisionObject(
+            id=FRAME_CUTOFF_ID,
+            operation=CollisionObject.REMOVE,
+        )
+        return self._apply_scene([removal], report_error=False)
+
     def _plan_q_pre_with_temporary_collisions(
         self,
         group: str,
@@ -7483,8 +7491,6 @@ class G01Demo(Node):
             ):
                 log.error("[pipeline] 抓取成功后运动到识别位置失败")
                 return False
-            if start_next_grasp_plan is not None:
-                start_next_grasp_plan()
         try:
             post_grasp_plan = post_grasp_future.result() if post_grasp_future is not None else None
         except Exception as exc:
@@ -7494,17 +7500,16 @@ class G01Demo(Node):
             log.error("[pipeline] 当前物体交换/放置后台纯规划失败")
             return False
 
-        # 抓取成功后的交换/放置运动只添加隔板，不添加抓取物体。
-        if not self.add_frame_cutoff_only_for_pose(
-            target_pose,
-            source_frame=plan_frame,
-            target_frame=SCENE_FRAME,
-            joint_names=cutoff_joint_names,
-            tangent_link=link,
-            tangent_joints=q_pre,
-        ):
-            log.error("[pick] 第一段复位后添加隔板失败")
-            return False
+        scene_node = background_planner or self
+        if not scene_node.remove_frame_cutoff_only():
+            log.warning(
+                "[pipeline] 当前物体交换/放置轨迹规划完成后移除隔离板失败，继续流程"
+            )
+        else:
+            log.info("[pipeline] 当前物体交换/放置轨迹已规划完成，隔离板已移除")
+
+        if recognition_state is not None and start_next_grasp_plan is not None:
+            start_next_grasp_plan()
 
         if first_return_mode == 1:
             log.info(
