@@ -104,6 +104,7 @@ G01 MoveIt 演示脚本
 from __future__ import annotations
 
 import bisect
+import base64
 import copy
 import json
 import math
@@ -152,6 +153,7 @@ from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.serialization import deserialize_message, serialize_message
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import ColorRGBA, Float32MultiArray, String, UInt8
@@ -159,6 +161,14 @@ from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker
 from dobot_msgs_v4.srv import ClearError, SetToolPower
+
+_SOURCE_DATA_DIR = Path("/home/ws_moveit/src/hello_moveit/data")
+TRAJECTORY_CACHE_DIR = (
+    _SOURCE_DATA_DIR
+    if _SOURCE_DATA_DIR.parent.is_dir()
+    else Path(__file__).resolve().parents[1] / "data"
+) / "trajectory_cache"
+TRAJECTORY_CACHE_VERSION = 1
 
 # =============================================================================
 # 用户可调参数（改这里即可，无需动下面逻辑）
@@ -2829,6 +2839,73 @@ class UnloadPickTrajectoryPlan:
     approach: RobotTrajectory
     left_approach_distance: float
     right_approach_distance: float
+
+
+def _trajectory_cache_path(key: str) -> Path:
+    safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "_", key)
+    return TRAJECTORY_CACHE_DIR / f"{safe_key}.json"
+
+
+def _save_trajectory_cache(
+    key: str,
+    metadata: Mapping[str, object],
+    messages: Mapping[str, object],
+) -> bool:
+    try:
+        TRAJECTORY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": TRAJECTORY_CACHE_VERSION,
+            "metadata": dict(metadata),
+            "messages": {
+                name: base64.b64encode(serialize_message(message)).decode("ascii")
+                for name, message in messages.items()
+            },
+        }
+        path = _trajectory_cache_path(key)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def _load_trajectory_cache(
+    key: str,
+    message_types: Mapping[str, type],
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    path = _trajectory_cache_path(key)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") != TRAJECTORY_CACHE_VERSION:
+            return None
+        messages = {
+            name: deserialize_message(
+                base64.b64decode(payload["messages"][name]), message_type,
+            )
+            for name, message_type in message_types.items()
+        }
+        return dict(payload["metadata"]), messages
+    except Exception:
+        return None
+
+
+def _cached_joint_state_matches(
+    cached: object,
+    current: Mapping[str, float],
+    tolerance: float = 0.05,
+) -> bool:
+    if not isinstance(cached, dict) or set(cached) != set(current):
+        return False
+    try:
+        return max(
+            abs(float(cached[name]) - float(value))
+            for name, value in current.items()
+        ) <= tolerance
+    except (TypeError, ValueError):
+        return False
 
 
 class G01Demo(Node):
@@ -6480,6 +6557,39 @@ class G01Demo(Node):
         speed: float,
     ) -> PlaceTrajectoryPlan | None:
         """纯规划放置去程、下降和 Q1 复位轨迹，不执行任何运动。"""
+        cache_key = f"input4_place_{arm_group}_{yubei_name}_{place_name}"
+        cached = _load_trajectory_cache(
+            cache_key,
+            {
+                "to_yubei": RobotTrajectory,
+                "descent": RobotTrajectory,
+                "to_q1": RobotTrajectory,
+                "yubei_pose": Pose,
+            },
+        )
+        if cached is not None:
+            metadata, messages = cached
+            if (
+                metadata.get("body_joint_names") == body_joint_names
+                and metadata.get("arm_joint_names") == arm_joint_names
+                and metadata.get("yubei_joints") == yubei_joints
+                and metadata.get("fang_joints") == fang_joints
+                and _cached_joint_state_matches(
+                    metadata.get("start_joints"), start_joints,
+                )
+                and metadata.get("speed") == speed
+            ):
+                self.get_logger().info(f"[trajectory-cache] 命中 {cache_key}")
+                return PlaceTrajectoryPlan(
+                    arm_group, arm_plan_frame, body_group, arm_joint_names,
+                    body_joint_names, slot_name, yubei_name, place_name,
+                    dict(start_joints), yubei_joints, fang_joints,
+                    messages["to_yubei"], messages["descent"],
+                    messages["to_q1"], messages["yubei_pose"],
+                )
+        self.get_logger().info(
+            f"[trajectory-cache] 未命中或已失效 {cache_key}，正常规划"
+        )
         ok, _, to_yubei = self.plan_joint_motion(
             body_group,
             yubei_joints,
@@ -6521,22 +6631,75 @@ class G01Demo(Node):
             return None
         q1_source = list(EXCHANGE_Q1[:6] if arm_group == "left_arm" else EXCHANGE_Q1[-6:])
         q1_joints = q1_source[:len(arm_joint_names)] if arm_group == "left_arm" else q1_source[-len(arm_joint_names):]
-        ok, _, to_q1 = self.plan_joint_motion(
-            arm_group,
-            q1_joints,
-            joint_names=arm_joint_names,
-            start_joints=yubei_state,
-            speed_scale=speed,
-            execute=False,
+        return_cache_key = f"input4_return_{arm_group}_{yubei_name}"
+        cached_return = _load_trajectory_cache(
+            return_cache_key, {"to_q1": RobotTrajectory},
         )
-        if not ok or to_q1 is None:
-            return None
-        return PlaceTrajectoryPlan(
+        to_q1 = None
+        if cached_return is not None:
+            return_metadata, return_messages = cached_return
+            if (
+                return_metadata.get("arm_joint_names") == arm_joint_names
+                and return_metadata.get("yubei_joints") == yubei_joints
+                and return_metadata.get("q1_joints") == q1_joints
+                and return_metadata.get("speed") == speed
+            ):
+                to_q1 = return_messages["to_q1"]
+                self.get_logger().info(
+                    f"[trajectory-cache] 命中 {return_cache_key}"
+                )
+        if to_q1 is None:
+            ok, _, to_q1 = self.plan_joint_motion(
+                arm_group,
+                q1_joints,
+                joint_names=arm_joint_names,
+                start_joints=yubei_state,
+                speed_scale=speed,
+                execute=False,
+            )
+            if not ok or to_q1 is None:
+                return None
+            saved_return = _save_trajectory_cache(
+                return_cache_key,
+                {
+                    "arm_joint_names": arm_joint_names,
+                    "yubei_joints": yubei_joints,
+                    "q1_joints": q1_joints,
+                    "speed": speed,
+                },
+                {"to_q1": to_q1},
+            )
+            self.get_logger().info(
+                f"[trajectory-cache] "
+                f"{'已保存' if saved_return else '保存失败'} {return_cache_key}"
+            )
+        plan = PlaceTrajectoryPlan(
             arm_group, arm_plan_frame, body_group, arm_joint_names,
             body_joint_names, slot_name, yubei_name, place_name,
             dict(start_joints), yubei_joints, fang_joints,
             to_yubei, descent, to_q1, yubei_pose,
         )
+        saved = _save_trajectory_cache(
+            cache_key,
+            {
+                "body_joint_names": body_joint_names,
+                "arm_joint_names": arm_joint_names,
+                "yubei_joints": yubei_joints,
+                "fang_joints": fang_joints,
+                "start_joints": dict(start_joints),
+                "speed": speed,
+            },
+            {
+                "to_yubei": to_yubei,
+                "descent": descent,
+                "to_q1": to_q1,
+                "yubei_pose": yubei_pose,
+            },
+        )
+        self.get_logger().info(
+            f"[trajectory-cache] {'已保存' if saved else '保存失败'} {cache_key}"
+        )
+        return plan
 
     def _place_and_return(
         self,
@@ -8659,6 +8822,7 @@ def main(argv: list[str] | None = None) -> int:
         planning_start_joints: Mapping[str, float] | None = None,
         plan_only: bool = False,
         preplanned: UnloadPickTrajectoryPlan | None = None,
+        use_disk_cache: bool = False,
     ) -> bool | UnloadPickTrajectoryPlan:
         """从一对 SW 同步取料，并反向直线返回对应 yubei。"""
         pair_message = (
@@ -8737,6 +8901,35 @@ def main(argv: list[str] | None = None) -> int:
         if start_state is None:
             log.error("[unload] 读取取料规划起点失败")
             return False
+        cache_key = f"input7_first_pick_{right_slot}_{left_slot}"
+        if use_disk_cache:
+            cached = _load_trajectory_cache(
+                cache_key,
+                {"to_yubei": RobotTrajectory, "approach": RobotTrajectory},
+            )
+            if cached is not None:
+                metadata, messages = cached
+                if (
+                    _cached_joint_state_matches(
+                        metadata.get("start_joints"), start_state,
+                    )
+                    and metadata.get("yubei_target") == list(yubei_target)
+                ):
+                    plan = UnloadPickTrajectoryPlan(
+                        right_slot,
+                        left_slot,
+                        dual_body_joint_names,
+                        list(yubei_target),
+                        messages["to_yubei"],
+                        messages["approach"],
+                        float(metadata["left_approach_distance"]),
+                        float(metadata["right_approach_distance"]),
+                    )
+                    log.info(f"[trajectory-cache] 命中 {cache_key}")
+                    return plan if plan_only else execute_pick_plan(plan)
+            log.info(
+                f"[trajectory-cache] 未命中或已失效 {cache_key}，正常规划"
+            )
         ok, _, to_yubei = node.plan_joint_motion(
             "dual_arm_body", yubei_target,
             joint_names=dual_body_joint_names,
@@ -8871,6 +9064,20 @@ def main(argv: list[str] | None = None) -> int:
             left_approach_distance,
             right_approach_distance,
         )
+        if use_disk_cache:
+            saved = _save_trajectory_cache(
+                cache_key,
+                {
+                    "start_joints": start_state,
+                    "yubei_target": list(yubei_target),
+                    "left_approach_distance": left_approach_distance,
+                    "right_approach_distance": right_approach_distance,
+                },
+                {"to_yubei": to_yubei, "approach": approach},
+            )
+            log.info(
+                f"[trajectory-cache] {'已保存' if saved else '保存失败'} {cache_key}"
+            )
         return plan if plan_only else execute_pick_plan(plan)
 
     def move_unload_pair_to_place(
@@ -9854,6 +10061,7 @@ def main(argv: list[str] | None = None) -> int:
                 right_slot, left_slot,
                 on_pick_motion_start=start_place_plan,
                 preplanned=pick_plan,
+                use_disk_cache=(batch_index == 0 and pick_plan is None),
             ):
                 return False
             if place_future is None:
