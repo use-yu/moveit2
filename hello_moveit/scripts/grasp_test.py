@@ -151,6 +151,7 @@ from moveit_msgs.srv import (
 )
 from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.serialization import deserialize_message, serialize_message
@@ -3056,6 +3057,13 @@ class G01Demo(Node):
         )
         self._cylinder_marker_ids: dict[str, int] = {}
         self._next_cylinder_marker_id = 0
+        self._executor = SingleThreadedExecutor(context=self.context)
+        self._executor.add_node(self)
+
+    def shutdown_executor(self) -> None:
+        """从专属 executor 移除节点并关闭其 wait-set。"""
+        self._executor.remove_node(self)
+        self._executor.shutdown()
 
     def _on_odom(self, msg: Odometry) -> None:
         """仅向当前采样请求交付一帧；其余里程计消息直接丢弃。"""
@@ -3099,8 +3107,7 @@ class G01Demo(Node):
         try:
             deadline = time.monotonic() + max(0.0, float(timeout_sec))
             while rclpy.ok() and time.monotonic() < deadline:
-                rclpy.spin_once(
-                    self,
+                self._executor.spin_once(
                     timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
                 )
                 snapshot = request["snapshot"]
@@ -3200,7 +3207,7 @@ class G01Demo(Node):
         )
 
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.1)
+            self._executor.spin_once(timeout_sec=0.1)
             if self._nav_result_count <= result_count_before_publish:
                 continue
             if self._latest_nav_success:
@@ -3435,8 +3442,7 @@ class G01Demo(Node):
             if now >= next_retry:
                 self._send_servoj_control(side, command, request_id=request_id)
                 next_retry = now + 0.25
-            rclpy.spin_once(
-                self,
+            self._executor.spin_once(
                 timeout_sec=min(0.05, max(0.0, deadline - now)),
             )
 
@@ -3463,8 +3469,7 @@ class G01Demo(Node):
         topic = LEFT_FT_SENSOR_TOPIC if side == "left" else RIGHT_FT_SENSOR_TOPIC
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
         while rclpy.ok() and time.monotonic() < deadline:
-            rclpy.spin_once(
-                self,
+            self._executor.spin_once(
                 timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
             )
             if self._ft_sensor_count[side] > count_before_wait:
@@ -3494,8 +3499,7 @@ class G01Demo(Node):
             return True
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
         while rclpy.ok() and time.monotonic() < deadline:
-            rclpy.spin_once(
-                self,
+            self._executor.spin_once(
                 timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
             )
             if self._driver_signal is not None and (
@@ -3589,7 +3593,7 @@ class G01Demo(Node):
                 latest_command = self._latest_upper_command
                 self._latest_upper_command = None
                 return latest_command
-            rclpy.spin_once(self, timeout_sec=0.1)
+            self._executor.spin_once(timeout_sec=0.1)
         return None
 
     def wait_for_operator(self, message: str = "按回车继续 …") -> None:
@@ -3639,7 +3643,7 @@ class G01Demo(Node):
 
     def _spin_until(self, future, timeout: float) -> bool:
         """阻塞直到 future 完成或超时。"""
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+        self._executor.spin_until_future_complete(future, timeout_sec=timeout)
         return future.done() and future.result() is not None
 
     def _get_joints(self, names: list[str], wait_new=False, timeout=10.0) -> dict[str, float] | None:
@@ -3651,12 +3655,12 @@ class G01Demo(Node):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if wait_new and self._js_count <= seq0:
-                rclpy.spin_once(self, timeout_sec=0.1)
+                self._executor.spin_once(timeout_sec=0.1)
                 continue
             missing = [n for n in names if n not in self._joints]
             if not missing:
                 return {n: self._joints[n] for n in names}
-            rclpy.spin_once(self, timeout_sec=0.1)
+            self._executor.spin_once(timeout_sec=0.1)
         self.get_logger().error(f"读取关节超时，缺失: {[n for n in names if n not in self._joints]}")
         return None
 
@@ -5637,8 +5641,7 @@ class G01Demo(Node):
             guard["monitoring"] = True
             deadline = time.monotonic() + max(0.0, timeout)
             while rclpy.ok() and time.monotonic() < deadline:
-                rclpy.spin_once(
-                    self,
+                self._executor.spin_once(
                     timeout_sec=min(0.01, max(0.0, deadline - time.monotonic())),
                 )
                 if guard["contact"]:
@@ -5740,8 +5743,7 @@ class G01Demo(Node):
                                 )
                                 and time.monotonic() < sample_deadline
                             ):
-                                rclpy.spin_once(
-                                    self,
+                                self._executor.spin_once(
                                     timeout_sec=min(
                                         0.01,
                                         max(0.0, sample_deadline - time.monotonic()),
@@ -5776,8 +5778,7 @@ class G01Demo(Node):
         """ServoJ 恢复后，从实测停止位置重新规划直线退回 pre。"""
         settle_deadline = time.monotonic() + SERVOJ_RECOVERY_SETTLE_SEC
         while rclpy.ok() and time.monotonic() < settle_deadline:
-            rclpy.spin_once(
-                self,
+            self._executor.spin_once(
                 timeout_sec=min(0.02, settle_deadline - time.monotonic()),
             )
 
@@ -6617,18 +6618,59 @@ class G01Demo(Node):
         )
         if yubei_pose is None or fang_pose is None:
             return None
-        descent = self.plan_cartesian_line(
+        fang_state = dict(yubei_state)
+        fang_state.update(zip(arm_joint_names, fang_joints))
+        fang_to_yubei = self.plan_cartesian_line(
             arm_group,
             link,
-            fang_pose,
+            yubei_pose,
             speed_scale=speed,
             avoid_collisions=False,
-            start_joints=yubei_state,
+            start_joints=fang_state,
             joint_names=arm_joint_names,
             plan_frame=arm_plan_frame,
         )
-        if descent is None:
+        if fang_to_yubei is None:
             return None
+        descent = self._reverse_trajectory(fang_to_yubei)
+        if not descent.joint_trajectory.points:
+            return None
+        trajectory_names = list(descent.joint_trajectory.joint_names)
+        yubei_target = dict(zip(body_joint_names, yubei_joints))
+        fang_target = dict(zip(arm_joint_names, fang_joints))
+        yubei_error = max(
+            (
+                abs(value - yubei_target[name])
+                for name, value in zip(
+                    trajectory_names,
+                    descent.joint_trajectory.points[0].positions,
+                )
+                if name in yubei_target
+            ),
+            default=float("inf"),
+        )
+        fang_error = max(
+            (
+                abs(value - fang_target[name])
+                for name, value in zip(
+                    trajectory_names,
+                    descent.joint_trajectory.points[-1].positions,
+                )
+                if name in fang_target
+            ),
+            default=float("inf"),
+        )
+        if yubei_error > 0.05 or fang_error > 0.05:
+            self.get_logger().error(
+                f"[pick] {place_name} 反向 Cartesian 分支不匹配："
+                f"yubei 误差={yubei_error:.4f}, fang 误差={fang_error:.4f}"
+            )
+            return None
+        self.get_logger().info(
+            f"[pick] {place_name} 使用 fang 锁定 IK 分支反向规划，"
+            f"执行方向 yubei → fang；端点误差="
+            f"{yubei_error:.4f}/{fang_error:.4f}"
+        )
         q1_source = list(EXCHANGE_Q1[:6] if arm_group == "left_arm" else EXCHANGE_Q1[-6:])
         q1_joints = q1_source[:len(arm_joint_names)] if arm_group == "left_arm" else q1_source[-len(arm_joint_names):]
         return_cache_key = f"input4_return_{arm_group}_{yubei_name}"
@@ -7470,8 +7512,6 @@ class G01Demo(Node):
                 + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
             )
             
-            self.wait_for_operator("[pick] 3/9  到达抓取位置，按回车继续 …")
-
             exchange_q3 = EXCHANGE_Q3.get(tool_side)
             if exchange_q3 is None:
                 log.error(f"[pick] EXCHANGE_Q3 未配置 {tool_side}")
@@ -7609,14 +7649,12 @@ class G01Demo(Node):
         log.info(f"[exchange] 1/4 执行缓存轨迹 → Q2（{plan.q2_slice_text}）")
         if not self._execute_traj(plan.to_q2):
             return False
-        self.wait_for_operator()
         log.info(
             f"[exchange] 2/4 执行缓存直线：{plan.source_group} "
             f"沿末端 -Z {plan.z_down_distance:.3f} m"
         )
         if not self._execute_traj(plan.down):
             return False
-        self.wait_for_operator()
         if not self.set_tool_power(plan.source_side, 0):
             return False
         if not self.set_tool_power(plan.receiver_side, 1):
@@ -8823,6 +8861,7 @@ def main(argv: list[str] | None = None) -> int:
         plan_only: bool = False,
         preplanned: UnloadPickTrajectoryPlan | None = None,
         use_disk_cache: bool = False,
+        planning_node: G01Demo | None = None,
     ) -> bool | UnloadPickTrajectoryPlan:
         """从一对 SW 同步取料，并反向直线返回对应 yubei。"""
         pair_message = (
@@ -8843,6 +8882,7 @@ def main(argv: list[str] | None = None) -> int:
         left_joint_names = joint_names_for_group("left_arm")
         right_joint_names = joint_names_for_group("right_arm")
         dual_arm_joint_names = joint_names_for_group("dual_arm")
+        planner = planning_node or node
         def execute_pick_plan(plan: UnloadPickTrajectoryPlan) -> bool:
             actual_start = node._get_joints(
                 list(plan.to_yubei.joint_trajectory.joint_names), wait_new=True,
@@ -8896,7 +8936,7 @@ def main(argv: list[str] | None = None) -> int:
         start_state = (
             dict(planning_start_joints)
             if planning_start_joints is not None
-            else node._get_joints(dual_body_joint_names, wait_new=True)
+            else planner._get_joints(dual_body_joint_names, wait_new=True)
         )
         if start_state is None:
             log.error("[unload] 读取取料规划起点失败")
@@ -8930,7 +8970,7 @@ def main(argv: list[str] | None = None) -> int:
             log.info(
                 f"[trajectory-cache] 未命中或已失效 {cache_key}，正常规划"
             )
-        ok, _, to_yubei = node.plan_joint_motion(
+        ok, _, to_yubei = planner.plan_joint_motion(
             "dual_arm_body", yubei_target,
             joint_names=dual_body_joint_names,
             start_joints=start_state,
@@ -8945,13 +8985,13 @@ def main(argv: list[str] | None = None) -> int:
         current = dict(start_state)
         current.update(zip(dual_body_joint_names, yubei_target))
 
-        left_pose = node._get_link_pose_fk(
+        left_pose = planner._get_link_pose_fk(
             "l_tool",
             joints=current,
             joint_names=left_joint_names,
             plan_frame="l_base_link",
         )
-        right_pose = node._get_link_pose_fk(
+        right_pose = planner._get_link_pose_fk(
             "r_tool",
             joints=current,
             joint_names=right_joint_names,
@@ -8978,7 +9018,7 @@ def main(argv: list[str] | None = None) -> int:
 
         left_seed = {name: current[name] for name in left_joint_names}
         right_seed = {name: current[name] for name in right_joint_names}
-        left_ik = node._solve_ik(
+        left_ik = planner._solve_ik(
             "left_arm",
             "l_tool",
             left_target,
@@ -8986,7 +9026,7 @@ def main(argv: list[str] | None = None) -> int:
             avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
             plan_frame="l_base_link",
         )
-        right_ik = node._solve_ik(
+        right_ik = planner._solve_ik(
             "right_arm",
             "r_tool",
             right_target,
@@ -9021,7 +9061,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
 
-        left_trajectory = node.plan_cartesian_line(
+        left_trajectory = planner.plan_cartesian_line(
             "left_arm",
             "l_tool",
             left_target,
@@ -9031,7 +9071,7 @@ def main(argv: list[str] | None = None) -> int:
             joint_names=left_joint_names,
             plan_frame="l_base_link",
         )
-        right_trajectory = node.plan_cartesian_line(
+        right_trajectory = planner.plan_cartesian_line(
             "right_arm",
             "r_tool",
             right_target,
@@ -9089,6 +9129,7 @@ def main(argv: list[str] | None = None) -> int:
         plan_only: bool = False,
         preplanned: UnloadPlaceTrajectoryPlan | None = None,
         on_place_motion_start: Callable[[Mapping[str, float]], None] | None = None,
+        planning_node: G01Demo | None = None,
     ) -> bool | UnloadPlaceTrajectoryPlan:
         """吸附取料后验证放置可达性，并执行已经缓存的放置轨迹。
 
@@ -9103,10 +9144,11 @@ def main(argv: list[str] | None = None) -> int:
         dual_arm_joint_names = joint_names_for_group("dual_arm")
         left_body_joint_names = joint_names_for_group("left_body")
         dual_body_joint_names = joint_names_for_group("dual_arm_body")
+        planner = planning_node or node
         current_full = (
             dict(planning_start_joints)
             if planning_start_joints is not None
-            else node._get_joints(dual_body_joint_names, wait_new=True)
+            else planner._get_joints(dual_body_joint_names, wait_new=True)
         )
         if current_full is None:
             log.error("[unload] 读取物料台放置规划起点失败")
@@ -9154,7 +9196,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 raise ValueError(f"未知手臂侧别: {side}")
 
-            start_pose = node._get_link_pose_fk(
+            start_pose = planner._get_link_pose_fk(
                 link,
                 joints=endpoint_state,
                 plan_frame=SCENE_FRAME,
@@ -9169,7 +9211,7 @@ def main(argv: list[str] | None = None) -> int:
                 start_pose,
                 UNLOAD_PLACE_DESCENT_DISTANCE,
             )
-            descent = node.plan_cartesian_line(
+            descent = planner.plan_cartesian_line(
                 group,
                 link,
                 descent_pose,
@@ -9186,7 +9228,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 不可达"
                 )
                 return None
-            if not node.validate_trajectory_self_collision(
+            if not planner.validate_trajectory_self_collision(
                 descent,
                 group=group,
                 base_state=endpoint_state,
@@ -9247,7 +9289,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return None
 
-            if not node.validate_trajectory_self_collision(
+            if not planner.validate_trajectory_self_collision(
                 merged,
                 group=collision_group,
                 base_state=endpoint_state,
@@ -9292,7 +9334,7 @@ def main(argv: list[str] | None = None) -> int:
             if merged_descent is None:
                 return None
 
-            ok, used_ms, trajectory = node.plan_joint_motion(
+            ok, used_ms, trajectory = planner.plan_joint_motion(
                 group,
                 target,
                 joint_names=joint_names_for_group(group),
@@ -9548,12 +9590,12 @@ def main(argv: list[str] | None = None) -> int:
         # 第一级：身体保持当前位置，只求左右纯臂多组 IK。
         # 目标原始表达在 moveit_base_link；纯臂 IK 必须分别转换到 l/r_base_link。
         # ------------------------------------------------------------------
-        left_base_pose = node._get_link_pose_fk(
+        left_base_pose = planner._get_link_pose_fk(
             "l_base_link",
             joints=current_full,
             plan_frame=SCENE_FRAME,
         )
-        right_base_pose = node._get_link_pose_fk(
+        right_base_pose = planner._get_link_pose_fk(
             "r_base_link",
             joints=current_full,
             plan_frame=SCENE_FRAME,
@@ -9574,7 +9616,7 @@ def main(argv: list[str] | None = None) -> int:
             "右目标转换到 r_base_link"
         )
 
-        left_arm_solutions = node._solve_ik_candidates_from_seed(
+        left_arm_solutions = planner._solve_ik_candidates_from_seed(
             "left_arm",
             "l_tool",
             left_pose_in_arm_base,
@@ -9589,7 +9631,7 @@ def main(argv: list[str] | None = None) -> int:
             perturb_joint_names=left_joint_names,
             avoid_collisions=True,
         )
-        right_arm_solutions = node._solve_ik_candidates_from_seed(
+        right_arm_solutions = planner._solve_ik_candidates_from_seed(
             "right_arm",
             "r_tool",
             right_pose_in_arm_base,
@@ -9720,7 +9762,7 @@ def main(argv: list[str] | None = None) -> int:
         # 右目标保持在固定 SCENE_FRAME，避免 MoveIt 使用当前 r_base_link TF
         # 转换尚未执行的候选 body 状态。最终使用 dual_arm_body 联合规划。
         # ------------------------------------------------------------------
-        left_body_solutions = node._solve_ik_candidates_from_seed(
+        left_body_solutions = planner._solve_ik_candidates_from_seed(
             "left_body",
             "l_tool",
             left_pose,
@@ -9757,7 +9799,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"body_joint2={waist:.4f} rad"
             )
 
-            right_solutions = node._solve_ik_candidates_from_seed(
+            right_solutions = planner._solve_ik_candidates_from_seed(
                 "right_arm",
                 "r_tool",
                 right_pose,
@@ -10034,6 +10076,7 @@ def main(argv: list[str] | None = None) -> int:
                         right_point,
                         planning_start_joints=dict(start_state),
                         plan_only=True,
+                        planning_node=planner_node,
                     )
                     return (
                         result
@@ -10091,6 +10134,7 @@ def main(argv: list[str] | None = None) -> int:
                             next_left_slot,
                             planning_start_joints=dict(end_state),
                             plan_only=True,
+                            planning_node=planner_node,
                         )
                         return (
                             result
@@ -10104,7 +10148,7 @@ def main(argv: list[str] | None = None) -> int:
                     return
 
                 def plan_reset() -> RobotTrajectory | None:
-                    ok, _, trajectory = node.plan_joint_motion(
+                    ok, _, trajectory = planner_node.plan_joint_motion(
                         "dual_arm_body",
                         MOVE_TO_GRASP_RESET_Q,
                         joint_names=reset_joint_names,
@@ -10277,6 +10321,8 @@ def main(argv: list[str] | None = None) -> int:
             if not node.remove_frame():
                 log.warning(f"移除「{FRAME_ID}」失败，忽略该退出清理失败")
         planner_pool.shutdown(wait=True, cancel_futures=True)
+        planner_node.shutdown_executor()
+        node.shutdown_executor()
         planner_node.destroy_node()
         node.destroy_node()
         if rclpy.ok():
