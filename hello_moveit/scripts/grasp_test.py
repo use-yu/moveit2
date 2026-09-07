@@ -368,7 +368,6 @@ MOVE_TO_GRASP_RESET_Q = [
     1.672852,
     0.588477,
 ]
-
 # 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
 # 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
 GRASP_VISION_WAIST_ANGLES_DEG = (30,)
@@ -395,11 +394,22 @@ GRASP_Q1 = [
     1.672852,
     0.588477,
 ]
-# 下料流程识别物料台前的预备构型，只控制升降和腰部。
-# 顺序为 body_joint1/body_joint2，双臂保持当前位置。
+# 下料流程识别物料台前的预备构型，顺序与 dual_arm_body 一致。
 UNLOAD_TABLE_VISION_PREP_Q = [
     0.05,
     0 * math.pi / 180,
+    -1.57,
+    -0.15,
+    -1.578090,
+    -1.370549,
+    -1.672852,
+    -0.588477,
+    1.57,
+    0.15,
+    1.578090,
+    1.370549,
+    1.672852,
+    0.588477,
 ]
 for q1_name, q1_values in (
     ("MOVE_TO_GRASP_RESET_Q", MOVE_TO_GRASP_RESET_Q),
@@ -411,10 +421,10 @@ for q1_name, q1_values in (
             f"{q1_name} 长度 {len(q1_values)} 与 dual_arm_body 关节数 "
             f"{len(JOINT_TARGETS['dual_arm_body'])} 不一致"
         )
-if len(UNLOAD_TABLE_VISION_PREP_Q) != len(JOINT_TARGETS["body"]):
+if len(UNLOAD_TABLE_VISION_PREP_Q) != len(JOINT_TARGETS["dual_arm_body"]):
     raise ValueError(
         f"UNLOAD_TABLE_VISION_PREP_Q 长度 {len(UNLOAD_TABLE_VISION_PREP_Q)} "
-        f"与 body 关节数 {len(JOINT_TARGETS['body'])} 不一致"
+        f"与 dual_arm_body 关节数 {len(JOINT_TARGETS['dual_arm_body'])} 不一致"
     )
 
 
@@ -2799,6 +2809,26 @@ class ExchangeTrajectoryPlan:
 class PostGraspTrajectoryPlan:
     exchange: ExchangeTrajectoryPlan | None
     place: PlaceTrajectoryPlan
+
+
+@dataclass
+class UnloadPlaceTrajectoryPlan:
+    group: str
+    label: str
+    to_place: RobotTrajectory
+    descent: RobotTrajectory
+
+
+@dataclass
+class UnloadPickTrajectoryPlan:
+    right_slot: str
+    left_slot: str
+    dual_body_joint_names: list[str]
+    yubei_target: list[float]
+    to_yubei: RobotTrajectory
+    approach: RobotTrajectory
+    left_approach_distance: float
+    right_approach_distance: float
 
 
 class G01Demo(Node):
@@ -8621,7 +8651,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return True
 
-    def execute_unload_pick_pair(right_slot: str, left_slot: str) -> bool:
+    def execute_unload_pick_pair(
+        right_slot: str,
+        left_slot: str,
+        on_pick_motion_start: Callable[[Mapping[str, float]], None] | None = None,
+        *,
+        planning_start_joints: Mapping[str, float] | None = None,
+        plan_only: bool = False,
+        preplanned: UnloadPickTrajectoryPlan | None = None,
+    ) -> bool | UnloadPickTrajectoryPlan:
         """从一对 SW 同步取料，并反向直线返回对应 yubei。"""
         pair_message = (
             f"[unload] 选择右臂 {right_slot.upper()} + "
@@ -8638,29 +8676,81 @@ def main(argv: list[str] | None = None) -> int:
             log.error(f"[unload] 拼接双臂 yubei 目标失败: {exc}")
             return False
 
-        log.info(
-            f"[unload] dual_arm_body → yubei："
-            f"body_joint1=0, body_joint2=0, "
-            f"右={right_slot.upper()}, 左={left_slot.upper()}"
-        )
-        if not node.plan_execute_joint_waypoints(
-            "dual_arm_body",
-            UNLOAD_JOINT_SPEED,
-            dual_body_joint_names,
-            [yubei_target],
-            num_attempts=30,
-            planning_time_sec=10.0,
-        ):
-            log.error("[unload] dual_arm_body 到 yubei 失败")
-            return False
-
         left_joint_names = joint_names_for_group("left_arm")
         right_joint_names = joint_names_for_group("right_arm")
         dual_arm_joint_names = joint_names_for_group("dual_arm")
-        current = node._get_joints(dual_arm_joint_names, wait_new=True)
-        if current is None:
-            log.error("[unload] 读取 yubei 处双臂关节失败")
+        def execute_pick_plan(plan: UnloadPickTrajectoryPlan) -> bool:
+            actual_start = node._get_joints(
+                list(plan.to_yubei.joint_trajectory.joint_names), wait_new=True,
+            )
+            first_point = plan.to_yubei.joint_trajectory.points[0]
+            start_error = max(
+                (
+                    abs(actual_start[name] - value)
+                    for name, value in zip(
+                        plan.to_yubei.joint_trajectory.joint_names,
+                        first_point.positions,
+                    )
+                    if actual_start is not None and name in actual_start
+                ),
+                default=float("inf") if actual_start is None else 0.0,
+            )
+            if start_error > 0.05:
+                log.error(
+                    f"[unload][pipeline] 抓取缓存起点偏差 {start_error:.4f} > 0.05，"
+                    "禁止执行缓存轨迹"
+                )
+                return False
+            if on_pick_motion_start is not None:
+                on_pick_motion_start(
+                    dict(zip(plan.dual_body_joint_names, plan.yubei_target))
+                )
+            log.info("[unload] 执行缓存轨迹 dual_arm_body → 取料 yubei")
+            if not node._execute_traj(plan.to_yubei):
+                return False
+            node.wait_for_operator("按回车执行双臂同步直线取料: ")
+            if not node._execute_traj(plan.approach):
+                log.error("[unload] 双臂同步直线取料失败")
+                return False
+            node.wait_for_operator("按回车给左右末端上电: ")
+            if not set_unload_tool_power(1, "取料"):
+                return False
+            if node.sim_mode and not node._update_simulated_place_slots(
+                [right_slot, left_slot], has_material=False,
+                reason="双臂完成下料取料",
+            ):
+                return False
+            time.sleep(UNLOAD_TOOL_SETTLE_SEC)
+            log.info("[unload] 反向执行缓存抓取直线，原路复位到 yubei")
+            if not node._execute_traj(node._reverse_trajectory(plan.approach)):
+                return False
+            return True
+
+        if preplanned is not None:
+            return execute_pick_plan(preplanned)
+
+        start_state = (
+            dict(planning_start_joints)
+            if planning_start_joints is not None
+            else node._get_joints(dual_body_joint_names, wait_new=True)
+        )
+        if start_state is None:
+            log.error("[unload] 读取取料规划起点失败")
             return False
+        ok, _, to_yubei = node.plan_joint_motion(
+            "dual_arm_body", yubei_target,
+            joint_names=dual_body_joint_names,
+            start_joints=start_state,
+            speed_scale=UNLOAD_JOINT_SPEED,
+            num_attempts=30,
+            planning_time_sec=10.0,
+            execute=False,
+        )
+        if not ok or to_yubei is None:
+            log.error("[unload] dual_arm_body 到 yubei 纯规划失败")
+            return False
+        current = dict(start_state)
+        current.update(zip(dual_body_joint_names, yubei_target))
 
         left_pose = node._get_link_pose_fk(
             "l_tool",
@@ -8679,12 +8769,10 @@ def main(argv: list[str] | None = None) -> int:
             return False
 
         left_approach_distance = (
-            UNLOAD_APPROACH_DISTANCE
-            + UNLOAD_EXTRA_APPROACH_BY_SLOT[left_slot]
+            UNLOAD_APPROACH_DISTANCE + UNLOAD_EXTRA_APPROACH_BY_SLOT[left_slot]
         )
         right_approach_distance = (
-            UNLOAD_APPROACH_DISTANCE
-            + UNLOAD_EXTRA_APPROACH_BY_SLOT[right_slot]
+            UNLOAD_APPROACH_DISTANCE + UNLOAD_EXTRA_APPROACH_BY_SLOT[right_slot]
         )
         left_target = pose_offset_local_z(left_pose, left_approach_distance)
         right_target = pose_offset_local_z(right_pose, right_approach_distance)
@@ -8773,45 +8861,28 @@ def main(argv: list[str] | None = None) -> int:
             log.error(f"[unload] 合并双臂 Cartesian 轨迹失败: {exc}")
             return False
 
-        node.wait_for_operator("按回车执行双臂同步直线取料: ")
-
-        log.info(
-            f"[unload] 一次执行双臂沿末端 +Z 直线："
-            f"左臂 {left_approach_distance:.3f} m，"
-            f"右臂 {right_approach_distance:.3f} m（不考虑碰撞）"
+        plan = UnloadPickTrajectoryPlan(
+            right_slot,
+            left_slot,
+            dual_body_joint_names,
+            list(yubei_target),
+            to_yubei,
+            approach,
+            left_approach_distance,
+            right_approach_distance,
         )
-        if not node._execute_traj(approach):
-            log.error("[unload] 双臂同步直线取料失败")
-            return False
-
-        node.wait_for_operator("按回车给左右末端上电: ")
-
-        if not set_unload_tool_power(1, "取料"):
-            return False
-        if node.sim_mode and not node._update_simulated_place_slots(
-            [right_slot, left_slot],
-            has_material=False,
-            reason="双臂完成下料取料",
-        ):
-            return False
-        time.sleep(UNLOAD_TOOL_SETTLE_SEC)
-
-        log.info("[unload] 反向执行同一条双臂直线轨迹，原路复位到 yubei")
-        if not node._execute_traj(node._reverse_trajectory(approach)):
-            log.error("[unload] 双臂同步直线复位失败")
-            return False
-
-        log.info(
-            f"[unload] {right_slot.upper()} + {left_slot.upper()} "
-            "双臂取料并复位完成"
-        )
-        return True
+        return plan if plan_only else execute_pick_plan(plan)
 
     def move_unload_pair_to_place(
         place_poses: dict[int, Pose],
         left_point: int,
         right_point: int,
-    ) -> bool:
+        *,
+        planning_start_joints: Mapping[str, float] | None = None,
+        plan_only: bool = False,
+        preplanned: UnloadPlaceTrajectoryPlan | None = None,
+        on_place_motion_start: Callable[[Mapping[str, float]], None] | None = None,
+    ) -> bool | UnloadPlaceTrajectoryPlan:
         """吸附取料后验证放置可达性，并执行已经缓存的放置轨迹。
 
         先保持身体不动分别求左右纯臂 IK；若任一侧无解或所有纯臂组合未
@@ -8825,9 +8896,10 @@ def main(argv: list[str] | None = None) -> int:
         dual_arm_joint_names = joint_names_for_group("dual_arm")
         left_body_joint_names = joint_names_for_group("left_body")
         dual_body_joint_names = joint_names_for_group("dual_arm_body")
-        current_full = node._get_joints(
-            dual_body_joint_names,
-            wait_new=True,
+        current_full = (
+            dict(planning_start_joints)
+            if planning_start_joints is not None
+            else node._get_joints(dual_body_joint_names, wait_new=True)
         )
         if current_full is None:
             log.error("[unload] 读取物料台放置规划起点失败")
@@ -9080,6 +9152,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"[unload] 已选中 {label}，直接执行缓存的 {group} "
                 "联合轨迹到放置预备位"
             )
+            if on_place_motion_start is not None:
+                endpoint = to_place.joint_trajectory.points[-1]
+                end_state = dict(current_full)
+                end_state.update(zip(
+                    to_place.joint_trajectory.joint_names,
+                    endpoint.positions,
+                ))
+                on_place_motion_start(end_state)
             if not node._execute_traj(to_place):
                 log.error(f"[unload] {label} 联合轨迹执行失败")
                 return False
@@ -9226,6 +9306,36 @@ def main(argv: list[str] | None = None) -> int:
                 "（检查机器人自碰撞，忽略物体碰撞）"
             )
             return reachable
+
+        if preplanned is not None:
+            actual_start = node._get_joints(
+                list(preplanned.to_place.joint_trajectory.joint_names),
+                wait_new=True,
+            )
+            first_point = preplanned.to_place.joint_trajectory.points[0]
+            start_error = max(
+                (
+                    abs(actual_start[name] - value)
+                    for name, value in zip(
+                        preplanned.to_place.joint_trajectory.joint_names,
+                        first_point.positions,
+                    )
+                    if actual_start is not None and name in actual_start
+                ),
+                default=float("inf") if actual_start is None else 0.0,
+            )
+            if start_error > 0.05:
+                log.error(
+                    f"[unload][pipeline] 放置缓存起点偏差 {start_error:.4f} > 0.05，"
+                    "禁止执行缓存轨迹"
+                )
+                return False
+            return execute_cached_place_plan(
+                preplanned.group,
+                preplanned.label,
+                preplanned.to_place,
+                preplanned.descent,
+            )
 
         # ------------------------------------------------------------------
         # 第一级：身体保持当前位置，只求左右纯臂多组 IK。
@@ -9381,6 +9491,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             if cached_plan is not None:
                 to_place, descent = cached_plan
+                if plan_only:
+                    return UnloadPlaceTrajectoryPlan(
+                        "dual_arm", label, to_place, descent,
+                    )
                 return execute_cached_place_plan(
                     "dual_arm",
                     label,
@@ -9509,6 +9623,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if cached_plan is not None:
                     to_place, descent = cached_plan
+                    if plan_only:
+                        return UnloadPlaceTrajectoryPlan(
+                            "dual_arm_body", label, to_place, descent,
+                        )
                     return execute_cached_place_plan(
                         "dual_arm_body",
                         label,
@@ -9549,12 +9667,11 @@ def main(argv: list[str] | None = None) -> int:
             # 刷新流程一旦开始就丢弃旧放置点，避免后续步骤误用旧识别结果。
             unload_place_poses = None
 
-        vision_prep_group = BODY_GROUP
+        vision_prep_group = "dual_arm_body"
         vision_prep_joint_names = joint_names_for_group(vision_prep_group)
         log.info(
             f"[unload] 物料台识别前，{vision_prep_group} 先通过 OMPL "
-            "只运动 body_joint1/body_joint2 到 "
-            "UNLOAD_TABLE_VISION_PREP_Q，双臂保持当前位置"
+            "整机运动到 UNLOAD_TABLE_VISION_PREP_Q"
         )
         if not node.plan_execute_joint_waypoints(
             vision_prep_group,
@@ -9659,9 +9776,17 @@ def main(argv: list[str] | None = None) -> int:
             log.error("[unload] 双臂未全部下电，禁止执行后续动作")
             return False
 
+        next_pick_cache: dict[str, object] = {}
+        reset_future: Future[RobotTrajectory | None] | None = None
+
         for batch_index in range(UNLOAD_MAX_PAIRS_PER_RUN):
-            if not node._wait_for_driver_signal(require_new=True):
-                return False
+            cached_selected = next_pick_cache.pop("selected", None)
+            cached_pick_future = next_pick_cache.pop("future", None)
+            if cached_selected is None:
+                if not node._wait_for_driver_signal(require_new=True):
+                    return False
+            else:
+                log.info("[unload][pipeline] 使用第一次放置期间选定的第二次取料")
             material_slots = unload_material_slots()
             material_text = (
                 ", ".join(slot.upper() for slot in material_slots)
@@ -9670,7 +9795,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"{GREEN}[unload] 当前有料位置: {material_text}{RESET}")
 
-            selected = select_unload_pair()
+            selected = cached_selected or select_unload_pair()
             if selected is None:
                 log.info(
                     "[unload] 没有完整料对（需要 SW1+SW3 或 SW2+SW4），"
@@ -9690,12 +9815,108 @@ def main(argv: list[str] | None = None) -> int:
                 f"右臂 {right_slot.upper()}→物料台点{right_point}，"
                 f"左臂 {left_slot.upper()}→物料台点{left_point}"
             )
-            if not execute_unload_pick_pair(right_slot, left_slot):
+            place_future: Future[UnloadPlaceTrajectoryPlan | None] | None = None
+
+            def start_place_plan(start_state: Mapping[str, float]) -> None:
+                nonlocal place_future
+
+                def plan_place() -> UnloadPlaceTrajectoryPlan | None:
+                    result = move_unload_pair_to_place(
+                        unload_place_poses,
+                        left_point,
+                        right_point,
+                        planning_start_joints=dict(start_state),
+                        plan_only=True,
+                    )
+                    return (
+                        result
+                        if isinstance(result, UnloadPlaceTrajectoryPlan)
+                        else None
+                    )
+
+                place_future = planner_pool.submit(plan_place)
+                log.info(
+                    "[unload][pipeline] 开始运动到取料 yubei，"
+                    "已提交本轮放置轨迹后台规划"
+                )
+
+            pick_plan = None
+            if isinstance(cached_pick_future, Future):
+                try:
+                    pick_plan = cached_pick_future.result()
+                except Exception as exc:
+                    log.error(f"[unload][pipeline] 第二次抓取后台规划异常: {exc}")
+                    return False
+                if not isinstance(pick_plan, UnloadPickTrajectoryPlan):
+                    log.error("[unload][pipeline] 第二次抓取后台纯规划失败")
+                    return False
+            if not execute_unload_pick_pair(
+                right_slot, left_slot,
+                on_pick_motion_start=start_place_plan,
+                preplanned=pick_plan,
+            ):
                 return False
+            if place_future is None:
+                log.error("[unload][pipeline] 双臂取料后未提交放置规划")
+                return False
+            try:
+                place_plan = place_future.result()
+            except Exception as exc:
+                log.error(f"[unload][pipeline] 双臂放置后台规划异常: {exc}")
+                return False
+            if place_plan is None:
+                log.error("[unload][pipeline] 双臂放置后台纯规划失败")
+                return False
+            def plan_next_stage(end_state: Mapping[str, float]) -> None:
+                nonlocal reset_future
+                if batch_index == 0:
+                    if not node._wait_for_driver_signal(require_new=True):
+                        return
+                    next_selected = select_unload_pair()
+                    if next_selected is None:
+                        return
+                    _, next_right_slot, next_left_slot, _, _ = next_selected
+
+                    def plan_next_pick() -> UnloadPickTrajectoryPlan | None:
+                        result = execute_unload_pick_pair(
+                            next_right_slot,
+                            next_left_slot,
+                            planning_start_joints=dict(end_state),
+                            plan_only=True,
+                        )
+                        return (
+                            result
+                            if isinstance(result, UnloadPickTrajectoryPlan)
+                            else None
+                        )
+
+                    next_pick_cache["selected"] = next_selected
+                    next_pick_cache["future"] = planner_pool.submit(plan_next_pick)
+                    log.info("[unload][pipeline] 第一次放置开始，后台规划第二次抓取")
+                    return
+
+                def plan_reset() -> RobotTrajectory | None:
+                    ok, _, trajectory = node.plan_joint_motion(
+                        "dual_arm_body",
+                        MOVE_TO_GRASP_RESET_Q,
+                        joint_names=reset_joint_names,
+                        start_joints=dict(end_state),
+                        speed_scale=UNLOAD_JOINT_SPEED,
+                        num_attempts=30,
+                        planning_time_sec=10.0,
+                        execute=False,
+                    )
+                    return trajectory if ok else None
+
+                reset_future = planner_pool.submit(plan_reset)
+                log.info("[unload][pipeline] 第二次放置开始，后台规划复位轨迹")
+
             if not move_unload_pair_to_place(
                 unload_place_poses,
                 left_point,
                 right_point,
+                preplanned=place_plan,
+                on_place_motion_start=plan_next_stage,
             ):
                 return False
 
@@ -9709,7 +9930,39 @@ def main(argv: list[str] | None = None) -> int:
                 f"该料对下次循环目标=({next_left}, {next_right})"
             )
 
-        return reset_after_unload_cycle()
+        if reset_future is None:
+            return reset_after_unload_cycle()
+        try:
+            reset_plan = reset_future.result()
+        except Exception as exc:
+            log.error(f"[unload][pipeline] 复位后台规划异常: {exc}")
+            return False
+        if reset_plan is None:
+            log.error("[unload][pipeline] 复位后台纯规划失败")
+            return False
+        actual_reset_start = node._get_joints(
+            list(reset_plan.joint_trajectory.joint_names), wait_new=True,
+        )
+        reset_first = reset_plan.joint_trajectory.points[0]
+        reset_start_error = max(
+            (
+                abs(actual_reset_start[name] - value)
+                for name, value in zip(
+                    reset_plan.joint_trajectory.joint_names,
+                    reset_first.positions,
+                )
+                if actual_reset_start is not None and name in actual_reset_start
+            ),
+            default=float("inf") if actual_reset_start is None else 0.0,
+        )
+        if reset_start_error > 0.05:
+            log.error(
+                f"[unload][pipeline] 复位缓存起点偏差 "
+                f"{reset_start_error:.4f} > 0.05，禁止执行缓存轨迹"
+            )
+            return False
+        log.info("[unload][pipeline] 执行第二次放置期间缓存的复位轨迹")
+        return node._execute_traj(reset_plan)
 
     def remove_cached_unload_scene() -> bool:
         """移除步骤 6 创建的场景，并清空对应缓存。"""
