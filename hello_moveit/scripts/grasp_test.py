@@ -9021,51 +9021,6 @@ def main(argv: list[str] | None = None) -> int:
             f"{right_approach_distance * 1000.0:.1f} mm"
         )
 
-        left_seed = {name: current[name] for name in left_joint_names}
-        right_seed = {name: current[name] for name in right_joint_names}
-        left_ik = planner._solve_ik(
-            "left_arm",
-            "l_tool",
-            left_target,
-            left_seed,
-            avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
-            plan_frame="l_base_link",
-        )
-        right_ik = planner._solve_ik(
-            "right_arm",
-            "r_tool",
-            right_target,
-            right_seed,
-            avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
-            plan_frame="r_base_link",
-        )
-        if left_ik is None or right_ik is None:
-            log.error("[unload] 至少一只手臂的直线终点没有 IK")
-            return False
-        missing_left = [
-            name for name in left_joint_names if name not in left_ik
-        ]
-        missing_right = [
-            name for name in right_joint_names if name not in right_ik
-        ]
-        if missing_left or missing_right:
-            log.error(
-                f"[unload] IK 返回的关节不完整："
-                f"left_missing={missing_left}, right_missing={missing_right}"
-            )
-            return False
-        dual_arm_target = {
-            **{name: left_ik[name] for name in left_joint_names},
-            **{name: right_ik[name] for name in right_joint_names},
-        }
-        log.info(
-            "[unload] 左右终点 IK 已合成 dual_arm 目标: "
-            + ", ".join(
-                f"{name}={dual_arm_target[name]:.3f}"
-                for name in dual_arm_joint_names
-            )
-        )
-
         left_trajectory = planner.plan_cartesian_line(
             "left_arm",
             "l_tool",
