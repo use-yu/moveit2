@@ -4696,6 +4696,35 @@ class G01Demo(Node):
 
         planned_trajectory: RobotTrajectory | None = None
         try:
+            if not self._validity_cli.wait_for_service(timeout_sec=10.0):
+                log.error(f"[grasp-select] 服务 {SVC_STATE_VALIDITY} 不可用，跳过 q_pre")
+                return None
+            validity_request = GetStateValidity.Request()
+            validity_request.group_name = group
+            validity_request.robot_state = RobotState()
+            validity_request.robot_state.is_diff = True
+            q_pre_state = dict(planning_start_joints or {})
+            q_pre_state.update(q_pre)
+            validity_request.robot_state.joint_state.name = list(q_pre_state)
+            validity_request.robot_state.joint_state.position = list(q_pre_state.values())
+            validity_future = self._validity_cli.call_async(validity_request)
+            if not self._spin_until(validity_future, 5.0):
+                validity_future.cancel()
+                log.error("[grasp-select] q_pre 碰撞检查超时，跳过该候选")
+                return None
+            validity_response = validity_future.result()
+            if not validity_response.valid:
+                contacts = ", ".join(
+                    f"{contact.contact_body_1}<->{contact.contact_body_2}"
+                    for contact in validity_response.contacts[:5]
+                )
+                log.info(
+                    "[grasp-select] q_pre 存在碰撞，跳过 OMPL"
+                    + (f": {contacts}" if contacts else "")
+                )
+                return None
+            log.info("[grasp-select] q_pre 无碰撞，继续 OMPL 规划")
+
             ok, _, trajectory = self.plan_joint_motion(
                 group,
                 q_pre,
@@ -6761,8 +6790,9 @@ class G01Demo(Node):
         first_return_mode: int,
         selected_slot_name: str | None = None,
         preplanned: PlaceTrajectoryPlan | None = None,
+        return_to_q1: bool = True,
     ) -> bool:
-        """body+手臂到 yubei，再用纯臂放置、原路返回并运动到 Q1。"""
+        """body+手臂到 yubei，纯臂放置并原路返回，可选再运动到 Q1。"""
         log = self.get_logger()
         arm_context = arm_context_for_group(group)
         if arm_context is None:
@@ -7078,6 +7108,10 @@ class G01Demo(Node):
                 ):
                     return False
 
+        if not return_to_q1:
+            log.info("[pick] 放置直线返回 yubei 后跳过 Q1，直接进入识别位置运动")
+            return True
+
         q1_count = len(arm_joint_names)
         if arm_group == "left_arm":
             q1_source = list(EXCHANGE_Q1[:6])
@@ -7125,6 +7159,61 @@ class G01Demo(Node):
             )
             return False
         return True
+
+    def _return_yubei_to_recognition_cached(
+        self,
+        recognition_state: Mapping[str, float],
+        *,
+        arm_group: str,
+        first_return_mode: int,
+        slot_name: str | None,
+        speed: float,
+    ) -> bool:
+        """规划/缓存并执行输入 4 的 yubei → 识别位置固定轨迹。"""
+        joint_names = list(recognition_state)
+        start = self._get_joints(joint_names, wait_new=True)
+        if start is None:
+            return False
+        yubei_name = "yubei_j" if first_return_mode == 1 else "yubei"
+        cache_key = (
+            f"input4_recognition_{arm_group}_{yubei_name}.{slot_name or 'default'}"
+        )
+        trajectory = None
+        cached = _load_trajectory_cache(cache_key, {"trajectory": RobotTrajectory})
+        if cached is not None:
+            metadata, messages = cached
+            if (
+                metadata.get("target_joints") == dict(recognition_state)
+                and metadata.get("speed") == speed
+                and _cached_joint_state_matches(metadata.get("start_joints"), start)
+            ):
+                trajectory = messages["trajectory"]
+                self.get_logger().info(f"[trajectory-cache] 命中 {cache_key}")
+        if trajectory is None:
+            self.get_logger().info(
+                f"[trajectory-cache] 未命中或已失效 {cache_key}，正常规划"
+            )
+            ok, _, trajectory = self.plan_joint_motion(
+                "dual_arm_body", recognition_state,
+                joint_names=joint_names, start_joints=start,
+                speed_scale=speed, num_attempts=30,
+                planning_time_sec=10.0, execute=False,
+            )
+            if not ok or trajectory is None:
+                return False
+            saved = _save_trajectory_cache(
+                cache_key,
+                {
+                    "start_joints": start,
+                    "target_joints": dict(recognition_state),
+                    "speed": speed,
+                },
+                {"trajectory": trajectory},
+            )
+            self.get_logger().info(
+                f"[trajectory-cache] {'已保存' if saved else '保存失败'} {cache_key}"
+            )
+        return self._execute_traj(trajectory)
 
     def pick_and_return(
         self,
@@ -7541,6 +7630,10 @@ class G01Demo(Node):
                 first_return_mode=first_return_mode,
                 selected_slot_name=selected_place_slot,
                 preplanned=post_grasp_plan.place if post_grasp_plan else None,
+                return_to_q1=not (
+                    recognition_state is not None
+                    and start_next_grasp_plan is not None
+                ),
             ):
                 return False
 
@@ -7553,13 +7646,20 @@ class G01Demo(Node):
                 first_return_mode=first_return_mode,
                 selected_slot_name=selected_place_slot,
                 preplanned=post_grasp_plan.place if post_grasp_plan else None,
+                return_to_q1=not (
+                    recognition_state is not None
+                    and start_next_grasp_plan is not None
+                ),
             ):
                 return False
 
         if recognition_state is not None and start_next_grasp_plan is not None:
-            if not self.plan_execute_joint_waypoints(
-                "dual_arm_body", place_speed_scale, list(recognition_state),
-                [recognition_state], num_attempts=30, planning_time_sec=10.0,
+            if not self._return_yubei_to_recognition_cached(
+                recognition_state,
+                arm_group=place_arm_group,
+                first_return_mode=first_return_mode,
+                slot_name=selected_place_slot,
+                speed=place_speed_scale,
             ):
                 log.error("[pipeline] 放置后返回识别位置失败")
                 return False
