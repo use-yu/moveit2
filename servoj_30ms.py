@@ -148,6 +148,8 @@ LEFT_FT_SENSOR_COMMAND_SERVICE = "/g01/left/ft_sensor_commands"
 RIGHT_FT_SENSOR_COMMAND_SERVICE = "/g01/right/ft_sensor_commands"
 LEFT_CLEAR_ERROR_SERVICE = "/g01/left/clear_error"
 RIGHT_CLEAR_ERROR_SERVICE = "/g01/right/clear_error"
+LEFT_DISABLE_ROBOT_SERVICE = "/g01/left/disable_robot"
+RIGHT_DISABLE_ROBOT_SERVICE = "/g01/right/disable_robot"
 DUAL_ARM_DISABLE_ROBOT_SERVICE = "/g01/dual_arm/disable_robot"
 # DEFAULT_PAYLOAD = (1.1, 0.0, 0.0, 45.0)
 # TOOL_POWER_ON_PAYLOAD = (4.85, 0.0, 0.0, 87.0)
@@ -284,6 +286,16 @@ class ArmRosBridge(Node):
             ClearError,
             RIGHT_CLEAR_ERROR_SERVICE,
             self._on_right_clear_error,
+        )
+        self.create_service(
+            DisableRobot,
+            LEFT_DISABLE_ROBOT_SERVICE,
+            self._on_left_disable_robot,
+        )
+        self.create_service(
+            DisableRobot,
+            RIGHT_DISABLE_ROBOT_SERVICE,
+            self._on_right_disable_robot,
         )
         self.create_service(
             DisableRobot,
@@ -536,6 +548,39 @@ class ArmRosBridge(Node):
 
     def _on_right_clear_error(self, _request, response):
         return self._on_clear_error(response, "right", self.arm_clients[1])
+
+    def _on_disable_robot(self, response, side, client):
+        """关闭指定臂指令入口并清缓存，确认该臂掉使能后返回成功。"""
+        with self._arm_command_lock:
+            self._arm_paused[side] = True
+            self._latest_arm_commands[side] = None
+            self._new_arm_commands[side] = False
+
+        arm_name = "左臂" if side == "left" else "右臂"
+        try:
+            disable_robot_runtime(client, arm_name)
+        except (ConnectionError, TimeoutError, OSError, RuntimeError) as exc:
+            response.res = -1
+            response.robot_return = str(exc)
+            self.get_logger().error(
+                f"/g01/{side}/disable_robot 执行失败：{exc}；"
+                f"{arm_name} ServoJ 指令入口保持关闭"
+            )
+            return response
+
+        response.res = 0
+        response.robot_return = f"{arm_name} 已确认掉使能，ServoJ 指令入口保持关闭"
+        self.get_logger().warning(
+            f"/g01/{side}/disable_robot 执行成功："
+            f"{arm_name} 已掉使能，ServoJ 指令入口保持关闭"
+        )
+        return response
+
+    def _on_left_disable_robot(self, _request, response):
+        return self._on_disable_robot(response, "left", self.arm_clients[0])
+
+    def _on_right_disable_robot(self, _request, response):
+        return self._on_disable_robot(response, "right", self.arm_clients[1])
 
     def _on_dual_arm_disable_robot(self, _request, response):
         """关闭指令入口并让左右机械臂同时掉使能。"""
