@@ -3114,6 +3114,59 @@ class G01Demo(Node):
         else:
             self.get_logger().error(message)
 
+    def verify_startup_hardware(self) -> bool:
+        """启动自检：双工具上电→双力新帧→双工具下电→最新关节位置。"""
+        log = self.get_logger()
+        sides = ("left", "right")
+
+        def check(action, error_code: int, label: str):
+            # 正常失败由底层方法发布对应错误码；调用异常也归入当前检查项。
+            try:
+                return action()
+            except Exception as exc:
+                self.publish_error(error_code, f"启动自检 {label}: {exc}")
+                return None
+
+        log.info("[startup-check] 双末端上电，检查左右力传感器新帧")
+        force_values = {}
+        try:
+            power_on = [
+                check(lambda side=side: self.set_tool_power(side, 1), 6, f"{side} 上电")
+                for side in sides
+            ]
+            if all(power_on):
+                for side in sides:
+                    force_values[side] = check(
+                        lambda side=side: self.wait_for_ft_sensor_z(side),
+                        5, f"{side} 力传感器新帧",
+                    )
+        finally:
+            # 任一侧上电或传感器检查失败，也必须尝试给两个末端下电。
+            log.info("[startup-check] 给两个末端下电")
+            power_off = [
+                check(lambda side=side: self.set_tool_power(side, 0), 7, f"{side} 下电")
+                for side in sides
+            ]
+
+        if not all(power_on) or not all(power_off) or any(
+            force_values.get(side) is None for side in sides
+        ):
+            return False
+
+        joint_names = list(JOINT_TARGETS["dual_arm_body"])
+        log.info("[startup-check] 获取双臂、腰部及升降的最新关节位置")
+        joints = check(
+            lambda: self._get_joints(joint_names, wait_new=True),
+            9, "获取当前位置",
+        )
+        if joints is None:
+            return False
+        log.info(
+            "[startup-check] 自检成功；当前位置: "
+            + ", ".join(f"{name}={value:.6f}" for name, value in joints.items())
+        )
+        return True
+
     def shutdown_executor(self) -> None:
         """从专属 executor 移除节点并关闭其 wait-set。"""
         self._executor.remove_node(self)
@@ -10430,8 +10483,11 @@ def _run_main(
         frame_added = False
         code = 0
 
-        # 主节点、后台规划节点、线程池及流程状态均已初始化。
-        # 只反馈程序初始化结果，不代表相机/机械臂等硬件已通过自检。
+        # 自检失败的对应错误码已由检查项发布，随后反馈 false。
+        if not node.verify_startup_hardware():
+            publish_initialized(False)
+            log.error("[startup-check] 初始化自检失败，不进入等待命令流程")
+            return 1
         publish_initialized(True)
         while rclpy.ok():
             if keyboard_control_mode:
@@ -10520,12 +10576,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return _run_main(argv, publish_initialized)
     except Exception as exc:
+        report_runtime_exception(exc, "节点初始化/运行/退出")
         if status_pub is not None and not initialization_reported:
             try:
                 publish_initialized(False)
             except Exception as report_exc:
                 status_node.get_logger().error(f"初始化失败状态发布失败: {report_exc}")
-        report_runtime_exception(exc, "节点初始化/运行/退出")
         raise
     finally:
         _runtime_error_reporter = None
