@@ -157,11 +157,42 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.serialization import deserialize_message, serialize_message
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import ColorRGBA, Float32MultiArray, String, UInt8
+from std_msgs.msg import Bool, ColorRGBA, Float32MultiArray, Int32, String, UInt8
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker
 from dobot_msgs_v4.srv import ClearError, SetToolPower
+
+# 错误事件话题；主程序启动时发布一次 0 清错，保留原有运动/恢复流程。
+ERROR_CODE_TOPIC = "/arm_camera_error_code"
+ALGORITHM_INITIALIZED_TOPIC = "/arm_algorithm_initialized"
+ERROR_CODES = {
+    0: "清除错误状态",
+    1: "相机 TCP 连接失败",
+    2: "抓取相机数据不合法",
+    3: "放置相机数据不合法",
+    4: "SW 硬件信号等待超时",
+    5: "力传感器新帧等待超时或批次初始化失败",
+    6: "末端上电失败",
+    7: "末端下电失败",
+    8: "所有候选点及腰角尝试后均不能抓取",
+    9: "获取关节状态失败",
+    10: "放置位置不可达",
+    99: "其他运行时异常",
+}
+
+
+_runtime_error_reporter = None
+
+
+def report_runtime_exception(exc, context):
+    """99 兜底；不把普通 False 返回、正常退出或候选无解当成异常。"""
+    if getattr(exc, "_grasp_error_reported", False):
+        return
+    if _runtime_error_reporter is not None:
+        _runtime_error_reporter(99, f"{context}: {type(exc).__name__}: {exc}")
+        exc._grasp_error_reported = True
+
 
 _SOURCE_DATA_DIR = Path("/home/ws_moveit/src/hello_moveit/data")
 TRAJECTORY_CACHE_DIR = (
@@ -1101,7 +1132,7 @@ IK_RANDOM_SEED = 42           # 让 IK 多解枚举可复现；改成 None 则�
 # =============================================================================
 
 
-def connect_vision(log) -> socket.socket | None:
+def connect_vision(log, report_error=None) -> socket.socket | None:
     """连接视觉 TCP，后续可复用同一个 socket 多次读取。"""
     try:
         sock = socket.create_connection(
@@ -1112,6 +1143,8 @@ def connect_vision(log) -> socket.socket | None:
         log.info(f"已连接视觉 TCP：{VISION_IP}:{VISION_PORT}")
         return sock
     except OSError as exc:
+        if report_error is not None:
+            report_error(1, str(exc))
         message = f"viewer 连接失败：{exc}"
         log.error(message)
         print(message)
@@ -1122,6 +1155,7 @@ def read_vision_pose(
     sock: socket.socket,
     log,
     trigger_command: str = VISION_TRIGGER_COMMAND,
+    report_error=None,
 ) -> list[tuple[int, list[float]]] | None:
     """收齐并解析视觉数据。
 
@@ -1158,19 +1192,24 @@ def read_vision_pose(
         finally:
             sock.settimeout(original_timeout)
 
-        raw_text = response.decode("utf-8", errors="ignore").strip()
+        raw_text = response.decode("utf-8").strip()
         used_ms = (time.monotonic() - t0) * 1000.0
         message = f"viewer 发送命令到收齐数据耗时: {used_ms:.3f} ms"
         log.info(message)
         print(f"{GREEN}{message}{RESET}")
         print(f"{GREEN}viewer 接收到的数据: {raw_text}{RESET}")
 
-        numbers = [float(item) for item in NUMBER_PATTERN.findall(raw_text)]
+        if not raw_text:
+            raise ValueError("viewer 返回为空")
+        tokens = re.split(r"\s*,\s*|\s+", raw_text)
+        if any(NUMBER_PATTERN.fullmatch(item) is None for item in tokens):
+            raise ValueError(f"viewer 含非法数字或分隔格式：{raw_text}")
+        numbers = [float(item) for item in tokens]
+        if not all(math.isfinite(value) for value in numbers):
+            raise ValueError("viewer 含 NaN 或无穷值")
         if not numbers:
             message = f"viewer 返回中没有数字：{raw_text}"
-            log.error(message)
-            print(message)
-            return None
+            raise ValueError(message)
         payload = numbers[1:]
         if len(payload) % 8 != 0:
             message = (
@@ -1178,23 +1217,21 @@ def read_vision_pose(
                 f"剩余 {len(payload)} 个数字，不是 8 的整数倍；"
                 f"原始返回：{raw_text}"
             )
-            log.error(message)
-            print(message)
-            return None
+            raise ValueError(message)
         point_count = len(payload) // 8
         if point_count > VISION_MAX_POINT_COUNT:
             message = (
                 f"viewer 返回 {point_count} 个点，"
                 f"超过上限 {VISION_MAX_POINT_COUNT}"
             )
-            log.error(message)
-            print(message)
-            return None
+            raise ValueError(message)
 
         poses: list[tuple[int, list[float]]] = []
         for index in range(0, len(payload), 8):
             group = payload[index:index + 8]
             pose = group[:7]
+            if math.hypot(*pose[3:7]) == 0.0:
+                raise ValueError(f"viewer 第 {index // 8 + 1} 个点四元数长度为 0")
             mode_value = group[7]
             if mode_value not in (1.0, 2.0):
                 point_index = index // 8 + 1
@@ -1202,15 +1239,18 @@ def read_vision_pose(
                     f"viewer 第 {point_index} 个点模式码无效：{mode_value}，"
                     f"原始返回：{raw_text}"
                 )
-                log.error(message)
-                print(message)
-                return None
+                raise ValueError(message)
             poses.append((int(mode_value), pose))
 
         print(f"viewer 点个数: {len(poses)}")
         log.info(f"viewer 点个数: {len(poses)}")
         return poses
-    except (OSError, ValueError) as exc:
+    except ValueError as exc:
+        if report_error is not None:
+            report_error(3 if trigger_command == UNLOAD_TRIGGER_COMMAND else 2, str(exc))
+        log.error(f"viewer 数据非法：{exc}")
+        return None
+    except OSError as exc:
         message = f"viewer 获取 pose 失败：{exc}"
         log.error(message)
         print(message)
@@ -1427,7 +1467,7 @@ def read_vision_object_pose(
             f"first_return_mode = {first_return_mode}, pose = {pose}{RESET}"
         )
     else:
-        vision_sock = connect_vision(log)
+        vision_sock = connect_vision(log, node.publish_error)
         if vision_sock is None:
             return None
 
@@ -1437,6 +1477,7 @@ def read_vision_object_pose(
                 vision_sock,
                 log,
                 trigger_command=trigger_command,
+                report_error=node.publish_error,
             )
             if vision_results is None:
                 return None
@@ -1490,6 +1531,7 @@ def read_vision_object_pose(
                 right_xyz_rpy_mm = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
                 left_xyz_rpy_mm = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
             except ValueError as exc:
+                node.publish_error(3 if trigger_command == UNLOAD_TRIGGER_COMMAND else 2, f"point={point_index}: {exc}")
                 message = f"viewer 第 {point_index} 个 pose 解析失败：{exc}"
                 log.error(message)
                 print(message)
@@ -2867,7 +2909,8 @@ def _save_trajectory_cache(
         temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         temporary.replace(path)
         return True
-    except Exception:
+    except Exception as exc:
+        report_runtime_exception(exc, "_save_trajectory_cache")
         return False
 
 
@@ -2889,7 +2932,8 @@ def _load_trajectory_cache(
             for name, message_type in message_types.items()
         }
         return dict(payload["metadata"]), messages
-    except Exception:
+    except Exception as exc:
+        report_runtime_exception(exc, "_load_trajectory_cache")
         return None
 
 
@@ -2919,6 +2963,7 @@ class G01Demo(Node):
         node_name: str = "g01_demo",
     ):
         super().__init__(node_name)
+        self._error_pub = self.create_publisher(Int32, ERROR_CODE_TOPIC, 100)
         self.sim_mode = bool(sim_mode)
         self.upper_control_mode = bool(upper_control_mode)
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
@@ -3059,6 +3104,15 @@ class G01Demo(Node):
         self._next_cylinder_marker_id = 0
         self._executor = SingleThreadedExecutor(context=self.context)
         self._executor.add_node(self)
+
+    def publish_error(self, code: int, detail: str = "") -> None:
+        """发布一次错误事件或 0 清错；具体上下文保留在日志中。"""
+        self._error_pub.publish(Int32(data=int(code)))
+        message = f"[error-code={code}] {ERROR_CODES[code]}: {detail}"
+        if code == 0:
+            self.get_logger().info(message)
+        else:
+            self.get_logger().error(message)
 
     def shutdown_executor(self) -> None:
         """从专属 executor 移除节点并关闭其 wait-set。"""
@@ -3480,6 +3534,7 @@ class G01Demo(Node):
                     )
                     return force_z
 
+        self.publish_error(5, f"{side}: {topic} 新帧超时 {timeout_sec}s")
         self.get_logger().error(
             f"[pick] {timeout_sec:.1f}s 内未收到 {topic} 新帧；"
             "传感器可能离线，禁止使用旧力值判断吸附"
@@ -3509,6 +3564,7 @@ class G01Demo(Node):
         if self._driver_signal is None or (
             require_new and self._driver_signal_count <= signal_count_before_wait
         ):
+            self.publish_error(4, f"{DRIVER_SIGNAL_TOPIC}, timeout={timeout_sec}s")
             wait_desc = "新一帧" if require_new else "首帧"
             self.get_logger().error(
                 f"[pick] {timeout_sec:.1f}s 内未收到 {DRIVER_SIGNAL_TOPIC} {wait_desc}，"
@@ -3659,8 +3715,13 @@ class G01Demo(Node):
                 continue
             missing = [n for n in names if n not in self._joints]
             if not missing:
-                return {n: self._joints[n] for n in names}
+                joints = {n: self._joints[n] for n in names}
+                if not all(math.isfinite(value) for value in joints.values()):
+                    self.publish_error(9, f"关节状态含非有限数值: {names}")
+                    return None
+                return joints
             self._executor.spin_once(timeout_sec=0.1)
+        self.publish_error(9, f"读取关节状态超时: wait_new={wait_new}, names={names}")
         self.get_logger().error(f"读取关节超时，缺失: {[n for n in names if n not in self._joints]}")
         return None
 
@@ -3800,20 +3861,25 @@ class G01Demo(Node):
             log.error(f"未知工具电源 side={side}")
             return False
 
-        if not cli.wait_for_service(timeout_sec=timeout):
-            log.error(f"服务 {service_name} 不可用")
-            return False
+        error_code = 6 if status else 7
+        try:
+            if not cli.wait_for_service(timeout_sec=timeout):
+                self.publish_error(error_code, f"{side}: {service_name} 不可用")
+                return False
 
-        req = SetToolPower.Request()
-        req.status = int(status)
-        fut = cli.call_async(req)
-        if not self._spin_until(fut, timeout):
-            log.error(f"{service_name} SetToolPower({status}) 超时")
-            return False
+            req = SetToolPower.Request()
+            req.status = int(status)
+            fut = cli.call_async(req)
+            if not self._spin_until(fut, timeout):
+                self.publish_error(error_code, f"{side}: {service_name} 超时")
+                return False
 
-        res = fut.result().res
-        if res != 0:
-            log.error(f"{service_name} SetToolPower({status}) 失败：res={res}")
+            res = fut.result().res
+            if res != 0:
+                self.publish_error(error_code, f"{side}: {service_name}, res={res}")
+                return False
+        except Exception as exc:
+            self.publish_error(error_code, f"{side}: {service_name}: {exc}")
             return False
         log.info(f"{service_name} SetToolPower({status}) 成功")
         return True
@@ -3848,6 +3914,7 @@ class G01Demo(Node):
         try:
             response = future.result()
         except Exception as exc:
+            report_runtime_exception(exc, "clear_arm_alarm")
             log.error(f"[alarm-recovery] {service_name} 调用异常：{exc}")
             return False
         if response is None or response.res != 0:
@@ -4216,6 +4283,7 @@ class G01Demo(Node):
         try:
             response = future.result()
         except Exception as exc:  # rclpy Future 会在 result() 时重新抛出服务异常
+            report_runtime_exception(exc, "clear_world_scene_objects")
             log.info(f"[scene-cleanup] 读取 world 场景失败: {exc}")
             return False
         if response is None:
@@ -5518,6 +5586,7 @@ class G01Demo(Node):
             try:
                 response = future.result()
             except Exception as exc:
+                report_runtime_exception(exc, "validate_trajectory_self_collision")
                 log.error(
                     f"[self-collision] {label} 状态检查失败: "
                     f"point={index}, {exc}"
@@ -6468,6 +6537,7 @@ class G01Demo(Node):
         try:
             response = future.result()
         except Exception as exc:
+            report_runtime_exception(exc, "_current_dual_arm_self_collision")
             log.error(f"[pick][exchange-place] 当前双臂自碰撞检查失败: {exc}")
             return None
         if response is None:
@@ -6639,6 +6709,7 @@ class G01Demo(Node):
             execute=False,
         )
         if not ok or to_yubei is None:
+            self.publish_error(10, f"{arm_group}: {yubei_name} 放置预备位不可达")
             return None
         yubei_state = dict(start_joints)
         yubei_state.update(zip(body_joint_names, yubei_joints))
@@ -6668,9 +6739,11 @@ class G01Demo(Node):
             plan_frame=arm_plan_frame,
         )
         if fang_to_yubei is None:
+            self.publish_error(10, f"{arm_group}: {place_name} 放置直线不可达")
             return None
         descent = self._reverse_trajectory(fang_to_yubei)
         if not descent.joint_trajectory.points:
+            self.publish_error(10, f"{arm_group}: {place_name} 放置轨迹为空")
             return None
         trajectory_names = list(descent.joint_trajectory.joint_names)
         yubei_target = dict(zip(body_joint_names, yubei_joints))
@@ -6698,6 +6771,7 @@ class G01Demo(Node):
             default=float("inf"),
         )
         if yubei_error > 0.05 or fang_error > 0.05:
+            self.publish_error(10, f"{arm_group}: {place_name} 放置轨迹端点不匹配")
             self.get_logger().error(
                 f"[pick] {place_name} 反向 Cartesian 分支不匹配："
                 f"yubei 误差={yubei_error:.4f}, fang 误差={fang_error:.4f}"
@@ -7583,6 +7657,7 @@ class G01Demo(Node):
         try:
             post_grasp_plan = post_grasp_future.result() if post_grasp_future is not None else None
         except Exception as exc:
+            report_runtime_exception(exc, "pick_and_return")
             log.error(f"[pipeline] 当前物体交换/放置后台规划异常: {exc}")
             post_grasp_plan = None
         if post_grasp_future is not None and post_grasp_plan is None:
@@ -7931,18 +8006,23 @@ def wait_for_keyboard_steps() -> tuple[int, ...] | None:
         return steps
 
 
-def main(argv: list[str] | None = None) -> int:
+def _run_main(
+    argv: list[str] | None,
+    publish_initialized: Callable[[bool], None],
+) -> int:
+    global _runtime_error_reporter
     (
         sim_mode,
         upper_control_mode,
         keyboard_control_mode,
         ros_args,
     ) = split_runtime_args(argv)
-    rclpy.init(args=ros_args)
     node = G01Demo(
         sim_mode=sim_mode,
         upper_control_mode=upper_control_mode,
     )
+    _runtime_error_reporter = node.publish_error
+    node.publish_error(0, "程序启动，清除上次错误状态")
     planner_node = G01Demo(
         sim_mode=sim_mode,
         upper_control_mode=True,
@@ -8459,6 +8539,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 cached_result = cached_future.result()
             except Exception as exc:
+                report_runtime_exception(exc, "run_one_grasp")
                 log.error(f"[pipeline] 下一物体后台解算异常: {exc}")
                 cached_result = None
             if cached_result is not None:
@@ -8538,6 +8619,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         if reachable is None:
+            node.publish_error(8, "全部视觉候选及配置腰角均不可抓取")
             node.last_pick_failure_reason = "all_waist_angles_unreachable"
             log.error(
                 "[pick-waist] 20°/30°/40°/50° 全部尝试完成，"
@@ -8752,6 +8834,7 @@ def main(argv: list[str] | None = None) -> int:
                 side: node.set_tool_power(side, 0) for side, _label in sides
             }
             if not all(power_off_results.values()):
+                node.publish_error(5, "批次力传感器初始化失败：双臂未全部下电")
                 log.error(
                     "[pick][sensor-check] 双臂工具未全部下电，禁止开始抓取："
                     f"left={power_off_results['left']}, "
@@ -8773,6 +8856,7 @@ def main(argv: list[str] | None = None) -> int:
                     "重新给双臂工具上电并读取一次"
                 )
 
+        node.publish_error(5, "批次力传感器初始化重试耗尽")
         log.error(
             "[pick][sensor-check] 两次上电均未收到完整的新力数据，"
             "禁止开始抓取"
@@ -8891,6 +8975,7 @@ def main(argv: list[str] | None = None) -> int:
                     try:
                         stale_future.result()
                     except Exception as exc:
+                        report_runtime_exception(exc, "run_grasps_until_no_empty_slot")
                         log.warning(f"[pipeline] 清理后台规划任务时收到异常: {exc}")
             cached_count = len(ungraspable_points)
             ungraspable_points.clear()
@@ -9456,7 +9541,6 @@ def main(argv: list[str] | None = None) -> int:
             descent: RobotTrajectory,
         ) -> bool:
             """只执行可达性阶段缓存的轨迹，不再调用 IK 或规划服务。"""
-
             log.info(
                 f"[unload] 已选中 {label}，直接执行缓存的 {group} "
                 "联合轨迹到放置预备位"
@@ -9838,6 +9922,7 @@ def main(argv: list[str] | None = None) -> int:
             avoid_collisions=True,
         )
         if not left_body_solutions:
+            node.publish_error(10, f"物料台左点{left_point}/右点{right_point}：纯臂及身体构型均未找到可行放置方案")
             log.error(
                 f"[unload] 左点{left_point} 即使加入腰部和升降仍无 IK"
             )
@@ -9945,6 +10030,7 @@ def main(argv: list[str] | None = None) -> int:
             if body_plan_count >= UNLOAD_PLACE_MAX_PAIR_PLANS:
                 break
 
+        node.publish_error(10, f"物料台左点{left_point}/右点{right_point}：所有放置候选均不可达")
         log.error(
             f"[unload] 左点{left_point}/右点{right_point} 的纯臂及 "
             "dual_arm_body 多构型全部失败"
@@ -10155,6 +10241,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     pick_plan = cached_pick_future.result()
                 except Exception as exc:
+                    report_runtime_exception(exc, "run_unload_cycle")
                     log.error(f"[unload][pipeline] 第二次抓取后台规划异常: {exc}")
                     return False
                 if not isinstance(pick_plan, UnloadPickTrajectoryPlan):
@@ -10173,6 +10260,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 place_plan = place_future.result()
             except Exception as exc:
+                report_runtime_exception(exc, "run_unload_cycle")
                 log.error(f"[unload][pipeline] 双臂放置后台规划异常: {exc}")
                 return False
             if place_plan is None:
@@ -10247,6 +10335,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             reset_plan = reset_future.result()
         except Exception as exc:
+            report_runtime_exception(exc, "run_unload_cycle")
             log.error(f"[unload][pipeline] 复位后台规划异常: {exc}")
             return False
         if reset_plan is None:
@@ -10341,6 +10430,9 @@ def main(argv: list[str] | None = None) -> int:
         frame_added = False
         code = 0
 
+        # 主节点、后台规划节点、线程池及流程状态均已初始化。
+        # 只反馈程序初始化结果，不代表相机/机械臂等硬件已通过自检。
+        publish_initialized(True)
         while rclpy.ok():
             if keyboard_control_mode:
                 steps = wait_for_keyboard_steps()
@@ -10372,6 +10464,9 @@ def main(argv: list[str] | None = None) -> int:
                 result_text = "成功" if workflow_ok else "失败"
                 print(f"{GREEN if workflow_ok else ''}[keyboard] {steps} 执行{result_text}{RESET}")
 
+    except Exception as exc:
+        report_runtime_exception(exc, "主流程")
+        raise
     finally:
         cleanup_grasp_display(remove_scene_objects=frame_added)
         if unload_scene_added:
@@ -10384,11 +10479,60 @@ def main(argv: list[str] | None = None) -> int:
         planner_node.shutdown_executor()
         node.shutdown_executor()
         planner_node.destroy_node()
+        _runtime_error_reporter = None
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
 
     return code
+
+
+def main(argv: list[str] | None = None) -> int:
+    """独立状态发布器覆盖主/后台节点初始化失败，仅发送一次初始化结果。"""
+    global _runtime_error_reporter
+    status_node = None
+    status_pub = None
+    initialization_reported = False
+
+    def publish_initialized(success: bool) -> None:
+        nonlocal initialization_reported
+        if initialization_reported:
+            return
+        status_pub.publish(Bool(data=success))
+        initialization_reported = True
+        message = f"{ALGORITHM_INITIALIZED_TOPIC}: {success}"
+        if success:
+            status_node.get_logger().info(message)
+        else:
+            status_node.get_logger().error(message)
+
+    try:
+        ros_args = split_runtime_args(argv)[3]
+        rclpy.init(args=ros_args)
+        # 在 G01Demo 构造之前创建，主节点构造失败也能反馈 false。
+        status_node = Node("arm_algorithm_initialization")
+        status_pub = status_node.create_publisher(
+            Bool,
+            ALGORITHM_INITIALIZED_TOPIC,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        return _run_main(argv, publish_initialized)
+    except Exception as exc:
+        if status_pub is not None and not initialization_reported:
+            try:
+                publish_initialized(False)
+            except Exception as report_exc:
+                status_node.get_logger().error(f"初始化失败状态发布失败: {report_exc}")
+        report_runtime_exception(exc, "节点初始化/运行/退出")
+        raise
+    finally:
+        _runtime_error_reporter = None
+        if status_node is not None:
+            status_node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
