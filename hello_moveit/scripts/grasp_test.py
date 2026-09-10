@@ -4,7 +4,7 @@
 """
 G01 MoveIt 演示脚本
 
-功能按 1~9 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
+功能按 1~11 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
 1. 导航到深框识别位置。
 2. 运动到深框识别构型，识别深框，并记录当时 /lio/odom 实际位姿；
    未收到有效视觉数据时最多重复发送识别命令 5 次。
@@ -160,7 +160,7 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Bool, ColorRGBA, Float32MultiArray, Int32, String, UInt8
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 from dobot_msgs_v4.srv import ClearError, SetToolPower
 
 # 错误事件话题；主程序启动时发布一次 0 清错，保留原有运动/恢复流程。
@@ -644,6 +644,8 @@ STEP_DESCRIPTIONS = {
     7: "按 SW 优先级循环放置",
     8: "导航回起点",
     9: "运动到独立识别构型，直接识别并添加深框碰撞模型",
+    10: "识别料台、添加碰撞模型，双臂同步抓取并抬起",
+    11: "双臂放回料台、下电、直线返回并复位",
 }
 NAV_GOAL_POSES = {
     NAV_TARGET_FRAME_RECOGNITION: {
@@ -2970,6 +2972,343 @@ def _cached_joint_state_matches(
         ) <= tolerance
     except (TypeError, ValueError):
         return False
+
+
+# 输入 10/11：料台抓取配置，位置偏移相对 table_top，单位 m。
+TABLE_PICK_PLAN_FRAME = "moveit_base_link"
+TABLE_PICK_TABLE_ID = "table"
+TABLE_PICK_TABLE_SIZE = (0.5, 1.8, 0.97)
+TABLE_PICK_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
+TABLE_PICK_SIM_RECOGNITION_XYZ_RPY = (0.8, 0.0, 0.97, 0.0, 0.0, 0.0)
+TABLE_PICK_RECOGNITION_TO_TABLE_TOP_LOCAL_Z = 0.0
+TABLE_PICK_TABLE_LOCAL_Z_ROTATION = 0.0
+TABLE_PICK_TABLE_LOCAL_Y_ROTATION = 0.0
+TABLE_PICK_VISION_TABLE_POSE_KEY = "right_body"
+TABLE_PICK_VISION_TRIGGER_COMMAND = "p,2"
+TABLE_PICK_LEFT_GROUP = "left_arm"
+TABLE_PICK_RIGHT_GROUP = "right_arm"
+TABLE_PICK_DUAL_GROUP = "dual_arm"
+TABLE_PICK_LEFT_LINK = "l_tool"
+TABLE_PICK_RIGHT_LINK = "r_tool"
+TABLE_PICK_LEFT_JOINTS = joint_names_for_group(TABLE_PICK_LEFT_GROUP)
+TABLE_PICK_RIGHT_JOINTS = joint_names_for_group(TABLE_PICK_RIGHT_GROUP)
+TABLE_PICK_DUAL_JOINTS = joint_names_for_group(TABLE_PICK_DUAL_GROUP)
+TABLE_PICK_LEFT_GRASP_LOCAL_XYZ = (0.0, 0.45, 0.0)
+TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ = (0.0, -0.445, 0.0)
+TABLE_PICK_GRASP_LOCAL_Y_ROTATION = math.pi
+TABLE_PICK_PRE_GRASP_LOCAL_Z = 0.15
+TABLE_PICK_JOINT_PLAN_SPEED = 0.20
+TABLE_PICK_CARTESIAN_SPEED = 0.15
+TABLE_PICK_CARTESIAN_EEF_STEP = 0.005
+TABLE_PICK_CARTESIAN_AVOID_COLLISIONS = True
+TABLE_PICK_TOOL_POWER_SETTLE_SEC = 1.0
+TABLE_PICK_SYNC_SAMPLE_PERIOD = 0.005
+TABLE_PICK_VALIDITY_SAMPLE_PERIOD = 0.02
+TABLE_PICK_TABLE_MARKER_TOPIC = "table_coordinate_system"
+TABLE_PICK_TABLE_MARKER_NS = "table_coordinate_system"
+TABLE_PICK_TABLE_TF_FRAME = "table_top"
+TABLE_PICK_TABLE_AXIS_LENGTH = 0.30
+
+
+def table_pick_pose_rotate_local_y(pose: Pose, angle: float) -> Pose:
+    """保持位置不变，将姿态绕自身局部 Y 轴右乘旋转 angle。"""
+    q = pose.orientation
+    half = angle / 2.0
+    sin_half = math.sin(half)
+    cos_half = math.cos(half)
+
+    out = copy.deepcopy(pose)
+    out.orientation.x = q.x * cos_half - q.z * sin_half
+    out.orientation.y = q.w * sin_half + q.y * cos_half
+    out.orientation.z = q.x * sin_half + q.z * cos_half
+    out.orientation.w = q.w * cos_half - q.y * sin_half
+    return out
+
+
+def table_pick_pose_rotate_local_z(pose: Pose, angle: float) -> Pose:
+    """保持位置不变，将姿态绕自身局部 Z 轴右乘旋转 angle。"""
+    q = pose.orientation
+    half = angle / 2.0
+    sin_half = math.sin(half)
+    cos_half = math.cos(half)
+
+    out = copy.deepcopy(pose)
+    out.orientation.x = q.x * cos_half + q.y * sin_half
+    out.orientation.y = q.y * cos_half - q.x * sin_half
+    out.orientation.z = q.w * sin_half + q.z * cos_half
+    out.orientation.w = q.w * cos_half - q.z * sin_half
+    return out
+
+
+def table_pick_make_table_collision(table_top_pose: Pose) -> CollisionObject:
+    """桌体从 table_top 沿局部 -Z 延伸。"""
+    center_pose = pose_offset_local(table_top_pose, 0.0, 0.0, -TABLE_PICK_TABLE_SIZE[2] / 2.0)
+    primitive = SolidPrimitive()
+    primitive.type = SolidPrimitive.BOX
+    primitive.dimensions = list(TABLE_PICK_TABLE_SIZE)
+
+    obj = CollisionObject()
+    obj.header.frame_id = TABLE_PICK_PLAN_FRAME
+    obj.id = TABLE_PICK_TABLE_ID
+    obj.primitives.append(primitive)
+    obj.primitive_poses.append(center_pose)
+    obj.operation = CollisionObject.ADD
+    return obj
+
+
+def table_pick_axis_marker(
+    table_top_pose: Pose,
+    marker_id: int,
+    local_axis: tuple[float, float, float],
+    color: ColorRGBA,
+) -> Marker:
+    q = table_top_pose.orientation
+    dx, dy, dz = rotate_xyz_by_quat(
+        local_axis[0] * TABLE_PICK_TABLE_AXIS_LENGTH,
+        local_axis[1] * TABLE_PICK_TABLE_AXIS_LENGTH,
+        local_axis[2] * TABLE_PICK_TABLE_AXIS_LENGTH,
+        q.x,
+        q.y,
+        q.z,
+        q.w,
+    )
+    start = table_top_pose.position
+    marker = Marker()
+    marker.header.frame_id = TABLE_PICK_PLAN_FRAME
+    marker.ns = TABLE_PICK_TABLE_MARKER_NS
+    marker.id = marker_id
+    marker.type = Marker.ARROW
+    marker.action = Marker.ADD
+    marker.pose.orientation.w = 1.0
+    marker.points = [
+        Point(x=start.x, y=start.y, z=start.z),
+        Point(x=start.x + dx, y=start.y + dy, z=start.z + dz),
+    ]
+    marker.scale.x = 0.015
+    marker.scale.y = 0.030
+    marker.scale.z = 0.035
+    marker.color = color
+    return marker
+
+
+def table_pick_point_marker(pose: Pose, marker_id: int, color: ColorRGBA, scale: float) -> Marker:
+    marker = Marker()
+    marker.header.frame_id = TABLE_PICK_PLAN_FRAME
+    marker.ns = TABLE_PICK_TABLE_MARKER_NS
+    marker.id = marker_id
+    marker.type = Marker.SPHERE
+    marker.action = Marker.ADD
+    marker.pose = copy.deepcopy(pose)
+    marker.scale.x = marker.scale.y = marker.scale.z = scale
+    marker.color = color
+    return marker
+
+
+def table_pick_make_table_markers(
+    table_top_pose: Pose,
+    left_target: Pose,
+    right_target: Pose,
+    left_pre: Pose,
+    right_pre: Pose,
+) -> MarkerArray:
+    """桌子局部 XYZ 坐标轴，以及左右目标/预抓点。"""
+    markers = MarkerArray()
+    markers.markers.extend(
+        [
+            table_pick_axis_marker(table_top_pose, 0, (1.0, 0.0, 0.0), ColorRGBA(r=1.0, a=1.0)),
+            table_pick_axis_marker(table_top_pose, 1, (0.0, 1.0, 0.0), ColorRGBA(g=1.0, a=1.0)),
+            table_pick_axis_marker(table_top_pose, 2, (0.0, 0.0, 1.0), ColorRGBA(b=1.0, a=1.0)),
+            table_pick_point_marker(left_target, 10, ColorRGBA(g=1.0, b=0.2, a=1.0), 0.045),
+            table_pick_point_marker(right_target, 11, ColorRGBA(r=1.0, g=0.45, a=1.0), 0.045),
+            table_pick_point_marker(left_pre, 12, ColorRGBA(g=1.0, b=0.2, a=0.45), 0.035),
+            table_pick_point_marker(right_pre, 13, ColorRGBA(r=1.0, g=0.45, a=0.45), 0.035),
+        ]
+    )
+    return markers
+
+
+def table_pick_acquire_recognition_pose(node: "G01Demo", sim_mode: bool) -> Pose | None:
+    """返回 moveit_base_link 下未经 4.5 cm 偏移和 180 度修正的视觉识别位姿。"""
+    log = node.get_logger()
+    if sim_mode:
+        pose = make_pose(*TABLE_PICK_SIM_RECOGNITION_XYZ_RPY)
+        log.info(f"[sim] 使用默认视觉识别位姿: {TABLE_PICK_SIM_RECOGNITION_XYZ_RPY}")
+        return pose
+
+    result = read_vision_object_pose(
+        node,
+        log,
+        sim_mode=False,
+        trigger_command=TABLE_PICK_VISION_TRIGGER_COMMAND,
+    )
+    if result is None:
+        return None
+    _, all_xyz_rpy = result
+    if not all_xyz_rpy:
+        log.error("视觉没有返回识别位姿")
+        return None
+    if TABLE_PICK_VISION_TABLE_POSE_KEY not in all_xyz_rpy[0]:
+        log.error(
+            f"视觉结果中没有 {TABLE_PICK_VISION_TABLE_POSE_KEY!r}，"
+            f"可选键: {list(all_xyz_rpy[0])}"
+        )
+        return None
+
+    values = all_xyz_rpy[0][TABLE_PICK_VISION_TABLE_POSE_KEY]
+    pose = make_pose(*values)
+    log.info(
+        "视觉识别位姿 @ moveit_base_link: "
+        f"xyz=({values[0]:.4f}, {values[1]:.4f}, {values[2]:.4f}) m, "
+        f"rpy=({math.degrees(values[3]):.2f}, {math.degrees(values[4]):.2f}, "
+        f"{math.degrees(values[5]):.2f}) deg"
+    )
+    return pose
+
+
+def table_pick_duration_seconds(point: JointTrajectoryPoint) -> float:
+    return point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+
+
+def table_pick_positions_at_phase(trajectory: RobotTrajectory, phase: float) -> list[float]:
+    """按轨迹自身归一化时间 phase 线性插值关节位置。"""
+    points = trajectory.joint_trajectory.points
+    if not points:
+        raise ValueError("轨迹没有路径点")
+    if len(points) == 1:
+        return list(points[0].positions)
+
+    times = [table_pick_duration_seconds(point) for point in points]
+    source_time = max(0.0, min(1.0, phase)) * times[-1]
+    if source_time <= times[0]:
+        return list(points[0].positions)
+    if source_time >= times[-1]:
+        return list(points[-1].positions)
+
+    upper = bisect.bisect_right(times, source_time)
+    lower = upper - 1
+    span = times[upper] - times[lower]
+    ratio = 0.0 if span <= 1e-12 else (source_time - times[lower]) / span
+    return [
+        a + ratio * (b - a)
+        for a, b in zip(points[lower].positions, points[upper].positions)
+    ]
+
+
+def table_pick_merge_synchronized_trajectories(
+    left: RobotTrajectory, right: RobotTrajectory
+) -> RobotTrajectory:
+    """两臂按相同路径进度重采样，使其同刻开始、同刻结束。"""
+    left_names = list(left.joint_trajectory.joint_names)
+    right_names = list(right.joint_trajectory.joint_names)
+    overlap = set(left_names).intersection(right_names)
+    if overlap:
+        raise ValueError(f"左右轨迹包含重复关节: {sorted(overlap)}")
+    if not left.joint_trajectory.points or not right.joint_trajectory.points:
+        raise ValueError("左右 Cartesian 轨迹不能为空")
+
+    left_duration = table_pick_duration_seconds(left.joint_trajectory.points[-1])
+    right_duration = table_pick_duration_seconds(right.joint_trajectory.points[-1])
+    duration = max(left_duration, right_duration)
+    if duration <= 0.0:
+        raise ValueError(
+            f"Cartesian 轨迹时长无效: left={left_duration}, right={right_duration}"
+        )
+
+    sample_count = max(1, int(math.ceil(duration / TABLE_PICK_SYNC_SAMPLE_PERIOD)))
+    merged = RobotTrajectory()
+    merged.joint_trajectory.header.frame_id = TABLE_PICK_PLAN_FRAME
+    merged.joint_trajectory.joint_names = left_names + right_names
+
+    for index in range(sample_count + 1):
+        phase = index / sample_count
+        timestamp = duration * phase
+        point = JointTrajectoryPoint()
+        point.positions = table_pick_positions_at_phase(left, phase) + table_pick_positions_at_phase(right, phase)
+        point.time_from_start.sec = int(timestamp)
+        point.time_from_start.nanosec = int(round((timestamp - int(timestamp)) * 1e9))
+        if point.time_from_start.nanosec >= 1_000_000_000:
+            point.time_from_start.sec += 1
+            point.time_from_start.nanosec -= 1_000_000_000
+        merged.joint_trajectory.points.append(point)
+    return merged
+
+
+def table_pick_show_table_markers(
+    self,
+    table_top_pose: Pose,
+    left_target: Pose,
+    right_target: Pose,
+    left_pre: Pose,
+    right_pre: Pose,
+) -> None:
+    table_tf = TransformStamped()
+    table_tf.header.frame_id = TABLE_PICK_PLAN_FRAME
+    table_tf.header.stamp = self.get_clock().now().to_msg()
+    table_tf.child_frame_id = TABLE_PICK_TABLE_TF_FRAME
+    table_tf.transform.translation.x = table_top_pose.position.x
+    table_tf.transform.translation.y = table_top_pose.position.y
+    table_tf.transform.translation.z = table_top_pose.position.z
+    table_tf.transform.rotation = copy.deepcopy(table_top_pose.orientation)
+    self._table_tf_broadcaster.sendTransform(table_tf)
+
+    marker_array = table_pick_make_table_markers(
+        table_top_pose, left_target, right_target, left_pre, right_pre
+    )
+    stamp = self.get_clock().now().to_msg()
+    for marker in marker_array.markers:
+        marker.header.stamp = stamp
+    self._table_marker_pub.publish(marker_array)
+    self.get_logger().info(
+        f"已发布桌子坐标系: TF={TABLE_PICK_PLAN_FRAME}->{TABLE_PICK_TABLE_TF_FRAME}, "
+        f"MarkerArray=/{TABLE_PICK_TABLE_MARKER_TOPIC}（X 红 / Y 绿 / Z 蓝）"
+    )
+
+
+def table_pick_validate_dual_trajectory(self, trajectory: RobotTrajectory) -> bool:
+    """在同一 dual_arm 状态中检查合并轨迹，捕获双臂相互碰撞。"""
+    log = self.get_logger()
+    if not self._validity_cli.wait_for_service(timeout_sec=10.0):
+        log.error("服务 check_state_validity 不可用")
+        return False
+
+    points = trajectory.joint_trajectory.points
+    names = list(trajectory.joint_trajectory.joint_names)
+    stride = max(1, int(round(TABLE_PICK_VALIDITY_SAMPLE_PERIOD / TABLE_PICK_SYNC_SAMPLE_PERIOD)))
+    indices = list(range(0, len(points), stride))
+    if not indices or indices[-1] != len(points) - 1:
+        indices.append(len(points) - 1)
+
+    for checked, index in enumerate(indices, start=1):
+        request = GetStateValidity.Request()
+        request.group_name = TABLE_PICK_DUAL_GROUP
+        request.robot_state = RobotState()
+        request.robot_state.is_diff = True
+        request.robot_state.joint_state.name = names
+        request.robot_state.joint_state.position = list(points[index].positions)
+        future = self._validity_cli.call_async(request)
+        if not self._spin_until(future, 5.0):
+            log.error(f"合并轨迹状态检查超时: point={index}")
+            return False
+        response = future.result()
+        if not response.valid:
+            contacts = [
+                f"{contact.contact_body_1}<->{contact.contact_body_2}"
+                for contact in response.contacts[:5]
+            ]
+            detail = ", ".join(contacts) if contacts else "未返回 contact 详情"
+            log.error(f"合并轨迹存在碰撞: point={index}, {detail}")
+            return False
+
+    log.info(f"合并轨迹 dual_arm 有效性检查通过: {len(indices)} 个采样状态")
+    return True
+
+
+def table_pick_make_grasp_pose(table_top_pose: Pose, x: float, y: float, z: float) -> Pose:
+    """先按 table_top 偏移位置，再绕局部 Y 旋转抓取姿态。"""
+    return table_pick_pose_rotate_local_y(
+        pose_offset_local(table_top_pose, x, y, z), TABLE_PICK_GRASP_LOCAL_Y_ROTATION,
+    )
+
 
 
 class G01Demo(Node):
@@ -8066,9 +8405,9 @@ def wait_for_keyboard_steps() -> tuple[int, ...] | None:
 
         if choice in {"0", "q", "quit", "exit"}:
             return None
-        match = re.fullmatch(r"([1-9])(?:\s*-\s*([1-9]))?", choice)
+        match = re.fullmatch(r"(1[01]|[1-9])(?:\s*-\s*(1[01]|[1-9]))?", choice)
         if match is None:
-            print(f"无效输入 {choice!r}，请输入 1~9 或正向区间（如 1-3）。")
+            print(f"无效输入 {choice!r}，请输入 1~11 或正向区间（如 1-3）。")
             continue
 
         start = int(match.group(1))
@@ -8115,7 +8454,7 @@ def _run_main(
     if keyboard_control_mode:
         log.info(
             "[keyboard] 已启用键盘流程选择；主循环不等待上位机命令。"
-            "输入 1~9 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
+            "输入 1~11 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
         )
     code = 1
     frame_added = False
@@ -8364,6 +8703,132 @@ def _run_main(
             return input().strip().lower() == "q"
         except EOFError:
             return False
+
+    table_pick_descent: RobotTrajectory | None = None
+    table_pick_top: Pose | None = None
+
+    def run_table_pick_place(*, place: bool) -> bool:
+        """步骤 10 抓起料台；步骤 11 使用本次抓取轨迹原位放回。"""
+        nonlocal table_pick_descent, table_pick_top
+        reset_names = joint_names_for_group("dual_arm_body")
+        if place:
+            if table_pick_descent is None or table_pick_top is None:
+                log.error("[table] 没有输入 10 保存的抓取轨迹，不能执行输入 11")
+                return False
+            current = node._get_joints(TABLE_PICK_DUAL_JOINTS, wait_new=True)
+            first = table_pick_descent.joint_trajectory.points[0]
+            expected = dict(zip(table_pick_descent.joint_trajectory.joint_names, first.positions))
+            if current is None or not _cached_joint_state_matches(expected, current):
+                log.error("[table] 当前双臂不在保存的预抓位置，停止放回")
+                return False
+            log.info("[table] 双臂同步下降到原抓取位置")
+            if not node._execute_traj(table_pick_descent):
+                return False
+            if not set_unload_tool_power(0, "料台放回"):
+                return False
+            if not node._execute_traj(node._reverse_trajectory(table_pick_descent)):
+                return False
+            if not node._apply_scene(
+                [table_pick_make_table_collision(table_pick_top)],
+                [ObjectColor(id=TABLE_PICK_TABLE_ID, color=TABLE_PICK_TABLE_COLOR)],
+            ):
+                return False
+            table_pick_descent = None
+            table_pick_top = None
+            log.info("[table] 料台已放回，双臂复位到识别构型")
+            return node.plan_execute_joint_waypoints(
+                "dual_arm_body", TABLE_PICK_JOINT_PLAN_SPEED, reset_names,
+                [UNLOAD_TABLE_VISION_PREP_Q],
+            )
+
+        if table_pick_descent is not None:
+            log.error("[table] 已有未放回的料台抓取记录，请先执行输入 11")
+            return False
+        if not node.plan_execute_joint_waypoints(
+            "dual_arm_body", TABLE_PICK_JOINT_PLAN_SPEED, reset_names,
+            [UNLOAD_TABLE_VISION_PREP_Q],
+        ):
+            return False
+        recognition = table_pick_acquire_recognition_pose(node, sim_mode)
+        if recognition is None:
+            return False
+        top = table_pick_pose_rotate_local_y(
+            table_pick_pose_rotate_local_z(
+                pose_offset_local(recognition, 0.0, 0.0, TABLE_PICK_RECOGNITION_TO_TABLE_TOP_LOCAL_Z),
+                TABLE_PICK_TABLE_LOCAL_Z_ROTATION,
+            ), TABLE_PICK_TABLE_LOCAL_Y_ROTATION,
+        )
+        if not node._apply_scene(
+            [table_pick_make_table_collision(top)],
+            [ObjectColor(id=TABLE_PICK_TABLE_ID, color=TABLE_PICK_TABLE_COLOR)],
+        ):
+            return False
+        if not hasattr(node, "_table_marker_pub"):
+            node._table_tf_broadcaster = StaticTransformBroadcaster(node)
+            node._table_marker_pub = node.create_publisher(
+                MarkerArray, TABLE_PICK_TABLE_MARKER_TOPIC,
+                QoSProfile(
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
+        table_pick_show_table_markers(
+            node, top,
+            table_pick_make_grasp_pose(top, *TABLE_PICK_LEFT_GRASP_LOCAL_XYZ),
+            table_pick_make_grasp_pose(top, *TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ),
+            table_pick_make_grasp_pose(top, *TABLE_PICK_LEFT_GRASP_LOCAL_XYZ[:2], TABLE_PICK_PRE_GRASP_LOCAL_Z),
+            table_pick_make_grasp_pose(top, *TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ[:2], TABLE_PICK_PRE_GRASP_LOCAL_Z),
+        )
+        planned = move_unload_pair_to_place(
+            {
+                1: table_pick_make_grasp_pose(top, *TABLE_PICK_LEFT_GRASP_LOCAL_XYZ[:2], TABLE_PICK_PRE_GRASP_LOCAL_Z),
+                2: table_pick_make_grasp_pose(top, *TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ[:2], TABLE_PICK_PRE_GRASP_LOCAL_Z),
+            },
+            1, 2, plan_only=True, table_pregrasp_only=True,
+        )
+        if not isinstance(planned, UnloadPlaceTrajectoryPlan) or not node._execute_traj(planned.to_place):
+            return False
+        if not set_unload_tool_power(0, "料台抓取前"):
+            return False
+        # 接触料台时临时移除桌体；仍检查其他障碍物与双臂自碰撞。
+        if not node._apply_scene([CollisionObject(id=TABLE_PICK_TABLE_ID, operation=CollisionObject.REMOVE)]):
+            return False
+        start = node._get_joints(TABLE_PICK_DUAL_JOINTS, wait_new=True)
+        if start is None:
+            return False
+        trajectories = []
+        for group, link, names, offset in (
+            (TABLE_PICK_LEFT_GROUP, TABLE_PICK_LEFT_LINK, TABLE_PICK_LEFT_JOINTS, TABLE_PICK_LEFT_GRASP_LOCAL_XYZ),
+            (TABLE_PICK_RIGHT_GROUP, TABLE_PICK_RIGHT_LINK, TABLE_PICK_RIGHT_JOINTS, TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ),
+        ):
+            trajectory = node.plan_cartesian_line(
+                group, link, table_pick_make_grasp_pose(top, *offset),
+                speed_scale=TABLE_PICK_CARTESIAN_SPEED,
+                avoid_collisions=TABLE_PICK_CARTESIAN_AVOID_COLLISIONS,
+                eef_step=TABLE_PICK_CARTESIAN_EEF_STEP, start_joints=start,
+                joint_names=names, plan_frame=TABLE_PICK_PLAN_FRAME,
+            )
+            if trajectory is None:
+                return False
+            trajectories.append(trajectory)
+        try:
+            descent = table_pick_merge_synchronized_trajectories(*trajectories)
+        except ValueError as exc:
+            log.error(f"[table] 双臂直线合并失败: {exc}")
+            return False
+        if not table_pick_validate_dual_trajectory(node, descent):
+            return False
+        if not node._execute_traj(descent):
+            return False
+        table_pick_descent, table_pick_top = descent, top
+        if not set_unload_tool_power(1, "料台抓取"):
+            return False
+        time.sleep(TABLE_PICK_TOOL_POWER_SETTLE_SEC)
+        if not node._execute_traj(node._reverse_trajectory(descent)):
+            return False
+        log.info("[table] 双臂已抓起料台并直线返回预抓点，可输入 11 原位放回")
+        return True
 
     def recognize_and_record_deep_frame(*, add_directly: bool = False) -> bool:
         """识别深框：记录里程计待转换，或直接在当前位置添加模型。"""
@@ -9373,6 +9838,7 @@ def _run_main(
         preplanned: UnloadPlaceTrajectoryPlan | None = None,
         on_place_motion_start: Callable[[Mapping[str, float]], None] | None = None,
         planning_node: G01Demo | None = None,
+        table_pregrasp_only: bool = False,
     ) -> bool | UnloadPlaceTrajectoryPlan:
         """吸附取料后验证放置可达性，并执行已经缓存的放置轨迹。
 
@@ -9381,11 +9847,17 @@ def _run_main(
         候选身体状态下求右纯臂 IK。所有 IK 都保留完整碰撞检测；每个单臂
         IK 解的下降直线只验证一次，忽略场景物体碰撞但保留机器人自碰撞检查，
         最终再验证到预备位的 OMPL 路径。执行阶段不重新规划。
+
+        table_pregrasp_only 用于输入 10：仅复用 IK 与 OMPL 到预抓点，
+        后备方案同时加入腰部和升降；下降仍由料台抓取流程单独规划。
         """
         left_joint_names = joint_names_for_group("left_arm")
         right_joint_names = joint_names_for_group("right_arm")
         dual_arm_joint_names = joint_names_for_group("dual_arm")
-        left_body_joint_names = joint_names_for_group("left_body")
+        fallback_left_group = "left_body"
+        fallback_dual_group = "dual_arm_body"
+        fallback_text = "腰部和升降"
+        left_body_joint_names = joint_names_for_group(fallback_left_group)
         dual_body_joint_names = joint_names_for_group("dual_arm_body")
         planner = planning_node or node
         current_full = (
@@ -9426,6 +9898,8 @@ def _run_main(
             随后逐点只检查机器人自碰撞；world/attached 物体接触被忽略。返回
             轨迹会一直缓存到执行阶段。
             """
+            if table_pregrasp_only:
+                return RobotTrajectory()
             if side == "left":
                 group = "left_arm"
                 link = "l_tool"
@@ -9520,6 +9994,8 @@ def _run_main(
             collision_group: str,
         ) -> RobotTrajectory | None:
             """合并左右下降轨迹，并检查同步运动时的双臂自碰撞。"""
+            if table_pregrasp_only:
+                return RobotTrajectory()
             try:
                 merged = merge_dual_arm_cartesian_trajectories(
                     left_descent,
@@ -9617,7 +10093,7 @@ def _run_main(
                 ),
                 default=0.0,
             )
-            if endpoint_delta > 1e-4:
+            if endpoint_delta > 1e-4 and not table_pregrasp_only:
                 log.info(
                     f"[unload] {label}：OMPL 末点与 IK 目标最大偏差 "
                     f"{endpoint_delta:.6f}，按实际末点更新直线缓存"
@@ -9627,8 +10103,9 @@ def _run_main(
                     return None
 
             log.info(
-                f"[unload] {label}：IK、左右 Cartesian、OMPL 均通过，"
-                "已缓存全部执行轨迹"
+                f"[unload] {label}："
+                + ("IK、OMPL 均通过，" if table_pregrasp_only else "IK、左右 Cartesian、OMPL 均通过，")
+                + "已缓存全部执行轨迹"
             )
             return trajectory, merged_descent
 
@@ -9780,6 +10257,8 @@ def _run_main(
             IK 解只规划一次 Cartesian 路径，后续左右组合不会重复调用服务。
             """
             reachable: list[tuple[dict[str, float], RobotTrajectory]] = []
+            if table_pregrasp_only:
+                return [(solution, RobotTrajectory()) for solution in solutions]
             for solution_index, solution in enumerate(solutions, start=1):
                 endpoint_state = dict(base_state)
                 endpoint_state.update(solution)
@@ -9901,7 +10380,7 @@ def _run_main(
                 missing_sides.append("右臂")
             log.warning(
                 f"[unload] {'、'.join(missing_sides)}纯臂无 IK，"
-                "纯臂组合无法成立，将加入腰部和升降"
+                f"纯臂组合无法成立，将加入{fallback_text}"
             )
 
         left_arm_reachable: list[
@@ -9994,8 +10473,8 @@ def _run_main(
                 )
 
         log.warning(
-            "[unload] 当前腰部/升降位置下没有通过 IK、左右直线和 OMPL "
-            "全部验证的纯臂组合，开始先求 left_body 构型"
+            f"[unload] 纯臂候选均未通过验证，加入{fallback_text}，"
+            f"开始求 {fallback_left_group} 构型"
         )
 
         # ------------------------------------------------------------------
@@ -10005,7 +10484,7 @@ def _run_main(
         # 转换尚未执行的候选 body 状态。最终使用 dual_arm_body 联合规划。
         # ------------------------------------------------------------------
         left_body_solutions = planner._solve_ik_candidates_from_seed(
-            "left_body",
+            fallback_left_group,
             "l_tool",
             left_pose,
             left_body_joint_names,
@@ -10022,7 +10501,7 @@ def _run_main(
         if not left_body_solutions:
             node.publish_error(10, f"物料台左点{left_point}/右点{right_point}：纯臂及身体构型均未找到可行放置方案")
             log.error(
-                f"[unload] 左点{left_point} 即使加入腰部和升降仍无 IK"
+                f"[unload] 左点{left_point} 即使加入{fallback_text}仍无 IK"
             )
             return False
 
@@ -10033,7 +10512,7 @@ def _run_main(
         ):
             candidate_state = dict(current_full)
             candidate_state.update(left_body_solution)
-            lift = left_body_solution["body_joint1"]
+            lift = candidate_state["body_joint1"]
             waist = left_body_solution["body_joint2"]
             log.info(
                 f"[unload] 左侧 body 构型 {body_index}/"
@@ -10098,15 +10577,15 @@ def _run_main(
                         if name in right_solution
                         else left_body_solution[name]
                     )
-                    for name in dual_body_joint_names
+                    for name in joint_names_for_group(fallback_dual_group)
                 }
                 label = (
-                    f"dual_arm_body 左body构型{body_index}/"
+                    f"{fallback_dual_group} 左侧构型{body_index}/"
                     f"{len(left_body_solutions)}，"
                     f"右可行解{right_index}/{len(right_reachable)}"
                 )
                 cached_plan = validate_place_candidate(
-                    "dual_arm_body",
+                    fallback_dual_group,
                     target,
                     current_full,
                     label,
@@ -10117,7 +10596,7 @@ def _run_main(
                     to_place, descent = cached_plan
                     if plan_only:
                         return UnloadPlaceTrajectoryPlan(
-                            "dual_arm_body", label, to_place, descent,
+                            fallback_dual_group, label, to_place, descent,
                         )
                     return execute_cached_place_plan(
                         "dual_arm_body",
@@ -10523,6 +11002,10 @@ def _run_main(
 
         if step == 9:
             return recognize_and_record_deep_frame(add_directly=True)
+        if step == 10:
+            return run_table_pick_place(place=False)
+        if step == 11:
+            return run_table_pick_place(place=True)
 
         log.error(f"未知步骤: {step}")
         return False
