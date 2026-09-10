@@ -4,7 +4,7 @@
 """
 G01 MoveIt 演示脚本
 
-功能按 1~8 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
+功能按 1~9 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
 1. 导航到深框识别位置。
 2. 运动到深框识别构型，识别深框，并记录当时 /lio/odom 实际位姿；
    未收到有效视觉数据时最多重复发送识别命令 5 次。
@@ -410,6 +410,23 @@ MOVE_TO_GRASP_RESET_Q = [
     1.672852,
     0.588477,
 ]
+# 键盘 9：当前位置直接识别深框的独立构型。
+FRAME_DIRECT_VISION_Q = [
+    0.13,
+    50 * math.pi / 180,
+    -1.57,
+    -0.15,
+    -1.578090,
+    -1.370549,
+    -1.672852,
+    -0.588477,
+    1.57,
+    0.15,
+    1.578090,
+    1.370549,
+    1.672852,
+    0.588477,
+]
 # 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
 # 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
 GRASP_VISION_WAIST_ANGLES_DEG = (30,)
@@ -626,6 +643,7 @@ STEP_DESCRIPTIONS = {
     6: "物料台预备构型、识别并添加碰撞模型",
     7: "按 SW 优先级循环放置",
     8: "导航回起点",
+    9: "运动到独立识别构型，直接识别并添加深框碰撞模型",
 }
 NAV_GOAL_POSES = {
     NAV_TARGET_FRAME_RECOGNITION: {
@@ -8048,9 +8066,9 @@ def wait_for_keyboard_steps() -> tuple[int, ...] | None:
 
         if choice in {"0", "q", "quit", "exit"}:
             return None
-        match = re.fullmatch(r"([1-8])(?:\s*-\s*([1-8]))?", choice)
+        match = re.fullmatch(r"([1-9])(?:\s*-\s*([1-9]))?", choice)
         if match is None:
-            print(f"无效输入 {choice!r}，请输入 1~8 或正向区间（如 1-3）。")
+            print(f"无效输入 {choice!r}，请输入 1~9 或正向区间（如 1-3）。")
             continue
 
         start = int(match.group(1))
@@ -8097,7 +8115,7 @@ def _run_main(
     if keyboard_control_mode:
         log.info(
             "[keyboard] 已启用键盘流程选择；主循环不等待上位机命令。"
-            "输入 1~8 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
+            "输入 1~9 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
         )
     code = 1
     frame_added = False
@@ -8347,25 +8365,27 @@ def _run_main(
         except EOFError:
             return False
 
-    def recognize_and_record_deep_frame() -> bool:
-        """识别深框，并同步记录识别工位的机器人实际位姿。"""
+    def recognize_and_record_deep_frame(*, add_directly: bool = False) -> bool:
+        """识别深框：记录里程计待转换，或直接在当前位置添加模型。"""
         nonlocal frame_added, pending_frame_recognition_pose, frame_recognition_odom
         # 一旦开始新识别，旧的待转换数据不再允许被步骤 3 误用。
         pending_frame_recognition_pose = None
         frame_recognition_odom = None
         q1_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
+        vision_q = FRAME_DIRECT_VISION_Q if add_directly else 框_Q1
+        vision_q_name = "FRAME_DIRECT_VISION_Q" if add_directly else "框_Q1"
         log.info(
             f"[frame-vision] {FRAME_VISION_TRIGGER_COMMAND} 识别前，"
-            "dual_arm_body 先关节空间运动到 框_Q1"
+            f"dual_arm_body 先关节空间运动到 {vision_q_name}"
         )
         if not node.plan_execute_joint_waypoints(
             "dual_arm_body",
             0.2,
             q1_joint_names,
-            [框_Q1],
+            [vision_q],
         ):
             log.error(
-                "[frame-vision] 运动到 框_Q1 失败，不发送 "
+                f"[frame-vision] 运动到 {vision_q_name} 失败，不发送 "
                 f"{FRAME_VISION_TRIGGER_COMMAND}"
             )
             return False
@@ -8384,9 +8404,11 @@ def _run_main(
         _, all_xyz_rpy = vision_result
 
         recognition_pose = make_pose(*all_xyz_rpy[0][FRAME_VISION_POSE_KEY])
-        recognition_odom = node.wait_for_odom_snapshot("深框识别位置")
-        if recognition_odom is None:
-            return False
+        recognition_odom = None
+        if not add_directly:
+            recognition_odom = node.wait_for_odom_snapshot("深框识别位置")
+            if recognition_odom is None:
+                return False
 
         frame_top_pose, frame_pose = deep_frame_poses_from_recognition(
             recognition_pose
@@ -8457,6 +8479,19 @@ def _run_main(
             f"{neg_y_obstacle_center_pose.position.y:.4f}, "
             f"{neg_y_obstacle_center_pose.position.z:.4f})"
         )
+
+        if add_directly:
+            node.configure_deep_frame_from_recognition(recognition_pose)
+            planner_node.configure_deep_frame_from_recognition(recognition_pose)
+            node.publish_deep_frame_vision_tf(
+                recognition_pose, frame_top_pose, frame_pose, box_top_pose,
+            )
+            if not node.add_frame():
+                log.error("[frame-vision] 当前位置添加深框碰撞模型失败")
+                return False
+            frame_added = True
+            log.info("[frame-vision] 已在当前位置直接识别并添加深框碰撞模型")
+            return True
 
         if frame_added:
             log.info(f"[frame-vision] 移除旧碰撞体「{FRAME_ID}」，等待到抓取点重建 …")
@@ -10485,6 +10520,9 @@ def _run_main(
             # 碰撞模型清理是尽力而为；失败既不阻止导航，也不令步骤失败。
             remove_cached_unload_scene()
             return node.navigate_and_wait(NAV_TARGET_INIT)
+
+        if step == 9:
+            return recognize_and_record_deep_frame(add_directly=True)
 
         log.error(f"未知步骤: {step}")
         return False
