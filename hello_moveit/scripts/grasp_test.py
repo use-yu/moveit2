@@ -1048,22 +1048,22 @@ NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
 # 下面会转成平移单位为毫米的 4x4 矩阵，与 viewer pose 的毫米单位保持一致。
 VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
-    -0.166538, -0.151546, -0.132837, 0.653505, -0.277459, -0.647778, -0.276283
+    -0.164051, -0.154038, -0.132963, 0.657101, -0.268392, -0.651622, -0.267530
 ]
 VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
     0.166404, -0.154310, -0.218199, 0.650793, -0.270204, 0.657223, 0.267425
 ]
 
 # 左臂抓
-SIM_VISION_RESULT = (
-    1,
-    [-195.0305, 43.2781, 889.8122, -0.481, 0.0739, -0.1165, -0.8658],
-)
-# 右臂抓
 # SIM_VISION_RESULT = (
 #     1,
-#     [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+#     [-195.0305, 43.2781, 889.8122, -0.481, 0.0739, -0.1165, -0.8658],
 # )
+# 右臂抓
+SIM_VISION_RESULT = (
+    1,
+    [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+)
 # 物料台 p,8 仿真视觉数据：
 # 原始协议为 header,x,y,z,qw,qx,qy,qz,mode；header 不使用。
 SIM_UNLOAD_VISION_RESULT = (
@@ -8720,6 +8720,11 @@ def _run_main(
         )
         log.info(selected_msg)
         print(f"\033[32m{selected_msg}\033[0m")
+
+        # 抓取前只显示选中机械臂的实际目标，与传给规划器的位姿和坐标系一致。
+        node.remove_all_pose_markers()
+        node.show_cylinder_at_pose(pick_target_pose, frame_id=pick_frame)
+        node.show_z_axis_at_pose(pick_target_pose, frame_id=pick_frame)
 
         if prompt_exit("按回车继续，输入 q 回车退出并移除深框 …"):
             return None
