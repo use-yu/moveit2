@@ -4,7 +4,7 @@
 """
 G01 MoveIt 演示脚本
 
-功能按 1~11 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
+功能按 1~13 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
 1. 导航到深框识别位置。
 2. 运动到深框识别构型，识别深框，并记录当时 /lio/odom 实际位姿；
    未收到有效视觉数据时最多重复发送识别命令 5 次。
@@ -646,6 +646,8 @@ STEP_DESCRIPTIONS = {
     9: "运动到独立识别构型，直接识别并添加深框碰撞模型",
     10: "识别料台、添加碰撞模型，双臂同步抓取并抬起",
     11: "双臂放回料台、下电、直线返回并复位",
+    12: "发送 p,6 识别物料台并添加碰撞模型",
+    13: "抓取物料台第一排，双臂放回后方空 SW 位",
 }
 NAV_GOAL_POSES = {
     NAV_TARGET_FRAME_RECOGNITION: {
@@ -722,6 +724,7 @@ DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 #   SW1+SW3: (1,3) → (11,13) → (1,3) → ...
 #   SW2+SW4: (2,4) → (12,14) → (2,4) → ...
 UNLOAD_TRIGGER_COMMAND = "p,4"
+LOAD_TABLE_TRIGGER_COMMAND = "p,6"
 UNLOAD_VISION_POSE_KEY = "right_body"
 UNLOAD_VISION_TF_FRAME = "material_table_vision"
 UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
@@ -1098,7 +1101,7 @@ def sim_vision_result_for_trigger(
     trigger_command: str,
 ) -> tuple[int, list[float]]:
     """按视觉触发命令选择对应的仿真数据。"""
-    if trigger_command == UNLOAD_TRIGGER_COMMAND:
+    if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND):
         return SIM_UNLOAD_VISION_RESULT
     if trigger_command == FRAME_VISION_TRIGGER_COMMAND:
         return SIM_FRAME_VISION_RESULT
@@ -1268,7 +1271,7 @@ def read_vision_pose(
         return poses
     except ValueError as exc:
         if report_error is not None:
-            report_error(3 if trigger_command == UNLOAD_TRIGGER_COMMAND else 2, str(exc))
+            report_error(3 if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND) else 2, str(exc))
         log.error(f"viewer 数据非法：{exc}")
         return None
     except OSError as exc:
@@ -1476,8 +1479,8 @@ def read_vision_object_pose(
     if sim_mode:
         first_return_mode, pose = sim_vision_result_for_trigger(trigger_command)
         vision_results = [(first_return_mode, list(pose))]
-        if trigger_command == UNLOAD_TRIGGER_COMMAND:
-            sim_source = "物料台 p,8"
+        if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND):
+            sim_source = f"物料台 {trigger_command}"
         elif trigger_command == FRAME_VISION_TRIGGER_COMMAND:
             sim_source = "深框 p,4"
         else:
@@ -1552,7 +1555,7 @@ def read_vision_object_pose(
                 right_xyz_rpy_mm = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
                 left_xyz_rpy_mm = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
             except ValueError as exc:
-                node.publish_error(3 if trigger_command == UNLOAD_TRIGGER_COMMAND else 2, f"point={point_index}: {exc}")
+                node.publish_error(3 if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND) else 2, f"point={point_index}: {exc}")
                 message = f"viewer 第 {point_index} 个 pose 解析失败：{exc}"
                 log.error(message)
                 print(message)
@@ -8405,9 +8408,9 @@ def wait_for_keyboard_steps() -> tuple[int, ...] | None:
 
         if choice in {"0", "q", "quit", "exit"}:
             return None
-        match = re.fullmatch(r"(1[01]|[1-9])(?:\s*-\s*(1[01]|[1-9]))?", choice)
+        match = re.fullmatch(r"(1[0-3]|[1-9])(?:\s*-\s*(1[0-3]|[1-9]))?", choice)
         if match is None:
-            print(f"无效输入 {choice!r}，请输入 1~11 或正向区间（如 1-3）。")
+            print(f"无效输入 {choice!r}，请输入 1~13 或正向区间（如 1-3）。")
             continue
 
         start = int(match.group(1))
@@ -8454,7 +8457,7 @@ def _run_main(
     if keyboard_control_mode:
         log.info(
             "[keyboard] 已启用键盘流程选择；主循环不等待上位机命令。"
-            "输入 1~11 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
+            "输入 1~13 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
         )
     code = 1
     frame_added = False
@@ -10614,7 +10617,7 @@ def _run_main(
         )
         return False
 
-    def prepare_unload_scene() -> bool:
+    def prepare_unload_scene(trigger_command: str = UNLOAD_TRIGGER_COMMAND) -> bool:
         """步骤 6：运动到识别预备构型，识别物料台并缓存碰撞场景。"""
         nonlocal frame_added, unload_scene_added, unload_place_poses
 
@@ -10653,7 +10656,7 @@ def _run_main(
         ):
             log.error(
                 "[unload] 运动到物料台识别预备构型失败，"
-                f"不发送 {UNLOAD_TRIGGER_COMMAND}"
+                f"不发送 {trigger_command}"
             )
             return False
 
@@ -10662,7 +10665,7 @@ def _run_main(
             node,
             log,
             sim_mode=sim_mode,
-            trigger_command=UNLOAD_TRIGGER_COMMAND,
+            trigger_command=trigger_command,
             required_pose_key=UNLOAD_VISION_POSE_KEY,
             scene_label="unload",
         )
@@ -10676,7 +10679,7 @@ def _run_main(
         place_poses = make_unload_place_poses(recognition_pose)
         node.publish_unload_place_tfs(place_poses)
         log.info(
-            f"[unload] {UNLOAD_TRIGGER_COMMAND} 识别点 @ {SCENE_FRAME}: "
+            f"[unload] {trigger_command} 识别点 @ {SCENE_FRAME}: "
             f"({recognition_pose.position.x:.4f}, "
             f"{recognition_pose.position.y:.4f}, "
             f"{recognition_pose.position.z:.4f})"
@@ -10712,6 +10715,173 @@ def _run_main(
             f"障碍物 size={UNLOAD_OBSTACLE_SIZE} m，"
             f"沿料台局部 +Y 偏移 {UNLOAD_OBSTACLE_Y_OFFSET:.3f} m"
         )
+        return True
+
+    def run_table_to_rear_cycle() -> bool:
+        pending: list[Future] = []
+        try:
+            return _run_table_to_rear_cycle(pending)
+        finally:
+            # 退出或报警时收完纯规划任务，避免与后续步骤共用后台节点。
+            for future in pending:
+                if not future.cancel():
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        log.warning(f"[table-to-rear][pipeline] 后台规划异常: {exc}")
+
+    def _run_table_to_rear_cycle(pending: list[Future]) -> bool:
+        """步骤 13：仅取物料台第一排，每对一次，按步骤 7 的对应关系放回 SW。"""
+        if not unload_scene_added or unload_place_poses is None:
+            log.error("[table-to-rear] 请先执行输入 12，识别并添加物料台")
+            return False
+        full_names = joint_names_for_group("dual_arm_body")
+        if not set_unload_tool_power(0, "料台取料开始"):
+            return False
+
+        def pair_empty(right_slot: str, left_slot: str) -> bool:
+            return (
+                node._place_slot_is_empty(right_slot)
+                and node._place_slot_is_empty(left_slot)
+            )
+
+        def submit(function, *args, **kwargs):
+            future = planner_pool.submit(function, *args, **kwargs)
+            pending.append(future)
+            return future
+
+        def endpoint_state(start, trajectory):
+            state = dict(start)
+            state.update(zip(
+                trajectory.joint_trajectory.joint_names,
+                trajectory.joint_trajectory.points[-1].positions,
+            ))
+            return state
+
+        def execute_checked(trajectory):
+            names = list(trajectory.joint_trajectory.joint_names)
+            current = node._get_joints(names, wait_new=True)
+            expected = dict(zip(names, trajectory.joint_trajectory.points[0].positions))
+            if current is None or not _cached_joint_state_matches(expected, current):
+                log.error("[table-to-rear][pipeline] 实际起点与预规划轨迹不匹配，停止执行")
+                return False
+            return node._execute_traj(trajectory)
+
+        next_pick = None
+        if not node._wait_for_driver_signal(require_new=True):
+            return False
+        pairs = [pair for pair in UNLOAD_PAIR_CYCLES if pair_empty(pair[0], pair[1])]
+        for pair_index, (right_slot, left_slot, point_pairs) in enumerate(pairs):
+            left_point, right_point = point_pairs[0]
+            if not node._wait_for_driver_signal(require_new=True):
+                return False
+            if not pair_empty(right_slot, left_slot):
+                log.info(
+                    f"[table-to-rear] {right_slot}/{left_slot} 未同时为空，跳过该对"
+                )
+                if next_pick is not None:
+                    next_pick.result()
+                    next_pick = None
+                continue
+            log.info(
+                f"[table-to-rear] 左点{left_point} → {left_slot}，"
+                f"右点{right_point} → {right_slot}，只取第一排"
+            )
+            # 同一物料台位置与下降轨迹，反转工具动作即可由放置改为抓取。
+            pick = next_pick.result() if next_pick is not None else move_unload_pair_to_place(
+                unload_place_poses, left_point, right_point, plan_only=True,
+            )
+            next_pick = None
+            if not isinstance(pick, UnloadPlaceTrajectoryPlan):
+                return False
+            start = node._get_joints(full_names, wait_new=True)
+            if start is None:
+                return False
+            pick_end = endpoint_state(start, pick.to_place)
+            rear_future = submit(
+                execute_unload_pick_pair, right_slot, left_slot,
+                plan_only=True, planning_start_joints=pick_end,
+                planning_node=planner_node,
+            )
+            log.info("[table-to-rear][pipeline] 执行料台抓取，同时后台规划后方放置")
+            if not execute_checked(pick.to_place):
+                return False
+            node.wait_for_operator("按回车执行双臂同步直线抓取料台第一排物料: ")
+            if not node._execute_traj(pick.descent):
+                return False
+            if not set_unload_tool_power(1, "料台第一排取料"):
+                return False
+            time.sleep(UNLOAD_TOOL_SETTLE_SEC)
+            if not node._execute_traj(node._reverse_trajectory(pick.descent)):
+                return False
+
+            # 复用步骤 7 的 SW yubei/直线规划，只执行放置所需的动作顺序。
+            rear = rear_future.result()
+            if not isinstance(rear, UnloadPickTrajectoryPlan):
+                return False
+            if not node._wait_for_driver_signal(require_new=True):
+                return False
+            if not pair_empty(right_slot, left_slot):
+                log.error("[table-to-rear] 后方目标已被占用，保持工具上电并停止")
+                return False
+            rear_end = endpoint_state(pick_end, rear.to_yubei)
+            if pair_index + 1 < len(pairs):
+                next_right, next_left, next_points = pairs[pair_index + 1]
+                if pair_empty(next_right, next_left):
+                    next_pick = submit(
+                        move_unload_pair_to_place, unload_place_poses,
+                        *next_points[0], planning_start_joints=rear_end,
+                        plan_only=True, planning_node=planner_node,
+                    )
+                    log.info("[table-to-rear][pipeline] 执行后方放置，同时后台规划下一对料台抓取")
+            if not execute_checked(rear.to_yubei):
+                return False
+            node.wait_for_operator("按回车执行双臂同步直线放回后方 SW 位: ")
+            # 必须在实际下降前再次检查，不能仅依赖取料前的空位信号。
+            if not node._wait_for_driver_signal(require_new=True):
+                return False
+            if not pair_empty(right_slot, left_slot):
+                log.error("[table-to-rear] 下降前发现后方目标非空，取消放置并保持上电")
+                return False
+            current = node._get_joints(full_names, wait_new=True)
+            if current is None:
+                return False
+            left_pre = node._get_link_pose_fk("l_tool", joints=current, plan_frame=SCENE_FRAME)
+            right_pre = node._get_link_pose_fk("r_tool", joints=current, plan_frame=SCENE_FRAME)
+            left_fz = node.wait_for_ft_sensor_z("left")
+            right_fz = node.wait_for_ft_sensor_z("right")
+            if left_pre is None or right_pre is None or left_fz is None or right_fz is None:
+                return False
+            result = node._execute_approach_with_force_guard(
+                rear.approach, ("left", "right"),
+                {"left": left_fz, "right": right_fz},
+                max(rear.left_approach_distance, rear.right_approach_distance),
+                near_force_drop_threshold=None,
+                stage_label="后方 SW 双臂放置下降", baseline_label="放置预备点",
+            )
+            if result != "success":
+                if result == "safety_failed":
+                    set_unload_tool_power(0, "后方放置安全停止失败")
+                    return False
+                node.recover_dual_arm_linear_after_alarm(
+                    left_return_pose=left_pre, right_return_pose=right_pre,
+                    full_joint_names=full_names, collision_group="dual_arm_body",
+                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    stage="后方 SW 双臂放置", clear_alarms=(result != "contact"),
+                )
+                # 未确认放置成功，不占用 SW、不继续抓取下一对。
+                return False
+            if not set_unload_tool_power(0, "后方 SW 放置"):
+                return False
+            time.sleep(UNLOAD_TOOL_SETTLE_SEC)
+            if node.sim_mode and not node._update_simulated_place_slots(
+                [right_slot, left_slot], has_material=True, reason="输入 13 放回后方",
+            ):
+                return False
+            if not node._execute_traj(node._reverse_trajectory(rear.approach)):
+                return False
+
+        log.info("[table-to-rear] 第一排处理结束，保持直线退回后的后方预备位")
         return True
 
     def run_unload_cycle() -> bool:
@@ -11006,6 +11176,10 @@ def _run_main(
             return run_table_pick_place(place=False)
         if step == 11:
             return run_table_pick_place(place=True)
+        if step == 12:
+            return prepare_unload_scene(LOAD_TABLE_TRIGGER_COMMAND)
+        if step == 13:
+            return run_table_to_rear_cycle()
 
         log.error(f"未知步骤: {step}")
         return False
