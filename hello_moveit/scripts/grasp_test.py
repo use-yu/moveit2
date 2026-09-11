@@ -4,7 +4,7 @@
 """
 G01 MoveIt 演示脚本
 
-功能按 1~13 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
+功能按 1~14 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
 1. 导航到深框识别位置。
 2. 运动到深框识别构型，识别深框，并记录当时 /lio/odom 实际位姿；
    未收到有效视觉数据时最多重复发送识别命令 5 次。
@@ -412,8 +412,8 @@ MOVE_TO_GRASP_RESET_Q = [
 ]
 # 键盘 9：当前位置直接识别深框的独立构型。
 FRAME_DIRECT_VISION_Q = [
-    0.13,
-    50 * math.pi / 180,
+    0,
+    0 * math.pi / 180,
     -1.57,
     -0.15,
     -1.578090,
@@ -648,6 +648,7 @@ STEP_DESCRIPTIONS = {
     11: "双臂放回料台、下电、直线返回并复位",
     12: "发送 p,6 识别物料台并添加碰撞模型",
     13: "抓取物料台第一排，双臂放回后方空 SW 位",
+    14: "先 SW2/SW4 再 SW1/SW3，双臂下料到深框中心两侧",
 }
 NAV_GOAL_POSES = {
     NAV_TARGET_FRAME_RECOGNITION: {
@@ -751,6 +752,9 @@ UNLOAD_OBSTACLE_Y_OFFSET = 0.95
 UNLOAD_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=0.85)
 UNLOAD_APPROACH_DISTANCE = 0.1
 UNLOAD_PLACE_DESCENT_DISTANCE = 0.13
+# 输入 14：最终放置点相对深框实体中心的局部 (x, y, z) 偏移，单位 m。
+FRAME_UNLOAD_LEFT_LOCAL_XYZ = (-0.3, 0.1, 0.4)
+FRAME_UNLOAD_RIGHT_LOCAL_XYZ = (-0.3, -0.1, 0.4)
 # 上料放置位抓取
 UNLOAD_EXTRA_APPROACH_BY_SLOT = {
     "sw1": 0.001,  # 右臂：多降 4 mm
@@ -1094,7 +1098,10 @@ SIM_UNLOAD_VISION_RESULT = (
     [-47.2306, -52.774, 621.5524, 0.2655, 0.6732, -0.6395, 0.2594],
 )
 # p,4 仿真时沿用同一套视觉协议；框位姿仍按旋转和平移链计算。
-SIM_FRAME_VISION_RESULT = SIM_UNLOAD_VISION_RESULT
+SIM_FRAME_VISION_RESULT = (
+    1,
+    [-47.2306, -52.774, 621.5524, 0.2655, 0.6732, -0.6395, 0.2594],
+)
 
 
 def sim_vision_result_for_trigger(
@@ -8408,9 +8415,9 @@ def wait_for_keyboard_steps() -> tuple[int, ...] | None:
 
         if choice in {"0", "q", "quit", "exit"}:
             return None
-        match = re.fullmatch(r"(1[0-3]|[1-9])(?:\s*-\s*(1[0-3]|[1-9]))?", choice)
+        match = re.fullmatch(r"(1[0-4]|[1-9])(?:\s*-\s*(1[0-4]|[1-9]))?", choice)
         if match is None:
-            print(f"无效输入 {choice!r}，请输入 1~13 或正向区间（如 1-3）。")
+            print(f"无效输入 {choice!r}，请输入 1~14 或正向区间（如 1-3）。")
             continue
 
         start = int(match.group(1))
@@ -8457,7 +8464,7 @@ def _run_main(
     if keyboard_control_mode:
         log.info(
             "[keyboard] 已启用键盘流程选择；主循环不等待上位机命令。"
-            "输入 1~13 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
+            "输入 1~14 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
         )
     code = 1
     frame_added = False
@@ -10884,11 +10891,42 @@ def _run_main(
         log.info("[table-to-rear] 第一排处理结束，保持直线退回后的后方预备位")
         return True
 
-    def run_unload_cycle() -> bool:
-        """步骤 7：最多放置两对料，正常结束后复位双臂和身体。"""
-        if not unload_scene_added or unload_place_poses is None:
+    def run_unload_cycle(*, to_frame: bool = False) -> bool:
+        """步骤 7/14：最多放置两对料，正常结束后复位双臂和身体。"""
+        place_targets = unload_place_poses
+        if to_frame:
+            if not frame_added:
+                log.error("[frame-unload] 请先识别并添加深框（输入 9 或步骤 2、3）")
+                return False
+            place_targets = {}
+            for point, local_xyz in (
+                (1, FRAME_UNLOAD_LEFT_LOCAL_XYZ),
+                (3, FRAME_UNLOAD_RIGHT_LOCAL_XYZ),
+            ):
+                target = pose_rotate_local_rpy(
+                    pose_offset_local(node._frame_pose, *local_xyz),
+                    0.0, math.pi, 0.0,
+                )
+                # 共用流程接收下降预备点；反推预备点，使下降终点落在指定偏移。
+                place_targets[point] = pose_offset_local_z(target, -UNLOAD_PLACE_DESCENT_DISTANCE)
+            log.info(
+                f"[frame-unload] 相对深框实体中心：左 {FRAME_UNLOAD_LEFT_LOCAL_XYZ}，"
+                f"右 {FRAME_UNLOAD_RIGHT_LOCAL_XYZ} m；局部 Y 转 180°"
+            )
+        elif not unload_scene_added or place_targets is None:
             log.error("[unload] 尚未执行步骤 6，缺少物料台碰撞模型和放置位")
             return False
+
+        used_pairs: set[int] = set()
+
+        def select_cycle_pair():
+            if not to_frame:
+                return select_unload_pair()
+            for index in (1, 0):
+                right_slot, left_slot, _ = UNLOAD_PAIR_CYCLES[index]
+                if index not in used_pairs and node._place_slot_has_material(right_slot) and node._place_slot_has_material(left_slot):
+                    return index, right_slot, left_slot, 1, 3
+            return None
 
         reset_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
 
@@ -10937,7 +10975,7 @@ def _run_main(
             )
             print(f"{GREEN}[unload] 当前有料位置: {material_text}{RESET}")
 
-            selected = cached_selected or select_unload_pair()
+            selected = cached_selected or select_cycle_pair()
             if selected is None:
                 log.info(
                     "[unload] 没有完整料对（需要 SW1+SW3 或 SW2+SW4），"
@@ -10952,6 +10990,7 @@ def _run_main(
                 left_point,
                 right_point,
             ) = selected
+            used_pairs.add(cycle_index)
             log.info(
                 f"[unload] 第 {batch_index + 1} 轮："
                 f"右臂 {right_slot.upper()}→物料台点{right_point}，"
@@ -10964,7 +11003,7 @@ def _run_main(
 
                 def plan_place() -> UnloadPlaceTrajectoryPlan | None:
                     result = move_unload_pair_to_place(
-                        unload_place_poses,
+                        place_targets,
                         left_point,
                         right_point,
                         planning_start_joints=dict(start_state),
@@ -11018,7 +11057,7 @@ def _run_main(
                 if batch_index == 0:
                     if not node._wait_for_driver_signal(require_new=True):
                         return
-                    next_selected = select_unload_pair()
+                    next_selected = select_cycle_pair()
                     if next_selected is None:
                         return
                     _, next_right_slot, next_left_slot, _, _ = next_selected
@@ -11059,7 +11098,7 @@ def _run_main(
                 log.info("[unload][pipeline] 第二次放置开始，后台规划复位轨迹")
 
             if not move_unload_pair_to_place(
-                unload_place_poses,
+                place_targets,
                 left_point,
                 right_point,
                 preplanned=place_plan,
@@ -11067,6 +11106,9 @@ def _run_main(
             ):
                 return False
 
+            if to_frame:
+                log.info(f"[frame-unload] {right_slot}/{left_slot} 下料完成")
+                continue
             point_pairs = UNLOAD_PAIR_CYCLES[cycle_index][2]
             unload_cycle_indices[cycle_index] = (
                 unload_cycle_indices[cycle_index] + 1
@@ -11140,11 +11182,11 @@ def _run_main(
                     has_material=False,
                     reason="键盘执行步骤 4，初始化四个空位",
                 )
-            elif step == 7:
+            elif step in (7, 14):
                 node._update_simulated_place_slots(
                     list(PLACE_SLOT_MASKS),
                     has_material=True,
-                    reason="键盘执行步骤 7，初始化四个有料位",
+                    reason=f"键盘执行步骤 {step}，初始化四个有料位",
                 )
 
         if step == 1:
@@ -11180,6 +11222,8 @@ def _run_main(
             return prepare_unload_scene(LOAD_TABLE_TRIGGER_COMMAND)
         if step == 13:
             return run_table_to_rear_cycle()
+        if step == 14:
+            return run_unload_cycle(to_frame=True)
 
         log.error(f"未知步骤: {step}")
         return False
