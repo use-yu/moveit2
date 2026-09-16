@@ -793,6 +793,8 @@ UNLOAD_PLACE_LOCAL_OFFSETS = {
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
+UNLOAD_PLACE_POSITION_TOLERANCE = 0.001  # 规划终点 FK 位置误差上限：1 mm。
+UNLOAD_PLACE_ORIENTATION_TOLERANCE = math.radians(0.1)  # 姿态误差上限：0.1°。
 UNLOAD_PLACE_ARM_IK_ATTEMPTS = 200
 UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS = 20
 UNLOAD_PLACE_BODY_IK_ATTEMPTS = 200
@@ -10152,6 +10154,25 @@ def _run_main(
                 if left_return_pose is None or right_return_pose is None:
                     log.error(f"[unload] {label} 规划阶段记录放置预备点 FK 失败")
                     return None
+                for side, actual, expected in (
+                    ("左臂", left_return_pose, left_pose),
+                    ("右臂", right_return_pose, right_pose),
+                ):
+                    position_error = _pose_position_delta(actual, expected)[3]
+                    orientation_error = _pose_orientation_error_rad(actual, expected)
+                    log.info(
+                        f"[unload] {label} {side}规划终点 FK 误差："
+                        f"位置={position_error * 1000.0:.3f} mm，"
+                        f"姿态={math.degrees(orientation_error):.4f}°"
+                    )
+                    if (
+                        not math.isfinite(position_error)
+                        or not math.isfinite(orientation_error)
+                        or position_error > UNLOAD_PLACE_POSITION_TOLERANCE
+                        or orientation_error > UNLOAD_PLACE_ORIENTATION_TOLERANCE
+                    ):
+                        log.warning(f"[unload] {label} {side}规划终点位姿误差超限，拒绝该候选")
+                        return None
 
             log.info(
                 f"[unload] {label}："
@@ -10339,42 +10360,20 @@ def _run_main(
             )
 
         # ------------------------------------------------------------------
-        # 第一级：身体保持当前位置，只求左右纯臂多组 IK。
-        # 目标原始表达在 moveit_base_link；纯臂 IK 必须分别转换到 l/r_base_link。
+        # 第一级：固定预计起点的身体状态，只求左右纯臂多组 IK。
+        # 直接提交固定模型坐标系目标，避免服务使用运动中的实时臂基座 TF。
         # ------------------------------------------------------------------
-        left_base_pose = planner._get_link_pose_fk(
-            "l_base_link",
-            joints=current_full,
-            plan_frame=SCENE_FRAME,
-        )
-        right_base_pose = planner._get_link_pose_fk(
-            "r_base_link",
-            joints=current_full,
-            plan_frame=SCENE_FRAME,
-        )
-        if left_base_pose is None or right_base_pose is None:
-            log.error("[unload] 计算当前左右纯臂基座位姿失败")
-            return False
-        left_pose_in_arm_base = pose_relative_to_frame(
-            left_pose,
-            left_base_pose,
-        )
-        right_pose_in_arm_base = pose_relative_to_frame(
-            right_pose,
-            right_base_pose,
-        )
         log.info(
-            "[unload] 纯臂 IK 基座：左目标转换到 l_base_link，"
-            "右目标转换到 r_base_link"
+            f"[unload] 左右纯臂 IK 使用 {SCENE_FRAME} 目标和完整预计关节状态"
         )
 
         left_arm_solutions = planner._solve_ik_candidates_from_seed(
             "left_arm",
             "l_tool",
-            left_pose_in_arm_base,
+            left_pose,
             left_joint_names,
             current_full,
-            plan_frame="l_base_link",
+            plan_frame=SCENE_FRAME,
             n_attempts=UNLOAD_PLACE_ARM_IK_ATTEMPTS,
             max_solutions=UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS,
             random_seed=(
@@ -10386,10 +10385,10 @@ def _run_main(
         right_arm_solutions = planner._solve_ik_candidates_from_seed(
             "right_arm",
             "r_tool",
-            right_pose_in_arm_base,
+            right_pose,
             right_joint_names,
             current_full,
-            plan_frame="r_base_link",
+            plan_frame=SCENE_FRAME,
             n_attempts=UNLOAD_PLACE_ARM_IK_ATTEMPTS,
             max_solutions=UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS,
             random_seed=(
@@ -10461,10 +10460,6 @@ def _run_main(
             f"[unload] 纯臂共生成 {len(pure_pairs)} 个左右组合，"
             f"按关节距离全范围分布验证 {len(pure_pairs_to_validate)} 组"
         )
-        pure_start = {
-            name: current_full[name]
-            for name in dual_arm_joint_names
-        }
         for pair_index, (
             left_solution,
             left_descent,
@@ -10485,7 +10480,7 @@ def _run_main(
             cached_plan = validate_place_candidate(
                 "dual_arm",
                 target,
-                pure_start,
+                current_full,
                 label,
                 left_descent,
                 right_descent,
