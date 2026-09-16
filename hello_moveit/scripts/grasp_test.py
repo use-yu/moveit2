@@ -4,7 +4,7 @@
 """
 G01 MoveIt 演示脚本
 
-功能按 1~14 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
+功能按 1~15 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
 1. 导航到深框识别位置。
 2. 运动到深框识别构型，识别深框，并记录当时 /lio/odom 实际位姿；
    未收到有效视觉数据时最多重复发送识别命令 5 次。
@@ -411,7 +411,7 @@ MOVE_TO_GRASP_RESET_Q = [
     1.672852,
     0.588477,
 ]
-# 键盘 9：当前位置直接识别深框的独立构型。
+# 键盘 9：直接识别深框，仅使用此构型的腰部角度，升降和双臂保持不动。
 FRAME_DIRECT_VISION_Q = [
     0,
     0 * math.pi / 180,
@@ -650,6 +650,7 @@ STEP_DESCRIPTIONS = {
     12: "发送 p,6 识别物料台并添加碰撞模型",
     13: "抓取物料台第一排，双臂放回后方空 SW 位",
     14: "先 SW2/SW4 再 SW1/SW3，双臂下料到深框中心两侧",
+    15: "清除环境中全部碰撞物",
 }
 NAV_GOAL_POSES = {
     NAV_TARGET_FRAME_RECOGNITION: {
@@ -8426,9 +8427,9 @@ def wait_for_keyboard_steps() -> tuple[int, ...] | None:
 
         if choice in {"0", "q", "quit", "exit"}:
             return None
-        match = re.fullmatch(r"(1[0-4]|[1-9])(?:\s*-\s*(1[0-4]|[1-9]))?", choice)
+        match = re.fullmatch(r"(1[0-5]|[1-9])(?:\s*-\s*(1[0-5]|[1-9]))?", choice)
         if match is None:
-            print(f"无效输入 {choice!r}，请输入 1~14 或正向区间（如 1-3）。")
+            print(f"无效输入 {choice!r}，请输入 1~15 或正向区间（如 1-3）。")
             continue
 
         start = int(match.group(1))
@@ -8478,7 +8479,7 @@ def _run_main(
     if keyboard_control_mode:
         log.info(
             "[keyboard] 已启用键盘流程选择；主循环不等待上位机命令。"
-            "输入 1~14 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
+            "输入 1~15 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
         )
     code = 1
     frame_added = False
@@ -8863,12 +8864,17 @@ def _run_main(
         q1_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
         vision_q = FRAME_DIRECT_VISION_Q if add_directly else 框_Q1
         vision_q_name = "FRAME_DIRECT_VISION_Q" if add_directly else "框_Q1"
+        vision_group = "dual_arm_body"
+        if add_directly:
+            vision_group = "waist"
+            vision_q = [vision_q[q1_joint_names.index("body_joint2")]]
+            q1_joint_names = ["body_joint2"]
         log.info(
             f"[frame-vision] {FRAME_VISION_TRIGGER_COMMAND} 识别前，"
-            f"dual_arm_body 先关节空间运动到 {vision_q_name}"
+            f"{vision_group} 先关节空间运动到 {vision_q_name}"
         )
         if not node.plan_execute_joint_waypoints(
-            "dual_arm_body",
+            vision_group,
             0.2,
             q1_joint_names,
             [vision_q],
@@ -11187,6 +11193,8 @@ def _run_main(
     def execute_step(step: int, source: str, payload: dict) -> bool:
         """执行一个独立步骤；区间和上位机流程均复用此入口。"""
         nonlocal frame_added
+        nonlocal unload_scene_added, unload_place_poses
+        nonlocal pending_frame_recognition_pose, frame_recognition_odom
         log.info(f"[{source}][步骤 {step}] {STEP_DESCRIPTIONS[step]}")
 
         if sim_mode and source == "keyboard":
@@ -11238,6 +11246,17 @@ def _run_main(
             return run_table_to_rear_cycle()
         if step == 14:
             return run_unload_cycle(to_frame=True)
+        if step == 15:
+            if not node.clear_world_scene_objects(service_timeout=10.0):
+                log.error("[scene-cleanup] 清除环境碰撞物失败，保留场景记录")
+                return False
+            frame_added = False
+            unload_scene_added = False
+            unload_place_poses = None
+            pending_frame_recognition_pose = None
+            frame_recognition_odom = None
+            log.info("[scene-cleanup] 环境碰撞物已全部清除，相关场景记录已清空")
+            return True
 
         log.error(f"未知步骤: {step}")
         return False
