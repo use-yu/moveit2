@@ -728,7 +728,7 @@ DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 #   SW2+SW4: (2,4) → (12,14) → (2,4) → ...
 UNLOAD_TRIGGER_COMMAND = "p,4"
 LOAD_TABLE_TRIGGER_COMMAND = "p,6"
-UNLOAD_VISION_POSE_KEY = "right_body"
+UNLOAD_VISION_POSE_KEY = "right_body"  # 料台碰撞模型和视觉基准 TF 使用右标定。
 UNLOAD_VISION_TF_FRAME = "material_table_vision"
 UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
 UNLOAD_PLACE_TF_FRAME_PREFIX = "material_table_place_point_"
@@ -736,6 +736,7 @@ UNLOAD_PAIR_CYCLES = (
     ("sw1", "sw3", ((1, 3), (11, 13))),
     ("sw4", "sw2", ((2, 4), (12, 14))),
 )
+UNLOAD_LEFT_PLACE_POINTS = (1, 2, 11, 12)
 UNLOAD_MAX_PAIRS_PER_RUN = 2
 UNLOAD_TABLE_ID = "unload_table"
 UNLOAD_TABLE_SIZE = (0.57, 1.7, 1.0) #0.5
@@ -2299,11 +2300,17 @@ def make_unload_obstacle(recognition_pose: Pose) -> CollisionObject:
     return obj
 
 
-def make_unload_place_poses(recognition_pose: Pose) -> dict[int, Pose]:
-    """以视觉识别点为基准，生成八个局部偏移后的放置位姿。"""
+def make_unload_place_poses(
+    left_recognition_pose: Pose, right_recognition_pose: Pose,
+) -> dict[int, Pose]:
+    """左臂点使用左标定，右臂点使用右标定，均表达在 SCENE_FRAME。"""
     return {
         point_index: pose_rotate_local_rpy(
-            pose_offset_local(recognition_pose, *local_offset),
+            pose_offset_local(
+                left_recognition_pose if point_index in UNLOAD_LEFT_PLACE_POINTS
+                else right_recognition_pose,
+                *local_offset,
+            ),
             0.0,
             UNLOAD_PLACE_LOCAL_PITCH,
             UNLOAD_PLACE_LOCAL_YAWS[point_index],
@@ -2903,6 +2910,8 @@ class UnloadPlaceTrajectoryPlan:
     label: str
     to_place: RobotTrajectory
     descent: RobotTrajectory
+    left_return_pose: Pose | None = None
+    right_return_pose: Pose | None = None
 
 
 @dataclass
@@ -10063,12 +10072,12 @@ def _run_main(
             label: str,
             left_descent: RobotTrajectory,
             right_descent: RobotTrajectory,
-        ) -> tuple[RobotTrajectory, RobotTrajectory] | None:
+        ) -> tuple[RobotTrajectory, RobotTrajectory, Pose | None, Pose | None] | None:
             """验证一个 IK 组合并缓存到预备位和直线下降轨迹。
 
             验证顺序为：左右臂分别验证仅考虑自碰撞的 Cartesian 下降，再用
             OMPL 验证从当前状态到放置预备位。成功时返回
-            ``(to_place_trajectory, merged_descent_trajectory)``；本函数绝不执行
+            到预备位轨迹、同步下降轨迹及左右预备点位姿；本函数绝不执行
             运动，因此可以安全地继续尝试其他 IK 构型。
             """
             candidate_state = dict(current_full)
@@ -10132,20 +10141,37 @@ def _run_main(
                 if merged_descent is None:
                     return None
 
+            left_return_pose = right_return_pose = None
+            if not table_pregrasp_only:
+                left_return_pose = planner._get_link_pose_fk(
+                    "l_tool", joints=endpoint_state, plan_frame=SCENE_FRAME,
+                )
+                right_return_pose = planner._get_link_pose_fk(
+                    "r_tool", joints=endpoint_state, plan_frame=SCENE_FRAME,
+                )
+                if left_return_pose is None or right_return_pose is None:
+                    log.error(f"[unload] {label} 规划阶段记录放置预备点 FK 失败")
+                    return None
+
             log.info(
                 f"[unload] {label}："
                 + ("IK、OMPL 均通过，" if table_pregrasp_only else "IK、左右 Cartesian、OMPL 均通过，")
                 + "已缓存全部执行轨迹"
             )
-            return trajectory, merged_descent
+            return trajectory, merged_descent, left_return_pose, right_return_pose
 
         def execute_cached_place_plan(
             group: str,
             label: str,
             to_place: RobotTrajectory,
             descent: RobotTrajectory,
+            left_return_pose: Pose | None,
+            right_return_pose: Pose | None,
         ) -> bool:
             """只执行可达性阶段缓存的轨迹，不再调用 IK 或规划服务。"""
+            if left_return_pose is None or right_return_pose is None:
+                log.error(f"[unload] {label} 缺少规划缓存的放置预备点位姿，禁止执行")
+                return False
             log.info(
                 f"[unload] 已选中 {label}，直接执行缓存的 {group} "
                 "联合轨迹到放置预备位"
@@ -10160,33 +10186,6 @@ def _run_main(
                 on_place_motion_start(end_state)
             if not node._execute_traj(to_place):
                 log.error(f"[unload] {label} 联合轨迹执行失败")
-                return False
-
-            return_state = node._get_joints(
-                dual_body_joint_names,
-                wait_new=True,
-            )
-            if return_state is None:
-                log.error(
-                    f"[unload] {label} 无法记录放置预备位实测关节，"
-                    "禁止执行下降"
-                )
-                return False
-            left_return_pose = node._get_link_pose_fk(
-                "l_tool",
-                joints=return_state,
-                plan_frame=SCENE_FRAME,
-            )
-            right_return_pose = node._get_link_pose_fk(
-                "r_tool",
-                joints=return_state,
-                plan_frame=SCENE_FRAME,
-            )
-            if left_return_pose is None or right_return_pose is None:
-                log.error(
-                    f"[unload] {label} 无法记录放置预备位双臂末端位姿，"
-                    "禁止执行下降"
-                )
                 return False
 
             node.wait_for_operator(
@@ -10335,6 +10334,8 @@ def _run_main(
                 preplanned.label,
                 preplanned.to_place,
                 preplanned.descent,
+                preplanned.left_return_pose,
+                preplanned.right_return_pose,
             )
 
         # ------------------------------------------------------------------
@@ -10490,16 +10491,19 @@ def _run_main(
                 right_descent,
             )
             if cached_plan is not None:
-                to_place, descent = cached_plan
+                to_place, descent, left_return_pose, right_return_pose = cached_plan
                 if plan_only:
                     return UnloadPlaceTrajectoryPlan(
                         "dual_arm", label, to_place, descent,
+                        left_return_pose, right_return_pose,
                     )
                 return execute_cached_place_plan(
                     "dual_arm",
                     label,
                     to_place,
                     descent,
+                    left_return_pose,
+                    right_return_pose,
                 )
 
         log.warning(
@@ -10623,16 +10627,19 @@ def _run_main(
                     right_descent,
                 )
                 if cached_plan is not None:
-                    to_place, descent = cached_plan
+                    to_place, descent, left_return_pose, right_return_pose = cached_plan
                     if plan_only:
                         return UnloadPlaceTrajectoryPlan(
                             fallback_dual_group, label, to_place, descent,
+                            left_return_pose, right_return_pose,
                         )
                     return execute_cached_place_plan(
                         "dual_arm_body",
                         label,
                         to_place,
                         descent,
+                        left_return_pose,
+                        right_return_pose,
                     )
             if body_plan_count >= UNLOAD_PLACE_MAX_PAIR_PLANS:
                 break
@@ -10687,7 +10694,7 @@ def _run_main(
             )
             return False
 
-        # 识别姿态同时用于构造场景和八个局部放置点。
+        # 场景沿用右标定；左右放置点分别使用各自的标定结果。
         vision_result = read_scene_vision_object_pose_with_retry(
             node,
             log,
@@ -10701,9 +10708,11 @@ def _run_main(
         _, all_xyz_rpy = vision_result
         recognition_values = all_xyz_rpy[0][UNLOAD_VISION_POSE_KEY]
         recognition_pose = make_pose(*recognition_values)
+        left_recognition_pose = make_pose(*all_xyz_rpy[0]["left_body"])
+        right_recognition_pose = make_pose(*all_xyz_rpy[0]["right_body"])
         node.publish_unload_vision_tf(recognition_pose)
         node.publish_unload_table_top_tf(recognition_pose)
-        place_poses = make_unload_place_poses(recognition_pose)
+        place_poses = make_unload_place_poses(left_recognition_pose, right_recognition_pose)
         node.publish_unload_place_tfs(place_poses)
         log.info(
             f"[unload] {trigger_command} 识别点 @ {SCENE_FRAME}: "
@@ -10715,8 +10724,9 @@ def _run_main(
             local_offset = UNLOAD_PLACE_LOCAL_OFFSETS[point_index]
             local_pitch_deg = math.degrees(UNLOAD_PLACE_LOCAL_PITCH)
             local_yaw_deg = math.degrees(UNLOAD_PLACE_LOCAL_YAWS[point_index])
+            calibration_side = "左" if point_index in UNLOAD_LEFT_PLACE_POINTS else "右"
             log.info(
-                f"[unload] 物料台点{point_index} vision_local={local_offset}, "
+                f"[unload] 物料台点{point_index} 使用{calibration_side}标定，vision_local={local_offset}, "
                 f"local_rpy=(0.0, {local_pitch_deg:.1f}, "
                 f"{local_yaw_deg:.1f}) deg, "
                 f"base=({point_pose.position.x:.4f}, "
@@ -10950,6 +10960,20 @@ def _run_main(
         elif not unload_scene_added or place_targets is None:
             log.error("[unload] 尚未执行步骤 6，缺少物料台碰撞模型和放置位")
             return False
+
+        if not to_frame:
+            for cycle_index, (_, _, point_pairs) in enumerate(UNLOAD_PAIR_CYCLES):
+                left_point, right_point = point_pairs[
+                    unload_cycle_indices[cycle_index] % len(point_pairs)
+                ]
+                for side, point in (("左臂", left_point), ("右臂", right_point)):
+                    x, y, z, roll, pitch, yaw = pose_to_xyz_rpy(place_targets[point])
+                    print(
+                        f"{GREEN}[unload] {side}放置预备点{point} @ {SCENE_FRAME}: "
+                        f"xyz(m)=({x:.6f}, {y:.6f}, {z:.6f}), "
+                        f"rpy(deg)=({math.degrees(roll):.6f}, "
+                        f"{math.degrees(pitch):.6f}, {math.degrees(yaw):.6f}){RESET}"
+                    )
 
         used_pairs: set[int] = set()
 
