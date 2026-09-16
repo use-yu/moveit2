@@ -201,7 +201,7 @@ TRAJECTORY_CACHE_DIR = (
     if _SOURCE_DATA_DIR.parent.is_dir()
     else Path(__file__).resolve().parents[1] / "data"
 ) / "trajectory_cache"
-TRAJECTORY_CACHE_VERSION = 1
+TRAJECTORY_CACHE_VERSION = 2  # 固定坐标系和完整预计状态规划；旧轨迹需重新生成。
 
 # =============================================================================
 # 用户可调参数（改这里即可，无需动下面逻辑）
@@ -1803,16 +1803,16 @@ def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
             "side": side,
             "group": f"{side}_arm",
             "link": "l_tool" if side == "left" else "r_tool",
-            "plan_frame": "l_base_link" if side == "left" else "r_base_link",
-            "xyz_key": side,
+            "plan_frame": SCENE_FRAME,
+            "xyz_key": f"{side}_body",
         })
     for side in side_order:
         attempts.append({
             "side": side,
             "group": f"{side}_waist",
             "link": "l_tool" if side == "left" else "r_tool",
-            "plan_frame": "SJ",
-            "xyz_key": f"{side}_sj",
+            "plan_frame": SCENE_FRAME,
+            "xyz_key": f"{side}_body",
         })
     for side in side_order:
         attempts.append({
@@ -6576,10 +6576,11 @@ class G01Demo(Node):
         dedup_tol: float = 1e-2,
         avoid_collisions: bool = True,
         plan_frame: str = PLAN_FRAME,
+        planning_start_joints: Mapping[str, float] | None = None,
     ) -> list[dict]:
         """通过随机种子枚举 pose 在 group 上的多个不同 IK 解。
 
-        - 第 0 次以当前 joint_states 为种子，能拿到「最自然」的解。
+        - 第 0 次使用完整预计起点；未指定时读取完整 joint_states。
         - 之后每次按 URDF 位置限位，对 `joint_names` 中的关节做全范围均匀采样。
         - 用 dedup_tol 在关节空间做去重（任一关节差异 < tol 视为同解）。
         - 失败时统计 error_code，方便区分「数值无解 / 碰撞被拒 / 输入非法」。
@@ -6588,7 +6589,8 @@ class G01Demo(Node):
         rng = random.Random(IK_RANDOM_SEED) if IK_RANDOM_SEED is not None else random
         log = self.get_logger()
 
-        current = self._get_joints(list(joint_names), wait_new=True)
+        current = (dict(planning_start_joints) if planning_start_joints is not None
+                   else self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True))
         if current is None:
             log.error("[ik-multi] 读取当前关节失败，无法构造种子")
             return []
@@ -6615,10 +6617,11 @@ class G01Demo(Node):
             if i == 0:
                 seed = dict(current)
             else:
-                seed = {
+                seed = dict(current)
+                seed.update({
                     name: rng.uniform(*joint_limits[name])
                     for name in joint_names
-                }
+                })
             sol, code = self._solve_ik(
                 group, link, pose, seed,
                 avoid_collisions=avoid_collisions, return_code=True, plan_frame=plan_frame,
@@ -6683,7 +6686,7 @@ class G01Demo(Node):
                 )
                 continue
 
-            seed = {n: raw_seed[n] for n in joint_names}
+            seed = dict(raw_seed)
             sol, code = self._solve_ik(
                 group, link, pose, seed,
                 avoid_collisions=avoid_collisions, return_code=True, plan_frame=plan_frame,
@@ -6742,6 +6745,12 @@ class G01Demo(Node):
             即真正用来「从 pre_pose 直线接近 target_pose」的轨迹。
         """
         log = self.get_logger()
+        planning_start_joints = (
+            dict(planning_start_joints) if planning_start_joints is not None
+            else self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True)
+        )
+        if planning_start_joints is None:
+            return None
         if target_seeds is None:
             candidates = self._solve_ik_multi(
                 group,
@@ -6751,10 +6760,13 @@ class G01Demo(Node):
                 n_candidates,
                 avoid_collisions=True,
                 plan_frame=plan_frame,
+                planning_start_joints=planning_start_joints,
             )
         else:
             candidates = self._solve_ik_from_seeds(
-                group, link, target_pose, joint_names, target_seeds, plan_frame=plan_frame
+                group, link, target_pose, joint_names,
+                [{**planning_start_joints, **seed} for seed in target_seeds],
+                plan_frame=plan_frame,
             )
         if not candidates:
             log.error("[grasp-select] target_pose 在该 group 上没有任何 IK 解")
@@ -6775,7 +6787,7 @@ class G01Demo(Node):
             retreat_traj = self.plan_cartesian_line(
                 group, link, pre_pose,
                 speed_scale=speed_scale,
-                start_joints=q_target,
+                start_joints={**planning_start_joints, **q_target},
                 joint_names=joint_names,
                 plan_frame=plan_frame,
                 verbose=False,
@@ -7109,6 +7121,7 @@ class G01Demo(Node):
         speed: float,
     ) -> PlaceTrajectoryPlan | None:
         """纯规划放置去程、下降和 Q1 复位轨迹，不执行任何运动。"""
+        arm_plan_frame = SCENE_FRAME
         cache_key = f"input4_place_{arm_group}_{yubei_name}_{place_name}"
         cached = _load_trajectory_cache(
             cache_key,
@@ -7163,12 +7176,7 @@ class G01Demo(Node):
             joint_names=arm_joint_names,
             plan_frame=arm_plan_frame,
         )
-        fang_pose = self._get_link_pose_fk(
-            link,
-            joints=dict(zip(arm_joint_names, fang_joints)),
-            plan_frame=arm_plan_frame,
-        )
-        if yubei_pose is None or fang_pose is None:
+        if yubei_pose is None:
             return None
         fang_state = dict(yubei_state)
         fang_state.update(zip(arm_joint_names, fang_joints))
@@ -7404,11 +7412,7 @@ class G01Demo(Node):
                 clearance_moved = True
 
         log.info(f"[pick] 5/9  {body_group} OMPL → {yubei_name}")
-        start_joint_names = (
-            joint_names_for_group("dual_arm_body")
-            if clearance_moved
-            else body_joint_names
-        )
+        start_joint_names = joint_names_for_group("dual_arm_body")
         current = self._get_joints(start_joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取放置规划当前实测关节状态失败")
@@ -8224,14 +8228,14 @@ class G01Demo(Node):
             return None
         receiver_side = "left" if source_side == "right" else "right"
         source_group = "right_arm" if source_side == "right" else "left_arm"
-        source_plan_frame = "r_base_link" if source_side == "right" else "l_base_link"
+        source_plan_frame = SCENE_FRAME
         source_joint_names = joint_names_for_group(source_group)
         q2_source = list(q2_by_side[source_side])
         if len(q2_source) != 14:
             self.get_logger().error(f"[exchange] EXCHANGE_Q2[{source_side!r}] 长度错误")
             return None
         q2 = q2_source[-len(exchange_joint_names):]
-        start = dict(start_joints) if start_joints is not None else self._get_joints(exchange_joint_names)
+        start = dict(start_joints) if start_joints is not None else self._get_joints(joint_names_for_group("dual_arm_body"))
         if start is None:
             return None
         ok, _, to_q2 = self.plan_joint_motion(
@@ -9783,13 +9787,13 @@ def _run_main(
             "l_tool",
             joints=current,
             joint_names=left_joint_names,
-            plan_frame="l_base_link",
+            plan_frame=SCENE_FRAME,
         )
         right_pose = planner._get_link_pose_fk(
             "r_tool",
             joints=current,
             joint_names=right_joint_names,
-            plan_frame="r_base_link",
+            plan_frame=SCENE_FRAME,
         )
         if left_pose is None or right_pose is None:
             log.error("[unload] 计算 yubei 处左右末端 FK 失败")
@@ -9818,7 +9822,7 @@ def _run_main(
             avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
             start_joints=current,
             joint_names=left_joint_names,
-            plan_frame="l_base_link",
+            plan_frame=SCENE_FRAME,
         )
         right_trajectory = planner.plan_cartesian_line(
             "right_arm",
@@ -9828,7 +9832,7 @@ def _run_main(
             avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
             start_joints=current,
             joint_names=right_joint_names,
-            plan_frame="r_base_link",
+            plan_frame=SCENE_FRAME,
         )
         if left_trajectory is None or right_trajectory is None:
             log.error("[unload] 至少一只手臂的 Cartesian 规划失败")
