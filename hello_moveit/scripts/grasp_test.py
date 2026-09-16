@@ -166,6 +166,7 @@ from dobot_msgs_v4.srv import ClearError, SetToolPower
 # 错误事件话题；主程序启动时发布一次 0 清错，保留原有运动/恢复流程。
 ERROR_CODE_TOPIC = "/arm_camera_error_code"
 ALGORITHM_INITIALIZED_TOPIC = "/arm_algorithm_initialized"
+SELFCHECK_REQUEST_TOPIC = "/selfcheck_request"
 ERROR_CODES = {
     0: "清除错误状态",
     1: "相机 TCP 连接失败",
@@ -3329,9 +3330,15 @@ class G01Demo(Node):
         sim_mode: bool = False,
         upper_control_mode: bool = True,
         node_name: str = "g01_demo",
+        upper_communication: bool = True,
     ):
         super().__init__(node_name)
-        self._error_pub = self.create_publisher(Int32, ERROR_CODE_TOPIC, 100)
+        self._error_pub = (
+            self.create_publisher(Int32, ERROR_CODE_TOPIC, 100)
+            if upper_communication else None
+        )
+        self._defer_error_publish = False
+        self._startup_error_codes: list[int] = []
         self.sim_mode = bool(sim_mode)
         self.upper_control_mode = bool(upper_control_mode)
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
@@ -3407,13 +3414,13 @@ class G01Demo(Node):
         self._servoj_request_id = 0
         self._servoj_control_acks: dict[tuple[str, str, int], dict] = {}
         self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
-        for command_topic in (
+        for command_topic in ((
             MOVE_TO_GRASP_POSE_CMD_TOPIC,
             GRASP_CMD_TOPIC,
             MOVE_TO_PLACE_POSE_CMD_TOPIC,
             PLACE_CMD_TOPIC,
             RETURN_INIT_POSE_TOPIC,
-        ):
+        ) if upper_communication else ()):
             self.create_subscription(
                 String,
                 command_topic,
@@ -3475,7 +3482,11 @@ class G01Demo(Node):
 
     def publish_error(self, code: int, detail: str = "") -> None:
         """发布一次错误事件或 0 清错；具体上下文保留在日志中。"""
-        self._error_pub.publish(Int32(data=int(code)))
+        if self._defer_error_publish:
+            if code and code not in self._startup_error_codes:
+                self._startup_error_codes.append(int(code))
+        elif self._error_pub is not None:
+            self._error_pub.publish(Int32(data=int(code)))
         message = f"[error-code={code}] {ERROR_CODES[code]}: {detail}"
         if code == 0:
             self.get_logger().info(message)
@@ -8433,7 +8444,7 @@ def wait_for_keyboard_steps() -> tuple[int, ...] | None:
 
 def _run_main(
     argv: list[str] | None,
-    publish_initialized: Callable[[bool], None],
+    publish_initialized: Callable[[bool, Sequence[int]], None],
 ) -> int:
     global _runtime_error_reporter
     (
@@ -8445,14 +8456,17 @@ def _run_main(
     node = G01Demo(
         sim_mode=sim_mode,
         upper_control_mode=upper_control_mode,
+        upper_communication=not keyboard_control_mode,
     )
     _runtime_error_reporter = node.publish_error
-    node.publish_error(0, "程序启动，清除上次错误状态")
+    node._defer_error_publish = True
     planner_node = G01Demo(
         sim_mode=sim_mode,
         upper_control_mode=True,
         node_name="g01_background_planner",
+        upper_communication=False,
     )
+    planner_node.publish_error = node.publish_error
     planner_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grasp-plan")
     log = node.get_logger()
     if sim_mode:
@@ -11232,12 +11246,12 @@ def _run_main(
         frame_added = False
         code = 0
 
-        # 自检失败的对应错误码已由检查项发布，随后反馈 false。
-        if not node.verify_startup_hardware():
-            publish_initialized(False)
+        startup_ok = node.verify_startup_hardware()
+        publish_initialized(startup_ok, node._startup_error_codes)
+        node._defer_error_publish = False
+        if not startup_ok:
             log.error("[startup-check] 初始化自检失败，不进入等待命令流程")
             return 1
-        publish_initialized(True)
         while rclpy.ok():
             if keyboard_control_mode:
                 steps = wait_for_keyboard_steps()
@@ -11291,16 +11305,38 @@ def _run_main(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """独立状态发布器覆盖主/后台节点初始化失败，仅发送一次初始化结果。"""
+    """非键盘模式自检结束后等待上位机请求，再反馈初始化结果。"""
     global _runtime_error_reporter
     status_node = None
     status_pub = None
+    error_pub = None
     initialization_reported = False
 
-    def publish_initialized(success: bool) -> None:
+    def publish_initialized(success: bool, error_codes: Sequence[int] = ()) -> None:
         nonlocal initialization_reported
-        if initialization_reported:
+        if initialization_reported or status_node is None:
             return
+        requested = False
+
+        def on_request(msg: Bool) -> None:
+            nonlocal requested
+            requested = True
+
+        subscription = status_node.create_subscription(
+            Bool, SELFCHECK_REQUEST_TOPIC, on_request, 1,
+        )
+        status_node.get_logger().info(
+            f"[startup-check] 自检结束（success={success}），等待 {SELFCHECK_REQUEST_TOPIC}"
+        )
+        try:
+            while rclpy.ok() and not requested:
+                rclpy.spin_once(status_node, timeout_sec=0.1)
+            if not requested:
+                return
+            for code in ([0] if success else (list(error_codes) or [99])):
+                error_pub.publish(Int32(data=code))
+        finally:
+            status_node.destroy_subscription(subscription)
         status_pub.publish(Bool(data=success))
         initialization_reported = True
         message = f"{ALGORITHM_INITIALIZED_TOPIC}: {success}"
@@ -11310,10 +11346,13 @@ def main(argv: list[str] | None = None) -> int:
             status_node.get_logger().error(message)
 
     try:
-        ros_args = split_runtime_args(argv)[3]
+        _, _, keyboard_control_mode, ros_args = split_runtime_args(argv)
         rclpy.init(args=ros_args)
+        if keyboard_control_mode:
+            return _run_main(argv, publish_initialized)
         # 在 G01Demo 构造之前创建，主节点构造失败也能反馈 false。
         status_node = Node("arm_algorithm_initialization")
+        error_pub = status_node.create_publisher(Int32, ERROR_CODE_TOPIC, 100)
         status_pub = status_node.create_publisher(
             Bool,
             ALGORITHM_INITIALIZED_TOPIC,
