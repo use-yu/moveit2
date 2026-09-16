@@ -10794,6 +10794,26 @@ def _run_main(
                 return False
             return node._execute_traj(trajectory)
 
+        def plan_rear_place(right_slot, left_slot, start):
+            rear = execute_unload_pick_pair(
+                right_slot, left_slot, plan_only=True,
+                planning_start_joints=start, planning_node=planner_node,
+            )
+            if not isinstance(rear, UnloadPickTrajectoryPlan):
+                return None
+            # 在后台规划阶段保存固定坐标系下的预备点，供异常直线退回使用。
+            pre_state = endpoint_state(start, rear.to_yubei)
+            left_pre = planner_node._get_link_pose_fk(
+                "l_tool", joints=pre_state, plan_frame=SCENE_FRAME,
+            )
+            right_pre = planner_node._get_link_pose_fk(
+                "r_tool", joints=pre_state, plan_frame=SCENE_FRAME,
+            )
+            if left_pre is None or right_pre is None:
+                log.error("[table-to-rear][pipeline] 后方放置预备点 FK 失败")
+                return None
+            return rear, left_pre, right_pre
+
         next_pick = None
         if not node._wait_for_driver_signal(require_new=True):
             return False
@@ -10826,9 +10846,7 @@ def _run_main(
                 return False
             pick_end = endpoint_state(start, pick.to_place)
             rear_future = submit(
-                execute_unload_pick_pair, right_slot, left_slot,
-                plan_only=True, planning_start_joints=pick_end,
-                planning_node=planner_node,
+                plan_rear_place, right_slot, left_slot, pick_end,
             )
             log.info("[table-to-rear][pipeline] 执行料台抓取，同时后台规划后方放置")
             if not execute_checked(pick.to_place):
@@ -10843,9 +10861,10 @@ def _run_main(
                 return False
 
             # 复用步骤 7 的 SW yubei/直线规划，只执行放置所需的动作顺序。
-            rear = rear_future.result()
-            if not isinstance(rear, UnloadPickTrajectoryPlan):
+            rear_result = rear_future.result()
+            if rear_result is None:
                 return False
+            rear, left_pre, right_pre = rear_result
             if not node._wait_for_driver_signal(require_new=True):
                 return False
             if not pair_empty(right_slot, left_slot):
@@ -10870,14 +10889,9 @@ def _run_main(
             if not pair_empty(right_slot, left_slot):
                 log.error("[table-to-rear] 下降前发现后方目标非空，取消放置并保持上电")
                 return False
-            current = node._get_joints(full_names, wait_new=True)
-            if current is None:
-                return False
-            left_pre = node._get_link_pose_fk("l_tool", joints=current, plan_frame=SCENE_FRAME)
-            right_pre = node._get_link_pose_fk("r_tool", joints=current, plan_frame=SCENE_FRAME)
             left_fz = node.wait_for_ft_sensor_z("left")
             right_fz = node.wait_for_ft_sensor_z("right")
-            if left_pre is None or right_pre is None or left_fz is None or right_fz is None:
+            if left_fz is None or right_fz is None:
                 return False
             result = node._execute_approach_with_force_guard(
                 rear.approach, ("left", "right"),
