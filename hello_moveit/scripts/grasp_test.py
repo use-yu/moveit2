@@ -8747,7 +8747,36 @@ def _run_main(
     table_pick_descent: RobotTrajectory | None = None
     table_pick_top: Pose | None = None
 
+    def read_dual_grasp_fz(stage: str) -> dict[str, float] | None:
+        values = {side: node.wait_for_ft_sensor_z(side) for side in ("left", "right")}
+        if any(value is None or not math.isfinite(value) for value in values.values()):
+            log.error(f"[{stage}] 双臂 Fz 读取失败，停止抓取流程")
+            return None
+        return values
+
+    def check_dual_suction(before: Mapping[str, float], stage: str) -> bool | None:
+        after = read_dual_grasp_fz(stage)
+        if after is None:
+            return None
+        increases = {side: after[side] - before[side] for side in before}
+        log.info(
+            f"[{stage}] 吸附检测：左臂 ΔFz={increases['left']:.3f} N，"
+            f"右臂 ΔFz={increases['right']:.3f} N；两侧均须 > "
+            f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N"
+        )
+        return node.sim_mode or all(
+            value > GRASP_FORCE_Z_INCREASE_THRESHOLD for value in increases.values()
+        )
+
     def run_table_pick_place(*, place: bool) -> bool:
+        while rclpy.ok():
+            result = attempt_table_pick_place(place=place)
+            if result is not None:
+                return result
+            log.warning("[table] 双臂未全部吸附成功，重新识别并抓取料台")
+        return False
+
+    def attempt_table_pick_place(*, place: bool) -> bool | None:
         """步骤 10 抓起料台；步骤 11 使用本次抓取轨迹原位放回。"""
         nonlocal table_pick_descent, table_pick_top
         reset_names = joint_names_for_group("dual_arm_body")
@@ -8859,6 +8888,9 @@ def _run_main(
             return False
         if not table_pick_validate_dual_trajectory(node, descent):
             return False
+        force_before = read_dual_grasp_fz("table")
+        if force_before is None:
+            return False
         if not node._execute_traj(descent):
             return False
         table_pick_descent, table_pick_top = descent, top
@@ -8867,6 +8899,19 @@ def _run_main(
         time.sleep(TABLE_PICK_TOOL_POWER_SETTLE_SEC)
         if not node._execute_traj(node._reverse_trajectory(descent)):
             return False
+        suction_ok = check_dual_suction(force_before, "table")
+        if suction_ok is None:
+            return False
+        if not suction_ok:
+            if not set_unload_tool_power(0, "料台吸附失败，已直线退回"):
+                return False
+            table_pick_descent = table_pick_top = None
+            if not node._apply_scene(
+                [table_pick_make_table_collision(top)],
+                [ObjectColor(id=TABLE_PICK_TABLE_ID, color=TABLE_PICK_TABLE_COLOR)],
+            ):
+                return False
+            return None
         log.info("[table] 双臂已抓起料台并直线返回预抓点，可输入 11 原位放回")
         return True
 
@@ -10843,30 +10888,58 @@ def _run_main(
                 f"[table-to-rear] 左点{left_point} → {left_slot}，"
                 f"右点{right_point} → {right_slot}，只取第一排"
             )
-            # 同一物料台位置与下降轨迹，反转工具动作即可由放置改为抓取。
-            pick = next_pick.result() if next_pick is not None else move_unload_pair_to_place(
-                unload_place_poses, left_point, right_point, plan_only=True,
-            )
-            next_pick = None
-            if not isinstance(pick, UnloadPlaceTrajectoryPlan):
-                return False
-            start = node._get_joints(full_names, wait_new=True)
-            if start is None:
-                return False
-            pick_end = endpoint_state(start, pick.to_place)
-            rear_future = submit(
-                plan_rear_place, right_slot, left_slot, pick_end,
-            )
-            log.info("[table-to-rear][pipeline] 执行料台抓取，同时后台规划后方放置")
-            if not execute_checked(pick.to_place):
-                return False
-            node.wait_for_operator("按回车执行双臂同步直线抓取料台第一排物料: ")
-            if not node._execute_traj(pick.descent):
-                return False
-            if not set_unload_tool_power(1, "料台第一排取料"):
-                return False
-            time.sleep(UNLOAD_TOOL_SETTLE_SEC)
-            if not node._execute_traj(node._reverse_trajectory(pick.descent)):
+            while rclpy.ok():
+                if not node._wait_for_driver_signal(require_new=True):
+                    return False
+                if not pair_empty(right_slot, left_slot):
+                    log.error("[table-to-rear] 抓取前发现后方目标非空，停止抓取")
+                    return False
+                # 同一物料台位置与下降轨迹，反转工具动作即可由放置改为抓取。
+                pick = next_pick.result() if next_pick is not None else move_unload_pair_to_place(
+                    unload_place_poses, left_point, right_point, plan_only=True,
+                )
+                next_pick = None
+                if not isinstance(pick, UnloadPlaceTrajectoryPlan):
+                    return False
+                start = node._get_joints(full_names, wait_new=True)
+                if start is None:
+                    return False
+                pick_end = endpoint_state(start, pick.to_place)
+                rear_future = submit(
+                    plan_rear_place, right_slot, left_slot, pick_end,
+                )
+                log.info("[table-to-rear][pipeline] 执行料台抓取，同时后台规划后方放置")
+                if not execute_checked(pick.to_place):
+                    return False
+                node.wait_for_operator("按回车执行双臂同步直线抓取料台第一排物料: ")
+                force_before = read_dual_grasp_fz("table-to-rear")
+                if force_before is None:
+                    return False
+                if not node._execute_traj(pick.descent):
+                    return False
+                if not set_unload_tool_power(1, "料台第一排取料"):
+                    return False
+                time.sleep(UNLOAD_TOOL_SETTLE_SEC)
+                if not node._execute_traj(node._reverse_trajectory(pick.descent)):
+                    return False
+                suction_ok = check_dual_suction(force_before, "table-to-rear")
+                if suction_ok is None:
+                    return False
+                if suction_ok:
+                    break
+                if not set_unload_tool_power(0, "物料吸附失败，已直线退回"):
+                    return False
+                # 丢弃失败抓取对应的后台轨迹，收完任务后才能更新视觉场景。
+                if not rear_future.cancel():
+                    try:
+                        rear_future.result()
+                    except Exception as exc:
+                        log.warning(f"[table-to-rear][pipeline] 丢弃旧放置规划: {exc}")
+                pending.remove(rear_future)
+                log.warning("[table-to-rear] 双臂未全部吸附成功，重新识别并抓取当前料对")
+                if not prepare_unload_scene(trigger_command=LOAD_TABLE_TRIGGER_COMMAND):
+                    return False
+            else:
                 return False
 
             # 复用步骤 7 的 SW yubei/直线规划，只执行放置所需的动作顺序。
