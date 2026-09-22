@@ -157,7 +157,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.serialization import deserialize_message, serialize_message
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import Bool, ColorRGBA, Float32MultiArray, Int32, String, UInt8
+from std_msgs.msg import Bool, ColorRGBA, Float32, Float32MultiArray, Int32, String, UInt8
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
@@ -411,10 +411,13 @@ MOVE_TO_GRASP_RESET_Q = [
     1.672852,
     0.588477,
 ]
-# 键盘 9：直接识别深框，仅使用此构型的腰部角度，升降和双臂保持不动。
+# 键盘 9：先发送头部目标，再运动腰部，确认头部到位后直接识别深框。
+FRAME_DIRECT_CAMERA_POSITION = 0.2854
+FRAME_DIRECT_CAMERA_TOLERANCE = 0.005  # rad
+# 仅使用此构型的腰部角度，升降和双臂保持不动。
 FRAME_DIRECT_VISION_Q = [
     0,
-    0 * math.pi / 180,
+    40 * math.pi / 180,
     -1.57,
     -0.15,
     -1.578090,
@@ -3476,6 +3479,9 @@ class G01Demo(Node):
             MOTOR_COMMAND_TOPIC,
             10,
         )
+        self._camera_position_pub = self.create_publisher(
+            Float32, "/camera_motor_control/position", 10,
+        )
         # 步骤 4 会在极短时间内为每个视觉点发布圆柱/+Z 两条
         # Marker。使用大队列 + reliable + transient-local，既防止密集
         # 发布丢掉前面的点，也允许 RViz 重连后收到当前显示。
@@ -3557,6 +3563,46 @@ class G01Demo(Node):
             + ", ".join(f"{name}={value:.6f}" for name, value in joints.items())
         )
         return True
+
+    def wait_for_camera_position(self, target: float) -> bool:
+        """腰部结束后订阅头部新反馈，持续等待到位或 ROS 关闭。"""
+        if self.sim_mode:
+            self.get_logger().info("[frame-vision][sim] 跳过头部硬件到位等待")
+            return True
+        # 与 comm.py 的腰部反馈类型、position 字段及 rad 单位一致。
+        from pkg_msg_define.msg import MotorRuntimeInfo
+
+        position = None
+
+        def on_camera_info(msg: MotorRuntimeInfo) -> None:
+            nonlocal position
+            position = float(msg.position)
+
+        subscription = self.create_subscription(
+            MotorRuntimeInfo,
+            "/driver_report/camera_motor_info",
+            on_camera_info,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+        )
+        self.get_logger().info(
+            f"[frame-vision] 等待头部到 {target:.4f} rad，"
+            f"允许误差 {FRAME_DIRECT_CAMERA_TOLERANCE:.4f} rad"
+        )
+        try:
+            while rclpy.ok():
+                self._executor.spin_once(timeout_sec=0.1)
+                if (
+                    position is not None
+                    and math.isfinite(position)
+                    and abs(position - target) <= FRAME_DIRECT_CAMERA_TOLERANCE
+                ):
+                    self.get_logger().info(
+                        f"[frame-vision] 头部已到位：{position:.4f} rad"
+                    )
+                    return True
+            return False
+        finally:
+            self.destroy_subscription(subscription)
 
     def shutdown_executor(self) -> None:
         """从专属 executor 移除节点并关闭其 wait-set。"""
@@ -8926,6 +8972,12 @@ def _run_main(
         vision_q_name = "FRAME_DIRECT_VISION_Q" if add_directly else "框_Q1"
         vision_group = "dual_arm_body"
         if add_directly:
+            node._camera_position_pub.publish(
+                Float32(data=FRAME_DIRECT_CAMERA_POSITION)
+            )
+            log.info(
+                f"[frame-vision] 已发送头部目标 {FRAME_DIRECT_CAMERA_POSITION:.4f} rad"
+            )
             vision_group = "waist"
             vision_q = [vision_q[q1_joint_names.index("body_joint2")]]
             q1_joint_names = ["body_joint2"]
@@ -8943,6 +8995,9 @@ def _run_main(
                 f"[frame-vision] 运动到 {vision_q_name} 失败，不发送 "
                 f"{FRAME_VISION_TRIGGER_COMMAND}"
             )
+            return False
+
+        if add_directly and not node.wait_for_camera_position(FRAME_DIRECT_CAMERA_POSITION):
             return False
 
         vision_result = read_scene_vision_object_pose_with_retry(
