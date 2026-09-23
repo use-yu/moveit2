@@ -15,6 +15,15 @@
                     <param name="state_timeout_sec">0.5</param>
                 </xacro:if>
             </hardware>
+            <!-- Real head feedback comes directly from comm.py. Supply a state
+                 in mock mode so FK/visualization also has a known head angle. -->
+            <xacro:if value="${hardware_plugin == 'mock_components/GenericSystem'}">
+                <joint name="head_joint">
+                    <state_interface name="position">
+                        <param name="initial_value">${initial_positions['head_joint']}</param>
+                    </state_interface>
+                </joint>
+            </xacro:if>
             <joint name="base_joint1">
                 <command_interface name="position"/>
                 <state_interface name="position">

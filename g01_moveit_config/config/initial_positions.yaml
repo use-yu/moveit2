@@ -1,6 +1,7 @@
 # Default initial positions for G01's ros2_control fake system
 
 initial_positions:
+  head_joint: 0.7853981633974483  # camera calibration position, 45 degrees
   base_joint1: 0
   base_joint2: 0
   body_joint1: 0

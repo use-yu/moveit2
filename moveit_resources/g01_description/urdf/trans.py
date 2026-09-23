@@ -12,8 +12,8 @@ import numpy as np
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PARAMS_PATH = BASE_DIR / "moveit_resources/g01_description/urdf/m_dh.json"
-OUTPUT_PATH = BASE_DIR / "moveit_resources/g01_description/urdf/m_dh_transforms.json"
+PARAMS_PATH = BASE_DIR / "m_dh.json"
+OUTPUT_PATH = BASE_DIR / "m_dh_transforms.json"
 MDH_KEYS = ("a(i-1)", "d(i)", "alpha(i-1)", "theta(i)")
 
 

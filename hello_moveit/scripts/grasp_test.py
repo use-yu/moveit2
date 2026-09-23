@@ -434,6 +434,8 @@ FRAME_DIRECT_VISION_Q = [
 # 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
 # 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
 GRASP_VISION_WAIST_ANGLES_DEG = (30,)
+# 输入 4：先发送此头部目标，再运动到识别构型；头部到位后才采集视觉。
+GRASP_VISION_CAMERA_POSITION = 0.7854
 # 抓取排序的姿态分组阈值：局部 +Z 与 moveit_base_link -Z
 # 的偏离角小于该值时，优先于其他物体抓取。
 GRASP_UPRIGHT_TILT_THRESHOLD_DEG = 30.0
@@ -513,15 +515,15 @@ FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 相对于 moveit_base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 # p,4 识别位姿先绕自身 Z 轴 +90°，再沿旋转后的自身坐标平移，
 # 得到深框顶部空心区域中心；该坐标点位于开口中，不落在框壁实体上。
-FRAME_VISION_TRIGGER_COMMAND = "p,5"
+FRAME_VISION_TRIGGER_COMMAND = "p,9"
 FRAME_VISION_POSE_KEY = "right_body"
 FRAME_VISION_TF_FRAME = "deep_frame_vision"
 FRAME_TOP_CENTER_TF_FRAME = "deep_frame_top_center"
 FRAME_CENTER_TF_FRAME = "deep_frame_center"
 FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0 *0
 FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
-    0.43,
-    0.0,
+    -0.367,
+    -0.356,
     0.11, #0.06
 )
 # 原有的深框局部 +Y 大长方体障碍物。
@@ -658,15 +660,15 @@ STEP_DESCRIPTIONS = {
 NAV_GOAL_POSES = {
     NAV_TARGET_FRAME_RECOGNITION: {
         "position": (
-            1.8185259103775024,
-            0.1005692407488823,
-            -0.010753761045634747,
+            1.9541624784469604,
+            0.17442595958709717,
+            0.007418082095682621,
         ),
         "orientation": (
-            0.00031845440389588475,
-            0.022325344383716583,
-            -0.004695464391261339,
-            0.9997628331184387,
+            -0.001856358372606337,
+            -0.0009955015266314149,
+            -0.004639043472707272,
+            0.9997707009315491,
         ),
     },
     NAV_TARGET_GRASP: {
@@ -1081,12 +1083,17 @@ SCENE_VISION_MAX_ATTEMPTS = 5
 # 正则表达式，用来匹配字符串里的数字：
 NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 # 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
+# 这两套外参是在 head_joint=0.785417 rad 时测得的相机 → 左/右臂基座变换。
+# 运行时先反解相机 → 随头部转动的 head link 固定外参，再用实测头角做 FK。
+VISION_CALIBRATION_HEAD_POSITION = 0.785417
+VISION_HEAD_JOINT = "head_joint"
+VISION_HEAD_LINK = "head"
 # 下面会转成平移单位为毫米的 4x4 矩阵，与 viewer pose 的毫米单位保持一致。
 VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
-    -0.164051, -0.154038, -0.132963, 0.657101, -0.268392, -0.651622, -0.267530
+    -0.164979, -0.152090, -0.133214, 0.654894, -0.273653, -0.649370, -0.273034
 ]
 VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
-    0.166404, -0.154310, -0.218199, 0.650793, -0.270204, 0.657223, 0.267425
+    0.164902, -0.154711, -0.219377, 0.650871, -0.270312, 0.656267, 0.269464
 ]
 
 # 左臂抓
@@ -1478,6 +1485,30 @@ def transform_vision_pose(
     return matrix_to_xyz_rpy(matmul4(transform_mm, pose_mm_wxyz_to_matrix(pose)))
 
 
+def camera_mount_transform(
+    arm_from_camera_mm: list[list[float]],
+    arm_from_head_at_calibration: Pose,
+) -> list[list[float]]:
+    """T_head_camera = inv(T_arm_head(45°)) * T_arm_camera(45°)，单位米。"""
+    arm_from_camera = [list(row) for row in arm_from_camera_mm]
+    for i in range(3):
+        arm_from_camera[i][3] *= 0.001
+    return matmul4(
+        invert_transform4(pose_to_matrix(arm_from_head_at_calibration)),
+        arm_from_camera,
+    )
+
+
+def camera_transform_at_head_position(
+    head_from_camera: list[list[float]], arm_from_head: Pose,
+) -> list[list[float]]:
+    """T_arm_camera(q) = T_arm_head(q) * T_head_camera；返回毫米制外参。"""
+    transform = matmul4(pose_to_matrix(arm_from_head), head_from_camera)
+    for i in range(3):
+        transform[i][3] *= 1000.0
+    return transform
+
+
 def read_vision_object_pose(
     node,
     log,
@@ -1524,14 +1555,22 @@ def read_vision_object_pose(
         # 读取实际身体关节：
         #   body_joint2 用于把左/右臂基坐标下的物体位姿转到 SJ；
         #   body_joint1 用于继续把 SJ 下的位姿转到 moveit_base_link。
-        body_joints = node._get_joints(["body_joint1", "body_joint2"], wait_new=True)
+        body_joints = node._get_joints(
+            ["body_joint1", "body_joint2", VISION_HEAD_JOINT], wait_new=True,
+        )
         if body_joints is None:
             log.error("读取实际身体关节失败，无法转换视觉位姿")
             return None
         print(
             f"实际身体关节: body_joint1={body_joints['body_joint1']:.6f} m, "
-            f"body_joint2={body_joints['body_joint2']:.6f} rad"
+            f"body_joint2={body_joints['body_joint2']:.6f} rad, "
+            f"head_joint={body_joints[VISION_HEAD_JOINT]:.6f} rad"
         )
+
+        camera_transforms = node.camera_transforms_for_joints(body_joints)
+        if camera_transforms is None:
+            return None
+        right_camera_transform, left_camera_transform = camera_transforms
 
         r_base_in_sj = node._get_link_pose_fk(
             "r_base_link",
@@ -1567,8 +1606,8 @@ def read_vision_object_pose(
 
         for point_index, (first_return_mode, pose) in enumerate(vision_results, start=1):
             try:
-                right_xyz_rpy_mm = transform_vision_pose(pose, VISION_RIGHT_TRANSFORM_MM)
-                left_xyz_rpy_mm = transform_vision_pose(pose, VISION_LEFT_TRANSFORM_MM)
+                right_xyz_rpy_mm = transform_vision_pose(pose, right_camera_transform)
+                left_xyz_rpy_mm = transform_vision_pose(pose, left_camera_transform)
             except ValueError as exc:
                 node.publish_error(3 if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND) else 2, f"point={point_index}: {exc}")
                 message = f"viewer 第 {point_index} 个 pose 解析失败：{exc}"
@@ -3355,6 +3394,7 @@ class G01Demo(Node):
         self._defer_error_publish = False
         self._startup_error_codes: list[int] = []
         self.sim_mode = bool(sim_mode)
+        self._camera_mount_transforms: dict[str, list[list[float]]] = {}
         self.upper_control_mode = bool(upper_control_mode)
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
         self._get_scene_cli = self.create_client(
@@ -3563,6 +3603,64 @@ class G01Demo(Node):
             + ", ".join(f"{name}={value:.6f}" for name, value in joints.items())
         )
         return True
+
+    def camera_transforms_for_joints(
+        self, joints: dict[str, float],
+    ) -> tuple[list[list[float]], list[list[float]]] | None:
+        """用 45° 标定推导固定头部外参，再计算当前头角下左右臂外参。"""
+        transforms = []
+        calibration_joints = dict(joints)
+        calibration_joints[VISION_HEAD_JOINT] = VISION_CALIBRATION_HEAD_POSITION
+        for arm_frame, calibrated_transform in (
+            ("r_base_link", VISION_RIGHT_TRANSFORM_MM),
+            ("l_base_link", VISION_LEFT_TRANSFORM_MM),
+        ):
+            if arm_frame not in self._camera_mount_transforms:
+                calibration_pose = self._get_link_pose_fk(
+                    VISION_HEAD_LINK, joints=calibration_joints, plan_frame=arm_frame,
+                )
+                zero_pose = self._get_link_pose_fk(
+                    VISION_HEAD_LINK,
+                    joints={**calibration_joints, VISION_HEAD_JOINT: 0.0},
+                    plan_frame=arm_frame,
+                )
+                if calibration_pose is None or zero_pose is None:
+                    return None
+                rotation = matmul4(
+                    invert_transform4(pose_to_matrix(zero_pose)),
+                    pose_to_matrix(calibration_pose),
+                )
+                angle = math.acos(max(-1.0, min(1.0, (
+                    sum(rotation[i][i] for i in range(3)) - 1.0
+                ) / 2.0)))
+                if abs(angle - VISION_CALIBRATION_HEAD_POSITION) > 1e-3:
+                    self.get_logger().error(
+                        "[vision] FK 头部关节未正确生效，请重新构建并重启 MoveIt，"
+                        "确认 head_joint 已由 fixed 改为 revolute"
+                    )
+                    return None
+                self._camera_mount_transforms[arm_frame] = camera_mount_transform(
+                    calibrated_transform, calibration_pose,
+                )
+                self.get_logger().info(
+                    f"[vision] 由 {arm_frame} 的 45° 标定反解 T_head_camera（米）: "
+                    f"{self._camera_mount_transforms[arm_frame]}"
+                )
+            current_pose = self._get_link_pose_fk(
+                VISION_HEAD_LINK, joints=joints, plan_frame=arm_frame,
+            )
+            if current_pose is None:
+                return None
+            transforms.append(camera_transform_at_head_position(
+                self._camera_mount_transforms[arm_frame], current_pose,
+            ))
+        return transforms[0], transforms[1]
+
+    def send_grasp_camera_position(self) -> None:
+        self._camera_position_pub.publish(Float32(data=GRASP_VISION_CAMERA_POSITION))
+        self.get_logger().info(
+            f"[pick-vision] 已发送头部目标 {GRASP_VISION_CAMERA_POSITION:.4f} rad"
+        )
 
     def wait_for_camera_position(self, target: float) -> bool:
         """腰部结束后订阅头部新反馈，持续等待到位或 ROS 关闭。"""
@@ -8143,11 +8241,15 @@ class G01Demo(Node):
         if recognition_state is not None:
             recognition_names = list(recognition_state)
             # 抓取后带料回识别位，速度降为放置速度的一半。
+            self.send_grasp_camera_position()
             if not self.plan_execute_joint_waypoints(
                 "dual_arm_body", place_speed_scale * 0.5, recognition_names,
                 [recognition_state], num_attempts=30, planning_time_sec=10.0,
             ):
                 log.error("[pipeline] 抓取成功后运动到识别位置失败")
+                return False
+            if not self.wait_for_camera_position(GRASP_VISION_CAMERA_POSITION):
+                self.last_pick_failure_reason = "camera_position_wait_failed"
                 return False
         try:
             post_grasp_plan = post_grasp_future.result() if post_grasp_future is not None else None
@@ -9263,6 +9365,7 @@ def _run_main(
                 f"{len(GRASP_VISION_WAIST_ANGLES_DEG)} 个角度："
                 f"腰部 body_joint2 → {waist_deg}°，然后重新视觉和验证"
             )
+            node.send_grasp_camera_position()
             if not node.plan_execute_joint_waypoints(
                 "dual_arm_body",
                 0.2,
@@ -9273,6 +9376,9 @@ def _run_main(
                 log.error(f"[pick-waist] 运动到 {waist_deg}° 识别构型失败")
                 return False
 
+            if not node.wait_for_camera_position(GRASP_VISION_CAMERA_POSITION):
+                node.last_pick_failure_reason = "camera_position_wait_failed"
+                return False
             time.sleep(1)
             vision_pose = read_vision_object_pose(
                 node,

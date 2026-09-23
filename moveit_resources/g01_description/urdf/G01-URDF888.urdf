@@ -321,7 +321,7 @@
   </link>
   <joint
     name="head_joint"
-    type="fixed">
+    type="revolute">
     <origin
       xyz="-0.047 0.5115 -0.1664"
       rpy="3.1416 0 3.1416" />
@@ -329,13 +329,13 @@
       link="YB" />
     <child
       link="head" />
-    <!-- <axis
-      xyz="0 0 1" />
+    <axis
+      xyz="0 0 -1" />
     <limit
-      lower="-1.045"
-      upper="0"
+      lower="0"
+      upper="1.0472"
       effort="100"
-      velocity="100" /> -->
+      velocity="100" />
   </joint>
 
 
@@ -347,7 +347,7 @@
     parent="YB"
     xyz="0.000 0.418 0.059"
     rpy="0 0 -3.1415926"
-    dh_id="'1084'" />
+    dh_id="'1077'" />
 
   <xacro:cr7_robot
     prefix="r_"
