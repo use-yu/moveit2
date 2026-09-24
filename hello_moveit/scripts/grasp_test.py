@@ -186,6 +186,10 @@ ERROR_CODES = {
 _runtime_error_reporter = None
 
 
+class ForceRangeAbort(BaseException):
+    """量程保护直接退出任务，不允许被普通 Exception 恢复/重试分支吞掉。"""
+
+
 def report_runtime_exception(exc, context):
     """99 兜底；不把普通 False 返回、正常退出或候选无解当成异常。"""
     if getattr(exc, "_grasp_error_reported", False):
@@ -1020,6 +1024,22 @@ UNGRASPABLE_POINT_GRASP_FAILURE_REASONS = frozenset({
     "suction_failed",
 })
 FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
+FT_FORCE_RANGE_N = 200.0
+FT_TORQUE_RANGE_NM = 8.0
+FT_RANGE_STOP_RATIO = 0.8
+
+
+def ft_range_violation(values: Sequence[float]) -> str | None:
+    """按六个分量的绝对值检查量程，不使用相对基准的增减量。"""
+    if len(values) < 6:
+        return f"六维力数据不足：{len(values)} < 6"
+    for index, name in enumerate(("Fx", "Fy", "Fz", "Mx", "My", "Mz")):
+        value = float(values[index])
+        limit = (FT_FORCE_RANGE_N if index < 3 else FT_TORQUE_RANGE_NM) * FT_RANGE_STOP_RATIO
+        unit = "N" if index < 3 else "N·m"
+        if not math.isfinite(value) or abs(value) >= limit:
+            return f"{name}={value:.6f} {unit}，保护阈值 ±{limit:g} {unit}"
+    return None
 APPROACH_FORCE_GUARD_DISTANCE = 0.07  # 从 q_pre 起前 9 cm 使用小阈值 [m]
 APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 60.0  # 前 9 cm 的 Fz 减小阈值 [N]
 APPROACH_FORCE_Z_DROP_ALL_THRESHOLD = 210.0  # 整段接近的 Fz 减小阈值 [N]
@@ -3394,6 +3414,12 @@ class G01Demo(Node):
         self._defer_error_publish = False
         self._startup_error_codes: list[int] = []
         self.sim_mode = bool(sim_mode)
+        # 后台节点只做规划；保护和硬件停臂由前台节点统一执行。
+        self._force_range_enabled = upper_communication
+        self._force_range_fault: str | None = None
+        self._force_task_active = False
+        self._force_stop_requests: dict[str, int] = {}
+        self._force_action_goals: list = []
         self._camera_mount_transforms: dict[str, list[list[float]]] = {}
         self.upper_control_mode = bool(upper_control_mode)
         self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
@@ -3942,10 +3968,51 @@ class G01Demo(Node):
         )
         return True
 
+    def _abort_on_force_range(self) -> None:
+        if self._force_range_fault is not None:
+            raise ForceRangeAbort(self._force_range_fault)
+
+    def _send_force_guarded_goal(self, client, goal):
+        """登记运动目标，包括保护触发时尚未返回接受结果的目标。"""
+        self._abort_on_force_range()
+        future = client.send_goal_async(goal)
+
+        def on_accepted(done):
+            handle = done.result()
+            if handle is None or not handle.accepted:
+                return
+            self._force_action_goals.append(handle)
+            result = handle.get_result_async()
+
+            def on_finished(_):
+                if handle in self._force_action_goals:
+                    self._force_action_goals.remove(handle)
+
+            result.add_done_callback(on_finished)
+            if self._force_range_fault is not None:
+                handle.cancel_goal_async()
+
+        future.add_done_callback(on_accepted)
+        return future
+
     def _on_ft_sensor(self, msg: Float32MultiArray, side: str) -> None:
         """缓存左右臂六维力中的 Z；数据顺序为 Fx/Fy/Fz/Mx/My/Mz。"""
         if side not in self._ft_sensor_z:
             return
+        if self._force_range_enabled:
+            violation = ft_range_violation(msg.data)
+            if violation is not None and self._force_range_fault is None:
+                self._force_range_fault = f"{side} 臂力传感器保护：{violation}"
+                self.get_logger().error(self._force_range_fault)
+                self._motor_command_pub.publish(UInt8(data=1))
+                self._force_stop_requests = {
+                    arm: self._send_servoj_control(arm, "stop")
+                    for arm in ("left", "right")
+                }
+                for handle in list(self._force_action_goals):
+                    handle.cancel_goal_async()
+            if self._force_task_active:
+                self._abort_on_force_range()
         if len(msg.data) < 3:
             self.get_logger().error(
                 f"{side} 力传感器消息长度不足：{len(msg.data)} < 3"
@@ -5563,7 +5630,7 @@ class G01Demo(Node):
                 f"[{group}] 本次关节空间规划已关闭碰撞检查，仅允许用于受控调试"
             )
 
-        send_fut = self._move_cli.send_goal_async(g)
+        send_fut = self._send_force_guarded_goal(self._move_cli, g)
         if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
             log.error("move_action 目标被拒绝或超时")
             return False, elapsed_ms(), None, None
@@ -6250,7 +6317,7 @@ class G01Demo(Node):
             return False
 
         goal = ExecuteTrajectory.Goal(trajectory=traj)
-        send_fut = self._exec_cli.send_goal_async(goal)
+        send_fut = self._send_force_guarded_goal(self._exec_cli, goal)
         if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
             log.error("execute_trajectory 目标被拒绝或超时")
             return False
@@ -6322,7 +6389,7 @@ class G01Demo(Node):
         self._active_approach_guard = guard
         try:
             goal = ExecuteTrajectory.Goal(trajectory=traj)
-            send_fut = self._exec_cli.send_goal_async(goal)
+            send_fut = self._send_force_guarded_goal(self._exec_cli, goal)
             if not self._spin_until(send_fut, 15.0):
                 log.error("execute_trajectory 目标发送超时")
                 return "failed"
@@ -11562,12 +11629,27 @@ def _run_main(
                 command_source = "upper"
 
             workflow_ok = True
-            for step in steps:
-                if not execute_step(step, command_source, payload):
-                    workflow_ok = False
-                    log.error(f"[{command_source}] 步骤 {step} 失败，停止后续步骤")
-                    break
-                log.info(f"[{command_source}] 步骤 {step} 完成")
+            try:
+                node._force_task_active = True
+                node._abort_on_force_range()
+                for step in steps:
+                    if not execute_step(step, command_source, payload):
+                        workflow_ok = False
+                        log.error(f"[{command_source}] 步骤 {step} 失败，停止后续步骤")
+                        break
+                    log.info(f"[{command_source}] 步骤 {step} 完成")
+            except ForceRangeAbort as exc:
+                workflow_ok = False
+                node._force_task_active = False
+                log.error(
+                    f"[force-range] {exc}；退出当前任务及后续步骤，"
+                    "保护已锁存，请排除过载并重启脚本后再执行任务"
+                )
+                for side, request_id in node._force_stop_requests.items():
+                    if not node._wait_for_servoj_control_state(side, "stop", request_id):
+                        log.error(f"[force-range] {side} 臂停止确认失败")
+            finally:
+                node._force_task_active = False
 
             if command_topic is None:
                 result_text = "成功" if workflow_ok else "失败"
@@ -11667,7 +11749,6 @@ def main(argv: list[str] | None = None) -> int:
             status_node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-
 
 if __name__ == "__main__":
     sys.exit(main())
