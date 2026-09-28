@@ -29,7 +29,7 @@ URDF_XACRO = Path(__file__).parent / "moveit_resources/g01_description/urdf/G01-
 
 # 基坐标系和末端坐标系 link 名。右臂可改成 BASE_LINK="r_base_link", EE_LINK="r_tool"。
 BASE_LINK = "base_sj"
-EE_LINK = "l_tool"
+EE_LINK = "r_tool"
 
 # 目标末端位姿，表达在 BASE_LINK 坐标系下，单位：m / rad。
 # 右臂放
@@ -72,23 +72,35 @@ EE_LINK = "l_tool"
 # TARGET_RPY = [179.698684, 0.510936, 40.278691]
 # SEED_JOINTS = [154.0, -89.0, -91.0, -2.0, -25.0, 42.0]
 
-TARGET_XYZ = [-0.141613859-0.17, -0.079137759, 0.7520456264]
-TARGET_RPY = [179.698684, 0.510936, 40.278691]
-SEED_JOINTS = [154.0, -89.0, -91.0, -2.0, -25.0, 42.0]
+# TARGET_XYZ = [-0.141613859-0.17, -0.079137759, 0.7520456264]
+# TARGET_RPY = [179.698684, 0.510936, 40.278691]
+# SEED_JOINTS = [154.0, -89.0, -91.0, -2.0, -25.0, 42.0]
 
+#右臂交换
 # 交换右
-# TARGET_XYZ = [0.757995453, -0.026005114, 1.121638622]
+# TARGET_XYZ = [0.881874783, -0.030132986, 1.293672203]
 # TARGET_RPY = [-180.0, 0.0, -90.0]
 # SEED_JOINTS = [-108.0, -88.0, -48.0, -42.0, 43.0, 0.0]
 #交换左
-# TARGET_XYZ = [0.757995453, -0.026005114, 0.981641356]
+# TARGET_XYZ = [0.881874783, -0.030132986, 1.160967491]
 # TARGET_RPY = [0.0, 0.0, 60.0]
 # SEED_JOINTS = [23, -87.0, -35.0, -60.0, 53.0, -2.0]
+
+#左臂交换
+# 交换右
+TARGET_XYZ = [0.887450935, 0.029714402, 1.159201119]
+TARGET_RPY = [0.0, 0.0, -120]
+SEED_JOINTS = [-23, 87.0, 35.0, 60.0, -53.0, 2.0]
+#交换左
+# TARGET_XYZ = [0.887450935, 0.029714402, 1.294792211]
+# TARGET_RPY = [180, 0, 90]
+# SEED_JOINTS = [108.0, 88.0, 48.0, 42.0, -43.0, 0.0]
+
 # BASE_LINK="base_sj" 到手臂末端的链会经过升降和腰部关节，二者都固定为 0。
 LIFT_JOINT = "body_joint1"
 LIFT_POSITION = 0.0  # m
 WAIST_JOINT = "body_joint2"
-WAIST_ANGLE = 0.0
+WAIST_ANGLE = 30.0
 WAIST_ANGLE_DEG = True
 
 # IK 迭代初始关节角。升降和腰部已固定，这里只填右臂 6 个关节。

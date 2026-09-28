@@ -35,8 +35,9 @@ DEFAULT_BASE_LINK = "base_sj"
 DEFAULT_TARGET_LINK = "l_tool"
 DEFAULT_JOINT_VALUES = [
     0.0,
-    0*math.pi/180,  # body_joint2
-    144.2503,-87.2058,-82.0991,-11.5162,-36.5635,50.2739,
+    30*math.pi/180,  # body_joint2
+    1.850076372,1.576109233,0.618642353,0.947968147,-0.771840083,-0.000991018,
+
 ]
 
 # 下面三个只用于兼容旧 CR7 参数 --tool / --link6 / fk6。
