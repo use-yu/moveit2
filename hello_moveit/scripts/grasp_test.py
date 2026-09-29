@@ -73,7 +73,6 @@ G01 MoveIt 演示脚本
 
 控制方式：
   默认：等待上位机话题命令。
-  --forces：禁用力传感器读取、自检、吸附检测及力保护。
   --keyboard：不等待上位机命令，每轮通过数字菜单选择要执行的流程。
   --interactive：运动流程中的人工确认点也等待按回车；可与 --keyboard 同时使用。
 
@@ -1117,15 +1116,15 @@ VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
 ]
 
 # 左臂抓
-# SIM_VISION_RESULT = (
-#     1,
-#     [-195.0305, 43.2781, 889.8122, -0.481, 0.0739, -0.1165, -0.8658],
-# )
-# 右臂抓
 SIM_VISION_RESULT = (
     1,
-    [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+    [-195.0305, 43.2781, 889.8122, -0.481, 0.0739, -0.1165, -0.8658],
 )
+# 右臂抓
+# SIM_VISION_RESULT = (
+#     1,
+#     [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+# )
 # 物料台 p,8 仿真视觉数据：
 # 原始协议为 header,x,y,z,qw,qx,qy,qz,mode；header 不使用。
 SIM_UNLOAD_VISION_RESULT = (
@@ -3405,7 +3404,6 @@ class G01Demo(Node):
         upper_control_mode: bool = True,
         node_name: str = "g01_demo",
         upper_communication: bool = True,
-        use_force_sensors: bool = True,
     ):
         super().__init__(node_name)
         self._error_pub = (
@@ -3415,9 +3413,8 @@ class G01Demo(Node):
         self._defer_error_publish = False
         self._startup_error_codes: list[int] = []
         self.sim_mode = bool(sim_mode)
-        self.use_force_sensors = use_force_sensors
         # 后台节点只做规划；保护和硬件停臂由前台节点统一执行。
-        self._force_range_enabled = upper_communication and use_force_sensors
+        self._force_range_enabled = upper_communication
         self._force_range_fault: str | None = None
         self._force_task_active = False
         self._force_stop_requests: dict[str, int] = {}
@@ -3510,20 +3507,19 @@ class G01Demo(Node):
                 lambda msg, topic=command_topic: self._on_upper_command(msg, topic),
                 1,
             )
-        if self.use_force_sensors:
-            # servoj_30ms.py 在传感器离线时停止发布；这里只接受调用后到达的新帧。
-            self.create_subscription(
-                Float32MultiArray,
-                LEFT_FT_SENSOR_TOPIC,
-                lambda msg: self._on_ft_sensor(msg, "left"),
-                1,
-            )
-            self.create_subscription(
-                Float32MultiArray,
-                RIGHT_FT_SENSOR_TOPIC,
-                lambda msg: self._on_ft_sensor(msg, "right"),
-                1,
-            )
+        # servoj_30ms.py 在传感器离线时停止发布；这里只接受调用后到达的新帧。
+        self.create_subscription(
+            Float32MultiArray,
+            LEFT_FT_SENSOR_TOPIC,
+            lambda msg: self._on_ft_sensor(msg, "left"),
+            1,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            RIGHT_FT_SENSOR_TOPIC,
+            lambda msg: self._on_ft_sensor(msg, "right"),
+            1,
+        )
         self.create_subscription(
             String,
             SERVOJ_CONTROL_STATE_TOPIC,
@@ -3593,14 +3589,14 @@ class G01Demo(Node):
                 self.publish_error(error_code, f"启动自检 {label}: {exc}")
                 return None
 
-        log.info("[startup-check] 双末端上电" + ("，检查左右力传感器新帧" if self.use_force_sensors else ""))
+        log.info("[startup-check] 双末端上电，检查左右力传感器新帧")
         force_values = {}
         try:
             power_on = [
                 check(lambda side=side: self.set_tool_power(side, 1), 6, f"{side} 上电")
                 for side in sides
             ]
-            if all(power_on) and self.use_force_sensors:
+            if all(power_on):
                 for side in sides:
                     force_values[side] = check(
                         lambda side=side: self.wait_for_ft_sensor_z(side),
@@ -3614,9 +3610,8 @@ class G01Demo(Node):
                 for side in sides
             ]
 
-        if not all(power_on) or not all(power_off) or (
-            self.use_force_sensors
-            and any(force_values.get(side) is None for side in sides)
+        if not all(power_on) or not all(power_off) or any(
+            force_values.get(side) is None for side in sides
         ):
             return False
 
@@ -4001,7 +3996,7 @@ class G01Demo(Node):
 
     def _on_ft_sensor(self, msg: Float32MultiArray, side: str) -> None:
         """缓存左右臂六维力中的 Z；数据顺序为 Fx/Fy/Fz/Mx/My/Mz。"""
-        if not self.use_force_sensors or side not in self._ft_sensor_z:
+        if side not in self._ft_sensor_z:
             return
         if self._force_range_enabled:
             violation = ft_range_violation(msg.data)
@@ -4170,9 +4165,7 @@ class G01Demo(Node):
         side: str,
         timeout_sec: float = FT_SENSOR_SAMPLE_TIMEOUT_SEC,
     ) -> float | None:
-        """等待新帧 Fz；禁用时返回占位值 0，不读取传感器。"""
-        if not self.use_force_sensors:
-            return 0.0
+        """阻塞等待调用后到达的一帧对应臂力数据，并返回 Fz。"""
         if side not in self._ft_sensor_z:
             self.get_logger().error(f"未知力传感器 side={side}")
             return None
@@ -6359,7 +6352,7 @@ class G01Demo(Node):
         ``contact`` 表示已完成 ServoJ 停止确认、MoveIt 轨迹终止确认以及 ServoJ
         恢复确认，可以安全地从实测当前位置规划退回 q_pre。
         """
-        if not self.use_force_sensors or self.sim_mode:
+        if self.sim_mode:
             return "success" if self._execute_traj(traj, timeout=timeout) else "failed"
 
         log = self.get_logger()
@@ -8268,44 +8261,43 @@ class G01Demo(Node):
             log.error("[pick] 反向播放 approach 失败")
             return False
 
-        if self.use_force_sensors:
-            force_z_after = self.wait_for_ft_sensor_z(tool_side)
-            if force_z_after is None:
-                log.error(
-                    f"[pick] 已回 q_pre，但无法读取{tool_label}吸附后 Fz；"
-                    "保持工具上电并停止本批次"
-                )
-                self.last_pick_failure_reason = "force_sensor_timeout"
-                return False
+        force_z_after = self.wait_for_ft_sensor_z(tool_side)
+        if force_z_after is None:
+            log.error(
+                f"[pick] 已回 q_pre，但无法读取{tool_label}吸附后 Fz；"
+                "保持工具上电并停止本批次"
+            )
+            self.last_pick_failure_reason = "force_sensor_timeout"
+            return False
 
-            force_z_increase = force_z_after - force_z_before
-            log.info(
-                f"[pick] {tool_label}吸附检测："
-                f"q_pre 吸附前 Fz={force_z_before:.6f} N，"
-                f"吸附后 Fz={force_z_after:.6f} N，"
-                f"增加={force_z_increase:.6f} N，"
-                f"阈值>{GRASP_FORCE_Z_INCREASE_THRESHOLD:.6f} N"
+        force_z_increase = force_z_after - force_z_before
+        log.info(
+            f"[pick] {tool_label}吸附检测："
+            f"q_pre 吸附前 Fz={force_z_before:.6f} N，"
+            f"吸附后 Fz={force_z_after:.6f} N，"
+            f"增加={force_z_increase:.6f} N，"
+            f"阈值>{GRASP_FORCE_Z_INCREASE_THRESHOLD:.6f} N"
+        )
+        suction_ok = (
+            self.sim_mode
+            or force_z_increase > GRASP_FORCE_Z_INCREASE_THRESHOLD
+        )
+        if not suction_ok:
+            log.warning(
+                f"[pick] {tool_label}Fz 增加未超过 "
+                f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定未吸附；"
+                "工具下电并开始下一次复位、识别、抓取"
             )
-            suction_ok = (
-                self.sim_mode
-                or force_z_increase > GRASP_FORCE_Z_INCREASE_THRESHOLD
-            )
-            if not suction_ok:
-                log.warning(
-                    f"[pick] {tool_label}Fz 增加未超过 "
-                    f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定未吸附；"
-                    "工具下电并开始下一次复位、识别、抓取"
-                )
-                self.last_pick_failure_reason = "suction_failed"
-                if not self.set_tool_power(tool_side, 0):
-                    log.error(f"[pick] 未吸附后{tool_label}工具下电失败")
-                    self.last_pick_failure_reason = "tool_power_off_failed"
-                return False
+            self.last_pick_failure_reason = "suction_failed"
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 未吸附后{tool_label}工具下电失败")
+                self.last_pick_failure_reason = "tool_power_off_failed"
+            return False
 
-            log.info(
-                f"[pick] {tool_label}Fz 增加超过 "
-                f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定吸附成功，继续放置"
-            )
+        log.info(
+            f"[pick] {tool_label}Fz 增加超过 "
+            f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定吸附成功，继续放置"
+        )
         # 全部视觉候选 Marker 仅用于抓取前/抓取中观察；
         # 吸附确认成功后立即删除，不等到后续放置流程结束。
         self.remove_all_pose_markers()
@@ -8626,12 +8618,11 @@ class G01Demo(Node):
 
 def split_runtime_args(
     argv: list[str] | None = None,
-) -> tuple[bool, bool, bool, bool, list[str]]:
+) -> tuple[bool, bool, bool, list[str]]:
     """解析本程序参数，并把剩余 ROS 参数交给 rclpy。
 
-    返回 ``(sim_mode, upper_control_mode, keyboard_control_mode, use_force_sensors, ros_args)``：
+    返回 ``(sim_mode, upper_control_mode, keyboard_control_mode, ros_args)``：
 
-    - ``--forces``：禁用全部力传感器逻辑。
     - ``--sim``：跳过真机工具服务并使用仿真输入。
     - ``--interactive``：保留运动流程内部的按回车确认点。
     - ``--keyboard``：主循环使用数字菜单，不等待上位机话题命令。
@@ -8643,12 +8634,11 @@ def split_runtime_args(
     sim_mode = "--sim" in raw_args
     upper_control_mode = "--interactive" not in raw_args
     keyboard_control_mode = "--keyboard" in raw_args
-    use_force_sensors = "--forces" not in raw_args
-    program_args = {"--sim", "--interactive", "--keyboard", "--forces"}
+    program_args = {"--sim", "--interactive", "--keyboard"}
     ros_args = [
         arg for arg in raw_args if arg not in program_args
     ]
-    return sim_mode, upper_control_mode, keyboard_control_mode, use_force_sensors, ros_args
+    return sim_mode, upper_control_mode, keyboard_control_mode, ros_args
 
 
 def wait_for_keyboard_steps() -> tuple[int, ...] | None:
@@ -8691,12 +8681,10 @@ def _run_main(
         sim_mode,
         upper_control_mode,
         keyboard_control_mode,
-        use_force_sensors,
         ros_args,
     ) = split_runtime_args(argv)
     node = G01Demo(
         sim_mode=sim_mode,
-        use_force_sensors=use_force_sensors,
         upper_control_mode=upper_control_mode,
         upper_communication=not keyboard_control_mode,
     )
@@ -8704,7 +8692,6 @@ def _run_main(
     node._defer_error_publish = True
     planner_node = G01Demo(
         sim_mode=sim_mode,
-        use_force_sensors=use_force_sensors,
         upper_control_mode=True,
         node_name="g01_background_planner",
         upper_communication=False,
@@ -8712,8 +8699,6 @@ def _run_main(
     planner_node.publish_error = node.publish_error
     planner_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grasp-plan")
     log = node.get_logger()
-    if not use_force_sensors:
-        log.info("[forces] 已禁用力传感器：不读取力数据，不执行力自检、吸附检测和力保护")
     if sim_mode:
         log.info(
             "[sim] 仿真模式：跳过工具电源服务，视觉使用固定 viewer pose，"
@@ -8984,8 +8969,6 @@ def _run_main(
         return values
 
     def check_dual_suction(before: Mapping[str, float], stage: str) -> bool | None:
-        if not node.use_force_sensors:
-            return True
         after = read_dual_grasp_fz(stage)
         if after is None:
             return None
@@ -9693,8 +9676,6 @@ def _run_main(
 
     def prepare_force_sensors_for_grasp_batch() -> bool:
         """双臂上电验证力数据；首轮无新帧时重新上电再验证一次。"""
-        if not node.use_force_sensors:
-            return True
         sides = (("left", "左臂"), ("right", "右臂"))
         max_attempts = 2
 
@@ -11736,7 +11717,7 @@ def main(argv: list[str] | None = None) -> int:
             status_node.get_logger().error(message)
 
     try:
-        _, _, keyboard_control_mode, _, ros_args = split_runtime_args(argv)
+        _, _, keyboard_control_mode, ros_args = split_runtime_args(argv)
         rclpy.init(args=ros_args)
         if keyboard_control_mode:
             return _run_main(argv, publish_initialized)

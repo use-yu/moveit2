@@ -5,7 +5,7 @@ kill 10568 11065 691478
 
 运行代码：
 
-python3 /home/ws_moveit/src/hello_moveit/scripts/grasp_test.py --sim --keyboard --interactive
+python3 /home/ws_moveit/src/hello_moveit/scripts/grasp_test.py --sim --keyboard --interactive --forces
 
 g01实际部署：
 
