@@ -1,0 +1,11812 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 关节空间规划不到1s，给末端位姿4s左右
+"""
+G01 MoveIt 演示脚本
+
+功能按 1~15 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
+1. 导航到深框识别位置。
+2. 运动到深框识别构型，识别深框，并记录当时 /agv_position 实际位姿；
+   未收到有效视觉数据时最多重复发送识别命令 5 次。
+3. 向 /agv_auto_control_speed 以 20 Hz 发布 linear.x=0.1 m/s，持续 3 秒后停车。
+   停车后再记录 /agv_position，将识别位置下的深框位姿转换到
+   抓取位置的 moveit_base_link 后再添加碰撞模型。
+4. 持续上料，直到 SW1~SW4 没有空位：
+    批次开始前双臂工具上电，确认左右力传感器均能读取新帧，再双臂下电
+    机器人先到初始位
+    → 读取视觉点
+    → 命中本批次不可抓缓存的点保留原顺序并用黑色显示，不参与姿态排序
+    → 按局部 +Z 偏离 moveit_base_link -Z 的角度分为 <30°/≥30° 两组，组内按 z 从高到低
+    → 用两种颜色显示所有视觉圆柱及各自的局部 +Z 方向
+    → 过滤本批次已验证不可抓或实际抓取失败的重复点
+    → 生成左臂、右臂、SJ、moveit_base_link 下的目标位姿
+    → 按视觉点和 group 顺序做可达性验证
+    → 选中“有无碰撞 IK + 直线 approach 可行 + OMPL 可到 q_pre”的候选
+    → 当前腰角全部点不可抓时，按 20°→30°→40°→50° 重新执行识别与验证
+    → OMPL 到 q_pre，工具上电并读取该臂力传感器 Z 基准值
+    → Cartesian approach 到抓取点；以前 9cm/Fz 减小 20N、整段/Fz 减小
+      200N 监测中途接触，触发后停止 ServoJ、取消轨迹并从当前位置直退 q_pre
+    → 反向 Cartesian 回 q_pre，再读取 Z 值判断是否吸附成功
+    → 根据 first_return_mode：
+    ├─ mode=1：双臂交换 → 放置规划前检查当前双臂自碰撞；若碰撞，原抓取
+    │  空载臂沿末端局部 -Z 无碰撞检查直移 2cm → 读取新状态 → 接物臂放置
+    └─ mode=0/2：抓取臂直接放置
+    空位大于 1 时启用流水线：执行抓取轨迹时，独立规划节点
+    同时计算当前物体的直接/交换放置轨迹；抓取后带料到识别位，
+    采集下一物体视觉并后台解算，前台同时放置当前物体；
+    放置后回识别位，有缓存解则直接抓取，未完成则原地等待。
+    SW 放置直线去程/回程若因机械臂报警失败，程序自动调用 servoj_30ms
+    清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
+5. 向 /agv_auto_control_speed 以 20 Hz 发布 linear.x=-0.1 m/s，持续 3 秒后停车。
+6. 运动到物料台识别预备构型，识别并添加碰撞模型；未收到有效视觉数据时
+   最多重复发送识别命令 5 次。
+7. 循环下料：
+    下料读取最新 SW 信号，0=有料。
+    优先取右臂 SW1 + 左臂 SW3，其次右臂 SW4 + 左臂 SW2；必须整对有料。
+    拼接对应 SW 的 yubei，腰部、升降均设为 0。
+    双臂分别计算末端 +Z 10cm 的 IK/Cartesian 路径，合成一条 12 关节轨迹，一次执行。
+    两个末端上电后，反向同一轨迹直线复位。
+    吸附完成后先做物料台放置可达性验证：纯臂 IK 优先；必要时先求
+    left_body，再固定该腰部/升降状态求右臂 IK。左右下降分别预检：忽略
+    world 物体碰撞，但保留机器人自碰撞检查；通过后缓存 OMPL 和同步下降
+    轨迹，执行阶段不重新规划。
+    双臂同步下降前读取左右 Fz；任一侧 Fz 下降超过 210N 时，
+    双末端下电并从实测位置同步直退到放置预备点后继续。
+    优先 SW1+SW3，目标按 (1,3)→(11,13) 循环；SW2+SW4 按
+    (2,4)→(12,14) 循环，不记录已经放过的位置。循环正常结束后，
+    dual_arm_body 复位到 MOVE_TO_GRASP_RESET_Q。
+    八点放置直线去程/回程报警时同样自动恢复；双臂清错、末端下电后，
+    从实测位置同步直退，忽略场景物体碰撞但保留机器人自碰撞检查。
+8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
+
+上位机步骤映射：
+  /move_to_grasp_pose_cmd = 1~3，/grasp_cmd = 4，
+  /move_to_place_pose_cmd = 5~6，/place_cmd = 7~8。
+前提：
+  - 已启动 move_group： ros2 launch g01_moveit_config demo.launch.py
+  - 本节点与 move_group 在同一 ROS 域
+  ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true
+
+运行（Python）：
+  colcon build --packages-select hello_moveit && source install/setup.bash
+  ros2 run hello_moveit g01.py
+
+控制方式：
+  默认：等待上位机话题命令。
+  --forces：禁用力传感器读取、自检、吸附检测及力保护。
+  --keyboard：不等待上位机命令，每轮通过数字菜单选择要执行的流程。
+  --interactive：运动流程中的人工确认点也等待按回车；可与 --keyboard 同时使用。
+
+腰部30度/0.523598 放置和交换
+
+交换放置相比直接放绕z轴顺时针转1度
+
+路径绕调参数num_attempts=30
+
+实际测试遇到的问题：
+1. moveit关节空间规划时由于时间参数化（TOTG）有时候规划成功，执行失败
+可以通过修改 ompl_planning.yaml 中的 longest_valid_segment_fraction 参数来解决，值越小，规划时间越长，但是规划成功率越高
+本代码采用设置一个较好的初始构型，再加上失败重新规划方法来解决这个问题，相比改参数这样求解速度更快
+
+2. 做末端直线运动时由于机械臂构型不同，实际有解但有时候会规划失败，
+本代码采用求解多个逆解，再从多个逆解中选择一个直线规划可以求解成功的逆解，保证构型合理
+
+3. moveit先plan再execute时，耗时较长
+本代码采用先plan+execute的方法
+
+4. 臂直接抓不可达
+加上腰部关节求解，先ik验证逆解可达，再只用臂验证直线退回，直线退回的ik初始值用带腰部关节求解的值
+
+"""
+# solution_rad: r_arm_joint1=-1.944364063, r_arm_joint2=-1.597215489, r_arm_joint3=-0.565983840, r_arm_joint4=-0.979311147, r_arm_joint5=0.851759446, r_arm_joint6=3.140000000
+# solution_deg: r_arm_joint1=-111.403854650, r_arm_joint2=-91.513706512, r_arm_joint3=-32.428485315, r_arm_joint4=-56.110395575, r_arm_joint5=48.802221443, r_arm_joint6=179.908747671
+# solution_rad: l_arm_joint1=0.070556798, l_arm_joint2=-1.414919441, l_arm_joint3=-1.053385853, l_arm_joint4=-0.663103266, l_arm_joint5=0.585734181, l_arm_joint6=-0.010876821
+# solution_deg: l_arm_joint1=4.042606739, l_arm_joint2=-81.068912306, l_arm_joint3=-60.354563592, l_arm_joint4=-37.993018506, l_arm_joint5=33.560096466, l_arm_joint6=-0.623195926
+from __future__ import annotations
+
+import bisect
+import base64
+import copy
+import json
+import math
+import random
+import re
+import socket
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Callable, Mapping, Sequence
+
+import rclpy
+from action_msgs.msg import GoalStatus
+from builtin_interfaces.msg import Duration as DurationMsg
+from geometry_msgs.msg import Point, Pose, Pose2D, PoseStamped, TransformStamped, Twist
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+from moveit_msgs.msg import (
+    BoundingVolume,
+    CollisionObject,
+    ContactInformation,
+    Constraints,
+    JointConstraint,
+    MoveItErrorCodes,
+    ObjectColor,
+    OrientationConstraint,
+    PlanningScene,
+    PlanningSceneComponents,
+    PositionConstraint,
+    RobotState,
+    RobotTrajectory,
+)
+from moveit_msgs.srv import (
+    ApplyPlanningScene,
+    GetCartesianPath,
+    GetPlanningScene,
+    GetPositionFK,
+    GetPositionIK,
+    GetStateValidity,
+)
+from rclpy.action import ActionClient
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.serialization import deserialize_message, serialize_message
+from sensor_msgs.msg import JointState
+from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import Bool, ColorRGBA, Float32, Float32MultiArray, Int32, String, UInt8
+from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
+from trajectory_msgs.msg import JointTrajectoryPoint
+from visualization_msgs.msg import Marker, MarkerArray
+from dobot_msgs_v4.srv import ClearError, SetToolPower
+
+# 错误事件话题；主程序启动时发布一次 0 清错，保留原有运动/恢复流程。
+ERROR_CODE_TOPIC = "/arm_camera_error_code"
+ALGORITHM_INITIALIZED_TOPIC = "/arm_algorithm_initialized"
+SELFCHECK_REQUEST_TOPIC = "/selfcheck_request"
+ERROR_CODES = {
+    0: "清除错误状态",
+    1: "相机 TCP 连接失败",
+    2: "抓取相机数据不合法",
+    3: "放置相机数据不合法",
+    4: "SW 硬件信号等待超时",
+    5: "力传感器新帧等待超时或批次初始化失败",
+    6: "末端上电失败",
+    7: "末端下电失败",
+    8: "所有候选点及腰角尝试后均不能抓取",
+    9: "获取关节状态失败",
+    10: "放置位置不可达",
+    99: "其他运行时异常",
+}
+
+
+_runtime_error_reporter = None
+
+
+class ForceRangeAbort(BaseException):
+    """量程保护直接退出任务，不允许被普通 Exception 恢复/重试分支吞掉。"""
+
+
+def report_runtime_exception(exc, context):
+    """99 兜底；不把普通 False 返回、正常退出或候选无解当成异常。"""
+    if getattr(exc, "_grasp_error_reported", False):
+        return
+    if _runtime_error_reporter is not None:
+        _runtime_error_reporter(99, f"{context}: {type(exc).__name__}: {exc}")
+        exc._grasp_error_reported = True
+
+
+_SOURCE_DATA_DIR = Path("/home/ws_moveit/src/hello_moveit/data")
+TRAJECTORY_CACHE_DIR = (
+    _SOURCE_DATA_DIR
+    if _SOURCE_DATA_DIR.parent.is_dir()
+    else Path(__file__).resolve().parents[1] / "data"
+) / "trajectory_cache"
+TRAJECTORY_CACHE_VERSION = 2  # 固定坐标系和完整预计状态规划；旧轨迹需重新生成。
+
+# =============================================================================
+# 用户可调参数（改这里即可，无需动下面逻辑）
+# =============================================================================
+GREEN = '\033[32m'
+RESET = '\033[0m'
+# 第一步：关节空间规划使用哪个 SRDF 组
+
+
+# 第二步：末端位姿规划组与目标（连杆 L6，坐标系 moveit_base_link）
+POSE_GROUP = "right_arm"
+
+PLAN_FRAME = "r_base_link"  # 末端位姿约束坐标系
+
+# EE_LINK 必须在 末端linkL6 下游、用 fixed joint 连上去的子 link（例如 l_tool）
+EE_LINK = "r_tool"
+
+# 各组的关节目标 [rad]（键名须与 URDF/SRDF 一致）
+JOINT_TARGETS = {
+
+    # 预备位：底盘略前伸、躯干抬起、双臂零位（与 hello_go1.cpp dual_arm 一致）
+    "robot": {
+        "base_joint1": 1.25,
+        "base_joint2": 0.0,
+        "body_joint1": -0.25,
+        "body_joint2": 1.1,
+        "l_arm_joint1": -20 * math.pi / 180,
+        "l_arm_joint2": -102 * math.pi / 180,
+        "l_arm_joint3": -92 * math.pi / 180,
+        "l_arm_joint4": 137 * math.pi / 180,
+        "l_arm_joint5": -0 * math.pi,
+        "l_arm_joint6": -0 * math.pi / 180,
+        "r_arm_joint1": 80 * math.pi / 180,
+        "r_arm_joint2": -102 * math.pi / 180,
+        "r_arm_joint3": -92 * math.pi / 180,
+        "r_arm_joint4": 137 * math.pi / 180,
+        "r_arm_joint5": -0 * math.pi,
+        "r_arm_joint6": -0 * math.pi / 180,
+    },
+    "dual_arm": {
+        "l_arm_joint1": -20 * math.pi / 180,
+        "l_arm_joint2": -102 * math.pi / 180,
+        "l_arm_joint3": -92 * math.pi / 180,
+        "l_arm_joint4": 137 * math.pi / 180,
+        "l_arm_joint5": -0 * math.pi,
+        "l_arm_joint6": -0 * math.pi / 180,
+        "r_arm_joint1": 80 * math.pi / 180,
+        "r_arm_joint2": -102 * math.pi / 180,
+        "r_arm_joint3": -92 * math.pi / 180,
+        "r_arm_joint4": 137 * math.pi / 180,
+        "r_arm_joint5": -0 * math.pi,
+        "r_arm_joint6": -0 * math.pi / 180,
+    },
+    "body": {
+        "body_joint1": 0.0,
+        "body_joint2": 0.0,
+    },
+    "dual_arm_body": {
+        "body_joint1": 0.0,
+        "body_joint2": 1.313,
+        "l_arm_joint1": -20 * math.pi / 180,
+        "l_arm_joint2": -102 * math.pi / 180,
+        "l_arm_joint3": -92 * math.pi / 180,
+        "l_arm_joint4": 137 * math.pi / 180,
+        "l_arm_joint5": -0 * math.pi,
+        "l_arm_joint6": -0 * math.pi / 180,
+        "r_arm_joint1": 80 * math.pi / 180,
+        "r_arm_joint2": -102 * math.pi / 180,
+        "r_arm_joint3": -92 * math.pi / 180,
+        "r_arm_joint4": 137 * math.pi / 180,
+        "r_arm_joint5": -0 * math.pi,
+        "r_arm_joint6": -0 * math.pi / 180,
+    },
+    "dual_arm_waist": {
+        "body_joint2": 1.313,
+        "l_arm_joint1": -20 * math.pi / 180,
+        "l_arm_joint2": -102 * math.pi / 180,
+        "l_arm_joint3": -92 * math.pi / 180,
+        "l_arm_joint4": 137 * math.pi / 180,
+        "l_arm_joint5": -0 * math.pi,
+        "l_arm_joint6": -0 * math.pi / 180,
+        "r_arm_joint1": 80 * math.pi / 180,
+        "r_arm_joint2": -102 * math.pi / 180,
+        "r_arm_joint3": -92 * math.pi / 180,
+        "r_arm_joint4": 137 * math.pi / 180,
+        "r_arm_joint5": -0 * math.pi,
+        "r_arm_joint6": -0 * math.pi / 180,
+    },
+    "left_body": {
+        "body_joint1": 0.0,
+        "body_joint2": 1.313,
+        "l_arm_joint1": 1.8697,
+        "l_arm_joint2": 0.2,
+        "l_arm_joint3": 0.135997,
+        "l_arm_joint4": 1.23459,
+        "l_arm_joint5": 2.1201,
+        "l_arm_joint6": -1.5702,
+    },
+    "left_waist": {
+        "body_joint2": 1.313,
+        "l_arm_joint1": 1.8697,
+        "l_arm_joint2": 0.2,
+        "l_arm_joint3": 0.135997,
+        "l_arm_joint4": 1.23459,
+        "l_arm_joint5": 2.1201,
+        "l_arm_joint6": -1.5702,
+    },
+    "left": {
+        "base_joint1": 1.25,
+        "base_joint2": 0.0,
+        "body_joint1": 0.0,
+        "body_joint2": 1.313,
+        "l_arm_joint1": 1.8697,
+        "l_arm_joint2": 0.2,
+        "l_arm_joint3": 0.135997,
+        "l_arm_joint4": 1.23459,
+        "l_arm_joint5": 2.1201,
+        "l_arm_joint6": -1.5702,
+    },
+    "left_arm": {
+        "l_arm_joint1": 1.8697,
+        "l_arm_joint2": 0.2,
+        "l_arm_joint3": 0.135997,
+        "l_arm_joint4": 1.23459,
+        "l_arm_joint5": 2.1201,
+        "l_arm_joint6": -1.5702,
+    },
+    "right": {
+        "base_joint1": 1.25,
+        "base_joint2": 0.0,
+        "body_joint1": 0.0,
+        "body_joint2": 1.313,
+        "r_arm_joint1": -1.8697,
+        "r_arm_joint2": 0.2,
+        "r_arm_joint3": 0.135997,
+        "r_arm_joint4": 1.23459,
+        "r_arm_joint5": 2.1201,
+        "r_arm_joint6": -1.5702,
+    },
+    "right_body": {
+        "body_joint1": 0.0,
+        "body_joint2": -1.313,
+        "r_arm_joint1": -1.8697,
+        "r_arm_joint2": 0.2,
+        "r_arm_joint3": 0.135997,
+        "r_arm_joint4": 1.23459,
+        "r_arm_joint5": 2.1201,
+        "r_arm_joint6": -1.5702,
+    },
+    "right_waist": {
+        "body_joint2": -1.313,
+        "r_arm_joint1": -1.8697,
+        "r_arm_joint2": 0.2,
+        "r_arm_joint3": 0.135997,
+        "r_arm_joint4": 1.23459,
+        "r_arm_joint5": 2.1201,
+        "r_arm_joint6": -1.5702,
+    },
+    "right_arm": {
+        "r_arm_joint1": -1.8697,
+        "r_arm_joint2": 0.2,
+        "r_arm_joint3": 0.135997,
+        "r_arm_joint4": 1.23459,
+        "r_arm_joint5": 2.1201,
+        "r_arm_joint6": -1.5702,
+    },
+    
+}
+
+# 位姿规划时作为起始状态的关节（不含底盘，与 left_body 组一致）
+POSE_START_JOINTS = list(JOINT_TARGETS.get(POSE_GROUP, {}).keys())
+if not POSE_START_JOINTS:
+    raise KeyError(f"JOINT_TARGETS 中未找到 POSE_GROUP={POSE_GROUP} 的关节列表")
+
+# /move_to_grasp_pose_cmd 第一步使用的复位构型，顺序与 dual_arm_body 一致。
+MOVE_TO_GRASP_RESET_Q = [
+    0.0,
+    0 * math.pi / 180,
+    -90 * math.pi / 180,
+    87 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    90 * math.pi / 180,
+    -87 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+    0 * math.pi / 180,
+]
+
+# p,4 深框识别专用预备构型，顺序与 dual_arm_body 一致。
+框_Q1 = [
+    0.0,
+    20 * math.pi / 180,
+    -1.57,
+    -0.15,
+    -1.578090,
+    -1.370549,
+    -1.672852,
+    -0.588477,
+    1.57,
+    0.15,
+    1.578090,
+    1.370549,
+    1.672852,
+    0.588477,
+]
+# 键盘 9：先发送头部目标，再运动腰部，确认头部到位后直接识别深框。
+FRAME_DIRECT_CAMERA_POSITION = 0.2854
+FRAME_DIRECT_CAMERA_TOLERANCE = 0.005  # rad
+# 仅使用此构型的腰部角度，升降和双臂保持不动。
+FRAME_DIRECT_VISION_Q = [
+    0,
+    40 * math.pi / 180,
+    -1.57,
+    -0.15,
+    -1.578090,
+    -1.370549,
+    -1.672852,
+    -0.588477,
+    1.57,
+    0.15,
+    1.578090,
+    1.370549,
+    1.672852,
+    0.588477,
+]
+# 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
+# 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
+GRASP_VISION_WAIST_ANGLES_DEG = (30,)
+# 输入 4：先发送此头部目标，再运动到识别构型；头部到位后才采集视觉。
+GRASP_VISION_CAMERA_POSITION = 0.7854
+# 抓取排序的姿态分组阈值：局部 +Z 与 moveit_base_link -Z
+# 的偏离角小于该值时，优先于其他物体抓取。
+GRASP_UPRIGHT_TILT_THRESHOLD_DEG = 30.0
+GRASP_Q1_WAIST_JOINT_INDEX = list(JOINT_TARGETS["dual_arm_body"]).index(
+    "body_joint2"
+)
+# 每轮抓取使用的预备构型；body_joint2 由上述重试序列动态覆盖。
+GRASP_Q1 = [
+    0.0,
+    GRASP_VISION_WAIST_ANGLES_DEG[0] * math.pi / 180,
+    -1.57,
+    -0.15,
+    -1.578090,
+    -1.370549,
+    -1.672852,
+    -0.588477,
+    1.57,
+    0.15,
+    1.578090,
+    1.370549,
+    1.672852,
+    0.588477,
+]
+# 下料流程识别物料台前的预备构型，顺序与 dual_arm_body 一致。
+UNLOAD_TABLE_VISION_PREP_Q = [
+    0.05,
+    0 * math.pi / 180,
+    -1.57,
+    -0.15,
+    -1.578090,
+    -1.370549,
+    -1.672852,
+    -0.588477,
+    1.57,
+    0.15,
+    1.578090,
+    1.370549,
+    1.672852,
+    0.588477,
+]
+for q1_name, q1_values in (
+    ("MOVE_TO_GRASP_RESET_Q", MOVE_TO_GRASP_RESET_Q),
+    ("框_Q1", 框_Q1),
+    ("GRASP_Q1", GRASP_Q1),
+):
+    if len(q1_values) != len(JOINT_TARGETS["dual_arm_body"]):
+        raise ValueError(
+            f"{q1_name} 长度 {len(q1_values)} 与 dual_arm_body 关节数 "
+            f"{len(JOINT_TARGETS['dual_arm_body'])} 不一致"
+        )
+if len(UNLOAD_TABLE_VISION_PREP_Q) != len(JOINT_TARGETS["dual_arm_body"]):
+    raise ValueError(
+        f"UNLOAD_TABLE_VISION_PREP_Q 长度 {len(UNLOAD_TABLE_VISION_PREP_Q)} "
+        f"与 dual_arm_body 关节数 {len(JOINT_TARGETS['dual_arm_body'])} 不一致"
+    )
+
+
+# 规划器
+PLANNER_ID = "RRTConnect"
+NUM_ATTEMPTS = 20
+PLAN_TIME_SEC = 10.0
+# 每次 move() 最多发送的完整 MoveGroup 请求数（包含第 1 次）。
+# 例如值为 10 时，日志中最多出现“第 10/10 次”，而不是首次 + 10 次重试。
+MOVE_MAX_RETRIES = 10
+
+# 执行速度缩放（同时用于 velocity / acceleration；范围 0~1，越大越快）
+DEFAULT_SPEED_SCALE = 0.5
+
+# 深框障碍物（相对于 moveit_base_link 发布）
+SCENE_FRAME = "moveit_base_link"
+FRAME_ID = "深框"
+FRAME_SIZE = (0.86, 0.86, 0.6)  # 深框整体外尺寸：长×宽×高 [m]0.8, 0.8, 0.71
+WALL_T = 0.06  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
+FRAME_Y_OUTER_THICKNESS = 0.05  # 局部 ±Y 两侧向外附加的厚度 [m]
+FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
+FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 相对于 moveit_base_link [degree]
+FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
+# p,4 识别位姿先绕自身 Z 轴 +90°，再沿旋转后的自身坐标平移，
+# 得到深框顶部空心区域中心；该坐标点位于开口中，不落在框壁实体上。
+FRAME_VISION_TRIGGER_COMMAND = "p,9"
+FRAME_VISION_POSE_KEY = "right_body"
+FRAME_VISION_TF_FRAME = "deep_frame_vision"
+FRAME_TOP_CENTER_TF_FRAME = "deep_frame_top_center"
+FRAME_CENTER_TF_FRAME = "deep_frame_center"
+FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0 *0
+FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
+    -0.367,
+    -0.356,
+    0.11, #0.06
+)
+# 原有的深框局部 +Y 大长方体障碍物。
+BOX_OBSTACLE_ID = "长方体障碍物"
+BOX_OBSTACLE_SIZE = (0.9, 1.0, 0.965)  # X × Y × Z [m]
+BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL = (0.0, 1.6, 0.4)
+BOX_OBSTACLE_TOP_TF_FRAME = "box_obstacle_top_center"
+BOX_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=1.0)
+
+# 新增的深框局部 -Y（右侧）墙状障碍物：靠近深框的一面与深框最外沿
+# 净距 0.60 m，底面与深框底面齐平。FRAME_Y_OUTER_THICKNESS 计入最外沿。
+FRAME_NEG_Y_OBSTACLE_ID = "深框负Y障碍物"
+FRAME_NEG_Y_OBSTACLE_SIZE = (1.7, 0.02, 0.96)  # X × Y × Z [m]
+FRAME_NEG_Y_OBSTACLE_GAP = 0.60
+FRAME_NEG_Y_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL = (
+    0.0,
+    -(
+        FRAME_SIZE[1] / 2.0
+        + FRAME_Y_OUTER_THICKNESS
+        + FRAME_NEG_Y_OBSTACLE_GAP
+        + FRAME_NEG_Y_OBSTACLE_SIZE[1] / 2.0
+    ),
+    FRAME_NEG_Y_OBSTACLE_SIZE[2] - FRAME_SIZE[2],
+)
+FRAME_NEG_Y_OBSTACLE_TOP_TF_FRAME = "frame_neg_y_obstacle_top_center"
+FRAME_NEG_Y_OBSTACLE_COLOR = ColorRGBA(r=0.35, g=0.35, b=0.35, a=1.0)
+
+# 深框局部 +X 为前侧；薄板贴住前表面，底部与框底齐平，顶部高出框顶 0.50 m。
+FRAME_FRONT_GUARD_THICKNESS = 0.01
+FRAME_FRONT_GUARD_ABOVE_TOP = 0.50
+
+FRAME_CUTOFF_ID = "深框隔离面"
+FRAME_CUTOFF_THICKNESS = 0.01  # 水平隔离面厚度 [m]，沿深框局部 z 轴
+FRAME_CUTOFF_BELOW_COLLISION = 0.02  # 隔离面上表面比 L6/R6 collision 最低点低 [m]
+FRAME_CUTOFF_COLOR = ColorRGBA(r=1.0, g=0.25, b=0.1, a=1.0)
+
+# 位姿标记圆柱（Marker 保持仅显示；q_pre OMPL 阶段另建同尺寸临时碰撞体）
+CYLINDER_MARKER_ID = "ee_pose_cylinder"
+CYLINDER_MARKER_NS = "g01_pose_cylinder"
+CYLINDER_MARKER_TOPIC = "g01_pose_cylinder"
+CYLINDER_DIAMETER = 0.15   # 直径 [m]
+CYLINDER_HEIGHT = 0.06     # 高度 [m]（沿位姿局部 z 轴）
+CYLINDER_COLOR = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.45)
+# 抓取视觉结果按排序后的物体索引交替取色；物体 0/1 分别为橙/蓝。
+# 圆柱保持半透明，对应的 +Z 箭头使用同色不透明版。
+GRASP_VISION_CYLINDER_COLORS = (
+    ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.45),
+    ColorRGBA(r=0.0, g=0.65, b=1.0, a=0.45),
+)
+GRASP_VISION_Z_AXIS_COLORS = (
+    ColorRGBA(r=1.0, g=0.5, b=0.0, a=1.0),
+    ColorRGBA(r=0.0, g=0.65, b=1.0, a=1.0),
+)
+# 命中本批次不可抓点缓存的物体统一显示为黑色，避免与碰撞体红色混淆。
+UNGRASPABLE_CYLINDER_COLOR = ColorRGBA(r=0.0, g=0.0, b=0.0, a=0.45)
+UNGRASPABLE_Z_AXIS_COLOR = ColorRGBA(r=0.0, g=0.0, b=0.0, a=1.0)
+GRASP_VISION_CYLINDER_MARKER_ID_PREFIX = "grasp_vision_cylinder_"
+GRASP_VISION_Z_AXIS_MARKER_ID_PREFIX = "grasp_vision_z_axis_"
+# 每个视觉点会发布圆柱和 +Z 箭头两条 Marker。大队列避免
+# 一次识别的密集发布把前面的物体从 DDS 历史中挤掉。
+POSE_MARKER_QUEUE_DEPTH = 2048
+GRASP_OBJECT_COLLISION_ID = "待抓取物体"
+GRASP_OBJECT_COLLISION_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
+Z_AXIS_MARKER_ID = "ee_pose_z_axis"
+Z_AXIS_LENGTH = CYLINDER_HEIGHT / 2.0  # 从圆柱中心到局部 +z 端面，不超出物体
+Z_AXIS_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
+
+# ROS 接口名（move_group 默认）
+SVC_APPLY_SCENE = "apply_planning_scene"
+SVC_GET_PLANNING_SCENE = "get_planning_scene"
+SVC_CARTESIAN_PATH = "compute_cartesian_path"
+SVC_COMPUTE_IK = "compute_ik"
+SVC_COMPUTE_FK = "compute_fk"
+SVC_STATE_VALIDITY = "check_state_validity"
+# 启动清理先等待 move_group 的场景查询服务；服务一就绪就立即继续。
+STARTUP_SCENE_CLEAR_SERVICE_WAIT_SEC = 5.0
+SCENE_CLEAR_RESPONSE_TIMEOUT_SEC = 5.0
+LEFT_TOOL_COMMAND_SERVICE = "/g01/left/tool_commands"
+RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
+LEFT_FT_SENSOR_TOPIC = "/g01/left/FTSensor"
+RIGHT_FT_SENSOR_TOPIC = "/g01/right/FTSensor"
+LEFT_CLEAR_ERROR_SERVICE = "/g01/left/clear_error"
+RIGHT_CLEAR_ERROR_SERVICE = "/g01/right/clear_error"
+SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
+SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
+MOTOR_COMMAND_TOPIC = "/g01/motor_commands"
+MOVE_TO_GRASP_POSE_CMD_TOPIC = "/move_to_grasp_pose_cmd"
+GRASP_CMD_TOPIC = "/grasp_cmd"
+MOVE_TO_PLACE_POSE_CMD_TOPIC = "/move_to_place_pose_cmd"
+PLACE_CMD_TOPIC = "/place_cmd"
+RETURN_INIT_POSE_TOPIC = "/return_init_pose"
+DRIVER_SIGNAL_TOPIC = "/driver_report/signal"
+NAV_GOAL_TOPIC = "/goal_pose"
+NAV_RESULT_TOPIC = "/nav_result"
+AGV_SPEED_TOPIC = "/agv_auto_control_speed"
+AGV_GRASP_SPEED_X = 0.1  # m/s
+AGV_PLACE_SPEED_X = -0.1  # m/s
+AGV_DRIVE_DURATION_SEC = 3.0
+AGV_SPEED_PUBLISH_HZ = 20.0
+AGV_POSITION_TOPIC = "/agv_position"
+AGV_POSITION_QUEUE_DEPTH = 100
+AGV_POSITION_WAIT_TIMEOUT_SEC = 10.0
+NAV_TARGET_FRAME_RECOGNITION = "frame_recognition"
+NAV_TARGET_GRASP = "grasp"
+NAV_TARGET_PLACE = "place"
+NAV_TARGET_INIT = "init"
+GRASP_NAV_X_OFFSET_FROM_RECOGNITION = 0.29
+UPPER_COMMAND_EXPECTED_TYPES = {
+    MOVE_TO_GRASP_POSE_CMD_TOPIC: 1,
+    GRASP_CMD_TOPIC: 1,
+    MOVE_TO_PLACE_POSE_CMD_TOPIC: 1,
+    PLACE_CMD_TOPIC: 1,
+}
+UPPER_COMMAND_STEPS = {
+    MOVE_TO_GRASP_POSE_CMD_TOPIC: (1, 2, 3,4,5,6,7,8),
+    GRASP_CMD_TOPIC: (),
+    MOVE_TO_PLACE_POSE_CMD_TOPIC: (5,6,7,8),
+    PLACE_CMD_TOPIC: (),
+    # 保留旧接口的订阅，但收到后不执行任何步骤，也不发布结果。
+    RETURN_INIT_POSE_TOPIC: (),
+}
+STEP_DESCRIPTIONS = {
+    1: "导航到深框识别位置",
+    2: "识别深框并记录识别位置的实际 AGV 位姿",
+    3: "AGV 以 0.1 m/s 前进 3 秒（20 Hz），转换并添加深框碰撞模型",
+    4: "抓满四个放置位",
+    5: "AGV 以 -0.1 m/s 后退 3 秒（20 Hz）",
+    6: "物料台预备构型、识别并添加碰撞模型",
+    7: "按 SW 优先级循环放置",
+    8: "导航回起点",
+    9: "运动到独立识别构型，直接识别并添加深框碰撞模型",
+    10: "识别料台、添加碰撞模型，双臂同步抓取并抬起",
+    11: "双臂放回料台、下电、直线返回并复位",
+    12: "发送 p,6 识别物料台并添加碰撞模型",
+    13: "抓取物料台第一排，双臂放回后方空 SW 位",
+    14: "先 SW2/SW4 再 SW1/SW3，双臂下料到深框中心两侧",
+    15: "清除环境中全部碰撞物",
+}
+NAV_GOAL_POSES = {
+    NAV_TARGET_FRAME_RECOGNITION: {
+        "position": (
+            1.9541624784469604,
+            0.17442595958709717,
+            0.007418082095682621,
+        ),
+        "orientation": (
+            -0.001856358372606337,
+            -0.0009955015266314149,
+            -0.004639043472707272,
+            0.9997707009315491,
+        ),
+    },
+    NAV_TARGET_GRASP: {
+        "position": (
+            2.0505805015563965,
+            0.0969683825969696,
+            -0.014873062260448933,
+        ),
+        "orientation": (
+            0.00039914611261337996,
+            0.02196754701435566,
+            -0.013393161818385124,
+            0.9996967315673828,
+        ),
+    },
+    NAV_TARGET_PLACE: {
+        "position": (
+            1.9342942237854004,
+            1.8165706396102905,
+            -0.038558609783649445,
+        ),
+        "orientation": (
+            -0.000984888756647706,
+            0.02201298624277115,
+            -0.001252052141353488,
+            0.9997838139533997,
+        ),
+    },
+    NAV_TARGET_INIT: {
+        "position": (
+            -0.4519396126270294,
+            0.29902148246765137,
+            0.023660462349653244,
+        ),
+        "orientation": (
+            0.0028479185421019793,
+            0.019094645977020264,
+            -0.021404169499874115,
+            0.9995894432067871,
+        ),
+    },
+}
+SIGNAL_SW1_MASK = 0x08
+SIGNAL_SW2_MASK = 0x10
+SIGNAL_SW3_MASK = 0x20
+SIGNAL_SW4_MASK = 0x40
+PLACE_SLOT_MASKS = {
+    "sw1": SIGNAL_SW1_MASK,
+    "sw2": SIGNAL_SW2_MASK,
+    "sw3": SIGNAL_SW3_MASK,
+    "sw4": SIGNAL_SW4_MASK,
+}
+ALL_PLACE_SLOTS_EMPTY_SIGNAL = (
+    SIGNAL_SW1_MASK | SIGNAL_SW2_MASK | SIGNAL_SW3_MASK | SIGNAL_SW4_MASK
+)
+ALL_PLACE_SLOTS_MATERIAL_SIGNAL = 0x00
+DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
+
+# 下料流程：优先选择 SW1+SW3；两组目标各自循环，不记录已放置点。
+# 格式：(右臂 SW, 左臂 SW, ((左臂点, 右臂点), ...))
+#   SW1+SW3: (1,3) → (11,13) → (1,3) → ...
+#   SW2+SW4: (2,4) → (12,14) → (2,4) → ...
+UNLOAD_TRIGGER_COMMAND = "p,4"
+LOAD_TABLE_TRIGGER_COMMAND = "p,6"
+UNLOAD_VISION_POSE_KEY = "right_body"  # 料台碰撞模型和视觉基准 TF 使用右标定。
+UNLOAD_VISION_TF_FRAME = "material_table_vision"
+UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
+UNLOAD_PLACE_TF_FRAME_PREFIX = "material_table_place_point_"
+UNLOAD_PAIR_CYCLES = (
+    ("sw1", "sw3", ((1, 3), (11, 13))),
+    ("sw4", "sw2", ((2, 4), (12, 14))),
+)
+UNLOAD_LEFT_PLACE_POINTS = (1, 2, 11, 12)
+UNLOAD_MAX_PAIRS_PER_RUN = 2
+UNLOAD_TABLE_ID = "unload_table"
+UNLOAD_TABLE_SIZE = (0.57, 1.7, 1.0) #0.5
+UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL = (
+    -0.1,
+    0.125,
+    0.06,
+)
+UNLOAD_TABLE_LOCAL_RPY = (0.0, 0.0, 0.0)
+UNLOAD_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
+# 仅用于清理旧版本可能残留在 MoveIt 场景中的桌面薄盒。
+UNLOAD_TABLE_TOP_BOX_ID = "unload_table_top_box"
+UNLOAD_OBSTACLE_ID = "unload_vision_y_obstacle"
+UNLOAD_OBSTACLE_SIZE = (1.0, 0.1, 2.5)
+UNLOAD_OBSTACLE_Y_OFFSET = 0.95
+UNLOAD_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=0.85)
+UNLOAD_APPROACH_DISTANCE = 0.1
+UNLOAD_PLACE_DESCENT_DISTANCE = 0.13
+# 输入 14：最终放置点相对深框实体中心的局部 (x, y, z) 偏移，单位 m。
+FRAME_UNLOAD_LEFT_LOCAL_XYZ = (-0.3, 0.1, 0.4)
+FRAME_UNLOAD_RIGHT_LOCAL_XYZ = (-0.3, -0.1, 0.4)
+# 上料放置位抓取
+UNLOAD_EXTRA_APPROACH_BY_SLOT = {
+    "sw1": 0.001,  # 右臂：多降 4 mm
+    "sw2": -0.001,  # 左臂：多降 1 mm
+    "sw3": 0.001,  # 左臂：多降 4 mm
+    "sw4": 0.003,  # 右臂：多降 8 mm
+}
+# 物料台放置点：相对视觉识别点 recognition_pose 的局部 xyz 偏移 [m]
+# 和局部旋转，不再叠加 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL。
+UNLOAD_PLACE_LOCAL_PITCH = math.pi
+UNLOAD_PLACE_LOCAL_YAWS = {
+    11: math.radians(151),
+    12: math.radians(159),
+    13: math.radians(153),
+    14: math.radians(158),
+
+    1: math.radians(158),
+    2: math.radians(155),
+    3: math.radians(154),
+    4: math.radians(155),
+}
+# 注意这里八个物料台点编号和机器人 SW 编号不一样。
+UNLOAD_PLACE_LOCAL_OFFSETS = {
+    11: (0.0-0.0065, 0.45-0.0025, 0.146),
+    12: (0.0-0.0035, 0.25-0.0015, 0.146),
+    13: (0.0+0.001, 0.0-0.0055, 0.152),
+    14: (0.0+0.0015, -0.2-0.004, 0.152),
+
+    1: (-0.2-0.0065, 0.45-0.004, 0.146),
+    2: (-0.2-0.0015, 0.25-0.0015, 0.146),
+    3: (-0.2+0.002, 0.0-0.006, 0.152),
+    4: (-0.2+0.002, -0.2-0.004, 0.152),
+}
+UNLOAD_JOINT_SPEED = 0.2
+UNLOAD_PLACE_JOINT_SPEED = 0.2
+UNLOAD_PLACE_POSITION_TOLERANCE = 0.001  # 规划终点 FK 位置误差上限：1 mm。
+UNLOAD_PLACE_ORIENTATION_TOLERANCE = math.radians(0.1)  # 姿态误差上限：0.1°。
+UNLOAD_PLACE_ARM_IK_ATTEMPTS = 200
+UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS = 20
+UNLOAD_PLACE_BODY_IK_ATTEMPTS = 200
+UNLOAD_PLACE_BODY_IK_MAX_SOLUTIONS = 20
+UNLOAD_PLACE_RIGHT_IK_ATTEMPTS_PER_BODY = 40
+UNLOAD_PLACE_RIGHT_IK_MAX_SOLUTIONS_PER_BODY = 10
+UNLOAD_PLACE_MAX_PAIR_PLANS = 200
+UNLOAD_PLACE_IK_PERTURB = math.pi
+UNLOAD_PLACE_IK_RANDOM_SEED = 20260724
+# IK 随机种子使用的 URDF 位置限位。抓取与下料共用，避免生成越界 RobotState。
+BODY_JOINT1_LIMITS = (0.0, 0.19)
+BODY_JOINT2_LIMITS = (0.0, 1.0)
+ARM_JOINT_LIMITS_BY_INDEX = {
+    1: (-3.14, 3.8),
+    2: (-3.14, 3.14),
+    3: (-2.79, 2.79),
+    4: (-3.14, 3.14),
+    5: (-3.14, 3.14),
+    6: (-3.14, 3.14),
+}
+UNLOAD_CARTESIAN_SPEED = 0.2
+UNLOAD_CARTESIAN_AVOID_COLLISIONS = False
+UNLOAD_SYNC_SAMPLE_PERIOD = 0.005
+# 放置同步轨迹按 20 ms 抽样做整机自碰撞检查，并始终检查首末点。
+# 单臂下降仍检查 compute_cartesian_path 返回的每一个离散点。
+UNLOAD_PLACE_SELF_COLLISION_SAMPLE_PERIOD = 0.02
+UNLOAD_TOOL_SETTLE_SEC = 1.0
+
+BODY_GROUP = "body"
+ACT_MOVE_GROUP = "move_action"
+ACT_EXEC_TRAJ = "execute_trajectory"
+
+# 末端目标容差（与 MoveGroupInterface 默认一致）没用到
+_POS_TOL = 1e-5
+_ORI_TOL = 1e-5
+
+# 笛卡尔直线运动参数
+CART_EEF_STEP = 0.005     # 服务端 IK 离散步长（m）
+CART_MIN_FRACTION = 0.99  # 接受的最小成功比例（<1 表示直线被截断）
+CART_JUMP_THRESHOLD = 2.0  # 相对关节跳变阈值；0 表示关闭，容易接受绕腕跳解
+CART_REVOLUTE_JUMP_THRESHOLD = 0.2  # 单步任一转动关节超过该值 [rad] 视为跳解
+CART_PRISMATIC_JUMP_THRESHOLD = 0.02  # 单步任一移动关节超过该值 [m] 视为跳解
+CART_JUMP_STEP_FACTOR = 3.0  # 单步关节空间距离超过平均值该倍数，直接淘汰
+CART_MAX_POINT_FACTOR = 2.0  # 实际点数超过理论直线点数该倍数时，认为 IK 分支不稳
+CART_MAX_POINT_EXTRA = 5
+DEFAULT_ROBOT_URDF = (
+    Path(__file__).resolve().parents[2]
+    / "moveit_resources/g01_description/urdf/G01-URDF888.urdf"
+)
+
+# 放置位关节目标 [rad]。fang 字典的顺序就是放置顺序，槽位按左右臂分别记录。
+PLACE_JOINTS = {
+    # "left_body": [
+    #     -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    # ],
+    # "left": [
+    #     1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    # ],
+    # "right_body": [
+    #     -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    # ],
+    # "right": [
+    #     1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    # ],
+    # "dual_arm": [
+    #     1.25, 0.0, -0.01292, 1.015203, -0.712975, -0.550402, 1.300752, 0.543868, -0.143126, -0.338787
+    #     ,3.13, -1.419584, 1.578090, 1.370549, 1.672852, 0.588477
+    # ],
+    "right_arm": {
+        "yubei_j": {
+            "sw1": [
+                0.0, 0*math.pi/180,
+                3.537801422,1.036855577,2.034580428,0.097826326,0.398728438,-2.334272076+0.02
+            ],
+            "sw2": [
+                0.0, 0*math.pi/180,
+                3.539166471,1.512905410,1.727965634,-0.078347365,0.404081781,-2.326902431+0.02
+            ],
+            "sw3": [
+                0.0, 0*math.pi/180,
+                3.405035216,1.569314673,1.190509578,0.426232574,0.271195234,-2.352745619+0.02
+            ],
+            "sw4": [
+                0.0, 0*math.pi/180,
+                3.405201295,1.149433448,1.489954286,0.553534223,0.268266338,-2.359880496+0.02
+            ],
+
+        },
+        "fang_j": {
+            "sw1": [
+                3.764760737,1.079822803,1.751727820,0.332183391,0.626423029,-2.326675870+0.02
+            ],
+            "sw2": [
+                3.765197166,1.520508845,1.458467222,0.181466221,0.630260905,-2.322575881+0.02
+            ],
+            "sw3": [
+                3.585224784,1.655159862,0.882617011,0.635370108,0.453068496,-2.338316304+0.02
+            ],
+            "sw4": [
+                3.586045101,1.237592644,1.221418852,0.716411092,0.450680183,-2.340845692+0.02
+            ],
+        },
+        "yubei": {
+            "sw1": [
+                0.0, 0*math.pi/180,
+                3.537801422,1.036855577,2.034580428,0.097826326,0.398728438,-2.334272076
+            ],
+            "sw2": [
+                0.0, 0*math.pi/180,
+                3.539166471,1.512905410,1.727965634,-0.078347365,0.404081781,-2.326902431
+            ],
+            "sw3": [
+                0.0, 0*math.pi/180,
+                3.405035216,1.569314673,1.190509578,0.426232574,0.271195234,-2.352745619
+            ],
+            "sw4": [
+                0.0, 0*math.pi/180,
+                3.405201295,1.149433448,1.489954286,0.553534223,0.268266338,-2.359880496
+            ],
+
+        },
+        "fang": {
+            "sw1": [
+                3.764760737,1.079822803,1.751727820,0.332183391,0.626423029,-2.326675870
+            ],
+            "sw2": [
+                3.765197166,1.520508845,1.458467222,0.181466221,0.630260905,-2.322575881
+            ],
+            "sw3": [
+                3.585224784,1.655159862,0.882617011,0.635370108,0.453068496,-2.338316304
+            ],
+            "sw4": [
+                3.586045101,1.237592644,1.221418852,0.716411092,0.450680183,-2.340845692
+            ],
+        },
+    },
+    "left_arm": {
+        "yubei_j": {
+            "sw1": [
+                0.0, 0*math.pi/180,
+                2.742245078,-1.511187626,-1.703249289,0.045934743,-0.413767659,0.892322578
+            ],
+            "sw2": [
+                0.0, 0*math.pi/180,
+                2.741619813,-1.036929909,-2.009855153,-0.118164843,-0.413388957,0.888450964
+            ],
+            "sw3": [
+                0.0, 0*math.pi/180,
+                2.872789960,-1.149615932,-1.477154931,-0.532694307,-0.280988579,0.883228579
+            ],
+            "sw4": [
+                0.0, 0*math.pi/180,
+                2.873308525,-1.570345964,-1.174308232,-0.418170249,-0.281922402,0.886718332
+            ],
+
+        },
+        "fang_j": {
+            "sw1": [
+                2.517642681,-1.522028306,-1.432899755,-0.200995503,-0.638153461,0.877445098
+            ],
+            "sw2": [
+                2.517072600,-1.082718564,-1.726067967,-0.345362973,-0.637404562,0.875245742
+            ],
+            "sw3": [
+                2.693123203,-1.241086970,-1.200620397,-0.708423717,-0.459644602,0.871874117
+            ],
+            "sw4": [
+                2.693623250,-1.659152000,-0.859399710,-0.632711268,-0.460542718,0.873130562
+            ],
+        },
+        "yubei": {
+            "sw1": [
+                0.0, 0*math.pi/180,
+                2.742245078,-1.511187626,-1.703249289,0.045934743,-0.413767659,0.892322578
+            ],
+            "sw2": [
+                0.0, 0*math.pi/180,
+                2.741619813,-1.036929909,-2.009855153,-0.118164843,-0.413388957,0.888450964
+            ],
+            "sw3": [
+                0.0, 0*math.pi/180,
+                2.872789960,-1.149615932,-1.477154931,-0.532694307,-0.280988579,0.883228579
+            ],
+            "sw4": [
+                0.0, 0*math.pi/180,
+                2.873308525,-1.570345964,-1.174308232,-0.418170249,-0.281922402,0.886718332
+            ],
+
+        },
+        "fang": {
+            "sw1": [
+                2.517642681,-1.522028306,-1.432899755,-0.200995503,-0.638153461,0.877445098
+            ],
+            "sw2": [
+                2.517072600,-1.082718564,-1.726067967,-0.345362973,-0.637404562,0.875245742
+            ],
+            "sw3": [
+                2.693123203,-1.241086970,-1.200620397,-0.708423717,-0.459644602,0.871874117
+            ],
+            "sw4": [
+                2.693623250,-1.659152000,-0.859399710,-0.632711268,-0.460542718,0.873130562
+            ],
+        },
+    },
+}
+
+# 抓取流程默认参数力传感器抓取失败判断参数
+PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
+GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增量阈值 [N]
+# 步骤 4 内不可抓点按 SJ 坐标系 xyz 去重；容差用于吸收多次视觉的小幅抖动。
+# 缓存在步骤 4 每次执行结束后清空，不影响下一批次。
+UNGRASPABLE_POINT_DISTANCE_TOLERANCE = 0.01
+# 这些失败说明已选中的物体点本身不宜再尝试。
+# 放置报警、力传感器或工具故障属于系统问题，不将物体点拉黑。
+UNGRASPABLE_POINT_GRASP_FAILURE_REASONS = frozenset({
+    "approach_obstacle",
+    "q_pre",
+    "suction_failed",
+})
+FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
+FT_FORCE_RANGE_N = 200.0
+FT_TORQUE_RANGE_NM = 8.0
+FT_RANGE_STOP_RATIO = 0.8
+
+
+def ft_range_violation(values: Sequence[float]) -> str | None:
+    """按六个分量的绝对值检查量程，不使用相对基准的增减量。"""
+    if len(values) < 6:
+        return f"六维力数据不足：{len(values)} < 6"
+    for index, name in enumerate(("Fx", "Fy", "Fz", "Mx", "My", "Mz")):
+        value = float(values[index])
+        limit = (FT_FORCE_RANGE_N if index < 3 else FT_TORQUE_RANGE_NM) * FT_RANGE_STOP_RATIO
+        unit = "N" if index < 3 else "N·m"
+        if not math.isfinite(value) or abs(value) >= limit:
+            return f"{name}={value:.6f} {unit}，保护阈值 ±{limit:g} {unit}"
+    return None
+APPROACH_FORCE_GUARD_DISTANCE = 0.07  # 从 q_pre 起前 9 cm 使用小阈值 [m]
+APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 60.0  # 前 9 cm 的 Fz 减小阈值 [N]
+APPROACH_FORCE_Z_DROP_ALL_THRESHOLD = 210.0  # 整段接近的 Fz 减小阈值 [N]
+SERVOJ_CONTROL_ACK_TIMEOUT_SEC = 2.0
+APPROACH_CANCEL_TIMEOUT_SEC = 5.0
+SERVOJ_RECOVERY_SETTLE_SEC = 0.12
+PLACE_SPEED_SCALE = 0.5     # 5/9~9/9 放置与返回的速度缩放
+# 交换后若当前双臂存在自碰撞，原抓取空载臂沿末端局部 -Z 避让的距离。
+EXCHANGE_PLACE_EMPTY_ARM_LOCAL_Z_OFFSET = -0.02
+FIRST_RETURN_MODE = 2       # 1: 只反向直线回到 q_pre；2: 直线+OMPL 回到 1/9 初始位置
+EXCHANGE_Q1 = [
+    -1.57, -0.15, -1.578090, -1.370549, -1.672852, -0.588477,
+    1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
+]
+# 交换放置 没用到
+EXCHANGE_Q3 = {
+    "right": [
+        -0.9828664660453796, 0.6264781951904297, 1.393784523010254,
+        1.1182692050933838, 2.6711831092834473, 0.891918420791626,
+        1.57, 0.15, 1.578090, 1.370549, 1.672852, 0.588477,
+    ],
+    "left": [
+        -1.57, -0.15, -1.578090, -1.370549, -1.672852, -0.588477,
+        0.9902063012123108, -0.6606103777885437, -1.4372066259384155,
+        -1.0370503664016724, -2.6659367084503174, -2.29879448,
+    ],
+}
+# 交换
+EXCHANGE_Q2 = {
+    "right": [
+        0.0, 30*math.pi/180,
+        0.163142053,-1.615957007,-0.747574312,-0.786926819,0.678801668,-0.511096934,
+        -1.844907096,-1.548230868,-0.671643870,-0.915794755,0.767438034,-0.006229398,
+    ],
+    "left": [
+        0.0, 30*math.pi/180,
+        1.850720850,1.564788210,0.637053887,0.925466610,-0.773867715,0.018625536,
+        -0.158089210,1.627052875,0.719848585,0.793074942,-0.687498266,-0.523212004,
+    ],
+}
+
+# 视觉 TCP 配置
+VISION_IP = "192.168.1.110"
+VISION_PORT = 50000
+VISION_TRIGGER_COMMAND = "p,1"
+VISION_CONNECT_TIMEOUT = 3.0
+VISION_RECV_TIMEOUT = 30.0
+# 视觉返回的首个数字不使用；后续每 8 个数字是一个物体。
+# TCP 无消息长度字段，收到首包后以短时间无新数据作为本次结束。
+VISION_RECV_CHUNK_BYTES = 4096
+VISION_RESPONSE_IDLE_TIMEOUT_SEC = 0.2
+VISION_MAX_POINT_COUNT = 1000
+VISION_MAX_RESPONSE_BYTES = 1024 * 1024
+if POSE_MARKER_QUEUE_DEPTH < 2 * VISION_MAX_POINT_COUNT + 1:
+    raise ValueError(
+        "POSE_MARKER_QUEUE_DEPTH 必须容纳 DELETEALL 和每个视觉点的两条 Marker"
+    )
+# 步骤 2 深框识别和步骤 6 物料台识别的总尝试次数（包含首次）。
+SCENE_VISION_MAX_ATTEMPTS = 5
+# 正则表达式，用来匹配字符串里的数字：
+NUMBER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+# 标定输入：x, y, z 单位米，四元数顺序为 w, x, y, z。
+# 这两套外参是在 head_joint=0.785417 rad 时测得的相机 → 左/右臂基座变换。
+# 运行时先反解相机 → 随头部转动的 head link 固定外参，再用实测头角做 FK。
+VISION_CALIBRATION_HEAD_POSITION = 0.785417
+VISION_HEAD_JOINT = "head_joint"
+VISION_HEAD_LINK = "head"
+# 下面会转成平移单位为毫米的 4x4 矩阵，与 viewer pose 的毫米单位保持一致。
+VISION_RIGHT_TRANSFORM_XYZ_WXYZ = [
+    -0.164979, -0.152090, -0.133214, 0.654894, -0.273653, -0.649370, -0.273034
+]
+VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
+    0.164902, -0.154711, -0.219377, 0.650871, -0.270312, 0.656267, 0.269464
+]
+
+# 左臂抓
+# SIM_VISION_RESULT = (
+#     1,
+#     [-195.0305, 43.2781, 889.8122, -0.481, 0.0739, -0.1165, -0.8658],
+# )
+# 右臂抓
+SIM_VISION_RESULT = (
+    1,
+    [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+)
+# 物料台 p,8 仿真视觉数据：
+# 原始协议为 header,x,y,z,qw,qx,qy,qz,mode；header 不使用。
+SIM_UNLOAD_VISION_RESULT = (
+    1,
+    [-47.2306, -52.774, 621.5524, 0.2655, 0.6732, -0.6395, 0.2594],
+)
+# p,4 仿真时沿用同一套视觉协议；框位姿仍按旋转和平移链计算。
+SIM_FRAME_VISION_RESULT = (
+    1,
+    [-47.2306, -52.774, 621.5524, 0.2655, 0.6732, -0.6395, 0.2594],
+)
+
+
+def sim_vision_result_for_trigger(
+    trigger_command: str,
+) -> tuple[int, list[float]]:
+    """按视觉触发命令选择对应的仿真数据。"""
+    if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND):
+        return SIM_UNLOAD_VISION_RESULT
+    if trigger_command == FRAME_VISION_TRIGGER_COMMAND:
+        return SIM_FRAME_VISION_RESULT
+    return SIM_VISION_RESULT
+
+def _transform_xyz_wxyz_m_to_matrix_mm(transform: Sequence[float]) -> list[list[float]]:
+    if len(transform) != 7:
+        raise ValueError(f"标定参数需要 7 个数: x, y, z, qw, qx, qy, qz，实际 {len(transform)} 个")
+
+    x_m, y_m, z_m, qw, qx, qy, qz = [float(value) for value in transform]
+    norm = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if norm < 1e-12:
+        raise ValueError("标定四元数长度为 0")
+    qw, qx, qy, qz = qw / norm, qx / norm, qy / norm, qz / norm
+
+    rot = [
+        [
+            1.0 - 2.0 * (qy * qy + qz * qz),
+            2.0 * (qx * qy - qz * qw),
+            2.0 * (qx * qz + qy * qw),
+        ],
+        [
+            2.0 * (qx * qy + qz * qw),
+            1.0 - 2.0 * (qx * qx + qz * qz),
+            2.0 * (qy * qz - qx * qw),
+        ],
+        [
+            2.0 * (qx * qz - qy * qw),
+            2.0 * (qy * qz + qx * qw),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ],
+    ]
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x_m * 1000.0],
+        [rot[1][0], rot[1][1], rot[1][2], y_m * 1000.0],
+        [rot[2][0], rot[2][1], rot[2][2], z_m * 1000.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+VISION_RIGHT_TRANSFORM_MM = _transform_xyz_wxyz_m_to_matrix_mm(VISION_RIGHT_TRANSFORM_XYZ_WXYZ)
+VISION_LEFT_TRANSFORM_MM = _transform_xyz_wxyz_m_to_matrix_mm(VISION_LEFT_TRANSFORM_XYZ_WXYZ)
+
+# IK 多解枚举参数（抓取流程选 IK 解 + approach 预检用）
+IK_N_CANDIDATES = 100          # 在 URDF 关节限位内尝试的 IK 种子数（含当前状态）
+IK_TIMEOUT_SEC = 0.2          # 每次 /compute_ik 超时（KDL 对边界姿态需更长收敛时间）
+IK_RANDOM_SEED = 42           # 让 IK 多解枚举可复现；改成 None 则每次随机
+
+
+# =============================================================================
+# 几何与消息构造（纯函数，无 ROS 通信）
+# =============================================================================
+
+
+def connect_vision(log, report_error=None) -> socket.socket | None:
+    """连接视觉 TCP，后续可复用同一个 socket 多次读取。"""
+    try:
+        sock = socket.create_connection(
+            (VISION_IP, VISION_PORT),
+            timeout=VISION_CONNECT_TIMEOUT,
+        )
+        sock.settimeout(VISION_RECV_TIMEOUT)
+        log.info(f"已连接视觉 TCP：{VISION_IP}:{VISION_PORT}")
+        return sock
+    except OSError as exc:
+        if report_error is not None:
+            report_error(1, str(exc))
+        message = f"viewer 连接失败：{exc}"
+        log.error(message)
+        print(message)
+        return None
+
+
+def read_vision_pose(
+    sock: socket.socket,
+    log,
+    trigger_command: str = VISION_TRIGGER_COMMAND,
+    report_error=None,
+) -> list[tuple[int, list[float]]] | None:
+    """收齐并解析视觉数据。
+
+    协议是 ``未使用头字段,N * (xyz(mm)+quat(wxyz)+模式码)``。
+    TCP 不保证一次 ``recv`` 收到一条完整消息，因此收到
+    首包后会继续接收，直到短时间无新数据，再跳过首个数字按 8 个一组解析。
+    """
+    try:
+        t0 = time.monotonic()
+        sock.sendall(trigger_command.encode("utf-8"))
+        log.info(f"viewer 已发送触发命令: {trigger_command}")
+        response = bytearray()
+        original_timeout = sock.gettimeout()
+        try:
+            while True:
+                sock.settimeout(
+                    VISION_RESPONSE_IDLE_TIMEOUT_SEC
+                    if response
+                    else original_timeout
+                )
+                try:
+                    chunk = sock.recv(VISION_RECV_CHUNK_BYTES)
+                except socket.timeout:
+                    if response:
+                        break
+                    raise
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if len(response) > VISION_MAX_RESPONSE_BYTES:
+                    raise ValueError(
+                        f"viewer 返回超过 {VISION_MAX_RESPONSE_BYTES} 字节上限"
+                    )
+        finally:
+            sock.settimeout(original_timeout)
+
+        raw_text = response.decode("utf-8").strip()
+        used_ms = (time.monotonic() - t0) * 1000.0
+        message = f"viewer 发送命令到收齐数据耗时: {used_ms:.3f} ms"
+        log.info(message)
+        print(f"{GREEN}{message}{RESET}")
+        print(f"{GREEN}viewer 接收到的数据: {raw_text}{RESET}")
+
+        if not raw_text:
+            raise ValueError("viewer 返回为空")
+        tokens = re.split(r"\s*,\s*|\s+", raw_text)
+        if any(NUMBER_PATTERN.fullmatch(item) is None for item in tokens):
+            raise ValueError(f"viewer 含非法数字或分隔格式：{raw_text}")
+        numbers = [float(item) for item in tokens]
+        if not all(math.isfinite(value) for value in numbers):
+            raise ValueError("viewer 含 NaN 或无穷值")
+        if not numbers:
+            message = f"viewer 返回中没有数字：{raw_text}"
+            raise ValueError(message)
+        payload = numbers[1:]
+        if len(payload) % 8 != 0:
+            message = (
+                "viewer 返回格式错误：跳过首个未使用数字后，"
+                f"剩余 {len(payload)} 个数字，不是 8 的整数倍；"
+                f"原始返回：{raw_text}"
+            )
+            raise ValueError(message)
+        point_count = len(payload) // 8
+        if point_count > VISION_MAX_POINT_COUNT:
+            message = (
+                f"viewer 返回 {point_count} 个点，"
+                f"超过上限 {VISION_MAX_POINT_COUNT}"
+            )
+            raise ValueError(message)
+
+        poses: list[tuple[int, list[float]]] = []
+        for index in range(0, len(payload), 8):
+            group = payload[index:index + 8]
+            pose = group[:7]
+            if math.hypot(*pose[3:7]) == 0.0:
+                raise ValueError(f"viewer 第 {index // 8 + 1} 个点四元数长度为 0")
+            mode_value = group[7]
+            if mode_value not in (1.0, 2.0):
+                point_index = index // 8 + 1
+                message = (
+                    f"viewer 第 {point_index} 个点模式码无效：{mode_value}，"
+                    f"原始返回：{raw_text}"
+                )
+                raise ValueError(message)
+            poses.append((int(mode_value), pose))
+
+        print(f"viewer 点个数: {len(poses)}")
+        log.info(f"viewer 点个数: {len(poses)}")
+        return poses
+    except ValueError as exc:
+        if report_error is not None:
+            report_error(3 if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND) else 2, str(exc))
+        log.error(f"viewer 数据非法：{exc}")
+        return None
+    except OSError as exc:
+        message = f"viewer 获取 pose 失败：{exc}"
+        log.error(message)
+        print(message)
+        return None
+
+
+def close_vision(sock: socket.socket | None, log) -> None:
+    """关闭视觉 TCP 连接。"""
+    if sock is None:
+        return
+    sock.close()
+    log.info("已关闭视觉 TCP 连接")
+
+
+def matmul4(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def invert_transform4(t: list[list[float]]) -> list[list[float]]:
+    """刚体 4x4 齐次矩阵求逆。"""
+    rot_t = [[t[j][i] for j in range(3)] for i in range(3)]
+    trans = [t[i][3] for i in range(3)]
+    inv_trans = [-sum(rot_t[i][k] * trans[k] for k in range(3)) for i in range(3)]
+    return [
+        [rot_t[0][0], rot_t[0][1], rot_t[0][2], inv_trans[0]],
+        [rot_t[1][0], rot_t[1][1], rot_t[1][2], inv_trans[1]],
+        [rot_t[2][0], rot_t[2][1], rot_t[2][2], inv_trans[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def rpy_to_rot(roll: float, pitch: float, yaw: float) -> list[list[float]]:
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+
+
+def rot_to_rpy(rot: list[list[float]]) -> tuple[float, float, float]:
+    pitch = math.atan2(-rot[2][0], math.hypot(rot[0][0], rot[1][0]))
+    if abs(math.cos(pitch)) < 1e-9:
+        roll = 0.0
+        yaw = math.atan2(-rot[0][1], rot[1][1])
+    else:
+        roll = math.atan2(rot[2][1], rot[2][2])
+        yaw = math.atan2(rot[1][0], rot[0][0])
+    return roll, pitch, yaw
+
+
+def pose_mm_deg_to_matrix(pose: Sequence[float]) -> list[list[float]]:
+    x, y, z, roll_deg, pitch_deg, yaw_deg = [float(value) for value in pose[:6]]
+    rot = rpy_to_rot(math.radians(roll_deg), math.radians(pitch_deg), math.radians(yaw_deg))
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x],
+        [rot[1][0], rot[1][1], rot[1][2], y],
+        [rot[2][0], rot[2][1], rot[2][2], z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def quat_wxyz_to_rot(qw: float, qx: float, qy: float, qz: float) -> list[list[float]]:
+    norm = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if norm < 1e-12:
+        raise ValueError("viewer 四元数长度为 0")
+    qw, qx, qy, qz = qw / norm, qx / norm, qy / norm, qz / norm
+    return [
+        [
+            1.0 - 2.0 * (qy * qy + qz * qz),
+            2.0 * (qx * qy - qz * qw),
+            2.0 * (qx * qz + qy * qw),
+        ],
+        [
+            2.0 * (qx * qy + qz * qw),
+            1.0 - 2.0 * (qx * qx + qz * qz),
+            2.0 * (qy * qz - qx * qw),
+        ],
+        [
+            2.0 * (qx * qz - qy * qw),
+            2.0 * (qy * qz + qx * qw),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ],
+    ]
+
+
+def pose_mm_wxyz_to_matrix(pose: Sequence[float]) -> list[list[float]]:
+    x, y, z, qw, qx, qy, qz = [float(value) for value in pose[:7]]
+    rot = quat_wxyz_to_rot(qw, qx, qy, qz)
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x],
+        [rot[1][0], rot[1][1], rot[1][2], y],
+        [rot[2][0], rot[2][1], rot[2][2], z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def matrix_to_xyz_rpy(matrix: list[list[float]]) -> tuple[float, float, float, float, float, float]:
+    rot = [row[:3] for row in matrix[:3]]
+    roll, pitch, yaw = rot_to_rpy(rot)
+    return (
+        matrix[0][3],
+        matrix[1][3],
+        matrix[2][3],
+        roll,
+        pitch,
+        yaw,
+    )
+
+
+def xyz_rpy_to_pose(values: Sequence[float], position_scale: float = 1.0) -> Pose:
+    """xyz+rpy 转 Pose；position_scale 可用于将毫米转换成米。"""
+    x, y, z, roll, pitch, yaw = [float(value) for value in values]
+    return make_pose(
+        x * position_scale,
+        y * position_scale,
+        z * position_scale,
+        roll,
+        pitch,
+        yaw,
+    )
+
+
+def xyz_rpy_to_matrix(values: Sequence[float], position_scale: float = 1.0) -> list[list[float]]:
+    """xyz+rpy 转 4×4 矩阵；position_scale 可用于将毫米转换成米。"""
+    x, y, z, roll, pitch, yaw = [float(value) for value in values]
+    rot = rpy_to_rot(roll, pitch, yaw)
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x * position_scale],
+        [rot[1][0], rot[1][1], rot[1][2], y * position_scale],
+        [rot[2][0], rot[2][1], rot[2][2], z * position_scale],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def pose_to_matrix(pose: Pose) -> list[list[float]]:
+    """geometry_msgs/Pose 转 4×4 齐次变换矩阵，平移单位为米。"""
+    q = pose.orientation
+    rot = quat_wxyz_to_rot(q.w, q.x, q.y, q.z)
+    p = pose.position
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], p.x],
+        [rot[1][0], rot[1][1], rot[1][2], p.y],
+        [rot[2][0], rot[2][1], rot[2][2], p.z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def pose_to_xyz_rpy(pose: Pose) -> tuple[float, float, float, float, float, float]:
+    """geometry_msgs/Pose 转 xyz+rpy。"""
+    return matrix_to_xyz_rpy(pose_to_matrix(pose))
+
+
+def pose2d_to_matrix(pose: Pose2D) -> list[list[float]]:
+    """AGV 平面位姿转齐次矩阵；x/y 为米，theta 为绕 Z 轴的弧度。"""
+    x, y, theta = float(pose.x), float(pose.y), float(pose.theta)
+    if not all(math.isfinite(value) for value in (x, y, theta)):
+        raise ValueError("Pose2D 的 x、y、theta 必须是有限数值")
+    c, s = math.cos(theta), math.sin(theta)
+    return [
+        [c, -s, 0.0, x],
+        [s, c, 0.0, y],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def transform_pose_between_robot_positions(
+    local_pose_at_source: Pose,
+    source_robot_pose: Pose2D,
+    target_robot_pose: Pose2D,
+) -> Pose:
+    """用两次 AGV 实际位姿将识别位姿转换到抓取位置的基座系。
+
+    T_target_object = inv(T_world_target) * T_world_source * T_source_object。
+    两次 Pose2D 必须使用同一世界坐标系，且描述 moveit_base_link 的
+    原点和轴向；平面移动的基座高度保持不变。
+    """
+    t_world_source = pose2d_to_matrix(source_robot_pose)
+    t_world_target = pose2d_to_matrix(target_robot_pose)
+    t_source_object = pose_to_matrix(local_pose_at_source)
+    t_target_object = matmul4(
+        invert_transform4(t_world_target),
+        matmul4(t_world_source, t_source_object),
+    )
+    return xyz_rpy_to_pose(matrix_to_xyz_rpy(t_target_object))
+
+
+def transform_vision_pose(
+    pose: Sequence[float],
+    transform_mm: list[list[float]],
+) -> tuple[float, float, float, float, float, float]:
+    """viewer pose 为 xyz(mm) + quat(wxyz)；左乘指定标定矩阵后返回 xyz(mm), rpy(rad)。"""
+    return matrix_to_xyz_rpy(matmul4(transform_mm, pose_mm_wxyz_to_matrix(pose)))
+
+
+def camera_mount_transform(
+    arm_from_camera_mm: list[list[float]],
+    arm_from_head_at_calibration: Pose,
+) -> list[list[float]]:
+    """T_head_camera = inv(T_arm_head(45°)) * T_arm_camera(45°)，单位米。"""
+    arm_from_camera = [list(row) for row in arm_from_camera_mm]
+    for i in range(3):
+        arm_from_camera[i][3] *= 0.001
+    return matmul4(
+        invert_transform4(pose_to_matrix(arm_from_head_at_calibration)),
+        arm_from_camera,
+    )
+
+
+def camera_transform_at_head_position(
+    head_from_camera: list[list[float]], arm_from_head: Pose,
+) -> list[list[float]]:
+    """T_arm_camera(q) = T_arm_head(q) * T_head_camera；返回毫米制外参。"""
+    transform = matmul4(pose_to_matrix(arm_from_head), head_from_camera)
+    for i in range(3):
+        transform[i][3] *= 1000.0
+    return transform
+
+
+def read_vision_object_pose(
+    node,
+    log,
+    sim_mode: bool = False,
+    trigger_command: str = VISION_TRIGGER_COMMAND,
+    sort_by_sj_z: bool = True,
+):
+    """视觉识别封装：返回所有点的模式码和 xyz_rpy。
+
+    ``sort_by_sj_z=False`` 时保留 viewer 原始顺序，供步骤 4
+    后续按姿态分组，再按 moveit_base_link 中的高度排序。
+    """
+    vision_sock = None
+    if sim_mode:
+        first_return_mode, pose = sim_vision_result_for_trigger(trigger_command)
+        vision_results = [(first_return_mode, list(pose))]
+        if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND):
+            sim_source = f"物料台 {trigger_command}"
+        elif trigger_command == FRAME_VISION_TRIGGER_COMMAND:
+            sim_source = "深框 p,4"
+        else:
+            sim_source = "普通抓取"
+        log.info(f"[sim] viewer 点个数: 1，使用{sim_source}固定 pose")
+        print(
+            f"{GREEN}[sim] viewer point 1: "
+            f"first_return_mode = {first_return_mode}, pose = {pose}{RESET}"
+        )
+    else:
+        vision_sock = connect_vision(log, node.publish_error)
+        if vision_sock is None:
+            return None
+
+    try:
+        if not sim_mode:
+            vision_results = read_vision_pose(
+                vision_sock,
+                log,
+                trigger_command=trigger_command,
+                report_error=node.publish_error,
+            )
+            if vision_results is None:
+                return None
+
+        # 读取实际身体关节：
+        #   body_joint2 用于把左/右臂基坐标下的物体位姿转到 SJ；
+        #   body_joint1 用于继续把 SJ 下的位姿转到 moveit_base_link。
+        body_joints = node._get_joints(
+            ["body_joint1", "body_joint2", VISION_HEAD_JOINT], wait_new=True,
+        )
+        if body_joints is None:
+            log.error("读取实际身体关节失败，无法转换视觉位姿")
+            return None
+        print(
+            f"实际身体关节: body_joint1={body_joints['body_joint1']:.6f} m, "
+            f"body_joint2={body_joints['body_joint2']:.6f} rad, "
+            f"head_joint={body_joints[VISION_HEAD_JOINT]:.6f} rad"
+        )
+
+        camera_transforms = node.camera_transforms_for_joints(body_joints)
+        if camera_transforms is None:
+            return None
+        right_camera_transform, left_camera_transform = camera_transforms
+
+        r_base_in_sj = node._get_link_pose_fk(
+            "r_base_link",
+            joints=body_joints,
+            plan_frame="SJ",
+        )
+        if r_base_in_sj is None:
+            log.error("计算 r_base_link → SJ 变换失败")
+            return None
+        l_base_in_sj = node._get_link_pose_fk(
+            "l_base_link",
+            joints=body_joints,
+            plan_frame="SJ",
+        )
+        if l_base_in_sj is None:
+            log.error("计算 l_base_link → SJ 变换失败")
+            return None
+        sj_in_base = node._get_link_pose_fk(
+            "SJ",
+            joints=body_joints,
+            plan_frame="moveit_base_link",
+        )
+        if sj_in_base is None:
+            log.error("计算 SJ → moveit_base_link 变换失败")
+            return None
+
+        t_sj_r_base = pose_to_matrix(r_base_in_sj)
+        t_sj_l_base = pose_to_matrix(l_base_in_sj)
+        t_base_sj = pose_to_matrix(sj_in_base)
+        first_return_modes: list[int] = []
+        all_xyz_rpy: list[dict[str, tuple[float, float, float, float, float, float]]] = []
+        raw_poses: list[list[float]] = []
+
+        for point_index, (first_return_mode, pose) in enumerate(vision_results, start=1):
+            try:
+                right_xyz_rpy_mm = transform_vision_pose(pose, right_camera_transform)
+                left_xyz_rpy_mm = transform_vision_pose(pose, left_camera_transform)
+            except ValueError as exc:
+                node.publish_error(3 if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND) else 2, f"point={point_index}: {exc}")
+                message = f"viewer 第 {point_index} 个 pose 解析失败：{exc}"
+                log.error(message)
+                print(message)
+                return None
+
+            # 标定输出的位置为毫米，统一转换成米制 4x4 矩阵。
+            right_matrix = xyz_rpy_to_matrix(right_xyz_rpy_mm, position_scale=0.001)
+            left_matrix = xyz_rpy_to_matrix(left_xyz_rpy_mm, position_scale=0.001)
+            right_sj_matrix = matmul4(t_sj_r_base, right_matrix)
+            left_sj_matrix = matmul4(t_sj_l_base, left_matrix)
+            right_body_matrix = matmul4(t_base_sj, right_sj_matrix)
+            left_body_matrix = matmul4(t_base_sj, left_sj_matrix)
+            xyz_rpy = {
+                "right": matrix_to_xyz_rpy(right_matrix),
+                "left": matrix_to_xyz_rpy(left_matrix),
+                "right_sj": matrix_to_xyz_rpy(right_sj_matrix),
+                "left_sj": matrix_to_xyz_rpy(left_sj_matrix),
+                "right_body": matrix_to_xyz_rpy(right_body_matrix),
+                "left_body": matrix_to_xyz_rpy(left_body_matrix),
+                "sj": matrix_to_xyz_rpy(right_sj_matrix),
+            }
+
+            first_return_modes.append(first_return_mode)
+            all_xyz_rpy.append(xyz_rpy)
+            raw_poses.append(pose)
+
+        ordered_results = list(zip(first_return_modes, all_xyz_rpy, raw_poses))
+        if sort_by_sj_z:
+            ordered_results.sort(
+                key=lambda item: item[1]["sj"][2],
+                reverse=True,
+            )
+        first_return_modes = [mode for mode, _, _ in ordered_results]
+        all_xyz_rpy = [xyz_rpy for _, xyz_rpy, _ in ordered_results]
+
+        for point_index, (first_return_mode, xyz_rpy, pose) in enumerate(
+            ordered_results,
+            start=1,
+        ):
+            print(
+                f"\033[32mviewer point {point_index}: "
+                f"first_return_mode = {first_return_mode}, pose = {pose}\033[0m"
+            )
+            print(f"xyz_rpy[{point_index}] [m, rad]: {xyz_rpy}")
+
+        return first_return_modes, all_xyz_rpy
+    finally:
+        close_vision(vision_sock, log)
+
+
+def read_scene_vision_object_pose_with_retry(
+    node,
+    log,
+    *,
+    sim_mode: bool,
+    trigger_command: str,
+    required_pose_key: str,
+    scene_label: str,
+    max_attempts: int = SCENE_VISION_MAX_ATTEMPTS,
+):
+    """场景识别失败时重新发送命令，返回首个包含所需位姿的数据。"""
+    max_attempts = max(1, int(max_attempts))
+    for attempt in range(1, max_attempts + 1):
+        log.info(
+            f"[{scene_label}] 发送视觉识别命令 {trigger_command} "
+            f"（第 {attempt}/{max_attempts} 次）"
+        )
+        vision_result = read_vision_object_pose(
+            node,
+            log,
+            sim_mode=sim_mode,
+            trigger_command=trigger_command,
+        )
+        if vision_result is not None:
+            first_return_modes, all_xyz_rpy = vision_result
+            if all_xyz_rpy and required_pose_key in all_xyz_rpy[0]:
+                if attempt > 1:
+                    log.info(
+                        f"[{scene_label}] 第 {attempt}/{max_attempts} 次识别成功"
+                    )
+                return first_return_modes, all_xyz_rpy
+            log.error(
+                f"[{scene_label}] {trigger_command} 视觉结果缺少 "
+                f"{required_pose_key!r}"
+            )
+
+        if attempt < max_attempts:
+            log.warning(
+                f"[{scene_label}] 第 {attempt}/{max_attempts} 次未收到有效数据，"
+                "重新发送识别命令"
+            )
+
+    log.error(
+        f"[{scene_label}] 连续 {max_attempts} 次未收到有效视觉数据，识别失败"
+    )
+    return None
+
+
+def quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
+    """固定轴 XYZ：欧拉角 → 四元数 (x, y, z, w)。"""
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+def joint_names_for_group(group: str) -> list[str]:
+    """从 JOINT_TARGETS 读取 group 的关节名列表（顺序与 place_joints 向量一致）。"""
+    if group not in JOINT_TARGETS:
+        raise KeyError(f"未知 group={group}，JOINT_TARGETS 可选: {list(JOINT_TARGETS)}")
+    return list(JOINT_TARGETS[group].keys())
+
+
+def ik_seed_limits_for_joint(joint_name: str) -> tuple[float, float]:
+    """返回 IK 随机种子使用的 URDF 位置限位。"""
+    if joint_name == "body_joint1":
+        return BODY_JOINT1_LIMITS
+    if joint_name == "body_joint2":
+        return BODY_JOINT2_LIMITS
+
+    arm_match = re.fullmatch(r"[lr]_arm_joint([1-6])", joint_name)
+    if arm_match:
+        return ARM_JOINT_LIMITS_BY_INDEX[int(arm_match.group(1))]
+
+    raise KeyError(f"没有配置关节 {joint_name!r} 的 IK 随机种子限位")
+
+
+def make_unload_yubei_joint_target(
+    right_slot: str,
+    left_slot: str,
+) -> tuple[list[str], list[float]]:
+    """把左右 SW 的 yubei 纯臂关节拼成 body_joint1/2 均为 0 的 dual_arm_body 目标。"""
+    right_config = PLACE_JOINTS.get("right_arm", {}).get("yubei")
+    left_config = PLACE_JOINTS.get("left_arm", {}).get("yubei")
+    if not isinstance(right_config, dict) or right_slot not in right_config:
+        raise KeyError(f"右臂 yubei 未配置 {right_slot}")
+    if not isinstance(left_config, dict) or left_slot not in left_config:
+        raise KeyError(f"左臂 yubei 未配置 {left_slot}")
+
+    right_values = list(right_config[right_slot])
+    left_values = list(left_config[left_slot])
+    if len(right_values) != 8 or len(left_values) != 8:
+        raise ValueError(
+            f"下料 yubei 配置长度必须为 8: "
+            f"right.{right_slot}={len(right_values)}, "
+            f"left.{left_slot}={len(left_values)}"
+        )
+
+    left_joint_names = joint_names_for_group("left_arm")
+    right_joint_names = joint_names_for_group("right_arm")
+    dual_body_joint_names = joint_names_for_group("dual_arm_body")
+    target = {
+        "body_joint1": 0.0,
+        "body_joint2": 0.0,
+        **dict(zip(left_joint_names, left_values[-6:])),
+        **dict(zip(right_joint_names, right_values[-6:])),
+    }
+    missing = [name for name in dual_body_joint_names if name not in target]
+    if missing:
+        raise ValueError(f"dual_arm_body 下料目标缺少关节: {missing}")
+    return dual_body_joint_names, [target[name] for name in dual_body_joint_names]
+
+
+def _side_order_from_xyz_rpy(xyz_rpy: dict) -> tuple[str, str]:
+    """根据物体在 SJ 下的 y 值决定左右优先级：y > 0 时左臂优先。"""
+    return ("left", "right") if xyz_rpy["sj"][1] > 0.0 else ("right", "left")
+
+
+def grasp_point_sj_position(xyz_rpy: Mapping) -> tuple[float, float, float] | None:
+    """取出用于跨次视觉匹配的 SJ.xyz；非法点返回 None。"""
+    values = xyz_rpy.get("sj")
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        return None
+    if len(values) < 3:
+        return None
+    try:
+        position = tuple(float(values[index]) for index in range(3))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in position):
+        return None
+    return position
+
+
+def find_ungraspable_point_match(
+    position: Sequence[float],
+    ungraspable_points: Sequence[Sequence[float]],
+    distance_tolerance: float = UNGRASPABLE_POINT_DISTANCE_TOLERANCE,
+) -> tuple[int, float] | None:
+    """返回容差内最近的已缓存不可抓点及距离。"""
+    nearest: tuple[int, float] | None = None
+    for cache_index, cached_position in enumerate(ungraspable_points):
+        if len(cached_position) < 3:
+            continue
+        distance = math.dist(position[:3], cached_position[:3])
+        if distance > distance_tolerance:
+            continue
+        if nearest is None or distance < nearest[1]:
+            nearest = cache_index, distance
+    return nearest
+
+
+def remember_ungraspable_point(
+    xyz_rpy: Mapping,
+    ungraspable_points: list[tuple[float, float, float]],
+    distance_tolerance: float = UNGRASPABLE_POINT_DISTANCE_TOLERANCE,
+) -> tuple[tuple[float, float, float] | None, bool]:
+    """缓存一个不可抓点；已有容差内点时不重复添加。"""
+    position = grasp_point_sj_position(xyz_rpy)
+    if position is None:
+        return None, False
+    if find_ungraspable_point_match(
+        position,
+        ungraspable_points,
+        distance_tolerance,
+    ) is not None:
+        return position, False
+    ungraspable_points.append(position)
+    return position, True
+
+
+def _reachability_attempts_for_point(xyz_rpy: dict) -> list[dict[str, str]]:
+    """依次验证纯臂、腰+臂、身体+臂，每层均按物体侧向决定左右顺序。"""
+    side_order = _side_order_from_xyz_rpy(xyz_rpy)
+    attempts: list[dict[str, str]] = []
+    for side in side_order:
+        attempts.append({
+            "side": side,
+            "group": f"{side}_arm",
+            "link": "l_tool" if side == "left" else "r_tool",
+            "plan_frame": SCENE_FRAME,
+            "xyz_key": f"{side}_body",
+        })
+    for side in side_order:
+        attempts.append({
+            "side": side,
+            "group": f"{side}_waist",
+            "link": "l_tool" if side == "left" else "r_tool",
+            "plan_frame": SCENE_FRAME,
+            "xyz_key": f"{side}_body",
+        })
+    for side in side_order:
+        attempts.append({
+            "side": side,
+            "group": f"{side}_body",
+            "link": "l_tool" if side == "left" else "r_tool",
+            "plan_frame": "moveit_base_link",
+            "xyz_key": f"{side}_body",
+        })
+    return attempts
+
+
+def arm_context_for_group(group: str) -> tuple[str, str] | None:
+    """抓取 group 对应的纯臂 group 和纯臂规划坐标系。"""
+    if group in ("left_arm", "left_waist", "left_body"):
+        return "left_arm", "l_base_link"
+    if group in ("right_arm", "right_waist", "right_body"):
+        return "right_arm", "r_base_link"
+    return None
+
+
+# 按视觉点顺序遍历：
+#   点1 → 点2 → 点3 ...
+
+# 每个点内按 side_value = xyz_rpy["sj"][1] 判断左右顺序：
+
+# side_value > 0:
+#   left_arm → right_arm → left_waist → right_waist → left_body → right_body
+# side_value <= 0:
+#   right_arm → left_arm → right_waist → left_waist → right_body → left_body
+def validate_reachable_grasp(
+    node,
+    all_xyz_rpy: list[dict],
+    speed_scale: float = 0.2,
+    cutoff_joint_names: Sequence[str] | None = None,
+    ungraspable_points: list[tuple[float, float, float]] | None = None,
+    planning_start_joints: Mapping[str, float] | None = None,
+):
+    """过滤失败点，再验证 IK、Cartesian approach 和 OMPL。
+
+    目标 IK 和 Cartesian approach 不加临时视觉碰撞体；只在
+    OMPL 规划当前位置到 q_pre 时，加入当前候选的一个圆柱
+    和隔离面。
+    """
+    log = node.get_logger()
+    if not all_xyz_rpy:
+        log.error("[reach] 没有可验证的视觉点")
+        return None
+
+    filtered_count = 0
+    tested_count = 0
+    for point_index, xyz_rpy in enumerate(all_xyz_rpy):
+        point_position = grasp_point_sj_position(xyz_rpy)
+        cached_match = (
+            find_ungraspable_point_match(point_position, ungraspable_points)
+            if point_position is not None and ungraspable_points is not None
+            else None
+        )
+        if cached_match is not None:
+            cache_index, distance = cached_match
+            filtered_count += 1
+            log.info(
+                f"[reach-cache] 过滤点 {point_index + 1}/{len(all_xyz_rpy)}: "
+                f"SJ.xyz=({point_position[0]:.4f}, {point_position[1]:.4f}, "
+                f"{point_position[2]:.4f}) 命中失败点 #{cache_index + 1}，"
+                f"距离={distance * 1000.0:.1f} mm，不再调用 IK/路径规划"
+            )
+            continue
+
+        tested_count += 1
+        collision_pose_values = xyz_rpy.get("right_body")
+        if collision_pose_values is None:
+            log.error(
+                f"[reach] 点 {point_index + 1} 缺少 right_body，"
+                "无法创建当前抓取物体的碰撞圆柱"
+            )
+            continue
+        pick_collision_pose = xyz_rpy_to_pose(collision_pose_values)
+        pick_scene_grasp_object_poses = [pick_collision_pose]
+        attempts = _reachability_attempts_for_point(xyz_rpy)
+        order_text = " → ".join(item["group"] for item in attempts)
+        log.info(
+            f"[reach] 点 {point_index + 1}/{len(all_xyz_rpy)}: "
+            f"SJ.y={xyz_rpy['sj'][1]:.6f}, 验证顺序 {order_text}"
+        )
+
+        for attempt in attempts:
+            pick_group = attempt["group"]
+            pick_link = attempt["link"]
+            pick_frame = attempt["plan_frame"]
+            xyz_key = attempt["xyz_key"]
+            if pick_group not in JOINT_TARGETS:
+                log.warning(f"[reach] 跳过未知 group={pick_group}")
+                continue
+            if xyz_key not in xyz_rpy:
+                log.warning(f"[reach] 点 {point_index + 1} 缺少 xyz_rpy[{xyz_key!r}]，跳过 {pick_group}")
+                continue
+
+            pick_joint_names = joint_names_for_group(pick_group)
+            pick_target_pose = xyz_rpy_to_pose(xyz_rpy[xyz_key])
+            pre_pose = pose_offset_local_z(pick_target_pose, PRE_GRASP_OFFSET)
+            log.info(
+                f"[reach] 验证点 {point_index + 1}: group={pick_group}, "
+                f"link={pick_link}, frame={pick_frame}, xyz_key={xyz_key}"
+            )
+            log.info(
+                f"[reach-collision] 点 {point_index + 1} / {pick_group}: "
+                "目标 IK/Cartesian 不加临时圆柱；"
+                "OMPL 到 q_pre 只加当前候选圆柱（1 个）+隔离面"
+            )
+            picked = node._select_feasible_grasp_pair(
+                pick_group,
+                pick_link,
+                pick_target_pose,
+                pre_pose,
+                joint_names=pick_joint_names,
+                speed_scale=speed_scale,
+                plan_frame=pick_frame,
+                cutoff_joint_names=cutoff_joint_names,
+                scene_grasp_object_poses=pick_scene_grasp_object_poses,
+                planning_start_joints=planning_start_joints,
+            )
+            if picked is None:
+                log.warning(f"[reach] 点 {point_index + 1} / {pick_group}: 不可达")
+                continue
+
+            q_pre, q_target, to_pre_traj, approach_traj = picked
+            log.info(f"[reach] 点 {point_index + 1} / {pick_group}: 可达 ✓")
+            # log.info(
+            #     f"{GREEN}[reach] 可行点 xyz_rpy[{xyz_key}]: "
+            #     f"{xyz_rpy[xyz_key]}{RESET}"
+            # )
+            log.info(
+                "[reach] 抓取点 q_target: "
+                + ", ".join(f"{n}={q_target[n]:.6f}" for n in pick_joint_names)
+            )
+            return {
+                "point_index": point_index,
+                "pick_side": attempt["side"],
+                "pick_group": pick_group,
+                "pick_link": pick_link,
+                "pick_frame": pick_frame,
+                "pick_xyz_key": xyz_key,
+                "pick_joint_names": pick_joint_names,
+                "pick_target_pose": pick_target_pose,
+                "pick_collision_pose": pick_collision_pose,
+                "pick_q_pre": q_pre,
+                "pick_q_target": q_target,
+                "pick_to_pre_traj": to_pre_traj,
+                "pick_approach_traj": approach_traj,
+            }
+
+        if ungraspable_points is not None:
+            position, added = remember_ungraspable_point(
+                xyz_rpy,
+                ungraspable_points,
+            )
+            if position is None:
+                log.warning(
+                    f"[reach-cache] 点 {point_index + 1} 全部候选不可达，"
+                    "但缺少有效 SJ.xyz，无法加入失败点缓存"
+                )
+            elif added:
+                log.warning(
+                    f"[reach-cache] 点 {point_index + 1} 全部候选不可达，"
+                    f"已记录失败点 SJ.xyz=({position[0]:.4f}, "
+                    f"{position[1]:.4f}, {position[2]:.4f})；"
+                    f"本批次共 {len(ungraspable_points)} 个"
+                )
+
+    log.error(
+        "[reach] 未找到可抓点："
+        f"实际验证 {tested_count} 个，缓存过滤 {filtered_count} 个"
+    )
+    return None
+
+
+def tool_side_for_link(link: str) -> str | None:
+    """只根据末端工具 link 判断左右臂。"""
+    link_l = link.lower()
+    if link_l == "l_tool":
+        return "left"
+    if link_l == "r_tool":
+        return "right"
+    return None
+
+
+def make_pose(x: float, y: float, z: float, roll=0.0, pitch=0.0, yaw=0.0) -> Pose:
+    """构造 geometry_msgs/Pose。"""
+    p = Pose()
+    p.position.x, p.position.y, p.position.z = x, y, z
+    qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
+    p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = qx, qy, qz, qw
+    return p
+
+
+def rotate_xyz_by_quat(
+    x: float,
+    y: float,
+    z: float,
+    qx: float,
+    qy: float,
+    qz: float,
+    qw: float,
+) -> tuple[float, float, float]:
+    """用四元数旋转向量。"""
+    return (
+        (1.0 - 2.0 * (qy * qy + qz * qz)) * x
+        + 2.0 * (qx * qy - qz * qw) * y
+        + 2.0 * (qx * qz + qy * qw) * z,
+        2.0 * (qx * qy + qz * qw) * x
+        + (1.0 - 2.0 * (qx * qx + qz * qz)) * y
+        + 2.0 * (qy * qz - qx * qw) * z,
+        2.0 * (qx * qz - qy * qw) * x
+        + 2.0 * (qy * qz + qx * qw) * y
+        + (1.0 - 2.0 * (qx * qx + qy * qy)) * z,
+    )
+
+
+def pose_offset_local(pose: Pose, dx: float, dy: float, dz: float) -> Pose:
+    """按 pose 自身坐标系平移 xyz，姿态保持不变。"""
+    qx, qy, qz, qw = (
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w,
+    )
+    offset_x, offset_y, offset_z = rotate_xyz_by_quat(
+        dx, dy, dz, qx, qy, qz, qw
+    )
+    out = copy.deepcopy(pose)
+    out.position.x += offset_x
+    out.position.y += offset_y
+    out.position.z += offset_z
+    return out
+
+
+def deep_frame_poses_from_recognition(
+    recognition_pose: Pose,
+) -> tuple[Pose, Pose]:
+    """返回（深框顶部空心中心，深框实体中心）两个位姿。"""
+    rotated_pose = pose_rotate_local_rpy(
+        recognition_pose,
+        0.0,
+        0.0,
+        FRAME_RECOGNITION_LOCAL_YAW,
+    )
+    top_center_pose = pose_offset_local(
+        rotated_pose,
+        *FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL,
+    )
+    frame_center_pose = pose_offset_local(
+        top_center_pose,
+        0.0,
+        0.0,
+        -FRAME_SIZE[2] / 2.0,
+    )
+    return top_center_pose, frame_center_pose
+
+
+def box_obstacle_top_pose_from_frame_top(frame_top_pose: Pose) -> Pose:
+    """由深框顶部空心中心计算长方体障碍物的上表面中心。"""
+    return pose_offset_local(
+        frame_top_pose,
+        *BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL,
+    )
+
+
+def frame_neg_y_obstacle_top_pose_from_frame_top(frame_top_pose: Pose) -> Pose:
+    """由深框顶部中心计算局部 -Y 墙状障碍物的上表面中心。"""
+    return pose_offset_local(
+        frame_top_pose,
+        *FRAME_NEG_Y_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL,
+    )
+
+
+def pose_rotate_local_rpy(
+    pose: Pose,
+    roll: float,
+    pitch: float,
+    yaw: float,
+) -> Pose:
+    """姿态右乘局部 RPY 旋转，位置保持不变。"""
+    ox, oy, oz, ow = quat_from_rpy(roll, pitch, yaw)
+    q = pose.orientation
+    out = copy.deepcopy(pose)
+    out.orientation.x = q.w * ox + q.x * ow + q.y * oz - q.z * oy
+    out.orientation.y = q.w * oy - q.x * oz + q.y * ow + q.z * ox
+    out.orientation.z = q.w * oz + q.x * oy - q.y * ox + q.z * ow
+    out.orientation.w = q.w * ow - q.x * ox - q.y * oy - q.z * oz
+    norm = math.sqrt(
+        out.orientation.x * out.orientation.x
+        + out.orientation.y * out.orientation.y
+        + out.orientation.z * out.orientation.z
+        + out.orientation.w * out.orientation.w
+    )
+    if norm <= 1e-12:
+        raise ValueError("局部旋转后的四元数长度为 0")
+    out.orientation.x /= norm
+    out.orientation.y /= norm
+    out.orientation.z /= norm
+    out.orientation.w /= norm
+    return out
+
+
+def pose_relative_to_frame(
+    pose_in_reference: Pose,
+    frame_in_reference: Pose,
+) -> Pose:
+    """把 reference 下的目标位姿转换成指定 frame 下的表达。"""
+    relative_matrix = matmul4(
+        invert_transform4(pose_to_matrix(frame_in_reference)),
+        pose_to_matrix(pose_in_reference),
+    )
+    return xyz_rpy_to_pose(matrix_to_xyz_rpy(relative_matrix))
+
+
+def joint_distance_squared(
+    candidate: dict[str, float],
+    reference: dict[str, float],
+    joint_names: Sequence[str],
+) -> float:
+    """用于按接近当前构型的程度排序 IK 解。"""
+    return sum(
+        (candidate[name] - reference[name]) ** 2
+        for name in joint_names
+    )
+
+
+def spread_sorted_candidates(
+    candidates: Sequence,
+    max_count: int,
+) -> list:
+    """从已排序候选中均匀取样，兼顾近、中、远构型。"""
+    candidates = list(candidates)
+    max_count = max(0, int(max_count))
+    if max_count == 0:
+        return []
+    if len(candidates) <= max_count:
+        return candidates
+    if max_count == 1:
+        return [candidates[0]]
+    last_index = len(candidates) - 1
+    return [
+        candidates[round(index * last_index / (max_count - 1))]
+        for index in range(max_count)
+    ]
+
+
+def pose_offset_local_z(pose: Pose, dz: float) -> Pose:
+    """沿 pose 自身坐标系 z 轴平移 dz 米，姿态保持不变。"""
+    return pose_offset_local(pose, 0.0, 0.0, dz)
+
+
+def make_deep_frame(frame_pose: Pose | None = None) -> CollisionObject:
+    """
+    深框 = 1 块底板 + 4 块侧墙 + 局部 ±Y 外侧加厚块
+    + 紧贴局部 +X 前表面的加高薄板，顶部无盖。
+    FRAME_SIZE 为深框整体外尺寸；frame_pose 为外轮廓中心位姿。
+    frame_pose=None 时使用静态 FRAME_CENTER / FRAME_RPY_DEG。
+    WALL_T 只向内部收缩；附加块仅沿局部 ±Y 向外延伸。
+    """
+    L, W, H = FRAME_SIZE
+    t = WALL_T
+    if frame_pose is None:
+        roll, pitch, yaw = (math.radians(v) for v in FRAME_RPY_DEG)
+        frame_pose = make_pose(*FRAME_CENTER, roll, pitch, yaw)
+
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = FRAME_ID
+    obj.operation = CollisionObject.ADD
+
+    def add_box(dx, dy, dz, ox, oy, oz):
+        prim = SolidPrimitive()
+        prim.type = SolidPrimitive.BOX
+        prim.dimensions = [dx, dy, dz]
+        obj.primitives.append(prim)
+        obj.primitive_poses.append(
+            pose_offset_local(frame_pose, ox, oy, oz)
+        )
+
+    wall_h = H - t
+    wall_z = -H / 2 + t + wall_h / 2
+    add_box(L, W, t, 0, 0, -H / 2 + t / 2)                    # 底板
+    add_box(t, W, wall_h, L / 2 - t / 2, 0, wall_z)           # +X 侧墙
+    add_box(t, W, wall_h, -(L / 2 - t / 2), 0, wall_z)        # -X 侧墙
+    add_box(L - 2 * t, t, wall_h, 0, W / 2 - t / 2, wall_z)   # +Y 侧墙
+    add_box(L - 2 * t, t, wall_h, 0, -(W / 2 - t / 2), wall_z)  # -Y 侧墙
+    outer_t = FRAME_Y_OUTER_THICKNESS
+    outer_y = W / 2 + outer_t / 2
+    add_box(L - 2 * t, outer_t, wall_h, 0, outer_y, wall_z)    # +Y 外侧加厚
+    add_box(L - 2 * t, outer_t, wall_h, 0, -outer_y, wall_z)   # -Y 外侧加厚
+    front_guard_h = H + FRAME_FRONT_GUARD_ABOVE_TOP
+    front_guard_x = L / 2 + FRAME_FRONT_GUARD_THICKNESS / 2
+    front_guard_z = -H / 2 + front_guard_h / 2
+    add_box(
+        FRAME_FRONT_GUARD_THICKNESS,
+        W,
+        front_guard_h,
+        front_guard_x,
+        0.0,
+        front_guard_z,
+    )  # +X 前侧薄板：贴住框前面，顶部高出 0.50 m
+    return obj
+
+
+def make_box_obstacle(
+    box_top_pose: Pose,
+    *,
+    object_id: str = BOX_OBSTACLE_ID,
+    size: Sequence[float] = BOX_OBSTACLE_SIZE,
+) -> CollisionObject:
+    """由长方体上表面中心向自身 -Z 下移半高，创建实体碰撞体。"""
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = object_id
+    obj.operation = CollisionObject.ADD
+
+    prim = SolidPrimitive()
+    prim.type = SolidPrimitive.BOX
+    prim.dimensions = list(size)
+    obj.primitives.append(prim)
+    obj.primitive_poses.append(
+        pose_offset_local(
+            box_top_pose,
+            0.0,
+            0.0,
+            -size[2] / 2.0,
+        )
+    )
+    return obj
+
+
+def make_unload_table_top_pose(recognition_pose: Pose) -> Pose:
+    """桌面中心按配置的视觉局部 xyz 偏移，再施加局部旋转。"""
+    translated = pose_offset_local(
+        recognition_pose,
+        *UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL,
+    )
+    return pose_rotate_local_rpy(translated, *UNLOAD_TABLE_LOCAL_RPY)
+
+
+def make_unload_table(recognition_pose: Pose) -> CollisionObject:
+    """以 material_table_top 为上表面中心，向局部 -Z 生成取料台实体。"""
+    table_top_pose = make_unload_table_top_pose(recognition_pose)
+    center_pose = pose_offset_local_z(
+        table_top_pose,
+        -UNLOAD_TABLE_SIZE[2] / 2.0,
+    )
+
+    primitive = SolidPrimitive()
+    primitive.type = SolidPrimitive.BOX
+    primitive.dimensions = list(UNLOAD_TABLE_SIZE)
+
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = UNLOAD_TABLE_ID
+    obj.operation = CollisionObject.ADD
+    obj.primitives.append(primitive)
+    obj.primitive_poses.append(center_pose)
+    return obj
+
+
+def make_unload_obstacle(recognition_pose: Pose) -> CollisionObject:
+    """沿物料台局部 +Y 平移，在地面上建立竖直墙状障碍物。"""
+    table_top_pose = make_unload_table_top_pose(recognition_pose)
+    center_pose = pose_offset_local(
+        table_top_pose,
+        0.0,
+        UNLOAD_OBSTACLE_Y_OFFSET,
+        0.0,
+    )
+    # 障碍物从 moveit_base_link 的地面向上延伸，故中心高度为半高。
+    center_pose.position.z = UNLOAD_OBSTACLE_SIZE[2] / 2.0
+
+    primitive = SolidPrimitive()
+    primitive.type = SolidPrimitive.BOX
+    primitive.dimensions = list(UNLOAD_OBSTACLE_SIZE)
+
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = UNLOAD_OBSTACLE_ID
+    obj.operation = CollisionObject.ADD
+    obj.primitives.append(primitive)
+    obj.primitive_poses.append(center_pose)
+    return obj
+
+
+def make_unload_place_poses(
+    left_recognition_pose: Pose, right_recognition_pose: Pose,
+) -> dict[int, Pose]:
+    """左臂点使用左标定，右臂点使用右标定，均表达在 SCENE_FRAME。"""
+    return {
+        point_index: pose_rotate_local_rpy(
+            pose_offset_local(
+                left_recognition_pose if point_index in UNLOAD_LEFT_PLACE_POINTS
+                else right_recognition_pose,
+                *local_offset,
+            ),
+            0.0,
+            UNLOAD_PLACE_LOCAL_PITCH,
+            UNLOAD_PLACE_LOCAL_YAWS[point_index],
+        )
+        for point_index, local_offset in UNLOAD_PLACE_LOCAL_OFFSETS.items()
+    }
+
+
+def make_deep_frame_cutoff(
+    scene_z: float,
+    frame_pose: Pose | None = None,
+) -> CollisionObject:
+    """在深框内生成水平隔离面，其上表面位于 SCENE_FRAME 的 scene_z。"""
+    L, W, _ = FRAME_SIZE
+    t = WALL_T
+    if frame_pose is None:
+        roll, pitch, yaw = (math.radians(v) for v in FRAME_RPY_DEG)
+        frame_pose = make_pose(*FRAME_CENTER, roll, pitch, yaw)
+    q = frame_pose.orientation
+
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = FRAME_CUTOFF_ID
+    obj.operation = CollisionObject.ADD
+
+    prim = SolidPrimitive()
+    prim.type = SolidPrimitive.BOX
+    prim.dimensions = [
+        max(0.0, L - 2.0 * t),
+        max(0.0, W - 2.0 * t),
+        FRAME_CUTOFF_THICKNESS,
+    ]
+    # 隔离面沿深框局部 X/Y 铺满内腔，局部 Z 为厚度方向。
+    # scene_z 是隔离面上表面高度，实体中心向下偏半个厚度。
+    ox, oy, oz = rotate_xyz_by_quat(
+        0.0,
+        0.0,
+        -FRAME_CUTOFF_THICKNESS / 2.0,
+        q.x,
+        q.y,
+        q.z,
+        q.w,
+    )
+    obj.primitives.append(prim)
+    cutoff_pose = copy.deepcopy(frame_pose)
+    cutoff_pose.position.x += ox
+    cutoff_pose.position.y += oy
+    cutoff_pose.position.z = scene_z + oz
+    obj.primitive_poses.append(cutoff_pose)
+    return obj
+
+
+def make_grasp_objects_collision(poses: Sequence[Pose]) -> CollisionObject:
+    """把传入的圆柱作为同一 MoveIt 碰撞对象的多个 primitive。"""
+    obj = CollisionObject()
+    obj.header.frame_id = SCENE_FRAME
+    obj.id = GRASP_OBJECT_COLLISION_ID
+    obj.operation = CollisionObject.ADD
+
+    for pose in poses:
+        prim = SolidPrimitive()
+        prim.type = SolidPrimitive.CYLINDER
+        prim.dimensions = [CYLINDER_HEIGHT, CYLINDER_DIAMETER / 2.0]
+        obj.primitives.append(prim)
+        obj.primitive_poses.append(copy.deepcopy(pose))
+    return obj
+
+
+def cylinder_half_extent_z(pose: Pose) -> float:
+    """圆柱按当前姿态投影到 Z 轴后的半尺寸，用于让水平隔板与圆柱相切。"""
+    return cylinder_half_extent_z_from_shape(pose, CYLINDER_DIAMETER / 2.0, CYLINDER_HEIGHT)
+
+
+def cylinder_half_extent_z_from_shape(pose: Pose, radius: float, length: float) -> float:
+    """指定半径/长度的圆柱按当前姿态投影到 Z 轴后的半尺寸。"""
+    q = pose.orientation
+    _, _, axis_z = rotate_xyz_by_quat(0.0, 0.0, 1.0, q.x, q.y, q.z, q.w)
+    axis_z = max(-1.0, min(1.0, axis_z))
+    half_height = float(length) / 2.0
+    radial_projection = math.sqrt(max(0.0, 1.0 - axis_z * axis_z))
+    return abs(axis_z) * half_height + radial_projection * float(radius)
+
+
+def matrix_from_xyz_rpy(xyz: Sequence[float], rpy: Sequence[float]) -> list[list[float]]:
+    x, y, z = [float(value) for value in xyz]
+    rot = rpy_to_rot(*[float(value) for value in rpy])
+    return [
+        [rot[0][0], rot[0][1], rot[0][2], x],
+        [rot[1][0], rot[1][1], rot[1][2], y],
+        [rot[2][0], rot[2][1], rot[2][2], z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _xml_numbers(value: str | None, default: Sequence[float]) -> list[float]:
+    if not value:
+        return list(default)
+    return [float(part) for part in value.split()]
+
+
+@lru_cache(maxsize=1)
+def _expanded_robot_urdf_root(urdf_path: str = str(DEFAULT_ROBOT_URDF)) -> ET.Element:
+    path = Path(urdf_path).resolve()
+    try:
+        result = subprocess.run(
+            ["xacro", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(path.parent),
+        )
+        return ET.fromstring(result.stdout)
+    except FileNotFoundError as exc:
+        raise RuntimeError("xacro command not found; source ROS environment first") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(exc.stderr.strip() or exc.stdout.strip()) from exc
+
+
+@lru_cache(maxsize=1)
+def _urdf_collision_data(urdf_path: str = str(DEFAULT_ROBOT_URDF)):
+    root = _expanded_robot_urdf_root(urdf_path)
+    collisions_by_link: dict[str, list[dict[str, object]]] = {}
+    parent_by_child: dict[str, str] = {}
+
+    for joint in root.iter("joint"):
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if parent is not None and child is not None:
+            parent_by_child[child.attrib["link"]] = parent.attrib["link"]
+
+    for link in root.iter("link"):
+        link_name = link.attrib.get("name")
+        if not link_name:
+            continue
+        for collision in link.findall("collision"):
+            cylinder = collision.find("./geometry/cylinder")
+            if cylinder is None:
+                continue
+            origin = collision.find("origin")
+            xyz = _xml_numbers(origin.attrib.get("xyz") if origin is not None else None, (0.0, 0.0, 0.0))
+            rpy = _xml_numbers(origin.attrib.get("rpy") if origin is not None else None, (0.0, 0.0, 0.0))
+            spec = {
+                "radius": float(cylinder.attrib["radius"]),
+                "length": float(cylinder.attrib["length"]),
+                "origin_matrix": matrix_from_xyz_rpy(xyz, rpy),
+            }
+            collisions_by_link.setdefault(link_name, []).append(spec)
+
+    return collisions_by_link, parent_by_child
+
+
+@lru_cache(maxsize=1)
+def _urdf_collision_link_names(
+    urdf_path: str = str(DEFAULT_ROBOT_URDF),
+) -> tuple[str, ...]:
+    """返回 URDF 中所有带 collision 几何体的 link 名称。
+
+    该列表只用于构造单次关节空间规划请求的 Allowed Collision Matrix。
+    与 ``_urdf_collision_data`` 不同，这里不限定几何体必须是圆柱，因此网格、
+    box、sphere 等碰撞几何也不会漏掉。
+    """
+    root = _expanded_robot_urdf_root(urdf_path)
+    return tuple(
+        link_name
+        for link in root.iter("link")
+        if (link_name := link.attrib.get("name")) and link.find("collision") is not None
+    )
+
+
+def collision_link_for_link(link: str) -> str | None:
+    """若 link 本身无 collision，则向父 link 查找最近的圆柱 collision link。"""
+    collisions_by_link, parent_by_child = _urdf_collision_data()
+    current = link
+    visited: set[str] = set()
+    while current and current not in visited:
+        visited.add(current)
+        if collisions_by_link.get(current):
+            return current
+        current = parent_by_child.get(current)
+    return None
+
+
+def pose_from_dict(ep: dict) -> Pose:
+    """EE_POSE2 风格字典 → geometry_msgs/Pose（位置 + roll/pitch/yaw）。"""
+    return make_pose(
+        ep["x"], ep["y"], ep["z"],
+        ep.get("roll", 0.0), ep.get("pitch", 0.0), ep.get("yaw", 0.0),
+    )
+
+
+def make_cylinder_marker(
+    pose: Pose,
+    marker_id: int,
+    frame_id: str = PLAN_FRAME,
+    diameter: float = CYLINDER_DIAMETER,
+    height: float = CYLINDER_HEIGHT,
+    color: ColorRGBA | None = None,
+    ns: str = CYLINDER_MARKER_NS,
+    action: int = Marker.ADD,
+) -> Marker:
+    """构造 RViz 圆柱 Marker（仅可视化，不参与碰撞检测）。
+
+    圆柱中心在 pose 原点，轴线沿 pose 局部 z；scale.x/y=直径，scale.z=高度。
+    """
+    m = Marker()
+    m.header.frame_id = frame_id
+    m.ns = ns
+    m.id = marker_id
+    m.type = Marker.CYLINDER
+    m.action = action
+    m.pose = pose
+    m.scale.x = diameter
+    m.scale.y = diameter
+    m.scale.z = height
+    m.color = color or CYLINDER_COLOR
+    return m
+
+
+def make_z_axis_marker(
+    pose: Pose,
+    marker_id: int,
+    frame_id: str = PLAN_FRAME,
+    length: float = Z_AXIS_LENGTH,
+    color: ColorRGBA | None = None,
+    ns: str = CYLINDER_MARKER_NS,
+) -> Marker:
+    """构造从 pose 原点指向其局部 +z 方向的红色箭头。"""
+    q = pose.orientation
+    dx, dy, dz = rotate_xyz_by_quat(0.0, 0.0, length, q.x, q.y, q.z, q.w)
+
+    start = Point(x=pose.position.x, y=pose.position.y, z=pose.position.z)
+    end = Point(x=start.x + dx, y=start.y + dy, z=start.z + dz)
+
+    m = Marker()
+    m.header.frame_id = frame_id
+    m.ns = ns
+    m.id = marker_id
+    m.type = Marker.ARROW
+    m.action = Marker.ADD
+    m.pose.orientation.w = 1.0
+    m.points = [start, end]
+    m.scale.x = 0.01  # 箭杆直径
+    m.scale.y = 0.015  # 箭头直径
+    m.scale.z = 0.012  # 箭头长度
+    m.color = color or Z_AXIS_COLOR
+    return m
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def _resolve_planning_time(planning_time_sec: float | None) -> float:
+    """返回本次 MoveGroup 请求的规划时间上限。
+
+    ``None`` 表示使用全局默认值 ``PLAN_TIME_SEC``。显式传入的值必须
+    是大于 0 的有限秒数，避免把 0、NaN 或无穷大发给 MoveIt。
+    """
+    value = PLAN_TIME_SEC if planning_time_sec is None else float(planning_time_sec)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"planning_time_sec 必须是大于 0 的有限秒数，当前={value}")
+    return value
+
+
+def _pose_distance(a: Pose, b: Pose) -> float:
+    dx = a.position.x - b.position.x
+    dy = a.position.y - b.position.y
+    dz = a.position.z - b.position.z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _pose_position_delta(actual: Pose, target: Pose) -> tuple[float, float, float, float]:
+    dx = actual.position.x - target.position.x
+    dy = actual.position.y - target.position.y
+    dz = actual.position.z - target.position.z
+    return dx, dy, dz, math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _pose_orientation_error_rad(actual: Pose, target: Pose) -> float:
+    aq = actual.orientation
+    tq = target.orientation
+    actual_norm = math.sqrt(aq.x * aq.x + aq.y * aq.y + aq.z * aq.z + aq.w * aq.w)
+    target_norm = math.sqrt(tq.x * tq.x + tq.y * tq.y + tq.z * tq.z + tq.w * tq.w)
+    if actual_norm <= 0.0 or target_norm <= 0.0:
+        return float("nan")
+    dot = (
+        aq.x * tq.x + aq.y * tq.y + aq.z * tq.z + aq.w * tq.w
+    ) / (actual_norm * target_norm)
+    dot = max(-1.0, min(1.0, abs(dot)))
+    return 2.0 * math.acos(dot)
+
+
+def _trajectory_joint_stats(traj: RobotTrajectory) -> tuple[float, float]:
+    """返回 (关节空间累计路程, 最大单步关节变化)。"""
+    pts = traj.joint_trajectory.points
+    if len(pts) < 2:
+        return 0.0, 0.0
+
+    total = 0.0
+    max_step = 0.0
+    for prev, cur in zip(pts, pts[1:]):
+        if not prev.positions or not cur.positions:
+            continue
+        deltas = [abs(b - a) for a, b in zip(prev.positions, cur.positions)]
+        if not deltas:
+            continue
+        total += sum(deltas)
+        max_step = max(max_step, max(deltas))
+    return total, max_step
+
+
+def _trajectory_joint_jump_reason(traj: RobotTrajectory) -> str | None:
+    """检测笛卡尔插补中的关节跳变；有跳变时返回原因，否则返回 None。"""
+    pts = traj.joint_trajectory.points
+    if len(pts) < 3:
+        return None
+
+    step_norms = []
+    max_joint_step = 0.0
+    for prev, cur in zip(pts, pts[1:]):
+        if not prev.positions or not cur.positions:
+            continue
+        deltas = [abs(b - a) for a, b in zip(prev.positions, cur.positions)]
+        if not deltas:
+            continue
+        max_joint_step = max(max_joint_step, max(deltas))
+        step_norms.append(math.sqrt(sum(d * d for d in deltas)))
+
+    if not step_norms:
+        return None
+
+    if max_joint_step > CART_REVOLUTE_JUMP_THRESHOLD:
+        return (
+            f"单关节单步 {max_joint_step:.3f} rad "
+            f"> {CART_REVOLUTE_JUMP_THRESHOLD:.3f} rad"
+        )
+
+    avg_step = sum(step_norms) / len(step_norms)
+    max_step = max(step_norms)
+    if avg_step > 1e-9 and max_step > avg_step * CART_JUMP_STEP_FACTOR:
+        return (
+            f"关节空间单步 {max_step:.3f} "
+            f"> 平均 {avg_step:.3f} * {CART_JUMP_STEP_FACTOR:.1f}"
+        )
+
+    return None
+
+
+def _moveit_error_name(val: int) -> str:
+    # 只覆盖常见错误，其他按数值输出
+    mapping = {
+        MoveItErrorCodes.SUCCESS: "SUCCESS",
+        MoveItErrorCodes.FAILURE: "FAILURE",
+        MoveItErrorCodes.PLANNING_FAILED: "PLANNING_FAILED",
+        MoveItErrorCodes.INVALID_MOTION_PLAN: "INVALID_MOTION_PLAN",
+        MoveItErrorCodes.MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE: "MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE",
+        MoveItErrorCodes.CONTROL_FAILED: "CONTROL_FAILED",
+        MoveItErrorCodes.UNABLE_TO_AQUIRE_SENSOR_DATA: "UNABLE_TO_AQUIRE_SENSOR_DATA",
+        MoveItErrorCodes.TIMED_OUT: "TIMED_OUT",
+        MoveItErrorCodes.PREEMPTED: "PREEMPTED",
+        MoveItErrorCodes.START_STATE_IN_COLLISION: "START_STATE_IN_COLLISION",
+        MoveItErrorCodes.START_STATE_VIOLATES_PATH_CONSTRAINTS: "START_STATE_VIOLATES_PATH_CONSTRAINTS",
+        MoveItErrorCodes.GOAL_IN_COLLISION: "GOAL_IN_COLLISION",
+        MoveItErrorCodes.GOAL_VIOLATES_PATH_CONSTRAINTS: "GOAL_VIOLATES_PATH_CONSTRAINTS",
+        MoveItErrorCodes.GOAL_CONSTRAINTS_VIOLATED: "GOAL_CONSTRAINTS_VIOLATED",
+        MoveItErrorCodes.INVALID_GROUP_NAME: "INVALID_GROUP_NAME",
+        MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS: "INVALID_GOAL_CONSTRAINTS",
+        MoveItErrorCodes.INVALID_ROBOT_STATE: "INVALID_ROBOT_STATE",
+        MoveItErrorCodes.INVALID_LINK_NAME: "INVALID_LINK_NAME",
+        MoveItErrorCodes.INVALID_OBJECT_NAME: "INVALID_OBJECT_NAME",
+        MoveItErrorCodes.FRAME_TRANSFORM_FAILURE: "FRAME_TRANSFORM_FAILURE",
+        MoveItErrorCodes.COLLISION_CHECKING_UNAVAILABLE: "COLLISION_CHECKING_UNAVAILABLE",
+        MoveItErrorCodes.ROBOT_STATE_STALE: "ROBOT_STATE_STALE",
+        MoveItErrorCodes.SENSOR_INFO_STALE: "SENSOR_INFO_STALE",
+        MoveItErrorCodes.NO_IK_SOLUTION: "NO_IK_SOLUTION",
+    }
+    return mapping.get(int(val), f"UNKNOWN({int(val)})")
+
+
+def make_joint_constraints(group: str, joints: dict[str, float]) -> Constraints:
+    """关节目标（dict）→ MoveIt goal_constraints（每个关节一个 JointConstraint）。"""
+    c = Constraints()
+    c.name = f"{group}_joint_goal"
+    for name, pos in joints.items():
+        jc = JointConstraint()
+        jc.joint_name = name
+        jc.position = pos
+        jc.tolerance_above = jc.tolerance_below = 1e-5
+        jc.weight = 1.0
+        c.joint_constraints.append(jc)
+    return c
+
+
+def make_pose_constraints(link: str, pose: Pose, frame_id: str = PLAN_FRAME) -> Constraints:
+    """
+    末端位姿目标 → PositionConstraint（位置球）+ OrientationConstraint。
+    约束在 frame_id 下表达，link_name 为末端连杆名。
+    """
+    c = Constraints()
+    c.name = "pose_goal"
+
+    sphere = SolidPrimitive()
+    sphere.type = SolidPrimitive.SPHERE
+    sphere.dimensions = [_POS_TOL]
+    region = BoundingVolume()
+    region.primitives.append(sphere)
+    pos_only = Pose()
+    pos_only.position = pose.position
+    pos_only.orientation.w = 1.0
+    region.primitive_poses.append(pos_only)
+
+    pc = PositionConstraint()
+    pc.header.frame_id = frame_id
+    pc.link_name = link
+    pc.constraint_region = region
+    pc.weight = 1.0
+    c.position_constraints.append(pc)
+
+    oc = OrientationConstraint()
+    oc.header.frame_id = frame_id
+    oc.link_name = link
+    oc.orientation = pose.orientation
+    oc.absolute_x_axis_tolerance = _ORI_TOL
+    oc.absolute_y_axis_tolerance = _ORI_TOL
+    oc.absolute_z_axis_tolerance = _ORI_TOL
+    oc.weight = 1.0
+    c.orientation_constraints.append(oc)
+    return c
+
+
+def _trajectory_duration_seconds(point: JointTrajectoryPoint) -> float:
+    return point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+
+
+def _trajectory_validation_indices(
+    points: Sequence[JointTrajectoryPoint],
+    sample_period: float | None,
+) -> list[int]:
+    """返回轨迹碰撞检查下标；始终包含首末点，None 表示逐点检查。"""
+    if not points:
+        return []
+    if sample_period is None or sample_period <= 0.0:
+        return list(range(len(points)))
+
+    indices = [0]
+    next_sample_time = float(sample_period)
+    for index, point in enumerate(points[1:-1], start=1):
+        point_time = _trajectory_duration_seconds(point)
+        if point_time + 1e-12 < next_sample_time:
+            continue
+        indices.append(index)
+        while next_sample_time <= point_time + 1e-12:
+            next_sample_time += sample_period
+
+    last_index = len(points) - 1
+    if indices[-1] != last_index:
+        indices.append(last_index)
+    return indices
+
+
+def _is_robot_self_contact(contact: ContactInformation) -> bool:
+    """仅把 robot link 与 robot link 的接触认定为机器人自碰撞。"""
+    return (
+        contact.body_type_1 == ContactInformation.ROBOT_LINK
+        and contact.body_type_2 == ContactInformation.ROBOT_LINK
+    )
+
+
+def _trajectory_positions_at_phase(
+    trajectory: RobotTrajectory,
+    phase: float,
+) -> list[float]:
+    """按归一化路径进度插值轨迹关节位置。"""
+    points = trajectory.joint_trajectory.points
+    if not points:
+        raise ValueError("轨迹没有路径点")
+    if len(points) == 1:
+        return list(points[0].positions)
+
+    times = [_trajectory_duration_seconds(point) for point in points]
+    source_time = max(0.0, min(1.0, phase)) * times[-1]
+    if source_time <= times[0]:
+        return list(points[0].positions)
+    if source_time >= times[-1]:
+        return list(points[-1].positions)
+
+    upper = bisect.bisect_right(times, source_time)
+    lower = upper - 1
+    span = times[upper] - times[lower]
+    ratio = 0.0 if span <= 1e-12 else (source_time - times[lower]) / span
+    return [
+        start + ratio * (end - start)
+        for start, end in zip(
+            points[lower].positions,
+            points[upper].positions,
+        )
+    ]
+
+
+def merge_dual_arm_cartesian_trajectories(
+    left: RobotTrajectory,
+    right: RobotTrajectory,
+) -> RobotTrajectory:
+    """把左右臂 Cartesian 路径同步重采样为一条可一次执行的 dual_arm 轨迹。"""
+    left_names = list(left.joint_trajectory.joint_names)
+    right_names = list(right.joint_trajectory.joint_names)
+    overlap = set(left_names).intersection(right_names)
+    if overlap:
+        raise ValueError(f"左右轨迹包含重复关节: {sorted(overlap)}")
+    if not left.joint_trajectory.points or not right.joint_trajectory.points:
+        raise ValueError("左右 Cartesian 轨迹不能为空")
+
+    left_duration = _trajectory_duration_seconds(left.joint_trajectory.points[-1])
+    right_duration = _trajectory_duration_seconds(right.joint_trajectory.points[-1])
+    duration = max(left_duration, right_duration)
+    if duration <= 0.0:
+        raise ValueError(
+            f"Cartesian 轨迹时长无效: left={left_duration}, right={right_duration}"
+        )
+
+    sample_count = max(
+        1,
+        int(math.ceil(duration / UNLOAD_SYNC_SAMPLE_PERIOD)),
+    )
+    merged = RobotTrajectory()
+    merged.joint_trajectory.header.frame_id = SCENE_FRAME
+    merged.joint_trajectory.joint_names = left_names + right_names
+
+    for index in range(sample_count + 1):
+        phase = index / sample_count
+        timestamp = duration * phase
+        point = JointTrajectoryPoint()
+        point.positions = (
+            _trajectory_positions_at_phase(left, phase)
+            + _trajectory_positions_at_phase(right, phase)
+        )
+        point.time_from_start.sec = int(timestamp)
+        point.time_from_start.nanosec = int(
+            round((timestamp - int(timestamp)) * 1e9)
+        )
+        if point.time_from_start.nanosec >= 1_000_000_000:
+            point.time_from_start.sec += 1
+            point.time_from_start.nanosec -= 1_000_000_000
+        merged.joint_trajectory.points.append(point)
+    return merged
+
+
+# =============================================================================
+# ROS 节点：场景管理 + move_action 调用
+# =============================================================================
+
+
+@dataclass
+class PlaceTrajectoryPlan:
+    arm_group: str
+    arm_plan_frame: str
+    body_group: str
+    arm_joint_names: list[str]
+    body_joint_names: list[str]
+    slot_name: str | None
+    yubei_name: str
+    place_name: str
+    start_joints: dict[str, float]
+    yubei_joints: list[float]
+    fang_joints: list[float]
+    to_yubei: RobotTrajectory
+    descent: RobotTrajectory
+    to_q1: RobotTrajectory
+    yubei_pose: Pose
+
+
+@dataclass
+class ExchangeTrajectoryPlan:
+    exchange_group: str
+    exchange_joint_names: list[str]
+    q2_slice_text: str
+    source_group: str
+    source_plan_frame: str
+    source_link: str
+    source_joint_names: list[str]
+    source_side: str
+    receiver_side: str
+    z_down_distance: float
+    to_q2: RobotTrajectory
+    down: RobotTrajectory
+
+
+@dataclass
+class PostGraspTrajectoryPlan:
+    exchange: ExchangeTrajectoryPlan | None
+    place: PlaceTrajectoryPlan
+
+
+@dataclass
+class UnloadPlaceTrajectoryPlan:
+    group: str
+    label: str
+    to_place: RobotTrajectory
+    descent: RobotTrajectory
+    left_return_pose: Pose | None = None
+    right_return_pose: Pose | None = None
+
+
+@dataclass
+class UnloadPickTrajectoryPlan:
+    right_slot: str
+    left_slot: str
+    dual_body_joint_names: list[str]
+    yubei_target: list[float]
+    to_yubei: RobotTrajectory
+    approach: RobotTrajectory
+    left_approach_distance: float
+    right_approach_distance: float
+
+
+def _trajectory_cache_path(key: str) -> Path:
+    safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "_", key)
+    return TRAJECTORY_CACHE_DIR / f"{safe_key}.json"
+
+
+def _save_trajectory_cache(
+    key: str,
+    metadata: Mapping[str, object],
+    messages: Mapping[str, object],
+) -> bool:
+    try:
+        TRAJECTORY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": TRAJECTORY_CACHE_VERSION,
+            "metadata": dict(metadata),
+            "messages": {
+                name: base64.b64encode(serialize_message(message)).decode("ascii")
+                for name, message in messages.items()
+            },
+        }
+        path = _trajectory_cache_path(key)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+        return True
+    except Exception as exc:
+        report_runtime_exception(exc, "_save_trajectory_cache")
+        return False
+
+
+def _load_trajectory_cache(
+    key: str,
+    message_types: Mapping[str, type],
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    path = _trajectory_cache_path(key)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") != TRAJECTORY_CACHE_VERSION:
+            return None
+        messages = {
+            name: deserialize_message(
+                base64.b64decode(payload["messages"][name]), message_type,
+            )
+            for name, message_type in message_types.items()
+        }
+        return dict(payload["metadata"]), messages
+    except Exception as exc:
+        report_runtime_exception(exc, "_load_trajectory_cache")
+        return None
+
+
+def _cached_joint_state_matches(
+    cached: object,
+    current: Mapping[str, float],
+    tolerance: float = 0.05,
+) -> bool:
+    if not isinstance(cached, dict) or set(cached) != set(current):
+        return False
+    try:
+        return max(
+            abs(float(cached[name]) - float(value))
+            for name, value in current.items()
+        ) <= tolerance
+    except (TypeError, ValueError):
+        return False
+
+
+# 输入 10/11：料台抓取配置，位置偏移相对 table_top，单位 m。
+TABLE_PICK_PLAN_FRAME = "moveit_base_link"
+TABLE_PICK_TABLE_ID = "table"
+TABLE_PICK_TABLE_SIZE = (0.5, 1.8, 0.97)
+TABLE_PICK_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
+TABLE_PICK_SIM_RECOGNITION_XYZ_RPY = (0.8, 0.0, 0.97, 0.0, 0.0, 0.0)
+TABLE_PICK_RECOGNITION_TO_TABLE_TOP_LOCAL_Z = 0.0
+TABLE_PICK_TABLE_LOCAL_Z_ROTATION = 0.0
+TABLE_PICK_TABLE_LOCAL_Y_ROTATION = 0.0
+TABLE_PICK_VISION_TABLE_POSE_KEY = "right_body"
+TABLE_PICK_VISION_TRIGGER_COMMAND = "p,2"
+TABLE_PICK_LEFT_GROUP = "left_arm"
+TABLE_PICK_RIGHT_GROUP = "right_arm"
+TABLE_PICK_DUAL_GROUP = "dual_arm"
+TABLE_PICK_LEFT_LINK = "l_tool"
+TABLE_PICK_RIGHT_LINK = "r_tool"
+TABLE_PICK_LEFT_JOINTS = joint_names_for_group(TABLE_PICK_LEFT_GROUP)
+TABLE_PICK_RIGHT_JOINTS = joint_names_for_group(TABLE_PICK_RIGHT_GROUP)
+TABLE_PICK_DUAL_JOINTS = joint_names_for_group(TABLE_PICK_DUAL_GROUP)
+TABLE_PICK_LEFT_GRASP_LOCAL_XYZ = (0.0, 0.45, 0.0)
+TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ = (0.0, -0.445, 0.0)
+TABLE_PICK_GRASP_LOCAL_Y_ROTATION = math.pi
+TABLE_PICK_PRE_GRASP_LOCAL_Z = 0.15
+TABLE_PICK_JOINT_PLAN_SPEED = 0.20
+TABLE_PICK_CARTESIAN_SPEED = 0.15
+TABLE_PICK_CARTESIAN_EEF_STEP = 0.005
+TABLE_PICK_CARTESIAN_AVOID_COLLISIONS = True
+TABLE_PICK_TOOL_POWER_SETTLE_SEC = 1.0
+TABLE_PICK_SYNC_SAMPLE_PERIOD = 0.005
+TABLE_PICK_VALIDITY_SAMPLE_PERIOD = 0.02
+TABLE_PICK_TABLE_MARKER_TOPIC = "table_coordinate_system"
+TABLE_PICK_TABLE_MARKER_NS = "table_coordinate_system"
+TABLE_PICK_TABLE_TF_FRAME = "table_top"
+TABLE_PICK_TABLE_AXIS_LENGTH = 0.30
+
+
+def table_pick_pose_rotate_local_y(pose: Pose, angle: float) -> Pose:
+    """保持位置不变，将姿态绕自身局部 Y 轴右乘旋转 angle。"""
+    q = pose.orientation
+    half = angle / 2.0
+    sin_half = math.sin(half)
+    cos_half = math.cos(half)
+
+    out = copy.deepcopy(pose)
+    out.orientation.x = q.x * cos_half - q.z * sin_half
+    out.orientation.y = q.w * sin_half + q.y * cos_half
+    out.orientation.z = q.x * sin_half + q.z * cos_half
+    out.orientation.w = q.w * cos_half - q.y * sin_half
+    return out
+
+
+def table_pick_pose_rotate_local_z(pose: Pose, angle: float) -> Pose:
+    """保持位置不变，将姿态绕自身局部 Z 轴右乘旋转 angle。"""
+    q = pose.orientation
+    half = angle / 2.0
+    sin_half = math.sin(half)
+    cos_half = math.cos(half)
+
+    out = copy.deepcopy(pose)
+    out.orientation.x = q.x * cos_half + q.y * sin_half
+    out.orientation.y = q.y * cos_half - q.x * sin_half
+    out.orientation.z = q.w * sin_half + q.z * cos_half
+    out.orientation.w = q.w * cos_half - q.z * sin_half
+    return out
+
+
+def table_pick_make_table_collision(table_top_pose: Pose) -> CollisionObject:
+    """桌体从 table_top 沿局部 -Z 延伸。"""
+    center_pose = pose_offset_local(table_top_pose, 0.0, 0.0, -TABLE_PICK_TABLE_SIZE[2] / 2.0)
+    primitive = SolidPrimitive()
+    primitive.type = SolidPrimitive.BOX
+    primitive.dimensions = list(TABLE_PICK_TABLE_SIZE)
+
+    obj = CollisionObject()
+    obj.header.frame_id = TABLE_PICK_PLAN_FRAME
+    obj.id = TABLE_PICK_TABLE_ID
+    obj.primitives.append(primitive)
+    obj.primitive_poses.append(center_pose)
+    obj.operation = CollisionObject.ADD
+    return obj
+
+
+def table_pick_axis_marker(
+    table_top_pose: Pose,
+    marker_id: int,
+    local_axis: tuple[float, float, float],
+    color: ColorRGBA,
+) -> Marker:
+    q = table_top_pose.orientation
+    dx, dy, dz = rotate_xyz_by_quat(
+        local_axis[0] * TABLE_PICK_TABLE_AXIS_LENGTH,
+        local_axis[1] * TABLE_PICK_TABLE_AXIS_LENGTH,
+        local_axis[2] * TABLE_PICK_TABLE_AXIS_LENGTH,
+        q.x,
+        q.y,
+        q.z,
+        q.w,
+    )
+    start = table_top_pose.position
+    marker = Marker()
+    marker.header.frame_id = TABLE_PICK_PLAN_FRAME
+    marker.ns = TABLE_PICK_TABLE_MARKER_NS
+    marker.id = marker_id
+    marker.type = Marker.ARROW
+    marker.action = Marker.ADD
+    marker.pose.orientation.w = 1.0
+    marker.points = [
+        Point(x=start.x, y=start.y, z=start.z),
+        Point(x=start.x + dx, y=start.y + dy, z=start.z + dz),
+    ]
+    marker.scale.x = 0.015
+    marker.scale.y = 0.030
+    marker.scale.z = 0.035
+    marker.color = color
+    return marker
+
+
+def table_pick_point_marker(pose: Pose, marker_id: int, color: ColorRGBA, scale: float) -> Marker:
+    marker = Marker()
+    marker.header.frame_id = TABLE_PICK_PLAN_FRAME
+    marker.ns = TABLE_PICK_TABLE_MARKER_NS
+    marker.id = marker_id
+    marker.type = Marker.SPHERE
+    marker.action = Marker.ADD
+    marker.pose = copy.deepcopy(pose)
+    marker.scale.x = marker.scale.y = marker.scale.z = scale
+    marker.color = color
+    return marker
+
+
+def table_pick_make_table_markers(
+    table_top_pose: Pose,
+    left_target: Pose,
+    right_target: Pose,
+    left_pre: Pose,
+    right_pre: Pose,
+) -> MarkerArray:
+    """桌子局部 XYZ 坐标轴，以及左右目标/预抓点。"""
+    markers = MarkerArray()
+    markers.markers.extend(
+        [
+            table_pick_axis_marker(table_top_pose, 0, (1.0, 0.0, 0.0), ColorRGBA(r=1.0, a=1.0)),
+            table_pick_axis_marker(table_top_pose, 1, (0.0, 1.0, 0.0), ColorRGBA(g=1.0, a=1.0)),
+            table_pick_axis_marker(table_top_pose, 2, (0.0, 0.0, 1.0), ColorRGBA(b=1.0, a=1.0)),
+            table_pick_point_marker(left_target, 10, ColorRGBA(g=1.0, b=0.2, a=1.0), 0.045),
+            table_pick_point_marker(right_target, 11, ColorRGBA(r=1.0, g=0.45, a=1.0), 0.045),
+            table_pick_point_marker(left_pre, 12, ColorRGBA(g=1.0, b=0.2, a=0.45), 0.035),
+            table_pick_point_marker(right_pre, 13, ColorRGBA(r=1.0, g=0.45, a=0.45), 0.035),
+        ]
+    )
+    return markers
+
+
+def table_pick_acquire_recognition_pose(node: "G01Demo", sim_mode: bool) -> Pose | None:
+    """返回 moveit_base_link 下未经 4.5 cm 偏移和 180 度修正的视觉识别位姿。"""
+    log = node.get_logger()
+    if sim_mode:
+        pose = make_pose(*TABLE_PICK_SIM_RECOGNITION_XYZ_RPY)
+        log.info(f"[sim] 使用默认视觉识别位姿: {TABLE_PICK_SIM_RECOGNITION_XYZ_RPY}")
+        return pose
+
+    result = read_vision_object_pose(
+        node,
+        log,
+        sim_mode=False,
+        trigger_command=TABLE_PICK_VISION_TRIGGER_COMMAND,
+    )
+    if result is None:
+        return None
+    _, all_xyz_rpy = result
+    if not all_xyz_rpy:
+        log.error("视觉没有返回识别位姿")
+        return None
+    if TABLE_PICK_VISION_TABLE_POSE_KEY not in all_xyz_rpy[0]:
+        log.error(
+            f"视觉结果中没有 {TABLE_PICK_VISION_TABLE_POSE_KEY!r}，"
+            f"可选键: {list(all_xyz_rpy[0])}"
+        )
+        return None
+
+    values = all_xyz_rpy[0][TABLE_PICK_VISION_TABLE_POSE_KEY]
+    pose = make_pose(*values)
+    log.info(
+        "视觉识别位姿 @ moveit_base_link: "
+        f"xyz=({values[0]:.4f}, {values[1]:.4f}, {values[2]:.4f}) m, "
+        f"rpy=({math.degrees(values[3]):.2f}, {math.degrees(values[4]):.2f}, "
+        f"{math.degrees(values[5]):.2f}) deg"
+    )
+    return pose
+
+
+def table_pick_duration_seconds(point: JointTrajectoryPoint) -> float:
+    return point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+
+
+def table_pick_positions_at_phase(trajectory: RobotTrajectory, phase: float) -> list[float]:
+    """按轨迹自身归一化时间 phase 线性插值关节位置。"""
+    points = trajectory.joint_trajectory.points
+    if not points:
+        raise ValueError("轨迹没有路径点")
+    if len(points) == 1:
+        return list(points[0].positions)
+
+    times = [table_pick_duration_seconds(point) for point in points]
+    source_time = max(0.0, min(1.0, phase)) * times[-1]
+    if source_time <= times[0]:
+        return list(points[0].positions)
+    if source_time >= times[-1]:
+        return list(points[-1].positions)
+
+    upper = bisect.bisect_right(times, source_time)
+    lower = upper - 1
+    span = times[upper] - times[lower]
+    ratio = 0.0 if span <= 1e-12 else (source_time - times[lower]) / span
+    return [
+        a + ratio * (b - a)
+        for a, b in zip(points[lower].positions, points[upper].positions)
+    ]
+
+
+def table_pick_merge_synchronized_trajectories(
+    left: RobotTrajectory, right: RobotTrajectory
+) -> RobotTrajectory:
+    """两臂按相同路径进度重采样，使其同刻开始、同刻结束。"""
+    left_names = list(left.joint_trajectory.joint_names)
+    right_names = list(right.joint_trajectory.joint_names)
+    overlap = set(left_names).intersection(right_names)
+    if overlap:
+        raise ValueError(f"左右轨迹包含重复关节: {sorted(overlap)}")
+    if not left.joint_trajectory.points or not right.joint_trajectory.points:
+        raise ValueError("左右 Cartesian 轨迹不能为空")
+
+    left_duration = table_pick_duration_seconds(left.joint_trajectory.points[-1])
+    right_duration = table_pick_duration_seconds(right.joint_trajectory.points[-1])
+    duration = max(left_duration, right_duration)
+    if duration <= 0.0:
+        raise ValueError(
+            f"Cartesian 轨迹时长无效: left={left_duration}, right={right_duration}"
+        )
+
+    sample_count = max(1, int(math.ceil(duration / TABLE_PICK_SYNC_SAMPLE_PERIOD)))
+    merged = RobotTrajectory()
+    merged.joint_trajectory.header.frame_id = TABLE_PICK_PLAN_FRAME
+    merged.joint_trajectory.joint_names = left_names + right_names
+
+    for index in range(sample_count + 1):
+        phase = index / sample_count
+        timestamp = duration * phase
+        point = JointTrajectoryPoint()
+        point.positions = table_pick_positions_at_phase(left, phase) + table_pick_positions_at_phase(right, phase)
+        point.time_from_start.sec = int(timestamp)
+        point.time_from_start.nanosec = int(round((timestamp - int(timestamp)) * 1e9))
+        if point.time_from_start.nanosec >= 1_000_000_000:
+            point.time_from_start.sec += 1
+            point.time_from_start.nanosec -= 1_000_000_000
+        merged.joint_trajectory.points.append(point)
+    return merged
+
+
+def table_pick_show_table_markers(
+    self,
+    table_top_pose: Pose,
+    left_target: Pose,
+    right_target: Pose,
+    left_pre: Pose,
+    right_pre: Pose,
+) -> None:
+    table_tf = TransformStamped()
+    table_tf.header.frame_id = TABLE_PICK_PLAN_FRAME
+    table_tf.header.stamp = self.get_clock().now().to_msg()
+    table_tf.child_frame_id = TABLE_PICK_TABLE_TF_FRAME
+    table_tf.transform.translation.x = table_top_pose.position.x
+    table_tf.transform.translation.y = table_top_pose.position.y
+    table_tf.transform.translation.z = table_top_pose.position.z
+    table_tf.transform.rotation = copy.deepcopy(table_top_pose.orientation)
+    self._table_tf_broadcaster.sendTransform(table_tf)
+
+    marker_array = table_pick_make_table_markers(
+        table_top_pose, left_target, right_target, left_pre, right_pre
+    )
+    stamp = self.get_clock().now().to_msg()
+    for marker in marker_array.markers:
+        marker.header.stamp = stamp
+    self._table_marker_pub.publish(marker_array)
+    self.get_logger().info(
+        f"已发布桌子坐标系: TF={TABLE_PICK_PLAN_FRAME}->{TABLE_PICK_TABLE_TF_FRAME}, "
+        f"MarkerArray=/{TABLE_PICK_TABLE_MARKER_TOPIC}（X 红 / Y 绿 / Z 蓝）"
+    )
+
+
+def table_pick_validate_dual_trajectory(self, trajectory: RobotTrajectory) -> bool:
+    """在同一 dual_arm 状态中检查合并轨迹，捕获双臂相互碰撞。"""
+    log = self.get_logger()
+    if not self._validity_cli.wait_for_service(timeout_sec=10.0):
+        log.error("服务 check_state_validity 不可用")
+        return False
+
+    points = trajectory.joint_trajectory.points
+    names = list(trajectory.joint_trajectory.joint_names)
+    stride = max(1, int(round(TABLE_PICK_VALIDITY_SAMPLE_PERIOD / TABLE_PICK_SYNC_SAMPLE_PERIOD)))
+    indices = list(range(0, len(points), stride))
+    if not indices or indices[-1] != len(points) - 1:
+        indices.append(len(points) - 1)
+
+    for checked, index in enumerate(indices, start=1):
+        request = GetStateValidity.Request()
+        request.group_name = TABLE_PICK_DUAL_GROUP
+        request.robot_state = RobotState()
+        request.robot_state.is_diff = True
+        request.robot_state.joint_state.name = names
+        request.robot_state.joint_state.position = list(points[index].positions)
+        future = self._validity_cli.call_async(request)
+        if not self._spin_until(future, 5.0):
+            log.error(f"合并轨迹状态检查超时: point={index}")
+            return False
+        response = future.result()
+        if not response.valid:
+            contacts = [
+                f"{contact.contact_body_1}<->{contact.contact_body_2}"
+                for contact in response.contacts[:5]
+            ]
+            detail = ", ".join(contacts) if contacts else "未返回 contact 详情"
+            log.error(f"合并轨迹存在碰撞: point={index}, {detail}")
+            return False
+
+    log.info(f"合并轨迹 dual_arm 有效性检查通过: {len(indices)} 个采样状态")
+    return True
+
+
+def table_pick_make_grasp_pose(table_top_pose: Pose, x: float, y: float, z: float) -> Pose:
+    """先按 table_top 偏移位置，再绕局部 Y 旋转抓取姿态。"""
+    return table_pick_pose_rotate_local_y(
+        pose_offset_local(table_top_pose, x, y, z), TABLE_PICK_GRASP_LOCAL_Y_ROTATION,
+    )
+
+
+
+class G01Demo(Node):
+    """封装 apply_planning_scene 与 move_action，对外提供少量高层接口。"""
+
+    def __init__(
+        self,
+        sim_mode: bool = False,
+        upper_control_mode: bool = True,
+        node_name: str = "g01_demo",
+        upper_communication: bool = True,
+        use_force_sensors: bool = True,
+    ):
+        super().__init__(node_name)
+        self._error_pub = (
+            self.create_publisher(Int32, ERROR_CODE_TOPIC, 100)
+            if upper_communication else None
+        )
+        self._defer_error_publish = False
+        self._startup_error_codes: list[int] = []
+        self.sim_mode = bool(sim_mode)
+        self.use_force_sensors = use_force_sensors
+        # 后台节点只做规划；保护和硬件停臂由前台节点统一执行。
+        self._force_range_enabled = upper_communication and use_force_sensors
+        self._force_range_fault: str | None = None
+        self._force_task_active = False
+        self._force_stop_requests: dict[str, int] = {}
+        self._force_action_goals: list = []
+        self._camera_mount_transforms: dict[str, list[list[float]]] = {}
+        self.upper_control_mode = bool(upper_control_mode)
+        self._scene_cli = self.create_client(ApplyPlanningScene, SVC_APPLY_SCENE)
+        self._get_scene_cli = self.create_client(
+            GetPlanningScene,
+            SVC_GET_PLANNING_SCENE,
+        )
+        self._cart_cli = self.create_client(GetCartesianPath, SVC_CARTESIAN_PATH)
+        self._ik_cli = self.create_client(GetPositionIK, SVC_COMPUTE_IK)
+        self._fk_cli = self.create_client(GetPositionFK, SVC_COMPUTE_FK)
+        self._validity_cli = self.create_client(
+            GetStateValidity,
+            SVC_STATE_VALIDITY,
+        )
+        self._left_tool_cli = self.create_client(SetToolPower, LEFT_TOOL_COMMAND_SERVICE)
+        self._right_tool_cli = self.create_client(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE)
+        self._left_clear_error_cli = self.create_client(
+            ClearError,
+            LEFT_CLEAR_ERROR_SERVICE,
+        )
+        self._right_clear_error_cli = self.create_client(
+            ClearError,
+            RIGHT_CLEAR_ERROR_SERVICE,
+        )
+        self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
+        self._exec_cli = ActionClient(self, ExecuteTrajectory, ACT_EXEC_TRAJ)
+        self._vision_tf_broadcaster = StaticTransformBroadcaster(self)
+        frame_roll, frame_pitch, frame_yaw = (
+            math.radians(value) for value in FRAME_RPY_DEG
+        )
+        self._frame_pose = make_pose(
+            *FRAME_CENTER,
+            frame_roll,
+            frame_pitch,
+            frame_yaw,
+        )
+        self._frame_top_pose = pose_offset_local(
+            self._frame_pose,
+            0.0,
+            0.0,
+            FRAME_SIZE[2] / 2.0,
+        )
+        self._box_obstacle_top_pose = (
+            box_obstacle_top_pose_from_frame_top(self._frame_top_pose)
+        )
+        # 缓存最新 joint_states，供规划起点使用
+        self._joints: dict[str, float] = {}
+        self._js_count = 0
+        # 上位机命令只保留最近收到的一条；新命令直接覆盖尚未处理的旧命令。
+        self._latest_upper_command: tuple[str, dict] | None = None
+        self.last_pick_failure_reason: str | None = None
+        # UInt8 会在回调中显式限制到 uint8 范围。真实模式在收到首帧前为未知，
+        # 未知状态按“没有安全空位”处理；仿真默认四个 SW 均为空。
+        # 键盘模式执行步骤 4 时会重置为全空，步骤 7 时会重置为全满；
+        # 进入具体流程后再由上料/下料动作实时更新对应 SW。
+        self._driver_signal: int | None = (
+            ALL_PLACE_SLOTS_EMPTY_SIGNAL if self.sim_mode else None
+        )
+        self._driver_signal_count = 0
+        self._nav_result_count = 0
+        self._latest_nav_success: bool | None = None
+        self._latest_nav_message = ""
+        # 深框识别成功后才延迟创建 /agv_position 订阅。订阅保持存活，
+        # 但非采样期间的消息直接丢弃，不在节点中缓存“最新 AGV 位姿”。
+        self._agv_position_subscription = None
+        self._agv_position_sample_request: dict[str, Pose2D | None] | None = None
+        self._ft_sensor_z: dict[str, float | None] = {
+            "left": None,
+            "right": None,
+        }
+        self._ft_sensor_count = {"left": 0, "right": 0}
+        self._active_approach_guard: dict | None = None
+        self._servoj_request_id = 0
+        self._servoj_control_acks: dict[tuple[str, str, int], dict] = {}
+        self.create_subscription(JointState, "/g01/joint_states", self._on_js, 10)
+        for command_topic in ((
+            MOVE_TO_GRASP_POSE_CMD_TOPIC,
+            GRASP_CMD_TOPIC,
+            MOVE_TO_PLACE_POSE_CMD_TOPIC,
+            PLACE_CMD_TOPIC,
+            RETURN_INIT_POSE_TOPIC,
+        ) if upper_communication else ()):
+            self.create_subscription(
+                String,
+                command_topic,
+                lambda msg, topic=command_topic: self._on_upper_command(msg, topic),
+                1,
+            )
+        if self.use_force_sensors:
+            # servoj_30ms.py 在传感器离线时停止发布；这里只接受调用后到达的新帧。
+            self.create_subscription(
+                Float32MultiArray,
+                LEFT_FT_SENSOR_TOPIC,
+                lambda msg: self._on_ft_sensor(msg, "left"),
+                1,
+            )
+            self.create_subscription(
+                Float32MultiArray,
+                RIGHT_FT_SENSOR_TOPIC,
+                lambda msg: self._on_ft_sensor(msg, "right"),
+                1,
+            )
+        self.create_subscription(
+            String,
+            SERVOJ_CONTROL_STATE_TOPIC,
+            self._on_servoj_control_state,
+            10,
+        )
+        # 只保留最新一帧，避免各阶段运动时积压旧的开关状态。
+        self.create_subscription(UInt8, DRIVER_SIGNAL_TOPIC, self._on_driver_signal, 1)
+        self.create_subscription(String, NAV_RESULT_TOPIC, self._on_nav_result, 10)
+        self._nav_goal_pub = self.create_publisher(
+            PoseStamped,
+            NAV_GOAL_TOPIC,
+            10,
+        )
+        self._agv_speed_pub = self.create_publisher(Twist, AGV_SPEED_TOPIC, 1)
+        self._servoj_control_pub = self.create_publisher(
+            String,
+            SERVOJ_CONTROL_TOPIC,
+            10,
+        )
+        self._motor_command_pub = self.create_publisher(
+            UInt8,
+            MOTOR_COMMAND_TOPIC,
+            10,
+        )
+        self._camera_position_pub = self.create_publisher(
+            Float32, "/camera_motor_control/position", 10,
+        )
+        # 步骤 4 会在极短时间内为每个视觉点发布圆柱/+Z 两条
+        # Marker。使用大队列 + reliable + transient-local，既防止密集
+        # 发布丢掉前面的点，也允许 RViz 重连后收到当前显示。
+        marker_qos = QoSProfile(depth=POSE_MARKER_QUEUE_DEPTH)
+        marker_qos.reliability = ReliabilityPolicy.RELIABLE
+        marker_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self._cylinder_marker_pub = self.create_publisher(
+            Marker,
+            CYLINDER_MARKER_TOPIC,
+            marker_qos,
+        )
+        self._cylinder_marker_ids: dict[str, int] = {}
+        self._next_cylinder_marker_id = 0
+        self._executor = SingleThreadedExecutor(context=self.context)
+        self._executor.add_node(self)
+
+    def publish_error(self, code: int, detail: str = "") -> None:
+        """发布一次错误事件或 0 清错；具体上下文保留在日志中。"""
+        if self._defer_error_publish:
+            if code and code not in self._startup_error_codes:
+                self._startup_error_codes.append(int(code))
+        elif self._error_pub is not None:
+            self._error_pub.publish(Int32(data=int(code)))
+        message = f"[error-code={code}] {ERROR_CODES[code]}: {detail}"
+        if code == 0:
+            self.get_logger().info(message)
+        else:
+            self.get_logger().error(message)
+
+    def verify_startup_hardware(self) -> bool:
+        """启动自检：双工具上电→双力新帧→双工具下电→最新关节位置。"""
+        log = self.get_logger()
+        sides = ("left", "right")
+
+        def check(action, error_code: int, label: str):
+            # 正常失败由底层方法发布对应错误码；调用异常也归入当前检查项。
+            try:
+                return action()
+            except Exception as exc:
+                self.publish_error(error_code, f"启动自检 {label}: {exc}")
+                return None
+
+        log.info("[startup-check] 双末端上电" + ("，检查左右力传感器新帧" if self.use_force_sensors else ""))
+        force_values = {}
+        try:
+            power_on = [
+                check(lambda side=side: self.set_tool_power(side, 1), 6, f"{side} 上电")
+                for side in sides
+            ]
+            if all(power_on) and self.use_force_sensors:
+                for side in sides:
+                    force_values[side] = check(
+                        lambda side=side: self.wait_for_ft_sensor_z(side),
+                        5, f"{side} 力传感器新帧",
+                    )
+        finally:
+            # 任一侧上电或传感器检查失败，也必须尝试给两个末端下电。
+            log.info("[startup-check] 给两个末端下电")
+            power_off = [
+                check(lambda side=side: self.set_tool_power(side, 0), 7, f"{side} 下电")
+                for side in sides
+            ]
+
+        if not all(power_on) or not all(power_off) or (
+            self.use_force_sensors
+            and any(force_values.get(side) is None for side in sides)
+        ):
+            return False
+
+        joint_names = list(JOINT_TARGETS["dual_arm_body"])
+        log.info("[startup-check] 获取双臂、腰部及升降的最新关节位置")
+        joints = check(
+            lambda: self._get_joints(joint_names, wait_new=True),
+            9, "获取当前位置",
+        )
+        if joints is None:
+            return False
+        log.info(
+            "[startup-check] 自检成功；当前位置: "
+            + ", ".join(f"{name}={value:.6f}" for name, value in joints.items())
+        )
+        return True
+
+    def camera_transforms_for_joints(
+        self, joints: dict[str, float],
+    ) -> tuple[list[list[float]], list[list[float]]] | None:
+        """用 45° 标定推导固定头部外参，再计算当前头角下左右臂外参。"""
+        transforms = []
+        calibration_joints = dict(joints)
+        calibration_joints[VISION_HEAD_JOINT] = VISION_CALIBRATION_HEAD_POSITION
+        for arm_frame, calibrated_transform in (
+            ("r_base_link", VISION_RIGHT_TRANSFORM_MM),
+            ("l_base_link", VISION_LEFT_TRANSFORM_MM),
+        ):
+            if arm_frame not in self._camera_mount_transforms:
+                calibration_pose = self._get_link_pose_fk(
+                    VISION_HEAD_LINK, joints=calibration_joints, plan_frame=arm_frame,
+                )
+                zero_pose = self._get_link_pose_fk(
+                    VISION_HEAD_LINK,
+                    joints={**calibration_joints, VISION_HEAD_JOINT: 0.0},
+                    plan_frame=arm_frame,
+                )
+                if calibration_pose is None or zero_pose is None:
+                    return None
+                rotation = matmul4(
+                    invert_transform4(pose_to_matrix(zero_pose)),
+                    pose_to_matrix(calibration_pose),
+                )
+                angle = math.acos(max(-1.0, min(1.0, (
+                    sum(rotation[i][i] for i in range(3)) - 1.0
+                ) / 2.0)))
+                if abs(angle - VISION_CALIBRATION_HEAD_POSITION) > 1e-3:
+                    self.get_logger().error(
+                        "[vision] FK 头部关节未正确生效，请重新构建并重启 MoveIt，"
+                        "确认 head_joint 已由 fixed 改为 revolute"
+                    )
+                    return None
+                self._camera_mount_transforms[arm_frame] = camera_mount_transform(
+                    calibrated_transform, calibration_pose,
+                )
+                self.get_logger().info(
+                    f"[vision] 由 {arm_frame} 的 45° 标定反解 T_head_camera（米）: "
+                    f"{self._camera_mount_transforms[arm_frame]}"
+                )
+            current_pose = self._get_link_pose_fk(
+                VISION_HEAD_LINK, joints=joints, plan_frame=arm_frame,
+            )
+            if current_pose is None:
+                return None
+            transforms.append(camera_transform_at_head_position(
+                self._camera_mount_transforms[arm_frame], current_pose,
+            ))
+        return transforms[0], transforms[1]
+
+    def send_grasp_camera_position(self) -> None:
+        self._camera_position_pub.publish(Float32(data=GRASP_VISION_CAMERA_POSITION))
+        self.get_logger().info(
+            f"[pick-vision] 已发送头部目标 {GRASP_VISION_CAMERA_POSITION:.4f} rad"
+        )
+
+    def wait_for_camera_position(self, target: float) -> bool:
+        """腰部结束后订阅头部新反馈，持续等待到位或 ROS 关闭。"""
+        if self.sim_mode:
+            self.get_logger().info("[frame-vision][sim] 跳过头部硬件到位等待")
+            return True
+        # 与 comm.py 的腰部反馈类型、position 字段及 rad 单位一致。
+        from pkg_msg_define.msg import MotorRuntimeInfo
+
+        position = None
+
+        def on_camera_info(msg: MotorRuntimeInfo) -> None:
+            nonlocal position
+            position = float(msg.position)
+
+        subscription = self.create_subscription(
+            MotorRuntimeInfo,
+            "/driver_report/camera_motor_info",
+            on_camera_info,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+        )
+        self.get_logger().info(
+            f"[frame-vision] 等待头部到 {target:.4f} rad，"
+            f"允许误差 {FRAME_DIRECT_CAMERA_TOLERANCE:.4f} rad"
+        )
+        try:
+            while rclpy.ok():
+                self._executor.spin_once(timeout_sec=0.1)
+                if (
+                    position is not None
+                    and math.isfinite(position)
+                    and abs(position - target) <= FRAME_DIRECT_CAMERA_TOLERANCE
+                ):
+                    self.get_logger().info(
+                        f"[frame-vision] 头部已到位：{position:.4f} rad"
+                    )
+                    return True
+            return False
+        finally:
+            self.destroy_subscription(subscription)
+
+    def shutdown_executor(self) -> None:
+        """从专属 executor 移除节点并关闭其 wait-set。"""
+        self._executor.remove_node(self)
+        self._executor.shutdown()
+
+    def _on_agv_position(self, msg: Pose2D) -> None:
+        """仅向当前采样请求交付一帧；其余 AGV 位姿消息直接丢弃。"""
+        request = self._agv_position_sample_request
+        if request is not None:
+            request["snapshot"] = copy.deepcopy(msg)
+
+    def start_agv_position_subscription(self) -> None:
+        """首次深框识别成功后启动 AGV 位姿订阅。"""
+        if self._agv_position_subscription is not None or self.sim_mode:
+            return
+        self._agv_position_subscription = self.create_subscription(
+            Pose2D,
+            AGV_POSITION_TOPIC,
+            self._on_agv_position,
+            AGV_POSITION_QUEUE_DEPTH,
+        )
+        self.get_logger().info(
+            f"[frame-agv-position] 已订阅 {AGV_POSITION_TOPIC}，queue depth={AGV_POSITION_QUEUE_DEPTH}"
+        )
+
+    def wait_for_agv_position_snapshot(
+        self,
+        stage_label: str,
+        timeout_sec: float = AGV_POSITION_WAIT_TIMEOUT_SEC,
+    ) -> Pose2D | None:
+        """等待调用后的一帧 AGV 位姿，并记录该阶段机器人实际位姿。"""
+        if self.sim_mode:
+            snapshot = Pose2D()
+            self.get_logger().info(
+                f"[sim][frame-agv-position] {stage_label}：使用单位位姿"
+            )
+            return snapshot
+
+        self.start_agv_position_subscription()
+        request: dict[str, Pose2D | None] = {"snapshot": None}
+        self._agv_position_sample_request = request
+        try:
+            deadline = time.monotonic() + max(0.0, float(timeout_sec))
+            while rclpy.ok() and time.monotonic() < deadline:
+                self._executor.spin_once(
+                    timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
+                )
+                snapshot = request["snapshot"]
+                if snapshot is None:
+                    continue
+                try:
+                    pose2d_to_matrix(snapshot)
+                except ValueError as exc:
+                    self.get_logger().error(
+                        f"[frame-agv-position] {stage_label}：{AGV_POSITION_TOPIC} 位姿无效: {exc}"
+                    )
+                    return None
+                self.get_logger().info(
+                    f"[frame-agv-position] {stage_label}机器人实际位姿: "
+                    f"topic={AGV_POSITION_TOPIC}, "
+                    f"x={snapshot.x:.6f}, y={snapshot.y:.6f}, "
+                    f"theta={snapshot.theta:.6f} rad"
+                )
+                return snapshot
+
+            self.get_logger().error(
+                f"[frame-agv-position] {stage_label}：{timeout_sec:.1f}s 内未收到 "
+                f"{AGV_POSITION_TOPIC} 当前新帧，无法安全转换深框位姿"
+            )
+            return None
+        finally:
+            # 订阅不销毁；只清除本次采样请求和其临时消息。
+            self._agv_position_sample_request = None
+
+    def _on_nav_result(self, msg: String):
+        """缓存格式为 {"message": "...", "success": true} 的导航结果。"""
+        log = self.get_logger()
+        try:
+            result = json.loads(msg.data)
+        except json.JSONDecodeError as exc:
+            log.error(
+                f"{NAV_RESULT_TOPIC} JSON 解析失败: {exc}; data={msg.data!r}"
+            )
+            return
+
+        if not isinstance(result, dict):
+            log.error(f"{NAV_RESULT_TOPIC} JSON 必须是 object: {msg.data!r}")
+            return
+
+        success = result.get("success")
+        if not isinstance(success, bool):
+            log.error(
+                f"{NAV_RESULT_TOPIC} 的 success 必须是 JSON bool: {msg.data!r}"
+            )
+            return
+
+        self._nav_result_count += 1
+        self._latest_nav_success = success
+        self._latest_nav_message = str(result.get("message", ""))
+        log.info(
+            f"收到 {NAV_RESULT_TOPIC}: success={success}, "
+            f"message={self._latest_nav_message!r}"
+        )
+
+    def drive_agv(self, speed_x: float) -> bool:
+        """以 20 Hz 发送指定 X 速度 3 秒，结束或异常退出时发送零速度。"""
+        if self.sim_mode:
+            self.get_logger().info("[sim][agv] 跳过 AGV 速度控制")
+            return True
+
+        command = Twist()
+        command.linear.x = speed_x
+        period = 1.0 / AGV_SPEED_PUBLISH_HZ
+        self.get_logger().info(
+            f"[agv] {AGV_SPEED_TOPIC}: linear.x={speed_x:.3f} m/s, "
+            f"持续 {AGV_DRIVE_DURATION_SEC:.1f}s, "
+            f"发布频率 {AGV_SPEED_PUBLISH_HZ:.1f} Hz"
+        )
+        start = time.monotonic()
+        deadline = start + AGV_DRIVE_DURATION_SEC
+        next_publish = start
+        try:
+            while rclpy.ok():
+                self._abort_on_force_range()
+                now = time.monotonic()
+                if now >= deadline:
+                    return True
+                if now >= next_publish:
+                    self._agv_speed_pub.publish(command)
+                    # 跳过调度延迟错过的周期，避免补发速度消息形成突发。
+                    next_publish += period
+                    if next_publish <= now:
+                        next_publish = now + period
+                self._executor.spin_once(
+                    timeout_sec=max(
+                        0.0, min(next_publish, deadline) - time.monotonic()
+                    ),
+                )
+            return False
+        finally:
+            self._agv_speed_pub.publish(Twist())
+            self.get_logger().info("[agv] 已发送零速度")
+
+    def navigate_and_wait(self, workflow: str) -> bool:
+        """真机发布工位目标并等待结果；仿真模式直接跳过导航。"""
+        goal_values = NAV_GOAL_POSES.get(str(workflow))
+        if goal_values is None:
+            self.get_logger().error(f"没有为阶段 {workflow!r} 配置导航目标")
+            return False
+
+        if self.sim_mode:
+            self.get_logger().info(
+                f"[sim][nav] 阶段 {workflow}：跳过导航"
+            )
+            return True
+
+        goal = PoseStamped()
+        goal.header.frame_id = "map"
+        goal.header.stamp.sec = 0
+        goal.header.stamp.nanosec = 0
+        (
+            goal.pose.position.x,
+            goal.pose.position.y,
+            goal.pose.position.z,
+        ) = goal_values["position"]
+        (
+            goal.pose.orientation.x,
+            goal.pose.orientation.y,
+            goal.pose.orientation.z,
+            goal.pose.orientation.w,
+        ) = goal_values["orientation"]
+
+        result_count_before_publish = self._nav_result_count
+        self._nav_goal_pub.publish(goal)
+        self.get_logger().info(
+            f"[nav] 阶段 {workflow}：已发布 {NAV_GOAL_TOPIC}，"
+            f"map 位置=({goal.pose.position.x:.6f}, "
+            f"{goal.pose.position.y:.6f}, {goal.pose.position.z:.6f})；"
+            f"阻塞等待 {NAV_RESULT_TOPIC}"
+        )
+
+        while rclpy.ok():
+            self._executor.spin_once(timeout_sec=0.1)
+            if self._nav_result_count <= result_count_before_publish:
+                continue
+            if self._latest_nav_success:
+                self.get_logger().info(
+                    f"[nav] 阶段 {workflow} 导航成功"
+                )
+                return True
+            self.get_logger().error(
+                f"[nav] 阶段 {workflow} 导航失败，"
+                f"message={self._latest_nav_message!r}，取消本次流程"
+            )
+            return False
+
+        return False
+
+    def _on_driver_signal(self, msg: UInt8):
+        """缓存驱动板 UInt8 信号；SW 位非 0=空，SW 位为 0=已有物体。"""
+        signal = int(msg.data) & 0xFF
+        self._driver_signal_count += 1
+        changed = signal != self._driver_signal
+        self._driver_signal = signal
+
+        if changed:
+            states = ", ".join(
+                f"{slot_name.upper()}={'空' if signal & mask else '有物体'}"
+                for slot_name, mask in PLACE_SLOT_MASKS.items()
+            )
+            self.get_logger().info(
+                f"收到 {DRIVER_SIGNAL_TOPIC}: uint8=0x{signal:02X}, {states}"
+            )
+
+    def _update_simulated_place_slots(
+        self,
+        slot_names: Sequence[str],
+        *,
+        has_material: bool,
+        reason: str,
+    ) -> bool:
+        """原子更新仿真模式下一个或多个 SW 的有料状态。
+
+        驱动板协议中对应 bit 为 0 表示有料、为 1 表示空位：
+
+        - 上料完成后传 ``has_material=True``，清除对应 bit；
+        - 下料抓走后传 ``has_material=False``，置位对应 bit。
+
+        一组动作无论包含一个还是两个 SW，都只生成一帧模拟信号并递增一次
+        ``_driver_signal_count``。真实模式禁止调用，真实信号仍完全由驱动板话题
+        更新。
+        """
+        log = self.get_logger()
+        if not self.sim_mode:
+            log.error("仅仿真模式允许直接更新 SW 状态")
+            return False
+
+        normalized_names = [str(name).lower() for name in slot_names]
+        unknown_names = [
+            name for name in normalized_names if name not in PLACE_SLOT_MASKS
+        ]
+        if unknown_names:
+            log.error(f"[sim][SW] 未知位置: {unknown_names}")
+            return False
+        if not normalized_names:
+            log.error("[sim][SW] 更新位置列表为空")
+            return False
+
+        signal = (
+            ALL_PLACE_SLOTS_MATERIAL_SIGNAL
+            if self._driver_signal is None
+            else int(self._driver_signal)
+        )
+        for slot_name in normalized_names:
+            mask = PLACE_SLOT_MASKS[slot_name]
+            if has_material:
+                signal &= ~mask
+            else:
+                signal |= mask
+
+        self._driver_signal = signal & 0xFF
+        self._driver_signal_count += 1
+        states = ", ".join(
+            f"{slot_name.upper()}="
+            f"{'空' if self._driver_signal & mask else '有物体'}"
+            for slot_name, mask in PLACE_SLOT_MASKS.items()
+        )
+        changed_slots = ", ".join(name.upper() for name in normalized_names)
+        target_state = "有物体" if has_material else "空"
+        log.info(
+            f"[sim][SW] {reason}：{changed_slots} → {target_state}; "
+            f"uint8=0x{self._driver_signal:02X}, {states}"
+        )
+        return True
+
+    def _abort_on_force_range(self) -> None:
+        if self._force_range_fault is not None:
+            raise ForceRangeAbort(self._force_range_fault)
+
+    def _send_force_guarded_goal(self, client, goal):
+        """登记运动目标，包括保护触发时尚未返回接受结果的目标。"""
+        self._abort_on_force_range()
+        future = client.send_goal_async(goal)
+
+        def on_accepted(done):
+            handle = done.result()
+            if handle is None or not handle.accepted:
+                return
+            self._force_action_goals.append(handle)
+            result = handle.get_result_async()
+
+            def on_finished(_):
+                if handle in self._force_action_goals:
+                    self._force_action_goals.remove(handle)
+
+            result.add_done_callback(on_finished)
+            if self._force_range_fault is not None:
+                handle.cancel_goal_async()
+
+        future.add_done_callback(on_accepted)
+        return future
+
+    def _on_ft_sensor(self, msg: Float32MultiArray, side: str) -> None:
+        """缓存左右臂六维力中的 Z；数据顺序为 Fx/Fy/Fz/Mx/My/Mz。"""
+        if not self.use_force_sensors or side not in self._ft_sensor_z:
+            return
+        if self._force_range_enabled:
+            violation = ft_range_violation(msg.data)
+            if violation is not None and self._force_range_fault is None:
+                self._force_range_fault = f"{side} 臂力传感器保护：{violation}"
+                self.get_logger().error(self._force_range_fault)
+                self._motor_command_pub.publish(UInt8(data=1))
+                self._force_stop_requests = {
+                    arm: self._send_servoj_control(arm, "stop")
+                    for arm in ("left", "right")
+                }
+                for handle in list(self._force_action_goals):
+                    handle.cancel_goal_async()
+            if self._force_task_active:
+                self._abort_on_force_range()
+        if len(msg.data) < 3:
+            self.get_logger().error(
+                f"{side} 力传感器消息长度不足：{len(msg.data)} < 3"
+            )
+            return
+        force_z = float(msg.data[2])
+        if not math.isfinite(force_z):
+            self.get_logger().error(f"{side} 力传感器 Z 非有限值：{force_z}")
+            return
+        self._ft_sensor_z[side] = force_z
+        self._ft_sensor_count[side] += 1
+
+        guard = self._active_approach_guard
+        if (
+            guard is None
+            or not guard["monitoring"]
+            or guard["contact"]
+            or side not in guard["sides"]
+        ):
+            return
+
+        baseline_force_z = guard["baseline_force_z_by_side"][side]
+        force_drop = baseline_force_z - force_z
+        travelled = guard["progress_fraction"] * guard["total_distance"]
+        in_first_zone = travelled <= min(
+            APPROACH_FORCE_GUARD_DISTANCE,
+            guard["total_distance"],
+        )
+        whole_path_contact = force_drop > APPROACH_FORCE_Z_DROP_ALL_THRESHOLD
+        first_zone_contact = (
+            guard["near_force_drop_threshold"] is not None
+            and in_first_zone
+            and force_drop > guard["near_force_drop_threshold"]
+        )
+        if not whole_path_contact and not first_zone_contact:
+            return
+
+        guard["contact"] = True
+        guard["force_z"] = force_z
+        guard["force_drop"] = force_drop
+        guard["travelled"] = travelled
+        guard["trigger"] = "all" if whole_path_contact else "first_zone"
+        self._motor_command_pub.publish(UInt8(data=1))
+        guard["contact_side"] = side
+        guard["stop_request_ids"] = {
+            stop_side: self._send_servoj_control(stop_side, "stop")
+            for stop_side in guard["sides"]
+        }
+        threshold = (
+            APPROACH_FORCE_Z_DROP_ALL_THRESHOLD
+            if whole_path_contact
+            else guard["near_force_drop_threshold"]
+        )
+        self.get_logger().error(
+            f"[pick][force-guard] {side} 臂{guard['stage_label']}中检测到障碍物："
+            f"已行进约 {travelled * 100.0:.2f} cm，"
+            f"{guard['baseline_label']} Fz={baseline_force_z:.6f} N，"
+            f"当前 Fz={force_z:.6f} N，减小={force_drop:.6f} N > "
+            f"{threshold:.3f} N；已发布 {MOTOR_COMMAND_TOPIC}=1 并立即请求 ServoJ 停止"
+        )
+
+    def _on_servoj_control_state(self, msg: String) -> None:
+        """缓存 servoj_30ms.py 对停止/恢复命令的确认。"""
+        try:
+            state = json.loads(msg.data)
+            side = str(state["side"])
+            state_name = str(state["state"])
+            request_id = int(state["request_id"])
+            success = state["success"]
+            if not isinstance(success, bool):
+                raise TypeError("success 必须是 JSON bool")
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            self.get_logger().error(
+                f"{SERVOJ_CONTROL_STATE_TOPIC} 消息格式错误：{msg.data!r}; {exc}"
+            )
+            return
+
+        if side not in ("left", "right") or state_name not in ("stopped", "running"):
+            self.get_logger().error(
+                f"{SERVOJ_CONTROL_STATE_TOPIC} 状态非法：{msg.data!r}"
+            )
+            return
+        state["success"] = success
+        self._servoj_control_acks[(side, state_name, request_id)] = state
+
+    def _send_servoj_control(
+        self,
+        side: str,
+        command: str,
+        request_id: int | None = None,
+    ) -> int:
+        """发布按臂 stop/resume；request_id 用于排除陈旧确认。"""
+        if request_id is None:
+            self._servoj_request_id += 1
+            request_id = self._servoj_request_id
+        msg = String()
+        msg.data = json.dumps(
+            {
+                "side": side,
+                "command": command,
+                "request_id": request_id,
+            },
+            ensure_ascii=False,
+        )
+        self._servoj_control_pub.publish(msg)
+        return request_id
+
+    def _wait_for_servoj_control_state(
+        self,
+        side: str,
+        command: str,
+        request_id: int,
+        timeout_sec: float = SERVOJ_CONTROL_ACK_TIMEOUT_SEC,
+    ) -> bool:
+        """等待匹配的停止/恢复确认，等待期间周期性重发同一幂等命令。"""
+        expected_state = "stopped" if command == "stop" else "running"
+        key = (side, expected_state, request_id)
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        next_retry = time.monotonic() + 0.25
+        while rclpy.ok() and time.monotonic() < deadline:
+            ack = self._servoj_control_acks.pop(key, None)
+            if ack is not None:
+                if ack["success"]:
+                    self.get_logger().info(
+                        f"[pick][force-guard] ServoJ {side} 已确认 "
+                        f"{expected_state}，request_id={request_id}"
+                    )
+                    return True
+                self.get_logger().error(
+                    f"[pick][force-guard] ServoJ {side} {expected_state} 失败："
+                    f"{ack.get('message', '')}"
+                )
+                return False
+
+            now = time.monotonic()
+            if now >= next_retry:
+                self._send_servoj_control(side, command, request_id=request_id)
+                next_retry = now + 0.25
+            self._executor.spin_once(
+                timeout_sec=min(0.05, max(0.0, deadline - now)),
+            )
+
+        self.get_logger().error(
+            f"[pick][force-guard] {timeout_sec:.1f}s 内未收到 ServoJ {side} "
+            f"{expected_state} 确认，request_id={request_id}"
+        )
+        return False
+
+    def wait_for_ft_sensor_z(
+        self,
+        side: str,
+        timeout_sec: float = FT_SENSOR_SAMPLE_TIMEOUT_SEC,
+    ) -> float | None:
+        """等待新帧 Fz；禁用时返回占位值 0，不读取传感器。"""
+        if not self.use_force_sensors:
+            return 0.0
+        if side not in self._ft_sensor_z:
+            self.get_logger().error(f"未知力传感器 side={side}")
+            return None
+        if self.sim_mode:
+            self.get_logger().info(f"[sim] 跳过 {side} 力传感器阻塞读取")
+            return 0.0
+
+        count_before_wait = self._ft_sensor_count[side]
+        topic = LEFT_FT_SENSOR_TOPIC if side == "left" else RIGHT_FT_SENSOR_TOPIC
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while rclpy.ok() and time.monotonic() < deadline:
+            self._executor.spin_once(
+                timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
+            )
+            if self._ft_sensor_count[side] > count_before_wait:
+                force_z = self._ft_sensor_z[side]
+                if force_z is not None:
+                    self.get_logger().info(
+                        f"[pick] 收到 {topic} 新帧：Fz={force_z:.6f} N"
+                    )
+                    return force_z
+
+        self.publish_error(5, f"{side}: {topic} 新帧超时 {timeout_sec}s")
+        self.get_logger().error(
+            f"[pick] {timeout_sec:.1f}s 内未收到 {topic} 新帧；"
+            "传感器可能离线，禁止使用旧力值判断吸附"
+        )
+        return None
+
+    def _wait_for_driver_signal(
+        self,
+        timeout_sec: float = DRIVER_SIGNAL_WAIT_TIMEOUT_SEC,
+        require_new: bool = False,
+    ) -> bool:
+        """等待可靠的放置位信号；require_new=True 时必须收到调用后处理的新帧。"""
+        if self.sim_mode:
+            return True
+        signal_count_before_wait = self._driver_signal_count
+        if self._driver_signal is not None and not require_new:
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while rclpy.ok() and time.monotonic() < deadline:
+            self._executor.spin_once(
+                timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())),
+            )
+            if self._driver_signal is not None and (
+                not require_new or self._driver_signal_count > signal_count_before_wait
+            ):
+                return True
+        if self._driver_signal is None or (
+            require_new and self._driver_signal_count <= signal_count_before_wait
+        ):
+            self.publish_error(4, f"{DRIVER_SIGNAL_TOPIC}, timeout={timeout_sec}s")
+            wait_desc = "新一帧" if require_new else "首帧"
+            self.get_logger().error(
+                f"[pick] {timeout_sec:.1f}s 内未收到 {DRIVER_SIGNAL_TOPIC} {wait_desc}，"
+                "无法确认放置位，禁止抓取"
+            )
+            return False
+        return True
+
+    def _place_slot_is_empty(self, slot_name: str) -> bool:
+        """按 SW 掩码判断指定槽位是否为空；未知名称/未知信号均返回 False。"""
+        mask = PLACE_SLOT_MASKS.get(str(slot_name).lower())
+        if mask is None or self._driver_signal is None:
+            return False
+        return (self._driver_signal & mask) != 0
+
+    def _place_slot_has_material(self, slot_name: str) -> bool:
+        """按实时 SW 掩码判断指定位置是否有料；信号未知时不视为有料。"""
+        mask = PLACE_SLOT_MASKS.get(str(slot_name).lower())
+        if mask is None or self._driver_signal is None:
+            return False
+        return (self._driver_signal & mask) == 0
+
+    def _has_any_empty_place_slot(self) -> bool:
+        return any(self._place_slot_is_empty(name) for name in PLACE_SLOT_MASKS)
+
+    def _on_upper_command(self, msg: String, command_topic: str) -> None:
+        """解析并排队上位机命令；return_init_pose 允许空字符串。"""
+        log = self.get_logger()
+        log.info(
+            f"[上位机订阅] 收到话题 {command_topic}: "
+            f"data={msg.data!r}"
+        )
+        raw = msg.data.strip()
+        payload: dict = {}
+        if raw:
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                if command_topic == RETURN_INIT_POSE_TOPIC:
+                    payload = {"raw": raw}
+                else:
+                    log.error(
+                        f"{command_topic} JSON 解析失败: {exc}; data={msg.data!r}"
+                    )
+                    return
+            else:
+                if not isinstance(decoded, dict):
+                    log.error(f"{command_topic} JSON 必须是 object: {msg.data!r}")
+                    return
+                payload = decoded
+
+        expected_cmd_type = UPPER_COMMAND_EXPECTED_TYPES.get(command_topic)
+        if expected_cmd_type is not None and "cmd_type" in payload:
+            try:
+                cmd_type = int(payload["cmd_type"])
+            except (TypeError, ValueError) as exc:
+                log.error(
+                    f"{command_topic} cmd_type 类型错误: {exc}; data={msg.data!r}"
+                )
+                return
+            if cmd_type != expected_cmd_type:
+                log.error(
+                    f"{command_topic} cmd_type={cmd_type}，"
+                    f"期望 {expected_cmd_type}"
+                )
+                return
+
+        self._latest_upper_command = (command_topic, payload)
+        log.info(
+            f"收到上位机命令 {command_topic}: "
+            f"{json.dumps(payload, ensure_ascii=False)}"
+        )
+
+    def wait_for_upper_command(self) -> tuple[str, dict] | None:
+        """阻塞等待下一条上位机命令。"""
+        self.get_logger().info(
+            "等待上位机命令：move_to_grasp_pose/grasp/"
+            "move_to_place_pose/place/return_init_pose"
+        )
+        while rclpy.ok():
+            if self._latest_upper_command is not None:
+                latest_command = self._latest_upper_command
+                self._latest_upper_command = None
+                return latest_command
+            self._executor.spin_once(timeout_sec=0.1)
+        return None
+
+    def wait_for_operator(self, message: str = "按回车继续 …") -> None:
+        """上位机模式不阻塞；--interactive 调试模式保留人工确认。"""
+        if self.upper_control_mode:
+            return
+        self.get_logger().info(message)
+        try:
+            input()
+        except EOFError:
+            pass
+
+    def _on_js(self, msg: JointState):
+        """每次收到 joint_states 更新缓存并递增计数（用于检测「新帧」）。"""
+        self._js_count += 1
+        for i, name in enumerate(msg.name):
+            if i < len(msg.position):
+                self._joints[name] = msg.position[i]
+
+        guard = self._active_approach_guard
+        if guard is None or not guard["monitoring"] or guard["contact"]:
+            return
+        trajectory = guard["trajectory"].joint_trajectory
+        if not trajectory.points or any(
+            name not in self._joints for name in trajectory.joint_names
+        ):
+            return
+
+        current = [self._joints[name] for name in trajectory.joint_names]
+        closest_index = min(
+            range(len(trajectory.points)),
+            key=lambda index: sum(
+                (actual - planned) ** 2
+                for actual, planned in zip(
+                    current,
+                    trajectory.points[index].positions,
+                )
+            ),
+        )
+        denominator = max(1, len(trajectory.points) - 1)
+        # 直线轨迹点由 compute_cartesian_path 按固定 eef_step 生成；最近点索引
+        # 因而可直接换算为沿直线的进度。只允许进度前进，避免反馈噪声跨阈值回跳。
+        guard["progress_fraction"] = max(
+            guard["progress_fraction"],
+            closest_index / denominator,
+        )
+
+    def _spin_until(self, future, timeout: float) -> bool:
+        """阻塞直到 future 完成或超时。"""
+        self._executor.spin_until_future_complete(future, timeout_sec=timeout)
+        return future.done() and future.result() is not None
+
+    def _get_joints(self, names: list[str], wait_new=False, timeout=10.0) -> dict[str, float] | None:
+        """
+        读取指定关节的当前位置。
+        wait_new=True：先等到比调用前更新的 joint_states（关节运动后用）。
+        """
+        seq0 = self._js_count if wait_new else -1
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if wait_new and self._js_count <= seq0:
+                self._executor.spin_once(timeout_sec=0.1)
+                continue
+            missing = [n for n in names if n not in self._joints]
+            if not missing:
+                joints = {n: self._joints[n] for n in names}
+                if not all(math.isfinite(value) for value in joints.values()):
+                    self.publish_error(9, f"关节状态含非有限数值: {names}")
+                    return None
+                return joints
+            self._executor.spin_once(timeout_sec=0.1)
+        self.publish_error(9, f"读取关节状态超时: wait_new={wait_new}, names={names}")
+        self.get_logger().error(f"读取关节超时，缺失: {[n for n in names if n not in self._joints]}")
+        return None
+
+    def _get_link_pose_fk(
+        self,
+        link: str,
+        joints: dict[str, float] | None = None,
+        joint_names: Sequence[str] | None = None,
+        plan_frame: str = PLAN_FRAME,
+    ) -> Pose | None:
+        """用 /compute_fk 根据关节角求 link 在 plan_frame 下的位姿。"""
+        log = self.get_logger()
+        if not self._fk_cli.wait_for_service(timeout_sec=5.0):
+            log.error(f"服务 {SVC_COMPUTE_FK} 不可用")
+            return None
+
+        if joints is None:
+            names = list(joint_names) if joint_names is not None else POSE_START_JOINTS
+            joints = self._get_joints(names, wait_new=True)
+        if joints is None:
+            return None
+
+        req = GetPositionFK.Request()
+        req.header.frame_id = plan_frame
+        req.fk_link_names = [link]
+        req.robot_state = RobotState()
+        req.robot_state.joint_state.name = list(joints.keys())
+        req.robot_state.joint_state.position = list(joints.values())
+        req.robot_state.is_diff = True
+
+        fut = self._fk_cli.call_async(req)
+        if not self._spin_until(fut, 5.0):
+            log.error("compute_fk 超时")
+            return None
+
+        res = fut.result()
+        if res.error_code.val != MoveItErrorCodes.SUCCESS or not res.pose_stamped:
+            log.error(
+                f"compute_fk 失败: error_code={res.error_code.val}"
+                f"({_moveit_error_name(res.error_code.val)})"
+            )
+            return None
+        return res.pose_stamped[0].pose
+
+    def _log_actual_fk_error(
+        self,
+        label: str,
+        link: str,
+        target_pose: Pose,
+        plan_frame: str,
+        joint_names: Sequence[str],
+    ) -> None:
+        """用实际 joint_states 做 FK，并打印实际末端与目标位姿的误差。"""
+        log = self.get_logger()
+        joints = self._get_joints(list(joint_names), wait_new=True, timeout=3.0)
+        if joints is None:
+            log.error(f"{label} 读取实际关节失败，无法计算 FK 误差")
+            return
+
+        actual_pose = self._get_link_pose_fk(
+            link,
+            joints=joints,
+            plan_frame=plan_frame,
+        )
+        if actual_pose is None:
+            log.error(f"{label} FK 计算失败，无法比较实际位姿")
+            return
+
+        dx, dy, dz, pos_err = _pose_position_delta(actual_pose, target_pose)
+        ori_err = _pose_orientation_error_rad(actual_pose, target_pose)
+        ap = actual_pose.position
+        tp = target_pose.position
+        ao = actual_pose.orientation
+        to = target_pose.orientation
+        log.info(
+            f"{label} 实际 FK {link} @ {plan_frame}: "
+            f"actual=({ap.x:.6f}, {ap.y:.6f}, {ap.z:.6f}), "
+            f"target=({tp.x:.6f}, {tp.y:.6f}, {tp.z:.6f}), "
+            f"actual_quat=({ao.x:.6f}, {ao.y:.6f}, {ao.z:.6f}, {ao.w:.6f}), "
+            f"target_quat=({to.x:.6f}, {to.y:.6f}, {to.z:.6f}, {to.w:.6f})"
+        )
+        log.info(
+            f"{GREEN}{label} 位姿误差: "
+            f"dxyz=({dx * 1000.0:.2f}, {dy * 1000.0:.2f}, {dz * 1000.0:.2f}) mm, "
+            f"|pos|={pos_err * 1000.0:.2f} mm, "
+            f"orientation={math.degrees(ori_err):.3f} deg{RESET}"
+        )
+
+    def _pose_in_frame(
+        self,
+        pose: Pose | dict,
+        source_frame: str,
+        target_frame: str,
+        joint_names: Sequence[str] | None = None,
+        joints: Mapping[str, float] | None = None,
+    ) -> Pose | None:
+        """把完整 pose（位置和姿态）从 source_frame 转到 target_frame。"""
+        p = pose if isinstance(pose, Pose) else pose_from_dict(pose)
+        if source_frame == target_frame:
+            return copy.deepcopy(p)
+
+        resolved_joints = dict(joints) if joints is not None else None
+        if joint_names is not None and resolved_joints is None:
+            resolved_joints = self._get_joints(list(joint_names), timeout=2.0)
+            if resolved_joints is None:
+                return None
+
+        source_pose = self._get_link_pose_fk(
+            source_frame,
+            joints=resolved_joints,
+            joint_names=joint_names,
+            plan_frame=target_frame,
+        )
+        if source_pose is None:
+            return None
+
+        transformed = matmul4(
+            pose_to_matrix(source_pose),
+            pose_to_matrix(p),
+        )
+        return xyz_rpy_to_pose(matrix_to_xyz_rpy(transformed))
+
+    def set_tool_power(self, side: str, status: int, timeout: float = 10.0) -> bool:
+        """调用左右工具电源服务，要求返回 res=0。"""
+        log = self.get_logger()
+        if self.sim_mode:
+            log.info(f"[sim] 跳过 {side} SetToolPower({status})")
+            return True
+
+        if side == "left":
+            cli = self._left_tool_cli
+            service_name = LEFT_TOOL_COMMAND_SERVICE
+        elif side == "right":
+            cli = self._right_tool_cli
+            service_name = RIGHT_TOOL_COMMAND_SERVICE
+        else:
+            log.error(f"未知工具电源 side={side}")
+            return False
+
+        error_code = 6 if status else 7
+        try:
+            if not cli.wait_for_service(timeout_sec=timeout):
+                self.publish_error(error_code, f"{side}: {service_name} 不可用")
+                return False
+
+            req = SetToolPower.Request()
+            req.status = int(status)
+            fut = cli.call_async(req)
+            if not self._spin_until(fut, timeout):
+                self.publish_error(error_code, f"{side}: {service_name} 超时")
+                return False
+
+            res = fut.result().res
+            if res != 0:
+                self.publish_error(error_code, f"{side}: {service_name}, res={res}")
+                return False
+        except Exception as exc:
+            self.publish_error(error_code, f"{side}: {service_name}: {exc}")
+            return False
+        log.info(f"{service_name} SetToolPower({status}) 成功")
+        return True
+
+    def clear_arm_alarm(self, side: str, timeout: float = 60.0) -> bool:
+        """请求 servoj_30ms 使用其现有 Dashboard 连接清错并恢复使能。"""
+        log = self.get_logger()
+        if self.sim_mode:
+            log.info(f"[sim][alarm-recovery] 跳过 {side} 臂清错服务")
+            return True
+
+        if side == "left":
+            cli = self._left_clear_error_cli
+            service_name = LEFT_CLEAR_ERROR_SERVICE
+        elif side == "right":
+            cli = self._right_clear_error_cli
+            service_name = RIGHT_CLEAR_ERROR_SERVICE
+        else:
+            log.error(f"[alarm-recovery] 未知机械臂 side={side}")
+            return False
+
+        if not cli.wait_for_service(timeout_sec=timeout):
+            log.error(
+                f"[alarm-recovery] 服务 {service_name} 不可用；"
+                "请重启包含清错服务的 servoj_30ms.py"
+            )
+            return False
+        future = cli.call_async(ClearError.Request())
+        if not self._spin_until(future, timeout):
+            log.error(f"[alarm-recovery] {service_name} 调用超时")
+            return False
+        try:
+            response = future.result()
+        except Exception as exc:
+            report_runtime_exception(exc, "clear_arm_alarm")
+            log.error(f"[alarm-recovery] {service_name} 调用异常：{exc}")
+            return False
+        if response is None or response.res != 0:
+            result = None if response is None else response.res
+            log.error(
+                f"[alarm-recovery] {service_name} 清错失败：res={result}"
+            )
+            return False
+        log.info(f"[alarm-recovery] {service_name} 清错并恢复 ENABLE 成功")
+        return True
+
+    def clear_arm_alarms_for_recovery(
+        self,
+        sides: Sequence[str],
+        stage: str,
+    ) -> bool:
+        """自动关闭 ServoJ 指令入口并清缓存，再请求对应机械臂清错。"""
+        normalized_sides = tuple(dict.fromkeys(str(side) for side in sides))
+        stop_results = {}
+        for side in normalized_sides:
+            request_id = self._send_servoj_control(side, "stop")
+            stop_results[side] = self._wait_for_servoj_control_state(
+                side,
+                "stop",
+                request_id,
+            )
+        if not all(stop_results.values()):
+            self.get_logger().error(
+                f"[alarm-recovery] {stage}：无法关闭全部 ServoJ 指令入口 "
+                f"{stop_results}；保持停止并自动重试"
+            )
+            return False
+
+        results = {
+            side: self.clear_arm_alarm(side)
+            for side in normalized_sides
+        }
+        if all(results.values()):
+            return True
+        failed = ", ".join(
+            side for side, success in results.items() if not success
+        )
+        self.get_logger().error(
+            f"[alarm-recovery] {stage}：清错未全部成功：{failed}；自动重试"
+        )
+        return False
+
+    def recover_single_arm_linear_after_alarm(
+        self,
+        *,
+        side: str,
+        group: str,
+        link: str,
+        return_pose: Pose,
+        joint_names: Sequence[str],
+        plan_frame: str,
+        speed_scale: float,
+        avoid_collisions: bool,
+        stage: str,
+    ) -> bool:
+        """自动清错、末端下电，再从实测位置直线退到阶段起点。"""
+        joint_names = list(joint_names)
+        while rclpy.ok():
+            if not self.clear_arm_alarms_for_recovery((side,), stage):
+                time.sleep(0.5)
+                continue
+            if not self.set_tool_power(side, 0):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：{side} 末端下电失败，"
+                    "不允许执行退回；自动重试"
+                )
+                time.sleep(0.5)
+                continue
+
+            current = self._get_joints(joint_names, wait_new=True)
+            if current is None:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：无法读取清错后的实测关节，"
+                    "自动重试"
+                )
+                time.sleep(0.5)
+                continue
+            resume_request_id = self._send_servoj_control(side, "resume")
+            if not self._wait_for_servoj_control_state(
+                side,
+                "resume",
+                resume_request_id,
+            ):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：ServoJ 指令入口恢复失败，"
+                    "不允许执行退回；自动重试"
+                )
+                time.sleep(0.5)
+                continue
+            retreat = self.plan_cartesian_line(
+                group,
+                link,
+                return_pose,
+                speed_scale=speed_scale,
+                avoid_collisions=avoid_collisions,
+                start_joints=current,
+                joint_names=joint_names,
+                plan_frame=plan_frame,
+            )
+            if retreat is None:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：无法从实测位置规划直线退回，"
+                    "自动重试"
+                )
+                time.sleep(0.5)
+                continue
+            if self._execute_traj(retreat):
+                self.get_logger().warning(
+                    f"[alarm-recovery] {stage}：已清错、末端下电并从实测位置直线退回"
+                )
+                return True
+            self.get_logger().error(
+                f"[alarm-recovery] {stage}：直线退回执行失败，"
+                "程序保持运行并自动重新清错、退回"
+            )
+            time.sleep(0.5)
+        return False
+
+    def recover_dual_arm_linear_after_alarm(
+        self,
+        *,
+        left_return_pose: Pose,
+        right_return_pose: Pose,
+        full_joint_names: Sequence[str],
+        collision_group: str,
+        speed_scale: float,
+        stage: str,
+        clear_alarms: bool = True,
+    ) -> bool:
+        """双臂八点放置报警恢复：忽略物体碰撞，但保留自碰撞检查。"""
+        left_joint_names = joint_names_for_group("left_arm")
+        right_joint_names = joint_names_for_group("right_arm")
+        full_joint_names = list(full_joint_names)
+        while rclpy.ok():
+            if clear_alarms and not self.clear_arm_alarms_for_recovery(
+                ("left", "right"), stage
+            ):
+                time.sleep(0.5)
+                continue
+
+            power_off_results = {
+                side: self.set_tool_power(side, 0)
+                for side in ("left", "right")
+            }
+            if not all(power_off_results.values()):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：双臂末端未全部下电 "
+                    f"{power_off_results}，不允许执行退回；自动重试"
+                )
+                time.sleep(0.5)
+                continue
+
+            current = self._get_joints(full_joint_names, wait_new=True)
+            if current is None:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：无法读取双臂实测关节，"
+                    "自动重试"
+                )
+                time.sleep(0.5)
+                continue
+            resume_results = {}
+            for side in ("left", "right"):
+                request_id = self._send_servoj_control(side, "resume")
+                resume_results[side] = self._wait_for_servoj_control_state(
+                    side,
+                    "resume",
+                    request_id,
+                )
+            if not all(resume_results.values()):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：双臂 ServoJ 指令入口未全部恢复 "
+                    f"{resume_results}；不允许执行退回，自动重试"
+                )
+                time.sleep(0.5)
+                continue
+            left_retreat = self.plan_cartesian_line(
+                "left_arm",
+                "l_tool",
+                left_return_pose,
+                speed_scale=speed_scale,
+                avoid_collisions=False,
+                start_joints=current,
+                joint_names=left_joint_names,
+                plan_frame=SCENE_FRAME,
+            )
+            right_retreat = self.plan_cartesian_line(
+                "right_arm",
+                "r_tool",
+                right_return_pose,
+                speed_scale=speed_scale,
+                avoid_collisions=False,
+                start_joints=current,
+                joint_names=right_joint_names,
+                plan_frame=SCENE_FRAME,
+            )
+            if left_retreat is None or right_retreat is None:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：至少一侧无法从实测位置"
+                    "规划直线退回；自动重试"
+                )
+                time.sleep(0.5)
+                continue
+            try:
+                retreat = merge_dual_arm_cartesian_trajectories(
+                    left_retreat,
+                    right_retreat,
+                )
+            except ValueError as exc:
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：合并双臂直线退回失败 "
+                    f"({exc})；自动重试"
+                )
+                time.sleep(0.5)
+                continue
+            if not self.validate_trajectory_self_collision(
+                retreat,
+                group=collision_group,
+                base_state=current,
+                sample_period=UNLOAD_PLACE_SELF_COLLISION_SAMPLE_PERIOD,
+                label=f"[alarm-recovery] {stage} 双臂直线退回",
+            ):
+                self.get_logger().error(
+                    f"[alarm-recovery] {stage}：双臂直线退回存在自碰撞或无法验证，"
+                    "自动重试"
+                )
+                time.sleep(0.5)
+                continue
+            if self._execute_traj(retreat):
+                recovery_action = "已清错、" if clear_alarms else ""
+                self.get_logger().warning(
+                    f"[alarm-recovery] {stage}：{recovery_action}"
+                    "双末端下电并从实测位置"
+                    "同步直线退回（忽略物体碰撞，保留自碰撞检查）"
+                )
+                return True
+            self.get_logger().error(
+                f"[alarm-recovery] {stage}：同步直线退回执行失败，"
+                "程序保持运行并自动重新清错、退回"
+            )
+            time.sleep(0.5)
+        return False
+
+    def _apply_scene(
+        self,
+        objects: list[CollisionObject],
+        colors: list[ObjectColor] | None = None,
+        report_error: bool = True,
+        *,
+        service_timeout: float = 10.0,
+        response_timeout: float = 10.0,
+    ) -> bool:
+        """向 move_group 提交规划场景 diff（添加/删除障碍物）。
+
+        ``service_timeout`` 和 ``response_timeout`` 可由启动清理使用较短值；
+        普通运动流程仍保留原来的 10 秒默认等待，不改变既有行为。
+        """
+        if not self._scene_cli.wait_for_service(
+            timeout_sec=max(0.0, float(service_timeout))
+        ):
+            if report_error:
+                self.get_logger().error(f"服务 {SVC_APPLY_SCENE} 不可用")
+            return False
+        scene = PlanningScene(is_diff=True)
+        scene.robot_state.is_diff = True
+        scene.world.collision_objects.extend(objects)
+        if colors:
+            scene.object_colors.extend(colors)
+        req = ApplyPlanningScene.Request(scene=scene)
+        fut = self._scene_cli.call_async(req)
+        if (
+            not self._spin_until(
+                fut,
+                max(0.0, float(response_timeout)),
+            )
+            or not fut.result().success
+        ):
+            if report_error:
+                self.get_logger().error("apply_planning_scene 失败")
+            return False
+        return True
+
+    def add_frame(self) -> bool:
+        """添加深框、原有 +Y 大长方体和新增 -Y 墙状障碍物。"""
+        neg_y_obstacle_top_pose = (
+            frame_neg_y_obstacle_top_pose_from_frame_top(self._frame_top_pose)
+        )
+        colors = [
+            ObjectColor(id=FRAME_ID, color=FRAME_COLOR),
+            ObjectColor(id=BOX_OBSTACLE_ID, color=BOX_OBSTACLE_COLOR),
+            ObjectColor(
+                id=FRAME_NEG_Y_OBSTACLE_ID,
+                color=FRAME_NEG_Y_OBSTACLE_COLOR,
+            ),
+        ]
+        return self._apply_scene(
+            [
+                make_deep_frame(self._frame_pose),
+                make_box_obstacle(self._box_obstacle_top_pose),
+                make_box_obstacle(
+                    neg_y_obstacle_top_pose,
+                    object_id=FRAME_NEG_Y_OBSTACLE_ID,
+                    size=FRAME_NEG_Y_OBSTACLE_SIZE,
+                ),
+            ],
+            colors,
+        )
+
+    def remove_frame(self) -> bool:
+        """同时删除深框及其 +Y/-Y 两个独立障碍物。"""
+        objects = [
+            CollisionObject(id=FRAME_ID, operation=CollisionObject.REMOVE),
+            CollisionObject(id=BOX_OBSTACLE_ID, operation=CollisionObject.REMOVE),
+            CollisionObject(
+                id=FRAME_NEG_Y_OBSTACLE_ID,
+                operation=CollisionObject.REMOVE,
+            ),
+        ]
+        return self._apply_scene(objects)
+
+    def clear_world_scene_objects(
+        self,
+        *,
+        service_timeout: float = STARTUP_SCENE_CLEAR_SERVICE_WAIT_SEC,
+        response_timeout: float = SCENE_CLEAR_RESPONSE_TIMEOUT_SEC,
+    ) -> bool:
+        """查询并批量清除 MoveIt world 中的全部碰撞体。
+
+        流程固定为：等待 ``get_planning_scene`` → 读取全部 world
+        collision object ID → 通过一次 ``apply_planning_scene`` 批量
+        REMOVE。只清理 world object，不修改机器人状态、ACM、attached
+        object 或 Octomap。
+        """
+        log = self.get_logger()
+        service_timeout = max(0.0, float(service_timeout))
+        response_timeout = max(0.0, float(response_timeout))
+        started_at = time.monotonic()
+
+        if not self._get_scene_cli.wait_for_service(timeout_sec=service_timeout):
+            log.info(
+                f"[scene-cleanup] {SVC_GET_PLANNING_SCENE} 在 "
+                f"{service_timeout:.1f}s 内未就绪，未清理 world 场景"
+            )
+            return False
+
+        service_ready_ms = (time.monotonic() - started_at) * 1000.0
+        log.info(
+            f"[scene-cleanup] {SVC_GET_PLANNING_SCENE} 已就绪 "
+            f"({service_ready_ms:.1f} ms)，读取 world object ID …"
+        )
+        request = GetPlanningScene.Request()
+        request.components.components = PlanningSceneComponents.WORLD_OBJECT_NAMES
+        future = self._get_scene_cli.call_async(request)
+        if not self._spin_until(future, response_timeout):
+            future.cancel()
+            log.info(
+                f"[scene-cleanup] {SVC_GET_PLANNING_SCENE} 响应超时 "
+                f"({response_timeout:.1f}s)，未清理 world 场景"
+            )
+            return False
+
+        try:
+            response = future.result()
+        except Exception as exc:  # rclpy Future 会在 result() 时重新抛出服务异常
+            report_runtime_exception(exc, "clear_world_scene_objects")
+            log.info(f"[scene-cleanup] 读取 world 场景失败: {exc}")
+            return False
+        if response is None:
+            log.info("[scene-cleanup] get_planning_scene 未返回结果")
+            return False
+
+        query_elapsed_ms = (time.monotonic() - started_at) * 1000.0
+        object_ids = sorted(
+            {
+                obj.id
+                for obj in response.scene.world.collision_objects
+                if obj.id
+            }
+        )
+        if not object_ids:
+            log.info(
+                f"[scene-cleanup] world 场景已为空 "
+                f"({query_elapsed_ms:.1f} ms)"
+            )
+            return True
+
+        log.info(
+            f"[scene-cleanup] 读取到 {len(object_ids)} 个 world object "
+            f"({query_elapsed_ms:.1f} ms)，批量删除 …"
+        )
+
+        removals = [
+            CollisionObject(
+                id=object_id,
+                operation=CollisionObject.REMOVE,
+            )
+            for object_id in object_ids
+        ]
+        cleared = self._apply_scene(
+            removals,
+            report_error=False,
+            service_timeout=service_timeout,
+            response_timeout=response_timeout,
+        )
+        elapsed_ms = (time.monotonic() - started_at) * 1000.0
+        if not cleared:
+            log.info(
+                f"[scene-cleanup] 已读取 {len(object_ids)} 个 world object，"
+                f"但批量 REMOVE 未应用 ({elapsed_ms:.1f} ms)"
+            )
+            return False
+
+        log.info(
+            f"[scene-cleanup] 已用一次请求清空 {len(removals)} 个 world object "
+            f"({elapsed_ms:.1f} ms)"
+        )
+        return True
+
+    def configure_deep_frame_from_recognition(
+        self,
+        recognition_pose: Pose,
+    ) -> Pose:
+        """保存由 p,4 识别位姿计算出的深框和长方体动态基准。"""
+        self._frame_top_pose, self._frame_pose = (
+            deep_frame_poses_from_recognition(recognition_pose)
+        )
+        self._box_obstacle_top_pose = (
+            box_obstacle_top_pose_from_frame_top(self._frame_top_pose)
+        )
+        return copy.deepcopy(self._frame_pose)
+
+    def publish_deep_frame_vision_tf(
+        self,
+        recognition_pose: Pose,
+        frame_top_pose: Pose,
+        frame_pose: Pose,
+        box_top_pose: Pose,
+    ) -> None:
+        """发布识别点、深框和 +Y/-Y 障碍物的基准坐标系。"""
+        neg_y_obstacle_top_pose = (
+            frame_neg_y_obstacle_top_pose_from_frame_top(frame_top_pose)
+        )
+        transforms = []
+        for child_frame, pose in (
+            (FRAME_VISION_TF_FRAME, recognition_pose),
+            (FRAME_TOP_CENTER_TF_FRAME, frame_top_pose),
+            (FRAME_CENTER_TF_FRAME, frame_pose),
+            (BOX_OBSTACLE_TOP_TF_FRAME, box_top_pose),
+            (
+                FRAME_NEG_Y_OBSTACLE_TOP_TF_FRAME,
+                neg_y_obstacle_top_pose,
+            ),
+        ):
+            transform = TransformStamped()
+            transform.header.frame_id = SCENE_FRAME
+            transform.header.stamp = self.get_clock().now().to_msg()
+            transform.child_frame_id = child_frame
+            transform.transform.translation.x = pose.position.x
+            transform.transform.translation.y = pose.position.y
+            transform.transform.translation.z = pose.position.z
+            transform.transform.rotation = copy.deepcopy(pose.orientation)
+            transforms.append(transform)
+        self._vision_tf_broadcaster.sendTransform(transforms)
+        self.get_logger().info(
+            f"[frame-vision] 已发布 TF: {SCENE_FRAME} → "
+            f"{FRAME_VISION_TF_FRAME}、{FRAME_TOP_CENTER_TF_FRAME}、"
+            f"{FRAME_CENTER_TF_FRAME}、{BOX_OBSTACLE_TOP_TF_FRAME}、"
+            f"{FRAME_NEG_Y_OBSTACLE_TOP_TF_FRAME}"
+        )
+
+    def add_unload_scene(self, recognition_pose: Pose) -> bool:
+        """添加视觉识别得到的料台及其局部 +Y 方向墙状障碍物。"""
+        colors = [
+            ObjectColor(id=UNLOAD_TABLE_ID, color=UNLOAD_TABLE_COLOR),
+            ObjectColor(id=UNLOAD_OBSTACLE_ID, color=UNLOAD_OBSTACLE_COLOR),
+        ]
+        return self._apply_scene(
+            [
+                make_unload_table(recognition_pose),
+                make_unload_obstacle(recognition_pose),
+            ],
+            colors,
+        )
+
+    def publish_unload_vision_tf(self, recognition_pose: Pose) -> None:
+        """发布 moveit_base_link → 上料台视觉识别坐标系的固定 TF。"""
+        transform = TransformStamped()
+        transform.header.frame_id = SCENE_FRAME
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.child_frame_id = UNLOAD_VISION_TF_FRAME
+        transform.transform.translation.x = recognition_pose.position.x
+        transform.transform.translation.y = recognition_pose.position.y
+        transform.transform.translation.z = recognition_pose.position.z
+        transform.transform.rotation = copy.deepcopy(
+            recognition_pose.orientation
+        )
+        self._vision_tf_broadcaster.sendTransform(transform)
+        self.get_logger().info(
+            f"[unload] 已发布视觉坐标系 TF: "
+            f"{SCENE_FRAME} → {UNLOAD_VISION_TF_FRAME}"
+        )
+
+    def publish_unload_table_top_tf(self, recognition_pose: Pose) -> None:
+        """发布物料台上表面中心的固定 TF。"""
+        table_top_pose = make_unload_table_top_pose(recognition_pose)
+        transform = TransformStamped()
+        transform.header.frame_id = SCENE_FRAME
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.child_frame_id = UNLOAD_TABLE_TOP_TF_FRAME
+        transform.transform.translation.x = table_top_pose.position.x
+        transform.transform.translation.y = table_top_pose.position.y
+        transform.transform.translation.z = table_top_pose.position.z
+        transform.transform.rotation = copy.deepcopy(table_top_pose.orientation)
+        self._vision_tf_broadcaster.sendTransform(transform)
+        mode_prefix = "[sim] " if self.sim_mode else ""
+        self.get_logger().info(
+            f"[unload] {mode_prefix}已发布上料桌上表面中心 TF: "
+            f"{SCENE_FRAME} → {UNLOAD_TABLE_TOP_TF_FRAME}"
+        )
+
+    def publish_unload_place_tfs(self, place_poses: dict[int, Pose]) -> None:
+        """发布物料台八个放置点的固定 TF，位姿与下料规划目标一致。"""
+        stamp = self.get_clock().now().to_msg()
+        transforms: list[TransformStamped] = []
+        for point_index, pose in sorted(place_poses.items()):
+            transform = TransformStamped()
+            transform.header.frame_id = SCENE_FRAME
+            transform.header.stamp = stamp
+            transform.child_frame_id = (
+                f"{UNLOAD_PLACE_TF_FRAME_PREFIX}{point_index}"
+            )
+            transform.transform.translation.x = pose.position.x
+            transform.transform.translation.y = pose.position.y
+            transform.transform.translation.z = pose.position.z
+            transform.transform.rotation = copy.deepcopy(pose.orientation)
+            transforms.append(transform)
+
+        if not transforms:
+            return
+        self._vision_tf_broadcaster.sendTransform(transforms)
+        frame_names = "、".join(
+            transform.child_frame_id for transform in transforms
+        )
+        self.get_logger().info(
+            f"[unload] 已发布物料台放置点 TF: {frame_names}"
+        )
+
+    def remove_unload_scene(self, *, report_error: bool = True) -> bool:
+        """移除料台及旧版本可能残留的场景物体。"""
+        objects = [
+            CollisionObject(
+                id=UNLOAD_TABLE_ID,
+                operation=CollisionObject.REMOVE,
+            ),
+            CollisionObject(
+                id=UNLOAD_TABLE_TOP_BOX_ID,
+                operation=CollisionObject.REMOVE,
+            ),
+            CollisionObject(
+                id=UNLOAD_OBSTACLE_ID,
+                operation=CollisionObject.REMOVE,
+            ),
+        ]
+        return self._apply_scene(objects, report_error=report_error)
+
+    def add_grasp_objects_collision_only(
+        self,
+        poses: Sequence[Pose],
+        *,
+        verbose: bool = True,
+    ) -> bool:
+        """只添加传入的抓取圆柱，不添加隔离面。
+
+        候选点 IK/Cartesian 验证前使用；位姿必须已在
+        ``SCENE_FRAME`` 下表达。
+        """
+        collision_poses = [copy.deepcopy(pose) for pose in poses]
+        if not collision_poses:
+            self.get_logger().error("抓取圆柱位姿为空，无法添加候选点碰撞体")
+            return False
+        if verbose:
+            self.get_logger().info(
+                f"只添加「{GRASP_OBJECT_COLLISION_ID}」："
+                f"{len(collision_poses)} 个当前候选圆柱"
+            )
+        return self._apply_scene(
+            [make_grasp_objects_collision(collision_poses)],
+            [
+                ObjectColor(
+                    id=GRASP_OBJECT_COLLISION_ID,
+                    color=GRASP_OBJECT_COLLISION_COLOR,
+                )
+            ],
+        )
+
+    def add_frame_cutoff_for_pose(
+        self,
+        pose: Pose | dict,
+        source_frame: str = PLAN_FRAME,
+        target_frame: str = SCENE_FRAME,
+        joint_names: Sequence[str] | None = None,
+        tangent_link: str | None = None,
+        tangent_joints: dict[str, float] | None = None,
+        verbose: bool = True,
+        scene_grasp_object_poses: Sequence[Pose] | None = None,
+        state_joints: Mapping[str, float] | None = None,
+    ) -> bool:
+        """添加隔板和传入的视觉物体；传入 link 时隔板低 1 cm。
+
+        ``scene_grasp_object_poses`` 中的位姿必须已在 ``target_frame``
+        下表达。未传入时保留兼容行为，只添加 ``pose`` 对应的圆柱。
+        """
+        scene_pose = self._pose_in_frame(
+            pose,
+            source_frame=source_frame,
+            target_frame=target_frame,
+            joint_names=joint_names,
+            joints=state_joints,
+        )
+        if scene_pose is None:
+            self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
+            return False
+
+        collision_poses = (
+            [copy.deepcopy(item) for item in scene_grasp_object_poses]
+            if scene_grasp_object_poses is not None
+            else [scene_pose]
+        )
+        if not collision_poses:
+            self.get_logger().error("视觉物体碰撞位姿为空，无法添加临时场景")
+            return False
+
+        if tangent_link:
+            link_surface = self._link_collision_min_z(
+                tangent_link,
+                target_frame=target_frame,
+                joints=tangent_joints,
+                joint_names=joint_names,
+            )
+            if link_surface is None:
+                return False
+            collision_min_z, collision_link = link_surface
+            scene_z = collision_min_z - FRAME_CUTOFF_BELOW_COLLISION
+            tangent_desc = (
+                f"q_pre 状态下 collision link {collision_link} 的最低面 "
+                f"z={collision_min_z:.3f} m，并向下偏移 "
+                f"{FRAME_CUTOFF_BELOW_COLLISION:.3f} m"
+            )
+        else:
+            half_extent_z = cylinder_half_extent_z(scene_pose)
+            scene_z = scene_pose.position.z - half_extent_z
+            tangent_desc = (
+                f"目标圆柱，物体中心 z={scene_pose.position.z:.3f} m, "
+                f"Z 半尺寸={half_extent_z:.3f} m"
+            )
+        colors = [
+            ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR),
+            ObjectColor(id=GRASP_OBJECT_COLLISION_ID, color=GRASP_OBJECT_COLLISION_COLOR),
+        ]
+        if verbose:
+            self.get_logger().info(
+                f"添加碰撞体「{FRAME_CUTOFF_ID}」+"
+                f"「{GRASP_OBJECT_COLLISION_ID}」到 {target_frame}: "
+                f"包含 {len(collision_poses)} 个视觉圆柱, "
+                f"隔板以{tangent_desc}为基准, "
+                f"隔板上表面 z={scene_z:.3f} m"
+            )
+        return self._apply_scene(
+            [
+                make_deep_frame_cutoff(scene_z, self._frame_pose),
+                make_grasp_objects_collision(collision_poses),
+            ],
+            # [make_deep_frame_cutoff(scene_z)],
+            colors,
+        )
+
+    def _link_collision_min_z(
+        self,
+        link: str,
+        *,
+        target_frame: str = SCENE_FRAME,
+        joints: dict[str, float] | None = None,
+        joint_names: Sequence[str] | None = None,
+    ) -> tuple[float, str] | None:
+        """读取 URDF cylinder collision，返回 link 在 target_frame 下的最低 Z 表面。"""
+        log = self.get_logger()
+        try:
+            collision_link = collision_link_for_link(link)
+            collisions_by_link, _ = _urdf_collision_data()
+        except RuntimeError as exc:
+            log.error(f"读取 URDF collision 失败：{exc}")
+            return None
+
+        if collision_link is None:
+            log.error(f"未在 {link} 或其父 link 上找到 cylinder collision")
+            return None
+
+        fk_joints = joints
+        if joints is not None and joint_names is not None:
+            current = self._get_joints(list(joint_names), timeout=2.0)
+            if current is not None:
+                fk_joints = dict(current)
+                fk_joints.update(joints)
+
+        link_pose = self._get_link_pose_fk(
+            collision_link,
+            joints=fk_joints,
+            joint_names=joint_names,
+            plan_frame=target_frame,
+        )
+        if link_pose is None:
+            log.error(f"无法计算 {collision_link} 在 {target_frame} 下的当前 FK")
+            return None
+
+        t_target_link = pose_to_matrix(link_pose)
+        min_z: float | None = None
+        for spec in collisions_by_link.get(collision_link, []):
+            collision_matrix = matmul4(t_target_link, spec["origin_matrix"])
+            collision_pose = xyz_rpy_to_pose(matrix_to_xyz_rpy(collision_matrix))
+            half_extent_z = cylinder_half_extent_z_from_shape(
+                collision_pose,
+                radius=float(spec["radius"]),
+                length=float(spec["length"]),
+            )
+            surface_z = collision_pose.position.z - half_extent_z
+            min_z = surface_z if min_z is None else min(min_z, surface_z)
+
+        if min_z is None:
+            log.error(f"{collision_link} 没有可用 cylinder collision")
+            return None
+        return min_z, collision_link
+
+    def add_frame_cutoff_only_for_pose(
+        self,
+        pose: Pose | dict,
+        source_frame: str = PLAN_FRAME,
+        target_frame: str = SCENE_FRAME,
+        joint_names: Sequence[str] | None = None,
+        tangent_link: str | None = None,
+        tangent_joints: dict[str, float] | None = None,
+    ) -> bool:
+        """只添加隔板；传入 link 时，隔板低于其 collision 最低面 1 cm。"""
+        if tangent_link:
+            link_surface = self._link_collision_min_z(
+                tangent_link,
+                target_frame=target_frame,
+                joints=tangent_joints,
+                joint_names=joint_names,
+            )
+            if link_surface is None:
+                return False
+            collision_min_z, collision_link = link_surface
+            scene_z = collision_min_z - FRAME_CUTOFF_BELOW_COLLISION
+            tangent_desc = (
+                f"q_pre 状态下 collision link {collision_link} 的最低面 "
+                f"z={collision_min_z:.3f} m，并向下偏移 "
+                f"{FRAME_CUTOFF_BELOW_COLLISION:.3f} m"
+            )
+        else:
+            scene_pose = self._pose_in_frame(
+                pose,
+                source_frame=source_frame,
+                target_frame=target_frame,
+                joint_names=joint_names,
+            )
+            if scene_pose is None:
+                self.get_logger().error(f"无法把目标位姿从 {source_frame} 转到 {target_frame}")
+                return False
+            half_extent_z = cylinder_half_extent_z(scene_pose)
+            scene_z = scene_pose.position.z - half_extent_z
+            tangent_desc = (
+                f"目标圆柱，物体中心 z={scene_pose.position.z:.3f} m, "
+                f"Z 半尺寸={half_extent_z:.3f} m"
+            )
+        self.get_logger().info(
+            f"添加碰撞体「{FRAME_CUTOFF_ID}」到 {target_frame}: "
+            f"隔板以{tangent_desc}为基准, "
+            f"隔板上表面 z={scene_z:.3f} m"
+        )
+        return self._apply_scene(
+            [make_deep_frame_cutoff(scene_z, self._frame_pose)],
+            [ObjectColor(id=FRAME_CUTOFF_ID, color=FRAME_CUTOFF_COLOR)],
+        )
+
+    def remove_frame_cutoff(self) -> bool:
+        """从场景中同时删除深框隔离面和临时抓取物体。"""
+        removals = [
+            CollisionObject(id=FRAME_CUTOFF_ID, operation=CollisionObject.REMOVE),
+            CollisionObject(id=GRASP_OBJECT_COLLISION_ID, operation=CollisionObject.REMOVE),
+        ]
+        return self._apply_scene(removals)
+
+    def remove_frame_cutoff_only(self) -> bool:
+        """只删除深框隔离面。"""
+        removal = CollisionObject(
+            id=FRAME_CUTOFF_ID,
+            operation=CollisionObject.REMOVE,
+        )
+        return self._apply_scene([removal], report_error=False)
+
+    def _plan_q_pre_with_temporary_collisions(
+        self,
+        group: str,
+        link: str,
+        target_pose: Pose,
+        plan_frame: str,
+        q_pre: dict[str, float],
+        joint_names: Sequence[str],
+        state_joint_names: Sequence[str],
+        speed_scale: float,
+        scene_grasp_object_poses: Sequence[Pose] | None = None,
+        planning_start_joints: Mapping[str, float] | None = None,
+    ) -> RobotTrajectory | None:
+        """临时加入传入的抓取碰撞体，规划当前位置到 q_pre 的 OMPL 路径。
+
+        这一步放在 IK 和 Cartesian approach 通过之后。使用 ``plan_only``，只
+        验证完整路径而不移动机器人；规划结束后无论成功与否都恢复临时场景。
+        成功时返回已通过碰撞检查和时间参数化的轨迹，供后续直接执行；
+        规划失败时返回 ``None``。临时场景移除失败只告警，不再丢弃已经
+        验证成功的轨迹。
+        """
+        log = self.get_logger()
+        current = dict(planning_start_joints) if planning_start_joints is not None else self._get_joints(list(joint_names), wait_new=True)
+        if current is None:
+            log.error("[grasp-select] 读取关节空间规划起点失败")
+            return None
+
+        tangent_state = dict(planning_start_joints or {})
+        tangent_state.update(q_pre)
+        if not self.add_frame_cutoff_for_pose(
+            target_pose,
+            source_frame=plan_frame,
+            target_frame=SCENE_FRAME,
+            joint_names=state_joint_names,
+            tangent_link=link,
+            tangent_joints=tangent_state,
+            verbose=False,
+            scene_grasp_object_poses=scene_grasp_object_poses,
+            state_joints=planning_start_joints,
+        ):
+            log.error("[grasp-select] 添加关节空间预检碰撞体失败")
+            return None
+
+        planned_trajectory: RobotTrajectory | None = None
+        try:
+            if not self._validity_cli.wait_for_service(timeout_sec=10.0):
+                log.error(f"[grasp-select] 服务 {SVC_STATE_VALIDITY} 不可用，跳过 q_pre")
+                return None
+            validity_request = GetStateValidity.Request()
+            validity_request.group_name = group
+            validity_request.robot_state = RobotState()
+            validity_request.robot_state.is_diff = True
+            q_pre_state = dict(planning_start_joints or {})
+            q_pre_state.update(q_pre)
+            validity_request.robot_state.joint_state.name = list(q_pre_state)
+            validity_request.robot_state.joint_state.position = list(q_pre_state.values())
+            validity_future = self._validity_cli.call_async(validity_request)
+            if not self._spin_until(validity_future, 5.0):
+                validity_future.cancel()
+                log.error("[grasp-select] q_pre 碰撞检查超时，跳过该候选")
+                return None
+            validity_response = validity_future.result()
+            if not validity_response.valid:
+                contacts = ", ".join(
+                    f"{contact.contact_body_1}<->{contact.contact_body_2}"
+                    for contact in validity_response.contacts[:5]
+                )
+                log.info(
+                    "[grasp-select] q_pre 存在碰撞，跳过 OMPL"
+                    + (f": {contacts}" if contacts else "")
+                )
+                return None
+            log.info("[grasp-select] q_pre 无碰撞，继续 OMPL 规划")
+
+            ok, _, trajectory = self.plan_joint_motion(
+                group,
+                q_pre,
+                joint_names=joint_names,
+                start_joints=current,
+                speed_scale=speed_scale,
+                max_retries=1,
+                avoid_collisions=True,
+                execute=False,
+            )
+            if ok and trajectory is not None and trajectory.joint_trajectory.points:
+                planned_trajectory = trajectory
+        finally:
+            if not self.remove_frame_cutoff():
+                log.warning(
+                    "[grasp-select] 移除关节空间预检碰撞体失败，"
+                    "忽略该清理失败并继续"
+                )
+        return planned_trajectory
+
+    def _cylinder_marker_numeric_id(self, object_id: str) -> int:
+        if object_id not in self._cylinder_marker_ids:
+            self._cylinder_marker_ids[object_id] = self._next_cylinder_marker_id
+            self._next_cylinder_marker_id += 1
+        return self._cylinder_marker_ids[object_id]
+
+    def show_cylinder_at_pose(
+        self,
+        pose: Pose | dict,
+        object_id: str = CYLINDER_MARKER_ID,
+        frame_id: str = PLAN_FRAME,
+        diameter: float = CYLINDER_DIAMETER,
+        height: float = CYLINDER_HEIGHT,
+        color: ColorRGBA | None = None,
+    ) -> bool:
+        """在 RViz 中半透明显示圆柱（仅 Marker，不参与碰撞检测）。
+
+        pose 可为 geometry_msgs/Pose，或 EE_POSE2 风格 dict。
+        需在 RViz 添加 Marker 显示，话题订阅 /<node_name>/g01_pose_cylinder。
+        """
+        p = pose if isinstance(pose, Pose) else pose_from_dict(pose)
+        mid = self._cylinder_marker_numeric_id(object_id)
+        m = make_cylinder_marker(
+            p, mid, frame_id=frame_id, diameter=diameter, height=height, color=color
+        )
+        m.header.stamp = self.get_clock().now().to_msg()
+        self._cylinder_marker_pub.publish(m)
+        self.get_logger().info(
+            f"已发布圆柱 Marker（仅显示）id={object_id} topic={CYLINDER_MARKER_TOPIC} "
+            f"@ {frame_id} pos=({p.position.x:.3f}, {p.position.y:.3f}, {p.position.z:.3f}), "
+            f"Ø{diameter * 100:.0f}cm × H{height * 100:.0f}cm"
+        )
+        return True
+
+    def show_z_axis_at_pose(
+        self,
+        pose: Pose | dict,
+        object_id: str = Z_AXIS_MARKER_ID,
+        frame_id: str = PLAN_FRAME,
+        length: float = Z_AXIS_LENGTH,
+        color: ColorRGBA | None = None,
+    ) -> bool:
+        """在 RViz 中用箭头显示 pose 的局部 +z 轴方向。"""
+        p = pose if isinstance(pose, Pose) else pose_from_dict(pose)
+        mid = self._cylinder_marker_numeric_id(object_id)
+        marker = make_z_axis_marker(
+            p,
+            mid,
+            frame_id=frame_id,
+            length=length,
+            color=color,
+        )
+        marker.header.stamp = self.get_clock().now().to_msg()
+        self._cylinder_marker_pub.publish(marker)
+        self.get_logger().info(
+            f"已发布 +z 轴 Marker id={object_id} topic={CYLINDER_MARKER_TOPIC} "
+            f"@ {frame_id} length={length:.3f} m"
+        )
+        return True
+
+    def remove_cylinder_at_pose(
+        self,
+        object_id: str = CYLINDER_MARKER_ID,
+        frame_id: str = PLAN_FRAME,
+    ) -> bool:
+        """删除 show_cylinder_at_pose 发布的 RViz 圆柱 Marker。"""
+        if object_id not in self._cylinder_marker_ids:
+            return True
+        m = Marker()
+        m.header.frame_id = frame_id
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = CYLINDER_MARKER_NS
+        m.id = self._cylinder_marker_ids[object_id]
+        m.action = Marker.DELETE
+        self._cylinder_marker_pub.publish(m)
+        del self._cylinder_marker_ids[object_id]
+        return True
+
+    def remove_all_pose_markers(self) -> bool:
+        """删除本节点已发布的全部圆柱和 +Z Marker。"""
+        marker_count = len(self._cylinder_marker_ids)
+        if marker_count:
+            marker = Marker()
+            marker.header.frame_id = SCENE_FRAME
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = CYLINDER_MARKER_NS
+            marker.action = Marker.DELETEALL
+            self._cylinder_marker_pub.publish(marker)
+            self._cylinder_marker_ids.clear()
+            self.get_logger().info(
+                f"已用一条 DELETEALL 删除 {marker_count} 个抓取位姿 Marker"
+            )
+        return True
+
+    def _move_once(
+        self,
+        group: str,
+        goal_constraints: list[Constraints],
+        start: dict[str, float] | None,
+        plan_only: bool,
+        speed_scale: float | None,
+        avoid_collisions: bool = True,
+        num_attempts: int | None = None,
+        planning_time_sec: float | None = None,
+    ) -> tuple[bool, float, RobotTrajectory | None, int | None]:
+        """执行一次 MoveGroup 请求。
+
+        ``avoid_collisions=True`` 使用 move_group 当前规划场景的正常碰撞检查。
+        ``False`` 只在本次请求的 planning_scene_diff 中临时允许机器人 collision
+        link 与其他对象相交，不会写入或污染全局规划场景。关闭碰撞检查具有真实
+        机械臂撞击风险，调用方必须明确承担安全责任。
+
+        返回 ``(是否成功, 耗时毫秒, 轨迹, MoveIt 错误码)``。
+        """
+        log = self.get_logger()
+        t0 = time.monotonic()
+        elapsed_ms = lambda: (time.monotonic() - t0) * 1000.0
+        planning_attempts = NUM_ATTEMPTS if num_attempts is None else max(1, int(num_attempts))
+        try:
+            planning_time = _resolve_planning_time(planning_time_sec)
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 规划时间参数无效: {exc}")
+            return False, elapsed_ms(), None, MoveItErrorCodes.FAILURE
+
+        g = MoveGroup.Goal()
+        g.request.group_name = group
+        g.request.planner_id = PLANNER_ID
+        g.request.num_planning_attempts = planning_attempts
+        g.request.allowed_planning_time = planning_time
+        g.request.goal_constraints = goal_constraints
+        if speed_scale is not None:
+            s = _clamp01(speed_scale)
+            g.request.max_velocity_scaling_factor = s
+            g.request.max_acceleration_scaling_factor = s
+        g.request.start_state.is_diff = True
+        if start:
+            g.request.start_state.joint_state.name = list(start.keys())
+            g.request.start_state.joint_state.position = list(start.values())
+        g.planning_options.plan_only = plan_only
+        if not avoid_collisions:
+            try:
+                collision_links = _urdf_collision_link_names()
+            except RuntimeError as exc:
+                log.error(f"读取 URDF collision link 失败，无法关闭碰撞检查：{exc}")
+                return False, elapsed_ms(), None, MoveItErrorCodes.FAILURE
+            if not collision_links:
+                log.error("URDF 中没有 collision link，无法构造忽略碰撞的规划请求")
+                return False, elapsed_ms(), None, MoveItErrorCodes.FAILURE
+
+            # AllowedCollisionMatrix 放在 MoveGroup.Goal 自带的场景 diff 中，
+            # 生命周期仅覆盖本次规划。把每个 collision link 的默认规则设为 True，
+            # 即允许它与机器人其他 link 及世界碰撞体发生接触。
+            scene_diff = g.planning_options.planning_scene_diff
+            scene_diff.is_diff = True
+            scene_diff.robot_state.is_diff = True
+            acm = scene_diff.allowed_collision_matrix
+            acm.default_entry_names = list(collision_links)
+            acm.default_entry_values = [True] * len(collision_links)
+            log.warning(
+                f"[{group}] 本次关节空间规划已关闭碰撞检查，仅允许用于受控调试"
+            )
+
+        send_fut = self._send_force_guarded_goal(self._move_cli, g)
+        if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
+            log.error("move_action 目标被拒绝或超时")
+            return False, elapsed_ms(), None, None
+
+        res_fut = send_fut.result().get_result_async()
+        if not self._spin_until(res_fut, planning_time + 30.0):
+            log.error("move_action 结果超时")
+            return False, elapsed_ms(), None, MoveItErrorCodes.TIMED_OUT
+
+        ar = res_fut.result()
+        code_val = ar.result.error_code.val if ar.result else None
+        if ar.status != GoalStatus.STATUS_SUCCEEDED:
+            log.error(
+                f"move_action 状态失败: {ar.status} (GoalStatus)，"
+                f" MoveItErrorCodes={code_val}({_moveit_error_name(code_val) if code_val is not None else 'None'})"
+            )
+            return False, elapsed_ms(), None, code_val
+        if code_val != MoveItErrorCodes.SUCCESS:
+            log.error(f"MoveIt 错误码: {code_val} ({_moveit_error_name(code_val)})")
+            return False, elapsed_ms(), None, code_val
+
+        traj = None
+        if ar.result and ar.result.planned_trajectory.joint_trajectory.points:
+            traj = ar.result.planned_trajectory
+        return True, elapsed_ms(), traj, MoveItErrorCodes.SUCCESS
+
+    @staticmethod
+    def _move_error_retryable(code: int | None) -> bool:
+        """是否值得因 OMPL 随机性再试（起点/终点本身非法的不重试）。"""
+        if code is None:
+            return True
+        non_retryable = {
+            MoveItErrorCodes.START_STATE_IN_COLLISION,
+            MoveItErrorCodes.GOAL_IN_COLLISION,
+            MoveItErrorCodes.START_STATE_VIOLATES_PATH_CONSTRAINTS,
+            MoveItErrorCodes.GOAL_VIOLATES_PATH_CONSTRAINTS,
+            MoveItErrorCodes.INVALID_GROUP_NAME,
+            MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS,
+            MoveItErrorCodes.NO_IK_SOLUTION,
+        }
+        return code not in non_retryable
+
+    def move(
+        self,
+        group: str,
+        goal_constraints: list[Constraints],
+        joint_names: list[str] | None = None,
+        start: dict[str, float] | None = None,
+        plan_only: bool = False,
+        speed_scale: float | None = None,
+        avoid_collisions: bool = True,
+        max_retries: int | None = None,
+        num_attempts: int | None = None,
+        planning_time_sec: float | None = None,
+    ) -> tuple[bool, float, RobotTrajectory | None]:
+        """
+        调用 move_action：规划（plan_only=True）或规划并执行（False）。
+
+        单次调用最多发送 MOVE_MAX_RETRIES 个完整 MoveGroup 请求
+        （包含第一次），用于应对 INVALID_MOTION_PLAN 等 OMPL 随机性失败。
+
+        返回 (是否成功, 墙钟耗时 [ms]（含所有尝试）, planned_trajectory)；
+        失败或无轨迹时第三项为 None。
+        joint_names + 未传 start：从 joint_states 读当前位置作为起点。
+        start：显式指定起点（位姿规划在关节运动后用）。
+        avoid_collisions：是否使用规划场景做碰撞检查；False 仅影响本次请求。
+        planning_time_sec：每个 MoveGroup 请求的规划时间上限；None 使用
+        PLAN_TIME_SEC。
+        """
+        log = self.get_logger()
+        retries = MOVE_MAX_RETRIES if max_retries is None else max(1, max_retries)
+        t0 = time.monotonic()
+        no_traj = lambda ok: (ok, (time.monotonic() - t0) * 1000.0, None)
+
+        try:
+            planning_time = _resolve_planning_time(planning_time_sec)
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 规划时间参数无效: {exc}")
+            return no_traj(False)
+
+        if not self._move_cli.wait_for_server(timeout_sec=10.0):
+            log.error(f"动作 {ACT_MOVE_GROUP} 不可用")
+            return no_traj(False)
+
+        if start is None and joint_names:
+            start = self._get_joints(joint_names)
+            if start is None:
+                return no_traj(False)
+
+        last_code: int | None = None
+        for attempt in range(1, retries + 1):
+            ok, _, traj, code = self._move_once(
+                group,
+                goal_constraints,
+                start,
+                plan_only,
+                speed_scale,
+                avoid_collisions,
+                num_attempts,
+                planning_time,
+            )
+            last_code = code
+            if ok:
+                if attempt > 1:
+                    log.info(f"[{group}] move_action 第 {attempt}/{retries} 次成功")
+                return True, (time.monotonic() - t0) * 1000.0, traj
+            if attempt < retries and self._move_error_retryable(code):
+                log.warning(
+                    f"[{group}] move_action 第 {attempt}/{retries} 次失败 "
+                    f"({_moveit_error_name(code) if code is not None else 'unknown'})，重试 …"
+                )
+                # 若上次已执行部分轨迹，用最新 joint_states 作下次起点
+                if start and not plan_only:
+                    refreshed = self._get_joints(list(start.keys()), wait_new=True)
+                    if refreshed is not None:
+                        start = refreshed
+                continue
+            break
+
+        if retries > 1:
+            log.error(
+                f"[{group}] move_action {retries} 次均失败，"
+                f"末次错误: {_moveit_error_name(last_code) if last_code is not None else 'unknown'}"
+            )
+        return no_traj(False)
+
+    def plan_joint_motion(
+        self,
+        group: str,
+        end_joints: Mapping[str, float] | Sequence[float],
+        *,
+        joint_names: Sequence[str] | None = None,
+        start_joints: Mapping[str, float] | None = None,
+        speed_scale: float = 0.2,
+        num_attempts: int | None = None,
+        max_retries: int | None = None,
+        planning_time_sec: float | None = None,
+        avoid_collisions: bool = True,
+        execute: bool = False,
+    ) -> tuple[bool, float, RobotTrajectory | None]:
+        """通用关节空间规划入口，可选择只规划或规划并执行。
+
+        参数：
+            group:
+                SRDF 规划组，例如 ``left_arm``、``dual_arm_body``。
+            end_joints:
+                终点关节。可传 ``{关节名: 位置}``；也可传数值序列，此时必须
+                同时传 ``joint_names``，两者按下标一一对应。
+            joint_names:
+                规划组的关节顺序。终点为字典时可省略，默认沿用字典插入顺序。
+            start_joints:
+                显式规划起点 ``{关节名: 位置}``。省略时读取最新 joint_states。
+                可包含组外关节，以便完整描述机器人起始状态。
+            speed_scale:
+                MoveIt 速度和加速度缩放，范围会限制到 0~1。
+            num_attempts:
+                单次 MoveGroup 请求内部的规划求解次数；省略时使用
+                ``NUM_ATTEMPTS``。
+            max_retries:
+                最多发送的完整 MoveGroup 请求总数（包含第一次）；
+                省略时使用 ``MOVE_MAX_RETRIES``。它和 ``num_attempts``
+                是两层不同的尝试计数。
+            planning_time_sec:
+                单个 MoveGroup 请求允许的总规划时间 [s]；省略时
+                使用 ``PLAN_TIME_SEC``。同一请求内的 ``num_attempts``
+                共享这个时间上限。
+            avoid_collisions:
+                True 使用规划场景碰撞检查；False 仅对本次请求临时放开碰撞，
+                不修改全局场景，但真实机器人使用时有撞击风险。
+            execute:
+                False 只规划并返回轨迹；True 由 MoveGroup 规划后立即执行。
+
+        返回：
+            ``(是否成功, 总耗时毫秒, RobotTrajectory 或 None)``。
+        """
+        log = self.get_logger()
+        try:
+            if isinstance(end_joints, Mapping):
+                names = (
+                    list(joint_names)
+                    if joint_names is not None
+                    else list(end_joints)
+                )
+                missing = [name for name in names if name not in end_joints]
+                if missing:
+                    log.error(f"[{group}] 终点关节字典缺少: {missing}")
+                    return False, 0.0, None
+                target = {name: float(end_joints[name]) for name in names}
+            else:
+                if joint_names is None:
+                    log.error(f"[{group}] 终点使用数值序列时必须提供 joint_names")
+                    return False, 0.0, None
+                names = list(joint_names)
+                values = list(end_joints)
+                if len(names) != len(values):
+                    log.error(
+                        f"[{group}] joint_names 与 end_joints 长度不一致: "
+                        f"{len(names)} != {len(values)}"
+                    )
+                    return False, 0.0, None
+                target = {
+                    name: float(value)
+                    for name, value in zip(names, values)
+                }
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 终点关节必须是可转换为 float 的数值: {exc}")
+            return False, 0.0, None
+
+        if not names:
+            log.error(f"[{group}] 关节列表为空")
+            return False, 0.0, None
+        if len(set(names)) != len(names):
+            log.error(f"[{group}] joint_names 中存在重复关节")
+            return False, 0.0, None
+        if any(not math.isfinite(value) for value in target.values()):
+            log.error(f"[{group}] 终点关节包含 NaN 或无穷值")
+            return False, 0.0, None
+
+        try:
+            start = (
+                {
+                    name: float(value)
+                    for name, value in start_joints.items()
+                }
+                if start_joints is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 起点关节必须是可转换为 float 的数值: {exc}")
+            return False, 0.0, None
+        if start is not None and any(
+            not math.isfinite(value) for value in start.values()
+        ):
+            log.error(f"[{group}] 起点关节包含 NaN 或无穷值")
+            return False, 0.0, None
+        goal = [make_joint_constraints(group, target)]
+        return self.move(
+            group,
+            goal,
+            joint_names=names,
+            start=start,
+            plan_only=not execute,
+            speed_scale=speed_scale,
+            avoid_collisions=avoid_collisions,
+            max_retries=max_retries,
+            num_attempts=num_attempts,
+            planning_time_sec=planning_time_sec,
+        )
+
+    def plan_execute_joint_waypoints(
+        self,
+        group: str,
+        speed_scale: float,
+        joint_names: Sequence[str],
+        waypoints: Sequence[Mapping[str, float] | Sequence[float]],
+        num_attempts: int | None = None,
+        *,
+        start_joints: Mapping[str, float] | None = None,
+        max_retries: int | None = None,
+        planning_time_sec: float | None = None,
+        avoid_collisions: bool = True,
+    ) -> bool:
+        """按顺序规划并执行多个关节空间路径点。
+
+        每个 waypoint 都复用 :meth:`plan_joint_motion`。第一段可从调用方指定的
+        ``start_joints`` 开始；后续段必须读取上一段执行后的真实 joint_states，
+        避免控制误差累积。``num_attempts``、``max_retries``、
+        ``planning_time_sec`` 和 ``avoid_collisions`` 会一致地应用到每一段。
+        """
+        log = self.get_logger()
+        if not waypoints:
+            log.error(f"[{group}] waypoints 为空")
+            return False
+
+        start = dict(start_joints) if start_joints is not None else self._get_joints(
+            list(joint_names)
+        )
+        if start is None:
+            return False
+        planning_attempts = NUM_ATTEMPTS if num_attempts is None else max(1, int(num_attempts))
+        try:
+            planning_time = _resolve_planning_time(planning_time_sec)
+        except (TypeError, ValueError) as exc:
+            log.error(f"[{group}] 规划时间参数无效: {exc}")
+            return False
+
+        log.info(
+            f"[{group}] 关节多点路径: {len(waypoints)} waypoints, speed_scale={_clamp01(speed_scale):.2f}, "
+            f"planner={PLANNER_ID}, attempts={planning_attempts}, time={planning_time:.1f}s"
+        )
+
+        for idx, q in enumerate(waypoints):
+            ok, used_ms, _ = self.plan_joint_motion(
+                group,
+                q,
+                joint_names=joint_names,
+                start_joints=start,
+                speed_scale=speed_scale,
+                num_attempts=planning_attempts,
+                max_retries=max_retries,
+                planning_time_sec=planning_time,
+                avoid_collisions=avoid_collisions,
+                execute=True,
+            )
+            log.info(
+                f"[{group}] segment {idx + 1}/{len(waypoints)} plan+exec: {used_ms:.3f} ms "
+                f"({'success' if ok else 'failed'})"
+            )
+            if not ok:
+                return False
+
+            start = self._get_joints(list(joint_names), wait_new=True)
+            if start is None:
+                return False
+
+        return True
+
+    def plan_execute_pose(
+        self,
+        group: str,
+        speed_scale: float,
+        link: str,
+        pose: Pose,
+        use_cartesian: bool = False,
+        planning_time_sec: float | None = None,
+    ) -> bool:
+        """位姿目标：直接输入 geometry_msgs/Pose。
+
+        use_cartesian=False（默认）：走 move_action（OMPL 关节空间规划，可绕障）。
+        use_cartesian=True         ：走 compute_cartesian_path 服务（笛卡尔直线，
+            等价于 RViz MotionPlanning 插件中 "Use Cartesian Path" 复选框）。
+        planning_time_sec 仅对 OMPL 分支生效；None 使用 PLAN_TIME_SEC。
+        """
+        p = pose.position
+        log = self.get_logger()
+        log.info(
+            f"[{group}] 位姿目标 {link} @ {PLAN_FRAME}: "
+            f"pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
+            f"quat({pose.orientation.x:.3f}, {pose.orientation.y:.3f}, "
+            f"{pose.orientation.z:.3f}, {pose.orientation.w:.3f}), "
+            f"speed_scale={_clamp01(speed_scale):.2f}, use_cartesian={use_cartesian}"
+        )
+
+        if use_cartesian:
+            return self.plan_execute_cartesian_line(
+                group, link, pose, speed_scale=speed_scale
+            )
+
+        start = self._get_joints(POSE_START_JOINTS, wait_new=True)
+        if start is None:
+            return False
+
+        goal = [make_pose_constraints(link, pose)]
+
+        ok, used_ms, _ = self.move(
+            group,
+            goal,
+            start=start,
+            plan_only=False,
+            speed_scale=speed_scale,
+            planning_time_sec=planning_time_sec,
+        )
+        log.info(f"[{group}] pose plan+exec: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        return ok
+
+    def plan_execute_pose_xyz_rpy(
+        self,
+        group: str,
+        speed_scale: float,
+        link: str,
+        x: float,
+        y: float,
+        z: float,
+        roll: float,
+        pitch: float,
+        yaw: float,
+        use_cartesian: bool = False,
+        planning_time_sec: float | None = None,
+    ) -> bool:
+        """位姿目标：输入 xyz + rpy；内部转 Pose 后调 plan_execute_pose。"""
+        pose = make_pose(x, y, z, roll, pitch, yaw)
+        return self.plan_execute_pose(
+            group,
+            speed_scale,
+            link,
+            pose,
+            use_cartesian,
+            planning_time_sec,
+        )
+
+    def plan_cartesian_line(
+        self,
+        group: str,
+        link: str,
+        end_pose: Pose,
+        *,
+        speed_scale: float = 0.2,
+        avoid_collisions: bool = True,
+        eef_step: float = CART_EEF_STEP,
+        min_fraction: float = CART_MIN_FRACTION,
+        start_joints: Mapping[str, float] | None = None,
+        joint_names: Sequence[str] | None = None,
+        plan_frame: str = PLAN_FRAME,
+        num_attempts: int = 1,
+        verbose: bool = True,
+    ) -> RobotTrajectory | None:
+        """规划一条从指定关节起点到末端目标位姿的笛卡尔直线。
+
+        参数：
+            group:
+                SRDF 规划组，例如 ``left_arm``、``right_body``。
+            link:
+                沿直线运动的末端 link，例如 ``l_tool`` 或 ``r_tool``。
+            end_pose:
+                直线终点位姿，必须在 ``plan_frame`` 中表达。
+            speed_scale:
+                轨迹速度缩放。Humble 的 GetCartesianPath 没有速度字段，因此
+                本函数统一缩放时间戳、速度和加速度后再返回轨迹。
+            avoid_collisions:
+                是否在 Cartesian 离散 IK 求解过程中检查规划场景碰撞。
+            eef_step:
+                末端直线的最大离散步长，单位 m；必须大于 0。
+            min_fraction:
+                可接受的最小完成比例，范围 0~1；低于该值视为失败。
+            start_joints:
+                起点关节 ``{name: pos}``。省略时读取 ``joint_names`` 对应的最新
+                joint_states。服务会先对该起点做 FK，因此无需另传 start_pose。
+                显式传入时可在不移动机器人的情况下预演任意起点。
+            joint_names:
+                未指定 ``start_joints`` 时要读取的关节名；省略则使用
+                ``POSE_START_JOINTS``。
+            plan_frame:
+                ``end_pose`` 所属的参考坐标系。
+            num_attempts:
+                compute_cartesian_path 的最大调用次数，至少为 1。任意一次达到
+                ``min_fraction`` 即返回。
+            verbose:
+                是否打印详细日志。批量 IK 候选预检时可关闭，避免刷屏。
+
+        返回：
+            成功时返回已按 ``speed_scale`` 缩放的 ``RobotTrajectory``；所有
+            尝试均失败时返回 None。轨迹可直接执行、缓存或反向播放。
+
+        关闭碰撞检查只影响本次服务请求，不会修改全局规划场景。
+        """
+        log = self.get_logger()
+        total_t0 = time.monotonic()
+
+        if eef_step <= 0.0:
+            log.error(f"[{group}] eef_step 必须大于 0，当前={eef_step}")
+            return None
+        if not 0.0 <= min_fraction <= 1.0:
+            log.error(f"[{group}] min_fraction 必须在 0~1，当前={min_fraction}")
+            return None
+        attempts = max(1, int(num_attempts))
+
+        if not self._cart_cli.wait_for_service(timeout_sec=10.0):
+            log.error(f"服务 {SVC_CARTESIAN_PATH} 不可用")
+            return None
+
+        start = dict(start_joints) if start_joints is not None else self._get_joints(
+            list(joint_names) if joint_names is not None else POSE_START_JOINTS,
+            wait_new=True,
+        )
+        if start is None:
+            return None
+
+        req = GetCartesianPath.Request()
+        req.header.frame_id = plan_frame
+        req.start_state.is_diff = True
+        req.start_state.joint_state.name = list(start.keys())
+        req.start_state.joint_state.position = list(start.values())
+        req.group_name = group
+        req.link_name = link
+        req.waypoints = [end_pose]
+        req.max_step = eef_step
+        req.jump_threshold = CART_JUMP_THRESHOLD
+        req.revolute_jump_threshold = CART_REVOLUTE_JUMP_THRESHOLD
+        req.prismatic_jump_threshold = CART_PRISMATIC_JUMP_THRESHOLD
+        req.avoid_collisions = avoid_collisions
+
+        p = end_pose.position
+        if verbose:
+            log.info(
+                f"[{group}] 笛卡尔直线 {link} @ {plan_frame}: "
+                f"end pos({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
+                f"max_step={eef_step:.4f}, avoid_collisions={avoid_collisions}, "
+                f"jump={CART_JUMP_THRESHOLD:.1f}/"
+                f"{CART_REVOLUTE_JUMP_THRESHOLD:.2f}rad, "
+                f"speed_scale={_clamp01(speed_scale):.2f}, attempts={attempts}"
+            )
+
+        trajectory: RobotTrajectory | None = None
+        last_fraction = 0.0
+        last_code: int | None = None
+        for attempt in range(1, attempts + 1):
+            attempt_t0 = time.monotonic()
+            fut = self._cart_cli.call_async(req)
+            if not self._spin_until(fut, 15.0):
+                if verbose:
+                    log.warning(
+                        f"[{group}] compute_cartesian_path "
+                        f"第 {attempt}/{attempts} 次超时"
+                    )
+                continue
+
+            res = fut.result()
+            last_fraction = res.fraction
+            last_code = res.error_code.val
+            if verbose:
+                log.info(
+                    f"[{group}] cartesian planning {attempt}/{attempts}: "
+                    f"{(time.monotonic() - attempt_t0) * 1000.0:.3f} ms, "
+                    f"fraction={last_fraction:.3f}, "
+                    f"error_code={last_code}({_moveit_error_name(last_code)})"
+                )
+            if (
+                last_fraction >= min_fraction
+                and last_code == MoveItErrorCodes.SUCCESS
+            ):
+                trajectory = res.solution
+                break
+
+        if trajectory is None:
+            if verbose:
+                error_name = (
+                    _moveit_error_name(last_code)
+                    if last_code is not None
+                    else "timeout"
+                )
+                log.error(
+                    f"[{group}] 笛卡尔直线 {attempts} 次规划均未达标："
+                    f"fraction={last_fraction:.3f} < {min_fraction}, "
+                    f"error_code={last_code}({error_name}), "
+                    f"total={(time.monotonic() - total_t0) * 1000.0:.3f} ms"
+                )
+            return None
+
+        scale = _clamp01(speed_scale)
+        if scale > 0.0 and abs(scale - 1.0) > 1e-6:
+            for point in trajectory.joint_trajectory.points:
+                total_seconds = (
+                    point.time_from_start.sec
+                    + point.time_from_start.nanosec * 1e-9
+                )
+                scaled_ns = int(
+                    round(total_seconds * 1_000_000_000 / scale)
+                )
+                (
+                    point.time_from_start.sec,
+                    point.time_from_start.nanosec,
+                ) = divmod(scaled_ns, 1_000_000_000)
+                point.velocities = [value * scale for value in point.velocities]
+                point.accelerations = [
+                    value * scale * scale for value in point.accelerations
+                ]
+
+        return trajectory
+
+    def validate_trajectory_self_collision(
+        self,
+        trajectory: RobotTrajectory,
+        *,
+        group: str,
+        base_state: Mapping[str, float] | None = None,
+        sample_period: float | None = None,
+        label: str = "轨迹",
+    ) -> bool:
+        """只校验轨迹的机器人自碰撞，忽略与 world/attached 物体的接触。
+
+        ``compute_cartesian_path(avoid_collisions=False)`` 会同时跳过自碰撞和
+        场景物体碰撞。这里把轨迹状态提交给 ``check_state_validity``，只拒绝
+        ``ROBOT_LINK <-> ROBOT_LINK`` 接触；涉及 ``WORLD_OBJECT`` 或
+        ``ROBOT_ATTACHED`` 的接触均不影响结果。
+
+        ``base_state`` 用于补全轨迹没有携带的腰部、升降和另一只手臂状态。
+        这对尚未执行的候选构型尤其重要，不能依赖 move_group 的当前状态。
+        """
+        log = self.get_logger()
+        points = trajectory.joint_trajectory.points
+        trajectory_names = list(trajectory.joint_trajectory.joint_names)
+        if not points or not trajectory_names:
+            log.error(f"[self-collision] {label} 为空，无法检查")
+            return False
+        if not self._validity_cli.wait_for_service(timeout_sec=10.0):
+            log.error(f"服务 {SVC_STATE_VALIDITY} 不可用，禁止执行未校验轨迹")
+            return False
+
+        indices = _trajectory_validation_indices(points, sample_period)
+        ignored_object_pairs: set[tuple[str, str]] = set()
+        for index in indices:
+            state = dict(base_state or {})
+            state.update(zip(trajectory_names, points[index].positions))
+
+            request = GetStateValidity.Request()
+            request.group_name = group
+            request.robot_state = RobotState()
+            request.robot_state.is_diff = True
+            request.robot_state.joint_state.name = list(state.keys())
+            request.robot_state.joint_state.position = list(state.values())
+            future = self._validity_cli.call_async(request)
+            if not self._spin_until(future, 5.0):
+                future.cancel()
+                log.error(
+                    f"[self-collision] {label} 状态检查超时: point={index}"
+                )
+                return False
+            try:
+                response = future.result()
+            except Exception as exc:
+                report_runtime_exception(exc, "validate_trajectory_self_collision")
+                log.error(
+                    f"[self-collision] {label} 状态检查失败: "
+                    f"point={index}, {exc}"
+                )
+                return False
+            if response is None:
+                log.error(
+                    f"[self-collision] {label} 未收到状态检查结果: point={index}"
+                )
+                return False
+
+            self_contacts = [
+                contact
+                for contact in response.contacts
+                if _is_robot_self_contact(contact)
+            ]
+            if self_contacts:
+                details = ", ".join(
+                    f"{contact.contact_body_1}<->{contact.contact_body_2}"
+                    for contact in self_contacts[:5]
+                )
+                log.info(
+                    f"[self-collision] {label} 存在机器人自碰撞: "
+                    f"point={index}, {details}"
+                )
+                return False
+
+            # GetStateValidity 的 valid=False 还可能仅表示 world/attached 物体
+            # 接触；这些接触按放料需求忽略，但保留汇总日志便于现场排查。
+            for contact in response.contacts:
+                ignored_object_pairs.add(
+                    tuple(
+                        sorted(
+                            (
+                                contact.contact_body_1,
+                                contact.contact_body_2,
+                            )
+                        )
+                    )
+                )
+            if not response.valid and not response.contacts:
+                log.error(
+                    f"[self-collision] {label} 状态无效但没有 contact 详情，"
+                    f"无法确认是否仅为物体碰撞: point={index}"
+                )
+                return False
+
+        ignored_text = ""
+        if ignored_object_pairs:
+            preview = ", ".join(
+                f"{first}<->{second}"
+                for first, second in sorted(ignored_object_pairs)[:5]
+            )
+            ignored_text = (
+                f"；已忽略 {len(ignored_object_pairs)} 组物体接触"
+                f"（{preview}）"
+            )
+        log.info(
+            f"[self-collision] {label} 通过: group={group}, "
+            f"检查 {len(indices)}/{len(points)} 个状态{ignored_text}"
+        )
+        return True
+
+    def _execute_traj(self, traj, timeout: float = 60.0) -> bool:
+        """直接把一条 RobotTrajectory 发给 execute_trajectory action。
+
+        traj 必须已是「速度缩放后」的最终轨迹（plan_cartesian_line 或
+        _reverse_trajectory 的返回值均已满足）。
+        """
+        log = self.get_logger()
+        if not self._exec_cli.wait_for_server(timeout_sec=10.0):
+            log.error(f"动作 {ACT_EXEC_TRAJ} 不可用")
+            return False
+
+        goal = ExecuteTrajectory.Goal(trajectory=traj)
+        send_fut = self._send_force_guarded_goal(self._exec_cli, goal)
+        if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
+            log.error("execute_trajectory 目标被拒绝或超时")
+            return False
+        res_fut = send_fut.result().get_result_async()
+        if not self._spin_until(res_fut, timeout):
+            log.error("execute_trajectory 结果超时")
+            return False
+
+        ar = res_fut.result()
+        exec_code = ar.result.error_code.val if ar.result else None
+        if ar.status != GoalStatus.STATUS_SUCCEEDED or exec_code != MoveItErrorCodes.SUCCESS:
+            log.error(
+                f"execute_trajectory 失败：status={ar.status}, "
+                f"error_code={exec_code}({_moveit_error_name(exec_code) if exec_code is not None else 'None'})"
+            )
+            return False
+        return True
+
+    def _execute_approach_with_force_guard(
+        self,
+        traj: RobotTrajectory,
+        side: str | Sequence[str],
+        baseline_force_z: float | Mapping[str, float],
+        total_distance: float,
+        timeout: float = 60.0,
+        near_force_drop_threshold: float | None = APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD,
+        stage_label: str = "直线接近",
+        baseline_label: str = "q_pre",
+    ) -> str:
+        """执行接近轨迹并实时监测 Fz。
+
+        返回 ``success``、``contact``、``failed`` 或 ``safety_failed``。
+        ``contact`` 表示已完成 ServoJ 停止确认、MoveIt 轨迹终止确认以及 ServoJ
+        恢复确认，可以安全地从实测当前位置规划退回 q_pre。
+        """
+        if not self.use_force_sensors or self.sim_mode:
+            return "success" if self._execute_traj(traj, timeout=timeout) else "failed"
+
+        log = self.get_logger()
+        if not self._exec_cli.wait_for_server(timeout_sec=10.0):
+            log.error(f"动作 {ACT_EXEC_TRAJ} 不可用")
+            return "failed"
+
+        sides = (side,) if isinstance(side, str) else tuple(side)
+        baseline_force_z_by_side = (
+            {sides[0]: float(baseline_force_z)}
+            if len(sides) == 1 and not isinstance(baseline_force_z, Mapping)
+            else {name: float(baseline_force_z[name]) for name in sides}
+        )
+        guard = {
+            "sides": sides,
+            "baseline_force_z_by_side": baseline_force_z_by_side,
+            "near_force_drop_threshold": near_force_drop_threshold,
+            "stage_label": stage_label,
+            "baseline_label": baseline_label,
+            "total_distance": max(0.0, float(total_distance)),
+            "trajectory": traj,
+            "monitoring": False,
+            "progress_fraction": 0.0,
+            "contact": False,
+            "force_z": None,
+            "force_drop": 0.0,
+            "travelled": 0.0,
+            "trigger": None,
+            "stop_request_ids": {},
+            "contact_side": None,
+            "completion_force_checked": False,
+        }
+        self._active_approach_guard = guard
+        try:
+            goal = ExecuteTrajectory.Goal(trajectory=traj)
+            send_fut = self._send_force_guarded_goal(self._exec_cli, goal)
+            if not self._spin_until(send_fut, 15.0):
+                log.error("execute_trajectory 目标发送超时")
+                return "failed"
+            goal_handle = send_fut.result()
+            if not goal_handle.accepted:
+                log.error("execute_trajectory 目标被拒绝")
+                return "failed"
+
+            result_fut = goal_handle.get_result_async()
+            guard["monitoring"] = True
+            deadline = time.monotonic() + max(0.0, timeout)
+            while rclpy.ok() and time.monotonic() < deadline:
+                self._executor.spin_once(
+                    timeout_sec=min(0.01, max(0.0, deadline - time.monotonic())),
+                )
+                if guard["contact"]:
+                    guard["monitoring"] = False
+                    # ServoJ 的 stop 已由力回调先发出；紧接着取消 MoveIt action，
+                    # 防止控制器继续产生这条接近轨迹的后续关节点。
+                    cancel_fut = goal_handle.cancel_goal_async()
+                    cancel_reply_received = self._spin_until(
+                        cancel_fut,
+                        APPROACH_CANCEL_TIMEOUT_SEC,
+                    )
+                    if not cancel_reply_received:
+                        log.error("[pick][force-guard] 取消直线接近轨迹请求超时")
+                    else:
+                        cancel_result = cancel_fut.result()
+                        if not cancel_result.goals_canceling and not result_fut.done():
+                            log.error(
+                                "[pick][force-guard] MoveIt 未接受直线接近轨迹取消请求"
+                            )
+
+                    stop_results = {
+                        stop_side: self._wait_for_servoj_control_state(
+                            stop_side,
+                            "stop",
+                            guard["stop_request_ids"].get(stop_side),
+                        )
+                        for stop_side in sides
+                    }
+                    stop_confirmed = all(stop_results.values())
+                    trajectory_ended = self._spin_until(
+                        result_fut,
+                        APPROACH_CANCEL_TIMEOUT_SEC,
+                    )
+                    if trajectory_ended:
+                        action_result = result_fut.result()
+                        exec_code = (
+                            action_result.result.error_code.val
+                            if action_result.result
+                            else None
+                        )
+                        log.warning(
+                            "[pick][force-guard] 直线接近轨迹已结束："
+                            f"status={action_result.status}, error_code={exec_code}"
+                        )
+                    else:
+                        log.error(
+                            "[pick][force-guard] 未能确认直线接近轨迹已经结束，"
+                            "保持 ServoJ 停止，禁止自动恢复"
+                        )
+
+                    if not stop_confirmed or not trajectory_ended:
+                        return "safety_failed"
+
+                    resume_results = {
+                        resume_side: self._wait_for_servoj_control_state(
+                            resume_side,
+                            "resume",
+                            self._send_servoj_control(resume_side, "resume"),
+                        )
+                        for resume_side in sides
+                    }
+                    resume_confirmed = all(resume_results.values())
+                    if not resume_confirmed:
+                        log.error(
+                            "[pick][force-guard] 未确认 ServoJ 恢复，禁止执行退回 q_pre"
+                        )
+                        return "safety_failed"
+                    return "contact"
+
+                if result_fut.done():
+                    action_result = result_fut.result()
+                    exec_code = (
+                        action_result.result.error_code.val
+                        if action_result.result
+                        else None
+                    )
+                    if (
+                        action_result.status == GoalStatus.STATUS_SUCCEEDED
+                        and exec_code == MoveItErrorCodes.SUCCESS
+                    ):
+                        if not guard["completion_force_checked"]:
+                            # action 结果和力话题来自不同通道。成功终态后再处理一帧
+                            # 新力数据，确保末端最后时刻仍受整段 200 N 阈值保护；
+                            # 此时进度置 100%，不会误用“前 9 cm”的 20 N 阈值。
+                            guard["completion_force_checked"] = True
+                            guard["progress_fraction"] = 1.0
+                            force_counts = {
+                                force_side: self._ft_sensor_count[force_side]
+                                for force_side in sides
+                            }
+                            sample_deadline = time.monotonic() + 0.1
+                            while (
+                                rclpy.ok()
+                                and not guard["contact"]
+                                and not all(
+                                    self._ft_sensor_count[force_side]
+                                    > force_counts[force_side]
+                                    for force_side in sides
+                                )
+                                and time.monotonic() < sample_deadline
+                            ):
+                                self._executor.spin_once(
+                                    timeout_sec=min(
+                                        0.01,
+                                        max(0.0, sample_deadline - time.monotonic()),
+                                    ),
+                                )
+                            if guard["contact"]:
+                                continue
+                        return "success"
+                    log.error(
+                        "execute_trajectory 失败："
+                        f"status={action_result.status}, error_code={exec_code}"
+                        f"({_moveit_error_name(exec_code) if exec_code is not None else 'None'})"
+                    )
+                    return "failed"
+
+            log.error("execute_trajectory 结果超时")
+            return "failed"
+        finally:
+            if self._active_approach_guard is guard:
+                self._active_approach_guard = None
+
+    def _return_to_pre_after_approach_contact(
+        self,
+        group: str,
+        link: str,
+        pre_pose: Pose,
+        joint_names: Sequence[str],
+        plan_frame: str,
+        speed_scale: float,
+        return_label: str = "q_pre",
+    ) -> bool:
+        """ServoJ 恢复后，从实测停止位置重新规划直线退回 pre。"""
+        settle_deadline = time.monotonic() + SERVOJ_RECOVERY_SETTLE_SEC
+        while rclpy.ok() and time.monotonic() < settle_deadline:
+            self._executor.spin_once(
+                timeout_sec=min(0.02, settle_deadline - time.monotonic()),
+            )
+
+        current = self._get_joints(list(joint_names), wait_new=True)
+        if current is None:
+            self.get_logger().error(
+                "[pick][force-guard] 无法读取停止后的实测关节位置"
+            )
+            return False
+        retreat = self.plan_cartesian_line(
+            group,
+            link,
+            pre_pose,
+            speed_scale=speed_scale,
+            avoid_collisions=True,
+            start_joints=current,
+            joint_names=joint_names,
+            plan_frame=plan_frame,
+        )
+        if retreat is None:
+            self.get_logger().error(
+                f"[pick][force-guard] 无法从停止位置规划直线退回{return_label}"
+            )
+            return False
+        if not self._execute_traj(retreat):
+            self.get_logger().error(
+                f"[pick][force-guard] 从停止位置直线退回{return_label}执行失败"
+            )
+            return False
+        self.get_logger().info(
+            f"[pick][force-guard] 已从中途停止位置直线退回{return_label}"
+        )
+        return True
+
+    @staticmethod
+    def _reverse_trajectory(traj):
+        """反向播放：positions/time 反序、velocity 取负、acceleration 仅反序（不变号）。
+
+        数学：设原 q(t) on [0,T]，反向播放定义 r(τ) = q(T − τ)，则
+            r'(τ)  = -q'(T − τ)    → velocity 每分量取负
+            r''(τ) = +q''(T − τ)   → acceleration 不变号（只是按时间反序）
+        时间戳：t_new[i] = T − t_old[N-1-i]（即反序后的第 0 点时间为 0）。
+        """
+        out = copy.deepcopy(traj)
+        pts = out.joint_trajectory.points
+        if len(pts) < 2:
+            return out
+
+        total_ns = pts[-1].time_from_start.sec * 1_000_000_000 + pts[-1].time_from_start.nanosec
+        rev_pts = []
+        for src in reversed(pts):
+            new = copy.deepcopy(src)
+            if new.velocities:
+                new.velocities = [-v for v in new.velocities]
+            old_ns = src.time_from_start.sec * 1_000_000_000 + src.time_from_start.nanosec
+            delta = total_ns - old_ns
+            new.time_from_start.sec = int(delta // 1_000_000_000)
+            new.time_from_start.nanosec = int(delta % 1_000_000_000)
+            rev_pts.append(new)
+        out.joint_trajectory.points = rev_pts
+        return out
+
+    def _solve_ik(
+        self,
+        group: str,
+        link: str,
+        pose: Pose,
+        seed: dict,
+        avoid_collisions: bool = True,
+        timeout: float = IK_TIMEOUT_SEC,
+        return_code: bool = False,
+        plan_frame: str = PLAN_FRAME,
+    ):
+        """调 /compute_ik 服务，求单个 IK 解。
+
+        seed: RobotState 种子关节字典（至少覆盖 group 内所有关节）。
+        默认返回 {joint_name: value} 或 None；
+        return_code=True 时返回 (dict_or_None, error_code_int)，
+            error_code_int 为 MoveItErrorCodes 数值（-31=NO_IK_SOLUTION，
+            -12=GOAL_IN_COLLISION，等等）；服务超时/不可用时返回 None。
+        """
+        if not self._ik_cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error(f"服务 {SVC_COMPUTE_IK} 不可用")
+            return (None, None) if return_code else None
+
+        req = GetPositionIK.Request()
+        req.ik_request.group_name = group
+        req.ik_request.ik_link_name = link
+        req.ik_request.avoid_collisions = avoid_collisions
+        req.ik_request.pose_stamped = PoseStamped()
+        req.ik_request.pose_stamped.header.frame_id = plan_frame
+        req.ik_request.pose_stamped.pose = pose
+        req.ik_request.robot_state = RobotState()
+        req.ik_request.robot_state.joint_state.name = list(seed.keys())
+        req.ik_request.robot_state.joint_state.position = list(seed.values())
+        req.ik_request.robot_state.is_diff = True
+        secs = int(timeout)
+        nsecs = int((timeout - secs) * 1e9)
+        req.ik_request.timeout = DurationMsg(sec=secs, nanosec=nsecs)
+
+        fut = self._ik_cli.call_async(req)
+        if not self._spin_until(fut, 5.0):
+            return (None, None) if return_code else None
+
+        res = fut.result()
+        code = int(res.error_code.val)
+        if code != MoveItErrorCodes.SUCCESS:
+            return (None, code) if return_code else None
+
+        js = res.solution.joint_state
+        sol = {n: p for n, p in zip(js.name, js.position)}
+        return (sol, code) if return_code else sol
+
+    def _solve_ik_candidates_from_seed(
+        self,
+        group: str,
+        link: str,
+        pose: Pose,
+        joint_names: Sequence[str],
+        seed_state: dict[str, float],
+        *,
+        plan_frame: str,
+        n_attempts: int,
+        max_solutions: int,
+        random_seed: int,
+        perturb_joint_names: Sequence[str] | None = None,
+        avoid_collisions: bool = False,
+        perturb: float = UNLOAD_PLACE_IK_PERTURB,
+        dedup_tol: float = 1e-2,
+    ) -> list[dict[str, float]]:
+        """从显式完整种子枚举多组 IK；允许固定额外关节参与 RobotState。
+
+        joint_names 是需要从 IK 结果提取的规划组关节。seed_state 可以额外包含
+        body_joint1/2 和另一只手臂，使 IK 服务在指定身体构型下求解。已知的
+        双臂、升降和腰部关节按 URDF 完整限位采样，其他关节使用 perturb 扰动。
+        """
+        log = self.get_logger()
+        joint_names = list(joint_names)
+        perturb_joint_names = list(
+            joint_names if perturb_joint_names is None else perturb_joint_names
+        )
+        missing_seed = [name for name in joint_names if name not in seed_state]
+        if missing_seed:
+            log.error(
+                f"[unload-ik] group={group} 种子缺少关节: {missing_seed}"
+            )
+            return []
+
+        rng = random.Random(int(random_seed))
+        solutions: list[dict[str, float]] = []
+        failure_codes: dict[int, int] = {}
+
+        for attempt in range(max(1, int(n_attempts))):
+            seed = dict(seed_state)
+            if attempt > 0:
+                for name in perturb_joint_names:
+                    if name not in seed:
+                        continue
+                    if name == "body_joint1":
+                        seed[name] = rng.uniform(*BODY_JOINT1_LIMITS)
+                    elif name == "body_joint2":
+                        seed[name] = rng.uniform(*BODY_JOINT2_LIMITS)
+                    else:
+                        arm_match = re.fullmatch(
+                            r"[lr]_arm_joint([1-6])",
+                            name,
+                        )
+                        if arm_match:
+                            joint_index = int(arm_match.group(1))
+                            seed[name] = rng.uniform(
+                                *ARM_JOINT_LIMITS_BY_INDEX[joint_index]
+                            )
+                        else:
+                            perturbed = (
+                                seed[name] + rng.uniform(-perturb, perturb)
+                            )
+                            seed[name] = math.atan2(
+                                math.sin(perturbed),
+                                math.cos(perturbed),
+                            )
+
+            solution, code = self._solve_ik(
+                group,
+                link,
+                pose,
+                seed,
+                avoid_collisions=avoid_collisions,
+                return_code=True,
+                plan_frame=plan_frame,
+            )
+            if solution is None:
+                if code is not None:
+                    failure_codes[int(code)] = (
+                        failure_codes.get(int(code), 0) + 1
+                    )
+                continue
+
+            candidate = {
+                name: solution[name]
+                for name in joint_names
+                if name in solution
+            }
+            if len(candidate) != len(joint_names):
+                continue
+            duplicate = any(
+                all(
+                    abs(candidate[name] - old[name]) < dedup_tol
+                    for name in joint_names
+                )
+                for old in solutions
+            )
+            if duplicate:
+                continue
+            solutions.append(candidate)
+            if len(solutions) >= max(1, int(max_solutions)):
+                break
+
+        solutions.sort(
+            key=lambda item: joint_distance_squared(
+                item,
+                seed_state,
+                joint_names,
+            )
+        )
+        failure_text = ""
+        if failure_codes:
+            failure_text = ", failures=" + ", ".join(
+                f"{_moveit_error_name(code)}:{count}"
+                for code, count in sorted(failure_codes.items())
+            )
+        log.info(
+            f"[unload-ik] group={group}, frame={plan_frame}, "
+            f"solutions={len(solutions)}/{n_attempts}, "
+            f"avoid_collisions={avoid_collisions}{failure_text}"
+        )
+        return solutions
+
+    def _solve_ik_multi(
+        self,
+        group: str,
+        link: str,
+        pose: Pose,
+        joint_names: Sequence[str],
+        n_candidates: int = IK_N_CANDIDATES,
+        dedup_tol: float = 1e-2,
+        avoid_collisions: bool = True,
+        plan_frame: str = PLAN_FRAME,
+        planning_start_joints: Mapping[str, float] | None = None,
+    ) -> list[dict]:
+        """通过随机种子枚举 pose 在 group 上的多个不同 IK 解。
+
+        - 第 0 次使用完整预计起点；未指定时读取完整 joint_states。
+        - 之后每次按 URDF 位置限位，对 `joint_names` 中的关节做全范围均匀采样。
+        - 用 dedup_tol 在关节空间做去重（任一关节差异 < tol 视为同解）。
+        - 失败时统计 error_code，方便区分「数值无解 / 碰撞被拒 / 输入非法」。
+        - 抓取可达性始终保留碰撞检查；0 解时不再关闭碰撞重新求解。
+        """
+        rng = random.Random(IK_RANDOM_SEED) if IK_RANDOM_SEED is not None else random
+        log = self.get_logger()
+
+        current = (dict(planning_start_joints) if planning_start_joints is not None
+                   else self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True))
+        if current is None:
+            log.error("[ik-multi] 读取当前关节失败，无法构造种子")
+            return []
+
+        try:
+            joint_limits = {
+                name: ik_seed_limits_for_joint(name)
+                for name in joint_names
+            }
+        except KeyError as exc:
+            log.error(f"[ik-multi] {exc}")
+            return []
+
+        solutions: list[dict] = []
+        fail_codes: dict[int, int] = {}
+
+        def _is_dup(cand: dict) -> bool:
+            for s in solutions:
+                if all(abs(cand[n] - s[n]) < dedup_tol for n in joint_names if n in cand and n in s):
+                    return True
+            return False
+
+        for i in range(n_candidates):
+            if i == 0:
+                seed = dict(current)
+            else:
+                seed = dict(current)
+                seed.update({
+                    name: rng.uniform(*joint_limits[name])
+                    for name in joint_names
+                })
+            sol, code = self._solve_ik(
+                group, link, pose, seed,
+                avoid_collisions=avoid_collisions, return_code=True, plan_frame=plan_frame,
+            )
+            if sol is None:
+                if code is not None:
+                    fail_codes[code] = fail_codes.get(code, 0) + 1
+                continue
+            sub = {n: sol[n] for n in joint_names if n in sol}
+            if len(sub) != len(joint_names):
+                continue
+            if not _is_dup(sub):
+                solutions.append(sub)
+
+        log.info(
+            f"[ik-multi] {len(solutions)} 个不同 IK 解 / {n_candidates} 次尝试 "
+            f"(按 URDF 关节限位采样, avoid_collisions={avoid_collisions})"
+        )
+        if fail_codes:
+            breakdown = ", ".join(
+                f"{_moveit_error_name(c)}={n}" for c, n in sorted(fail_codes.items())
+            )
+            log.info(f"[ik-multi] 失败原因分布: {breakdown}")
+
+        if not solutions:
+            p = pose.position
+            log.error(
+                f"[ik-multi] {n_candidates} 次限位内采样后仍无无碰撞 IK："
+                f"group={group}, link={link}, frame={plan_frame}, "
+                f"position=({p.x:.4f}, {p.y:.4f}, {p.z:.4f})"
+            )
+        return solutions
+
+    def _solve_ik_from_seeds(
+        self,
+        group: str,
+        link: str,
+        pose: Pose,
+        joint_names: Sequence[str],
+        seeds: Sequence[dict[str, float]],
+        dedup_tol: float = 1e-2,
+        avoid_collisions: bool = True,
+        plan_frame: str = PLAN_FRAME,
+    ) -> list[dict]:
+        """只使用调用方给定的 seed 求 IK，不额外尝试当前关节或随机初始值。"""
+        log = self.get_logger()
+        joint_names = list(joint_names)
+        solutions: list[dict] = []
+        fail_codes: dict[int, int] = {}
+
+        def _is_dup(cand: dict) -> bool:
+            for s in solutions:
+                if all(abs(cand[n] - s[n]) < dedup_tol for n in joint_names if n in cand and n in s):
+                    return True
+            return False
+
+        for idx, raw_seed in enumerate(seeds):
+            missing_seed = [n for n in joint_names if n not in raw_seed]
+            if missing_seed:
+                log.warning(
+                    f"[ik-seed] seed {idx + 1}/{len(seeds)} 缺少关节 {missing_seed}，跳过"
+                )
+                continue
+
+            seed = dict(raw_seed)
+            sol, code = self._solve_ik(
+                group, link, pose, seed,
+                avoid_collisions=avoid_collisions, return_code=True, plan_frame=plan_frame,
+            )
+            if sol is None:
+                if code is not None:
+                    fail_codes[code] = fail_codes.get(code, 0) + 1
+                continue
+
+            sub = {n: sol[n] for n in joint_names if n in sol}
+            if len(sub) != len(joint_names):
+                log.warning(
+                    f"[ik-seed] seed {idx + 1}/{len(seeds)} 返回解缺少部分关节，跳过"
+                )
+                continue
+            if not _is_dup(sub):
+                solutions.append(sub)
+
+        log.info(
+            f"[ik-seed] {len(solutions)} 个不同 IK 解 / {len(seeds)} 个指定 seed "
+            f"(avoid_collisions={avoid_collisions})"
+        )
+        if fail_codes:
+            breakdown = ", ".join(
+                f"{_moveit_error_name(c)}={n}" for c, n in sorted(fail_codes.items())
+            )
+            log.info(f"[ik-seed] 失败原因分布: {breakdown}")
+        return solutions
+
+    def _select_feasible_grasp_pair(
+        self,
+        group: str,
+        link: str,
+        target_pose: Pose,
+        pre_pose: Pose,
+        joint_names: Sequence[str],
+        speed_scale: float,
+        n_candidates: int = IK_N_CANDIDATES,
+        plan_frame: str = PLAN_FRAME,
+        target_seeds: Sequence[dict[str, float]] | None = None,
+        cutoff_joint_names: Sequence[str] | None = None,
+        scene_grasp_object_poses: Sequence[Pose] | None = None,
+        planning_start_joints: Mapping[str, float] | None = None,
+    ):
+        """从 target_pose 的多个 IK 解里挑可用的一组。
+
+        target_seeds 不为 None 时，只用这些 seed 求 IK，不做当前关节/随机 seed 枚举。
+        筛选顺序固定为：碰撞 IK → Cartesian approach → OMPL 到 q_pre。
+        cutoff_joint_names 不为 None 时，OMPL 预检会临时加入隔离面和
+        ``scene_grasp_object_poses`` 中的抓取物体；步骤 4 只传当前候选圆柱，
+        使验证条件与后续实际执行一致。
+        返回 (q_pre, q_target, to_pre_traj, approach_traj) 四元组；
+        找不到返回 None。to_pre_traj 是当前位置到 q_pre 的 OMPL 轨迹，
+        后续抓取直接执行它，不再随机重规划。
+        approach_traj = reverse( cartesian(start=q_target, end=pre_pose) )
+            即真正用来「从 pre_pose 直线接近 target_pose」的轨迹。
+        """
+        log = self.get_logger()
+        planning_start_joints = (
+            dict(planning_start_joints) if planning_start_joints is not None
+            else self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True)
+        )
+        if planning_start_joints is None:
+            return None
+        if target_seeds is None:
+            candidates = self._solve_ik_multi(
+                group,
+                link,
+                target_pose,
+                joint_names,
+                n_candidates,
+                avoid_collisions=True,
+                plan_frame=plan_frame,
+                planning_start_joints=planning_start_joints,
+            )
+        else:
+            candidates = self._solve_ik_from_seeds(
+                group, link, target_pose, joint_names,
+                [{**planning_start_joints, **seed} for seed in target_seeds],
+                plan_frame=plan_frame,
+            )
+        if not candidates:
+            log.error("[grasp-select] target_pose 在该 group 上没有任何 IK 解")
+            return None
+
+        line_distance = _pose_distance(target_pose, pre_pose)
+        expected_points = int(math.ceil(line_distance / max(CART_EEF_STEP, 1e-6))) + 2
+        max_points = max(
+            expected_points + CART_MAX_POINT_EXTRA,
+            int(math.ceil(expected_points * CART_MAX_POINT_FACTOR)),
+        )
+        feasible_pairs = []
+        cartesian_failed = 0
+        point_count_rejected = 0
+        joint_jump_rejected = 0
+
+        for idx, q_target in enumerate(candidates):
+            retreat_traj = self.plan_cartesian_line(
+                group, link, pre_pose,
+                speed_scale=speed_scale,
+                start_joints={**planning_start_joints, **q_target},
+                joint_names=joint_names,
+                plan_frame=plan_frame,
+                verbose=False,
+            )
+            if retreat_traj is None:
+                cartesian_failed += 1
+                continue
+
+            point_count = len(retreat_traj.joint_trajectory.points)
+            total_motion, _max_step = _trajectory_joint_stats(retreat_traj)
+            if point_count > max_points:
+                point_count_rejected += 1
+                continue
+            jump_reason = _trajectory_joint_jump_reason(retreat_traj)
+            if jump_reason:
+                joint_jump_rejected += 1
+                continue
+
+            approach_traj = self._reverse_trajectory(retreat_traj)
+            last_pt = retreat_traj.joint_trajectory.points[-1]
+            names = list(retreat_traj.joint_trajectory.joint_names)
+            q_pre = {n: p for n, p in zip(names, last_pt.positions)}
+            score = total_motion + 0.01 * point_count
+            feasible_pairs.append(
+                (
+                    score,
+                    q_pre,
+                    q_target,
+                    approach_traj,
+                    idx + 1,
+                )
+            )
+
+        log.info(
+            f"[grasp-select] Cartesian 直线接近：{len(feasible_pairs)}/"
+            f"{len(candidates)} 组可行"
+            f"（无路径={cartesian_failed}, 点数异常={point_count_rejected}, "
+            f"关节跳变={joint_jump_rejected}）"
+        )
+        feasible_pairs.sort(key=lambda item: item[0])
+        for (
+            _score,
+            q_pre,
+            q_target,
+            approach_traj,
+            best_idx,
+        ) in feasible_pairs:
+            ompl_trajectory: RobotTrajectory | None
+            if cutoff_joint_names is not None:
+                ompl_trajectory = self._plan_q_pre_with_temporary_collisions(
+                    group,
+                    link,
+                    target_pose,
+                    plan_frame,
+                    q_pre,
+                    joint_names,
+                    cutoff_joint_names,
+                    speed_scale,
+                    scene_grasp_object_poses=scene_grasp_object_poses,
+                    planning_start_joints=planning_start_joints,
+                )
+                if ompl_trajectory is None:
+                    continue
+            else:
+                current = dict(planning_start_joints) if planning_start_joints is not None else self._get_joints(list(joint_names), wait_new=True)
+                if current is None:
+                    return None
+                ompl_ok, _, ompl_trajectory = self.plan_joint_motion(
+                    group,
+                    q_pre,
+                    joint_names=joint_names,
+                    start_joints=current,
+                    speed_scale=speed_scale,
+                    max_retries=1,
+                    avoid_collisions=True,
+                    execute=False,
+                )
+                if not (
+                    ompl_ok
+                    and ompl_trajectory is not None
+                    and ompl_trajectory.joint_trajectory.points
+                ):
+                    continue
+            log.info(
+                f"[grasp-select] 选用候选 IK {best_idx}/{len(candidates)}："
+                "IK、Cartesian 接近、OMPL 到 q_pre 均通过"
+            )
+            return q_pre, q_target, ompl_trajectory, approach_traj
+
+        if feasible_pairs and cutoff_joint_names is not None:
+            log.error(
+                f"[grasp-select] {len(feasible_pairs)} 个直线可行候选中，"
+                "没有一个能从当前位置通过 OMPL 到达 q_pre"
+            )
+            return None
+
+        log.error(
+            f"[grasp-select] 共 {len(candidates)} 个候选 IK 解，没有一个能直线退回 pre_pose"
+        )
+        return None
+
+    def plan_execute_cartesian_line(
+        self,
+        group: str,
+        link: str,
+        end_pose: Pose,
+        *,
+        speed_scale: float = 0.2,
+        avoid_collisions: bool = True,
+        eef_step: float = CART_EEF_STEP,
+        min_fraction: float = CART_MIN_FRACTION,
+        start_joints: Mapping[str, float] | None = None,
+        joint_names: Sequence[str] | None = None,
+        plan_frame: str = PLAN_FRAME,
+        num_attempts: int = 1,
+        execute_timeout: float = 60.0,
+    ) -> bool:
+        """复用 :meth:`plan_cartesian_line` 规划并立即执行直线轨迹。
+
+        ``group``、速度、起点、终点、求解次数、碰撞策略、参考坐标系和离散
+        精度均可由调用方配置，含义与 ``plan_cartesian_line`` 完全一致。
+        ``execute_timeout`` 仅控制 execute_trajectory 的等待超时。若显式传入
+        ``start_joints``，执行前必须确保机器人实际处于该起点，否则控制器会因
+        轨迹起点不匹配而拒绝执行。
+        """
+        log = self.get_logger()
+        t0 = time.monotonic()
+        traj = self.plan_cartesian_line(
+            group,
+            link,
+            end_pose,
+            speed_scale=speed_scale,
+            avoid_collisions=avoid_collisions,
+            eef_step=eef_step,
+            min_fraction=min_fraction,
+            start_joints=start_joints,
+            joint_names=joint_names,
+            plan_frame=plan_frame,
+            num_attempts=num_attempts,
+        )
+        if traj is None:
+            return False
+        if not self._execute_traj(traj, timeout=execute_timeout):
+            return False
+        log.info(
+            f"[{group}] cartesian plan+exec: "
+            f"{(time.monotonic() - t0) * 1000.0:.3f} ms (success)"
+        )
+        return True
+
+    def _select_available_place_target(
+        self,
+        arm_group: str,
+        place_joints: dict[str, object],
+        first_return_mode: int,
+    ) -> tuple[bool, str | None]:
+        """返回 (是否可放, SW 名称)；字典配置会选择第一个真实空位。"""
+        suffix = "_j" if first_return_mode == 1 else ""
+        yubei_config = place_joints.get(f"yubei{suffix}")
+        fang_config = place_joints.get(f"fang{suffix}")
+        if isinstance(fang_config, dict):
+            if not isinstance(yubei_config, dict):
+                return False, None
+            slot_name = next(
+                (
+                    str(name).lower()
+                    for name in fang_config
+                    if name in yubei_config and self._place_slot_is_empty(str(name))
+                ),
+                None,
+            )
+            return slot_name is not None, slot_name
+
+        # *_j 是没有 SW 名称的单一旧配置，无法把某个掩码映射到不同关节目标；
+        # 仍要求四个硬件检测位中至少存在一个空位，确保“无空位不抓取”。
+        configured = yubei_config is not None and fang_config is not None
+        return configured and self._has_any_empty_place_slot(), None
+
+    def _current_dual_arm_self_collision(self) -> bool | None:
+        """检查当前双臂/身体实测状态；碰撞=True，无碰撞=False，检查失败=None。"""
+        log = self.get_logger()
+        group = "dual_arm_body"
+        joint_names = joint_names_for_group(group)
+        current = self._get_joints(joint_names, wait_new=True)
+        if current is None:
+            log.error("[pick][exchange-place] 读取当前双臂状态失败，无法检查自碰撞")
+            return None
+        if not self._validity_cli.wait_for_service(timeout_sec=10.0):
+            log.error(f"服务 {SVC_STATE_VALIDITY} 不可用，无法检查当前双臂自碰撞")
+            return None
+
+        request = GetStateValidity.Request()
+        request.group_name = group
+        request.robot_state = RobotState()
+        request.robot_state.is_diff = True
+        request.robot_state.joint_state.name = list(current)
+        request.robot_state.joint_state.position = list(current.values())
+        future = self._validity_cli.call_async(request)
+        if not self._spin_until(future, 5.0):
+            future.cancel()
+            log.error("[pick][exchange-place] 当前双臂自碰撞检查超时")
+            return None
+        try:
+            response = future.result()
+        except Exception as exc:
+            report_runtime_exception(exc, "_current_dual_arm_self_collision")
+            log.error(f"[pick][exchange-place] 当前双臂自碰撞检查失败: {exc}")
+            return None
+        if response is None:
+            log.error("[pick][exchange-place] 当前双臂自碰撞检查未返回结果")
+            return None
+
+        self_contacts = [
+            contact
+            for contact in response.contacts
+            if _is_robot_self_contact(contact)
+        ]
+        if self_contacts:
+            details = ", ".join(
+                f"{contact.contact_body_1}<->{contact.contact_body_2}"
+                for contact in self_contacts[:5]
+            )
+            log.warning(
+                "[pick][exchange-place] 放置规划前检测到当前双臂自碰撞: "
+                f"{details}"
+            )
+            return True
+
+        if not response.valid and not response.contacts:
+            log.error(
+                "[pick][exchange-place] 当前状态无效但没有 contact 详情，"
+                "无法确认双臂是否碰撞"
+            )
+            return None
+
+        ignored_contacts = len(response.contacts)
+        ignored_text = (
+            f"；忽略 {ignored_contacts} 个非机器人自碰撞接触"
+            if ignored_contacts
+            else ""
+        )
+        log.info(
+            "[pick][exchange-place] 放置规划前当前双臂无自碰撞"
+            f"{ignored_text}"
+        )
+        return False
+
+    def _move_exchange_empty_arm_for_place_clearance(
+        self,
+        holding_arm_group: str,
+        speed_scale: float,
+    ) -> bool:
+        """让交换后的空载原抓取臂沿末端局部 -Z 直线避让 2 cm。"""
+        log = self.get_logger()
+        if holding_arm_group == "left_arm":
+            empty_group = "right_arm"
+            empty_link = "r_tool"
+            empty_plan_frame = "r_base_link"
+            empty_label = "右臂"
+        elif holding_arm_group == "right_arm":
+            empty_group = "left_arm"
+            empty_link = "l_tool"
+            empty_plan_frame = "l_base_link"
+            empty_label = "左臂"
+        else:
+            log.error(
+                f"[pick][exchange-place] 持物臂 group={holding_arm_group} 无法确定空载臂"
+            )
+            return False
+
+        empty_joint_names = joint_names_for_group(empty_group)
+        current = self._get_joints(empty_joint_names, wait_new=True)
+        if current is None:
+            log.error(f"[pick][exchange-place] 读取空载{empty_label}当前位置失败")
+            return False
+        current_pose = self._get_link_pose_fk(
+            empty_link,
+            joints=current,
+            joint_names=empty_joint_names,
+            plan_frame=empty_plan_frame,
+        )
+        if current_pose is None:
+            log.error(f"[pick][exchange-place] 读取空载{empty_label}末端位姿失败")
+            return False
+
+        target_pose = pose_offset_local_z(
+            current_pose,
+            EXCHANGE_PLACE_EMPTY_ARM_LOCAL_Z_OFFSET,
+        )
+        log.warning(
+            f"[pick][exchange-place] 空载{empty_label}沿 {empty_link} 末端局部 -Z "
+            f"直线移动 {abs(EXCHANGE_PLACE_EMPTY_ARM_LOCAL_Z_OFFSET):.3f} m "
+            "（按要求不检查碰撞）"
+        )
+        trajectory = self.plan_cartesian_line(
+            empty_group,
+            empty_link,
+            target_pose,
+            speed_scale=speed_scale,
+            avoid_collisions=False,
+            start_joints=current,
+            joint_names=empty_joint_names,
+            plan_frame=empty_plan_frame,
+        )
+        if trajectory is None or not trajectory.joint_trajectory.points:
+            log.error(f"[pick][exchange-place] 空载{empty_label}避让直线规划失败")
+            return False
+        if not self._execute_traj(trajectory):
+            log.error(f"[pick][exchange-place] 空载{empty_label}避让直线执行失败")
+            return False
+        log.info(
+            f"[pick][exchange-place] 空载{empty_label}已沿末端局部 -Z 避让 2 cm"
+        )
+        return True
+
+    def _plan_place_trajectories(
+        self,
+        *,
+        arm_group: str,
+        arm_plan_frame: str,
+        body_group: str,
+        arm_joint_names: list[str],
+        body_joint_names: list[str],
+        slot_name: str | None,
+        yubei_name: str,
+        place_name: str,
+        start_joints: Mapping[str, float],
+        yubei_joints: list[float],
+        fang_joints: list[float],
+        link: str,
+        speed: float,
+    ) -> PlaceTrajectoryPlan | None:
+        """纯规划放置去程、下降和 Q1 复位轨迹，不执行任何运动。"""
+        arm_plan_frame = SCENE_FRAME
+        cache_key = f"input4_place_{arm_group}_{yubei_name}_{place_name}"
+        cached = _load_trajectory_cache(
+            cache_key,
+            {
+                "to_yubei": RobotTrajectory,
+                "descent": RobotTrajectory,
+                "to_q1": RobotTrajectory,
+                "yubei_pose": Pose,
+            },
+        )
+        if cached is not None:
+            metadata, messages = cached
+            if (
+                metadata.get("body_joint_names") == body_joint_names
+                and metadata.get("arm_joint_names") == arm_joint_names
+                and metadata.get("yubei_joints") == yubei_joints
+                and metadata.get("fang_joints") == fang_joints
+                and _cached_joint_state_matches(
+                    metadata.get("start_joints"), start_joints,
+                )
+                and metadata.get("speed") == speed
+            ):
+                self.get_logger().info(f"[trajectory-cache] 命中 {cache_key}")
+                return PlaceTrajectoryPlan(
+                    arm_group, arm_plan_frame, body_group, arm_joint_names,
+                    body_joint_names, slot_name, yubei_name, place_name,
+                    dict(start_joints), yubei_joints, fang_joints,
+                    messages["to_yubei"], messages["descent"],
+                    messages["to_q1"], messages["yubei_pose"],
+                )
+        self.get_logger().info(
+            f"[trajectory-cache] 未命中或已失效 {cache_key}，正常规划"
+        )
+        ok, _, to_yubei = self.plan_joint_motion(
+            body_group,
+            yubei_joints,
+            joint_names=body_joint_names,
+            start_joints=start_joints,
+            speed_scale=speed,
+            num_attempts=50,
+            planning_time_sec=20.0,
+            execute=False,
+        )
+        if not ok or to_yubei is None:
+            self.publish_error(10, f"{arm_group}: {yubei_name} 放置预备位不可达")
+            return None
+        yubei_state = dict(start_joints)
+        yubei_state.update(zip(body_joint_names, yubei_joints))
+        yubei_pose = self._get_link_pose_fk(
+            link,
+            joints=yubei_state,
+            joint_names=arm_joint_names,
+            plan_frame=arm_plan_frame,
+        )
+        if yubei_pose is None:
+            return None
+        fang_state = dict(yubei_state)
+        fang_state.update(zip(arm_joint_names, fang_joints))
+        fang_to_yubei = self.plan_cartesian_line(
+            arm_group,
+            link,
+            yubei_pose,
+            speed_scale=speed,
+            avoid_collisions=False,
+            start_joints=fang_state,
+            joint_names=arm_joint_names,
+            plan_frame=arm_plan_frame,
+        )
+        if fang_to_yubei is None:
+            self.publish_error(10, f"{arm_group}: {place_name} 放置直线不可达")
+            return None
+        descent = self._reverse_trajectory(fang_to_yubei)
+        if not descent.joint_trajectory.points:
+            self.publish_error(10, f"{arm_group}: {place_name} 放置轨迹为空")
+            return None
+        trajectory_names = list(descent.joint_trajectory.joint_names)
+        yubei_target = dict(zip(body_joint_names, yubei_joints))
+        fang_target = dict(zip(arm_joint_names, fang_joints))
+        yubei_error = max(
+            (
+                abs(value - yubei_target[name])
+                for name, value in zip(
+                    trajectory_names,
+                    descent.joint_trajectory.points[0].positions,
+                )
+                if name in yubei_target
+            ),
+            default=float("inf"),
+        )
+        fang_error = max(
+            (
+                abs(value - fang_target[name])
+                for name, value in zip(
+                    trajectory_names,
+                    descent.joint_trajectory.points[-1].positions,
+                )
+                if name in fang_target
+            ),
+            default=float("inf"),
+        )
+        if yubei_error > 0.05 or fang_error > 0.05:
+            self.publish_error(10, f"{arm_group}: {place_name} 放置轨迹端点不匹配")
+            self.get_logger().error(
+                f"[pick] {place_name} 反向 Cartesian 分支不匹配："
+                f"yubei 误差={yubei_error:.4f}, fang 误差={fang_error:.4f}"
+            )
+            return None
+        self.get_logger().info(
+            f"[pick] {place_name} 使用 fang 锁定 IK 分支反向规划，"
+            f"执行方向 yubei → fang；端点误差="
+            f"{yubei_error:.4f}/{fang_error:.4f}"
+        )
+        q1_source = list(EXCHANGE_Q1[:6] if arm_group == "left_arm" else EXCHANGE_Q1[-6:])
+        q1_joints = q1_source[:len(arm_joint_names)] if arm_group == "left_arm" else q1_source[-len(arm_joint_names):]
+        return_cache_key = f"input4_return_{arm_group}_{yubei_name}"
+        cached_return = _load_trajectory_cache(
+            return_cache_key, {"to_q1": RobotTrajectory},
+        )
+        to_q1 = None
+        if cached_return is not None:
+            return_metadata, return_messages = cached_return
+            if (
+                return_metadata.get("arm_joint_names") == arm_joint_names
+                and return_metadata.get("yubei_joints") == yubei_joints
+                and return_metadata.get("q1_joints") == q1_joints
+                and return_metadata.get("speed") == speed
+            ):
+                to_q1 = return_messages["to_q1"]
+                self.get_logger().info(
+                    f"[trajectory-cache] 命中 {return_cache_key}"
+                )
+        if to_q1 is None:
+            ok, _, to_q1 = self.plan_joint_motion(
+                arm_group,
+                q1_joints,
+                joint_names=arm_joint_names,
+                start_joints=yubei_state,
+                speed_scale=speed,
+                execute=False,
+            )
+            if not ok or to_q1 is None:
+                return None
+            saved_return = _save_trajectory_cache(
+                return_cache_key,
+                {
+                    "arm_joint_names": arm_joint_names,
+                    "yubei_joints": yubei_joints,
+                    "q1_joints": q1_joints,
+                    "speed": speed,
+                },
+                {"to_q1": to_q1},
+            )
+            self.get_logger().info(
+                f"[trajectory-cache] "
+                f"{'已保存' if saved_return else '保存失败'} {return_cache_key}"
+            )
+        plan = PlaceTrajectoryPlan(
+            arm_group, arm_plan_frame, body_group, arm_joint_names,
+            body_joint_names, slot_name, yubei_name, place_name,
+            dict(start_joints), yubei_joints, fang_joints,
+            to_yubei, descent, to_q1, yubei_pose,
+        )
+        saved = _save_trajectory_cache(
+            cache_key,
+            {
+                "body_joint_names": body_joint_names,
+                "arm_joint_names": arm_joint_names,
+                "yubei_joints": yubei_joints,
+                "fang_joints": fang_joints,
+                "start_joints": dict(start_joints),
+                "speed": speed,
+            },
+            {
+                "to_yubei": to_yubei,
+                "descent": descent,
+                "to_q1": to_q1,
+                "yubei_pose": yubei_pose,
+            },
+        )
+        self.get_logger().info(
+            f"[trajectory-cache] {'已保存' if saved else '保存失败'} {cache_key}"
+        )
+        return plan
+
+    def _place_and_return(
+        self,
+        speed: float,
+        place_joints: dict[str, object],
+        *,
+        group: str,
+        link: str,
+        first_return_mode: int,
+        selected_slot_name: str | None = None,
+        preplanned: PlaceTrajectoryPlan | None = None,
+        return_to_q1: bool = True,
+    ) -> bool:
+        """body+手臂到 yubei，纯臂放置并原路返回，可选再运动到 Q1。"""
+        log = self.get_logger()
+        arm_context = arm_context_for_group(group)
+        if arm_context is None:
+            log.error(f"[pick] group={group} 无法确定放置使用的纯臂 group")
+            return False
+        arm_group, arm_plan_frame = arm_context
+        arm_joint_names = joint_names_for_group(arm_group)
+        body_group = "left_body" if arm_group == "left_arm" else "right_body"
+        body_joint_names = joint_names_for_group(body_group)
+        suffix = "_j" if first_return_mode == 1 else ""
+        yubei_key = f"yubei{suffix}"
+        fang_key = f"fang{suffix}"
+        if yubei_key not in place_joints or fang_key not in place_joints:
+            log.error(f"[pick] group={group} 的放置配置缺少 {yubei_key}/{fang_key}")
+            return False
+
+        yubei_config = place_joints[yubei_key]
+        fang_config = place_joints[fang_key]
+        slot_name: str | None = None
+        if isinstance(fang_config, dict):
+            if not isinstance(yubei_config, dict):
+                log.error(f"[pick] {yubei_key} 不是按 SW 命名的放置配置")
+                return False
+            if (
+                selected_slot_name is not None
+                and selected_slot_name in fang_config
+                and selected_slot_name in yubei_config
+                and self._place_slot_is_empty(selected_slot_name)
+            ):
+                slot_name = selected_slot_name
+            else:
+                # 抓取过程中原目标可能被占用；放置动作开始前允许改选另一个空位。
+                available, slot_name = self._select_available_place_target(
+                    arm_group, place_joints, first_return_mode
+                )
+                if not available or slot_name is None:
+                    log.error(f"[pick] {fang_key} 没有硬件信号为“空”的可用放置位")
+                    return False
+                if selected_slot_name is not None and slot_name != selected_slot_name:
+                    log.warning(
+                        f"[pick] 原定放置位 {selected_slot_name} 已不可用，改用 {slot_name}"
+                    )
+            fang_values = fang_config[slot_name]
+        else:
+            if not self._has_any_empty_place_slot():
+                log.error("[pick] SW1~SW4 均有物体，禁止执行放置")
+                return False
+            fang_values = fang_config
+
+        if isinstance(yubei_config, dict):
+            if slot_name is None or slot_name not in yubei_config:
+                log.error(f"[pick] {yubei_key} 缺少与 {fang_key} 对应的槽位 {slot_name}")
+                return False
+            yubei_values = yubei_config[slot_name]
+        else:
+            yubei_values = yubei_config
+
+        try:
+            yubei_joints = list(yubei_values)
+            fang_joints = list(fang_values)
+        except TypeError:
+            log.error(f"[pick] {yubei_key}/{fang_key} 关节配置不是序列")
+            return False
+        if len(yubei_joints) != len(body_joint_names):
+            log.error(
+                f"[pick] {yubei_key} 配置长度错误："
+                f"{len(yubei_joints)} != {len(body_joint_names)}"
+            )
+            return False
+        if len(fang_joints) != len(arm_joint_names):
+            log.error(
+                f"[pick] {fang_key} 放置配置长度错误："
+                f"{len(fang_joints)} != {len(arm_joint_names)}"
+            )
+            return False
+        yubei_name = f"{yubei_key}.{slot_name}" if slot_name else yubei_key
+        place_name = f"{fang_key}.{slot_name}" if slot_name else fang_key
+
+        clearance_moved = False
+        if first_return_mode == 1:
+            current_collision = self._current_dual_arm_self_collision()
+            if current_collision is None:
+                log.error("[pick] 放置规划前无法确认当前双臂碰撞状态，停止流程")
+                return False
+            if current_collision:
+                if not self._move_exchange_empty_arm_for_place_clearance(
+                    arm_group,
+                    speed,
+                ):
+                    return False
+                clearance_moved = True
+
+        log.info(f"[pick] 5/9  {body_group} OMPL → {yubei_name}")
+        start_joint_names = joint_names_for_group("dual_arm_body")
+        current = self._get_joints(start_joint_names, wait_new=True)
+        if current is None:
+            log.error("[pick] 读取放置规划当前实测关节状态失败")
+            return False
+        plan = preplanned
+        if clearance_moved:
+            plan = None
+        if plan is not None and (
+            plan.arm_group != arm_group or plan.slot_name != slot_name
+        ):
+            log.warning("[pick] 预规划放置缓存与当前臂/SW不匹配，重新规划")
+            plan = None
+        if plan is not None:
+            first_point = plan.to_yubei.joint_trajectory.points[0]
+            start_error = max(
+                (
+                    abs(current[name] - value)
+                    for name, value in zip(
+                        plan.to_yubei.joint_trajectory.joint_names,
+                        first_point.positions,
+                    )
+                    if name in current
+                ),
+                default=0.0,
+            )
+            if start_error > 0.05:
+                log.warning(
+                    f"[pipeline] 放置缓存起点偏差 {start_error:.4f} > 0.05，"
+                    "改用实测状态重新规划"
+                )
+                plan = None
+        if plan is None:
+            plan = self._plan_place_trajectories(
+                arm_group=arm_group,
+                arm_plan_frame=arm_plan_frame,
+                body_group=body_group,
+                arm_joint_names=arm_joint_names,
+                body_joint_names=body_joint_names,
+                slot_name=slot_name,
+                yubei_name=yubei_name,
+                place_name=place_name,
+                start_joints=current,
+                yubei_joints=yubei_joints,
+                fang_joints=fang_joints,
+                link=link,
+                speed=speed,
+            )
+        if plan is None:
+            log.error(f"[pick] {yubei_name}/{place_name}/Q1 纯规划失败")
+            return False
+        if not self._execute_traj(plan.to_yubei):
+            log.error(f"[pick] 执行缓存轨迹到 {yubei_name} 失败")
+            return False
+
+        self.wait_for_operator()
+
+        log.info(f"[pick] 6/9  下降前读取新 SW 信号并复查 {place_name}")
+        if not self._wait_for_driver_signal(require_new=True):
+            log.error(
+                f"[pick] 下降前未收到新 SW 信号，"
+                f"无法确认 {place_name} 是否可用；"
+                "保持工具上电并中止放置"
+            )
+            return False
+        if slot_name is not None and not self._place_slot_is_empty(slot_name):
+            log.error(
+                f"[pick] 下降前复查发现 {slot_name} 已有物体，"
+                "保持工具上电并中止放置"
+            )
+            return False
+        if slot_name is None and not self._has_any_empty_place_slot():
+            log.error(
+                "[pick] 下降前复查发现 SW1~SW4 均有物体，"
+                "保持工具上电并中止放置"
+            )
+            return False
+
+        log.info(f"[pick] 6/9  {arm_group} 笛卡尔直线 → {place_name}（不考虑碰撞）")
+        current = self._get_joints(arm_joint_names, wait_new=True)
+        if current is None:
+            log.error("[pick] 读取当前手臂关节失败")
+            return False
+        yubei_return_pose = self._get_link_pose_fk(
+            link,
+            joints=current,
+            joint_names=arm_joint_names,
+            plan_frame=arm_plan_frame,
+        )
+        if yubei_return_pose is None:
+            log.error(f"[pick] 无法记录 {yubei_name} 处末端位姿用于报警退回")
+            return False
+        to_fang_traj = plan.descent
+        tool_side = tool_side_for_link(link)
+        if tool_side is None:
+            log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
+            return False
+        tool_label = "左臂" if tool_side == "left" else "右臂"
+        force_z_before_place = self.wait_for_ft_sensor_z(tool_side)
+        if force_z_before_place is None:
+            log.error(f"[pick] {place_name} 下降前无法读取{tool_label} Fz，取消放置")
+            return False
+        log.info(
+            f"[pick] {place_name} 下降前{tool_label} Fz="
+            f"{force_z_before_place:.6f} N，全程下降阈值="
+            f"{APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:.3f} N"
+        )
+        alarm_recovered = False
+        place_contact_recovered = False
+        place_result = self._execute_approach_with_force_guard(
+            to_fang_traj,
+            tool_side,
+            force_z_before_place,
+            _pose_distance(yubei_return_pose, self._get_link_pose_fk(
+                link,
+                joints=dict(zip(arm_joint_names, fang_joints)),
+                plan_frame=arm_plan_frame,
+            ) or yubei_return_pose),
+            near_force_drop_threshold=None,
+            stage_label="放置直线下降",
+            baseline_label="放置预备点",
+        )
+        if place_result == "contact":
+            log.warning(
+                f"[pick] {place_name} 直线下降检测到碰撞；"
+                f"先将{tool_label}工具下电，再从实测位置直线退回放置预备点"
+            )
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] {place_name} 碰撞后{tool_label}工具下电失败")
+                return False
+            if not self._return_to_pre_after_approach_contact(
+                arm_group,
+                link,
+                yubei_return_pose,
+                arm_joint_names,
+                arm_plan_frame,
+                speed,
+                return_label="放置预备点",
+            ):
+                log.error(f"[pick] {place_name} 碰撞后直线退回放置预备点失败")
+                return False
+            place_contact_recovered = True
+        elif place_result == "safety_failed":
+            log.error(f"[pick] {place_name} 碰撞后停止/轨迹终止/恢复确认失败")
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] {place_name} 安全停止失败后{tool_label}工具下电失败")
+            return False
+        elif place_result != "success":
+            log.error(
+                f"[pick] 直线运动到 {place_name} 执行失败，"
+                "进入人工清错和实测位置直线退回"
+            )
+            if not self.recover_single_arm_linear_after_alarm(
+                side=tool_side,
+                group=arm_group,
+                link=link,
+                return_pose=yubei_return_pose,
+                joint_names=arm_joint_names,
+                plan_frame=arm_plan_frame,
+                speed_scale=speed,
+                avoid_collisions=False,
+                stage=f"抓取后放到 {place_name}",
+            ):
+                return False
+            alarm_recovered = True
+
+        if not alarm_recovered and not place_contact_recovered:
+            log.info(
+                f"[pick] {place_name} 关节: "
+                + ", ".join(
+                    f"{n}={v:.3f}"
+                    for n, v in zip(arm_joint_names, fang_joints)
+                )
+            )
+
+            self.wait_for_operator()
+
+            log.info(f"[pick] 7/9  {tool_label}工具下电，放置到 {place_name}")
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] {tool_label}工具下电失败")
+                return False
+            print(f"\033[32m{tool_label}下电成功\033[0m")
+            if self.sim_mode:
+                if slot_name is None:
+                    log.error(
+                        "[sim][SW] 当前放置配置没有对应的 SW 名称，"
+                        "无法模拟上料后的占用状态"
+                    )
+                    return False
+                if not self._update_simulated_place_slots(
+                    [slot_name],
+                    has_material=True,
+                    reason=f"{tool_label}完成上料",
+                ):
+                    return False
+
+            log.info(
+                f"[pick] 8/9  反向播放到 {place_name} 的轨迹原路返回 "
+                f"（{len(to_fang_traj.joint_trajectory.points)} 点）"
+            )
+            if not self._execute_traj(self._reverse_trajectory(to_fang_traj)):
+                log.error(
+                    "[pick] 8/9 原路返回失败，"
+                    "进入人工清错和实测位置直线退回"
+                )
+                if not self.recover_single_arm_linear_after_alarm(
+                    side=tool_side,
+                    group=arm_group,
+                    link=link,
+                    return_pose=yubei_return_pose,
+                    joint_names=arm_joint_names,
+                    plan_frame=arm_plan_frame,
+                    speed_scale=speed,
+                    avoid_collisions=False,
+                    stage=f"{place_name} 放置后返回",
+                ):
+                    return False
+
+        if not return_to_q1:
+            log.info("[pick] 放置直线返回 yubei 后跳过 Q1，直接进入识别位置运动")
+            return True
+
+        q1_count = len(arm_joint_names)
+        if arm_group == "left_arm":
+            q1_source = list(EXCHANGE_Q1[:6])
+            q1_joints = q1_source[:q1_count]
+            q1_slice_text = "前6"
+        elif arm_group == "right_arm":
+            q1_source = list(EXCHANGE_Q1[-6:])
+            q1_joints = q1_source[-q1_count:]
+            q1_slice_text = "后6"
+        else:
+            log.error(f"[pick] 9/9 group={arm_group} 不支持按 Q1 固定点返回")
+            return False
+        if len(q1_joints) != q1_count:
+            log.error(
+                f"[pick] 9/9 Q1 固定点长度错误：Q1={len(q1_joints)}, "
+                f"关节数={q1_count}"
+            )
+            return False
+
+        log.info(
+            f"[pick] 9/9  从当前位置运动到 Q1 固定点 "
+            f"（{q1_slice_text} 个数，使用 {q1_count} 个关节）"
+        )
+        if not self._execute_traj(plan.to_q1):
+            log.error("[pick] 9/9 执行缓存轨迹到 Q1 固定点失败")
+            return False
+        log.info(
+            "[pick] Q1 固定点返回完成: "
+            + ", ".join(f"{n}={v:.3f}" for n, v in zip(arm_joint_names, q1_joints))
+        )
+        if alarm_recovered:
+            # 去程中断时物体可能尚未真正进入 SW，不计作一次成功放置；下一轮
+            # 重新读取真实 SW 信号后继续抓取，避免软件擅自占用该槽位。
+            self.last_pick_failure_reason = "place_alarm_recovered"
+            log.warning(
+                f"[pick] {place_name} 去程报警已恢复并返回 Q1；"
+                "本次不计为成功放置，下一轮按最新 SW 信号继续抓取"
+            )
+            return False
+        if place_contact_recovered:
+            self.last_pick_failure_reason = "place_obstacle_recovered"
+            log.warning(
+                f"[pick] {place_name} 下降碰撞后已下电、直退并返回 Q1；"
+                "本次不计为成功放置，下一轮按最新 SW 信号继续抓取"
+            )
+            return False
+        return True
+
+    def _return_yubei_to_recognition_cached(
+        self,
+        recognition_state: Mapping[str, float],
+        *,
+        arm_group: str,
+        first_return_mode: int,
+        slot_name: str | None,
+        speed: float,
+    ) -> bool:
+        """规划/缓存并执行输入 4 的 yubei → 识别位置固定轨迹。"""
+        joint_names = list(recognition_state)
+        start = self._get_joints(joint_names, wait_new=True)
+        if start is None:
+            return False
+        yubei_name = "yubei_j" if first_return_mode == 1 else "yubei"
+        cache_key = (
+            f"input4_recognition_{arm_group}_{yubei_name}.{slot_name or 'default'}"
+        )
+        trajectory = None
+        cached = _load_trajectory_cache(cache_key, {"trajectory": RobotTrajectory})
+        if cached is not None:
+            metadata, messages = cached
+            if (
+                metadata.get("target_joints") == dict(recognition_state)
+                and metadata.get("speed") == speed
+                and _cached_joint_state_matches(metadata.get("start_joints"), start)
+            ):
+                trajectory = messages["trajectory"]
+                self.get_logger().info(f"[trajectory-cache] 命中 {cache_key}")
+        if trajectory is None:
+            self.get_logger().info(
+                f"[trajectory-cache] 未命中或已失效 {cache_key}，正常规划"
+            )
+            ok, _, trajectory = self.plan_joint_motion(
+                "dual_arm_body", recognition_state,
+                joint_names=joint_names, start_joints=start,
+                speed_scale=speed, num_attempts=30,
+                planning_time_sec=10.0, execute=False,
+            )
+            if not ok or trajectory is None:
+                return False
+            saved = _save_trajectory_cache(
+                cache_key,
+                {
+                    "start_joints": start,
+                    "target_joints": dict(recognition_state),
+                    "speed": speed,
+                },
+                {"trajectory": trajectory},
+            )
+            self.get_logger().info(
+                f"[trajectory-cache] {'已保存' if saved else '保存失败'} {cache_key}"
+            )
+        return self._execute_traj(trajectory)
+
+    def pick_and_return(
+        self,
+        target_pose: Pose,
+        speed_scale: float,
+        group: str,
+        link: str,
+        plan_frame: str,
+        joint_names: Sequence[str],
+        place_speed_scale: float = PLACE_SPEED_SCALE,
+        cutoff_joint_names: Sequence[str] | None = None,
+        first_return_mode: int = FIRST_RETURN_MODE,
+        scene_grasp_object_poses: Sequence[Pose] | None = None,
+        prevalidated_pair: tuple[
+            dict[str, float],
+            dict[str, float],
+            RobotTrajectory,
+            RobotTrajectory,
+        ] | None = None,
+        background_planner: G01Demo | None = None,
+        planner_pool: ThreadPoolExecutor | None = None,
+        recognition_state: Mapping[str, float] | None = None,
+        start_next_grasp_plan: Callable[[], None] | None = None,
+    ) -> bool:
+        """抓取流程（IK 多解 + approach 预检 + 放置 + 原路返回）。
+
+        参数：
+            target_pose       : 末端抓取位姿（geometry_msgs/Pose，在 plan_frame 下表达）
+            speed_scale       : 抓取段速度缩放（0~1）
+            group             : SRDF 规划组（如 left_body）
+            link              : 末端连杆名（如 L6）
+            plan_frame        : 位姿/IK/笛卡尔规划使用的坐标系（如 moveit_base_link、world）
+            joint_names       : group 内关节名顺序
+            place_speed_scale : 放置段的速度缩放（0~1）
+            cutoff_joint_names: 用于计算 PLAN_FRAME → SCENE_FRAME 的关节名；None 时使用 joint_names
+            first_return_mode : 1=使用 *_j 并交换；2=使用普通放置点；0 兼容旧普通模式
+            scene_grasp_object_poses: 抓取和放置阶段的碰撞圆柱；
+                步骤 4 始终只传选中物体
+            prevalidated_pair : 可达性验证已选出的 (q_pre, q_target,
+                to_pre_traj, approach_traj)；传入后不再重复执行 100 次
+                IK、OMPL 到 q_pre 规划和 Cartesian 直线预检。
+        """
+        log = self.get_logger()
+        self.last_pick_failure_reason = None
+        joint_names = list(joint_names)
+        cutoff_joint_names = list(cutoff_joint_names) if cutoff_joint_names is not None else joint_names
+        first_return_mode = int(first_return_mode)
+        if first_return_mode not in (0, 1, 2):
+            log.error(f"[pick] first_return_mode 只能是 0、1 或 2，当前={first_return_mode}")
+            return False
+
+        log.info(
+            f"[pick] group={group}, link={link}, plan_frame={plan_frame}"
+        )
+        # 抓取前先下电
+        tool_side = tool_side_for_link(link)
+        if tool_side is None:
+            log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断抓取工具侧")
+            return False
+        tool_label = "左臂" if tool_side == "left" else "右臂"
+
+        if first_return_mode == 1:
+            place_arm_group = "left_arm" if tool_side == "right" else "right_arm"
+        else:
+            arm_context = arm_context_for_group(group)
+            if arm_context is None:
+                log.error(f"[pick] group={group} 无法确定放置手臂")
+                return False
+            place_arm_group, _ = arm_context
+        place_joint_config = PLACE_JOINTS.get(place_arm_group)
+        if not isinstance(place_joint_config, dict):
+            log.error(f"[pick] PLACE_JOINTS 未配置 {place_arm_group}")
+            return False
+        if not self._wait_for_driver_signal():
+            self.last_pick_failure_reason = "no_place_signal"
+            return False
+        place_available, selected_place_slot = self._select_available_place_target(
+            place_arm_group, place_joint_config, first_return_mode
+        )
+        if not place_available:
+            signal_text = (
+                "unknown"
+                if self._driver_signal is None
+                else f"0x{self._driver_signal:02X}"
+            )
+            log.error(
+                f"[pick] 没有信号为“空”且已配置的放置位"
+                f"（driver_signal={signal_text}），取消本次抓取"
+            )
+            self.last_pick_failure_reason = "no_place"
+            return False
+        if selected_place_slot is not None:
+            log.info(
+                f"[pick] 抓取前确认放置位 {selected_place_slot.upper()} 为空，"
+                "本次抓取将使用该位置"
+            )
+
+        if not self.set_tool_power(tool_side, 0):
+            log.error(f"[pick] {tool_label}工具下电失败")
+            return False
+
+        pre_pose = pose_offset_local_z(target_pose, PRE_GRASP_OFFSET)
+        pp = pre_pose.position
+        tp = target_pose.position
+        log.info(
+            f"[pick] 抓取目标 @ {plan_frame} pos({tp.x:.3f}, {tp.y:.3f}, {tp.z:.3f}); "
+            f"预备点（沿末端 z 退 {PRE_GRASP_OFFSET:.3f} m）pos({pp.x:.3f}, {pp.y:.3f}, {pp.z:.3f})"
+        )
+
+        picked = prevalidated_pair
+        if picked is None:
+            log.info("[pick] 0/9  IK 多解枚举 + approach + OMPL 预检 …")
+            picked = self._select_feasible_grasp_pair(
+                group,
+                link,
+                target_pose,
+                pre_pose,
+                joint_names=joint_names,
+                speed_scale=speed_scale,
+                plan_frame=plan_frame,
+                cutoff_joint_names=cutoff_joint_names,
+                scene_grasp_object_poses=scene_grasp_object_poses,
+            )
+        else:
+            log.info(
+                "[pick] 0/9 复用可达性验证选出的 IK、"
+                "OMPL 到 q_pre 轨迹和 Cartesian 轨迹"
+            )
+        if picked is None:
+            log.error(
+                "[pick] 未找到「无碰撞 IK + Cartesian approach + "
+                "OMPL 到 q_pre」均可行的解"
+            )
+            self.last_pick_failure_reason = "no_ik"
+            return False
+        q_pre, q_target, to_pre_traj, approach_traj = picked
+        post_grasp_future: Future[PostGraspTrajectoryPlan | None] | None = None
+        post_grasp_start = dict(recognition_state) if recognition_state is not None else None
+        if post_grasp_start is None and background_planner is not None and planner_pool is not None:
+            post_grasp_start = self._get_joints(
+                list(cutoff_joint_names or joint_names), wait_new=True,
+            )
+            if post_grasp_start is not None:
+                post_grasp_start.update(q_pre)
+        if background_planner is not None and planner_pool is not None and post_grasp_start is not None:
+            post_grasp_future = planner_pool.submit(
+                background_planner._plan_post_grasp_trajectories,
+                recognition_state=post_grasp_start,
+                pick_group=group,
+                pick_link=link,
+                first_return_mode=first_return_mode,
+                selected_slot_name=selected_place_slot,
+                place_joint_config=place_joint_config,
+                speed=place_speed_scale,
+            )
+            log.info("[pipeline] 抓取运动开始前已提交当前物体交换/放置后台规划")
+        log.info(
+            "[pick] 选定 q_pre: "
+            + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
+        )
+
+        if not to_pre_traj.joint_trajectory.points:
+            log.error("[pick] 1/9 缓存的 OMPL 到 q_pre 轨迹为空")
+            return False
+        actual_start = self._get_joints(list(to_pre_traj.joint_trajectory.joint_names), wait_new=True)
+        first_point = to_pre_traj.joint_trajectory.points[0]
+        start_error = max(
+            (abs(actual_start[name] - value) for name, value in zip(
+                to_pre_traj.joint_trajectory.joint_names, first_point.positions
+            ) if actual_start is not None and name in actual_start),
+            default=float("inf") if actual_start is None else 0.0,
+        )
+        if start_error > 0.05:
+            log.warning(
+                f"[pipeline] 抓取缓存起点偏差 {start_error:.4f} > 0.05，"
+                "改用实测识别位置重新规划到 q_pre"
+            )
+            replanned = self._plan_q_pre_with_temporary_collisions(
+                group, link, target_pose, plan_frame, q_pre, joint_names,
+                cutoff_joint_names or joint_names, speed_scale,
+                scene_grasp_object_poses=scene_grasp_object_poses,
+            )
+            if replanned is None:
+                self.last_pick_failure_reason = "q_pre"
+                return False
+            to_pre_traj = replanned
+        log.info(
+            f"[pick] 1/9  执行已验证的 OMPL 轨迹 → q_pre "
+            f"（{len(to_pre_traj.joint_trajectory.points)} 点，免重规划）"
+        )
+        # 缓存的 OMPL 轨迹已在带隔板场景下通过预检，直接执行。
+        execute_started = time.monotonic()
+        ok = self._execute_traj(to_pre_traj)
+
+        used_ms = (time.monotonic() - execute_started) * 1000.0
+        log.info(f"[pick] 缓存轨迹 → q_pre: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
+        if not ok:
+            log.error("[pick] 执行已验证的 OMPL 到 q_pre 轨迹失败")
+            self.last_pick_failure_reason = "q_pre"
+            return False
+
+        time.sleep(2)
+        self.wait_for_operator(
+            f"[pick] 1/9  已到 q_pre，按回车给{tool_label}工具上电 …"
+        )
+        log.info(
+            f"[pick] 2/9  已到 q_pre，{tool_label}工具上电并读取吸附前 Fz 基准"
+        )
+        if not self.set_tool_power(tool_side, 1):
+            log.error(f"[pick] {tool_label}工具上电失败")
+            return False
+        print(f"\033[32m{tool_label}在 q_pre 上电成功\033[0m")
+
+        force_z_before = self.wait_for_ft_sensor_z(tool_side)
+        if force_z_before is None:
+            log.error(f"[pick] 无法读取{tool_label}吸附前 Fz，取消本次抓取")
+            self.last_pick_failure_reason = "force_sensor_timeout"
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 取消抓取时{tool_label}工具下电失败")
+                return False
+
+            reset_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
+            log.info(
+                f"[pick] {tool_label}力传感器可能离线；工具已下电，"
+                "dual_arm_body 开始复位到 MOVE_TO_GRASP_RESET_Q"
+            )
+            if not self.plan_execute_joint_waypoints(
+                "dual_arm_body",
+                0.2,
+                reset_joint_names,
+                [MOVE_TO_GRASP_RESET_Q],
+                num_attempts=30,
+                planning_time_sec=10.0,
+            ):
+                log.error(
+                    "[pick] 力传感器离线后复位到 "
+                    "MOVE_TO_GRASP_RESET_Q 失败"
+                )
+                return False
+            log.info(
+                "[pick] 力传感器离线后已复位到 MOVE_TO_GRASP_RESET_Q"
+            )
+            return False
+
+        log.info(
+            f"[pick] 3/9  执行已缓存的 approach 轨迹 → q_target "
+            f"（{len(approach_traj.joint_trajectory.points)} 点，免重规划）"
+        )
+
+        self.wait_for_operator()
+
+        approach_distance = _pose_distance(pre_pose, target_pose)
+        approach_result = self._execute_approach_with_force_guard(
+            approach_traj,
+            tool_side,
+            force_z_before,
+            approach_distance,
+        )
+        if approach_result == "contact":
+            log.warning(
+                "[pick] 直线接近中途接触障碍物；接近轨迹和 ServoJ 状态均已确认，"
+                f"先将{tool_label}工具下电，再从当前位置直线退回 q_pre"
+            )
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 障碍物接触后{tool_label}工具下电失败")
+                self.last_pick_failure_reason = "tool_power_off_failed"
+                return False
+            if not self._return_to_pre_after_approach_contact(
+                group,
+                link,
+                pre_pose,
+                joint_names,
+                plan_frame,
+                speed_scale,
+            ):
+                self.last_pick_failure_reason = "approach_obstacle_recovery_failed"
+                return False
+            self.last_pick_failure_reason = "approach_obstacle"
+            log.warning(
+                "[pick] 障碍物接触恢复完成；工具已下电，"
+                "开始下一次 Q1 复位、视觉识别和抓取"
+            )
+            return False
+
+        if approach_result == "safety_failed":
+            log.error(
+                "[pick] 障碍物接触后的停止/轨迹终止/恢复确认失败；"
+                "不执行自动退回，停止本批次"
+            )
+            self.last_pick_failure_reason = "approach_force_guard_failed"
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 安全停止失败后{tool_label}工具下电失败")
+            return False
+
+        if approach_result != "success":
+            log.error("[pick] 直线接近执行失败")
+            if not self.set_tool_power(tool_side, 0):
+                log.error(f"[pick] 直线接近失败后{tool_label}工具下电失败")
+            return False
+
+        self._log_actual_fk_error(
+            "[pick] 3/9",
+            link=link,
+            target_pose=target_pose,
+            plan_frame=plan_frame,
+            joint_names=joint_names,
+        )
+        self.wait_for_operator("[pick] 3/9  到达抓取位置，工具已上电，按回车继续 …")
+
+        log.info("[pick] 4/9  反向播放 approach，直线复位回 q_pre")
+        retreat_approach = self._reverse_trajectory(approach_traj)
+        if not self._execute_traj(retreat_approach):
+            log.error("[pick] 反向播放 approach 失败")
+            return False
+
+        if self.use_force_sensors:
+            force_z_after = self.wait_for_ft_sensor_z(tool_side)
+            if force_z_after is None:
+                log.error(
+                    f"[pick] 已回 q_pre，但无法读取{tool_label}吸附后 Fz；"
+                    "保持工具上电并停止本批次"
+                )
+                self.last_pick_failure_reason = "force_sensor_timeout"
+                return False
+
+            force_z_increase = force_z_after - force_z_before
+            log.info(
+                f"[pick] {tool_label}吸附检测："
+                f"q_pre 吸附前 Fz={force_z_before:.6f} N，"
+                f"吸附后 Fz={force_z_after:.6f} N，"
+                f"增加={force_z_increase:.6f} N，"
+                f"阈值>{GRASP_FORCE_Z_INCREASE_THRESHOLD:.6f} N"
+            )
+            suction_ok = (
+                self.sim_mode
+                or force_z_increase > GRASP_FORCE_Z_INCREASE_THRESHOLD
+            )
+            if not suction_ok:
+                log.warning(
+                    f"[pick] {tool_label}Fz 增加未超过 "
+                    f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定未吸附；"
+                    "工具下电并开始下一次复位、识别、抓取"
+                )
+                self.last_pick_failure_reason = "suction_failed"
+                if not self.set_tool_power(tool_side, 0):
+                    log.error(f"[pick] 未吸附后{tool_label}工具下电失败")
+                    self.last_pick_failure_reason = "tool_power_off_failed"
+                return False
+
+            log.info(
+                f"[pick] {tool_label}Fz 增加超过 "
+                f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定吸附成功，继续放置"
+            )
+        # 全部视觉候选 Marker 仅用于抓取前/抓取中观察；
+        # 吸附确认成功后立即删除，不等到后续放置流程结束。
+        self.remove_all_pose_markers()
+
+        self.wait_for_operator()
+
+        if recognition_state is not None:
+            recognition_names = list(recognition_state)
+            # 抓取后带料回识别位，速度降为放置速度的一半。
+            self.send_grasp_camera_position()
+            if not self.plan_execute_joint_waypoints(
+                "dual_arm_body", place_speed_scale * 0.5, recognition_names,
+                [recognition_state], num_attempts=30, planning_time_sec=10.0,
+            ):
+                log.error("[pipeline] 抓取成功后运动到识别位置失败")
+                return False
+            if not self.wait_for_camera_position(GRASP_VISION_CAMERA_POSITION):
+                self.last_pick_failure_reason = "camera_position_wait_failed"
+                return False
+        try:
+            post_grasp_plan = post_grasp_future.result() if post_grasp_future is not None else None
+        except Exception as exc:
+            report_runtime_exception(exc, "pick_and_return")
+            log.error(f"[pipeline] 当前物体交换/放置后台规划异常: {exc}")
+            post_grasp_plan = None
+        if post_grasp_future is not None and post_grasp_plan is None:
+            log.error("[pipeline] 当前物体交换/放置后台纯规划失败")
+            return False
+
+        scene_node = background_planner or self
+        if not scene_node.remove_frame_cutoff_only():
+            log.warning(
+                "[pipeline] 当前物体交换/放置轨迹规划完成后移除隔离板失败，继续流程"
+            )
+        else:
+            log.info("[pipeline] 当前物体交换/放置轨迹已规划完成，隔离板已移除")
+
+        if recognition_state is not None and start_next_grasp_plan is not None:
+            start_next_grasp_plan()
+
+        if first_return_mode == 1:
+            log.info(
+                "[pick] 第一段复位完成，已反向直线回到 q_pre: "
+                + ", ".join(f"{n}={q_pre[n]:.3f}" for n in joint_names)
+            )
+            
+            exchange_q3 = EXCHANGE_Q3.get(tool_side)
+            if exchange_q3 is None:
+                log.error(f"[pick] EXCHANGE_Q3 未配置 {tool_side}")
+                return False
+
+            if not self.dual_arm_exchange(
+                exchange_q3,
+                EXCHANGE_Q2,
+                source_link=link,
+                pick_group=group,
+                dual_speed=place_speed_scale,
+                cartesian_speed=speed_scale,
+                preplanned=post_grasp_plan.exchange if post_grasp_plan else None,
+            ):
+                return False
+
+            if not self._place_and_return(
+                place_speed_scale,
+                place_joint_config,
+                group=place_arm_group,
+                link="l_tool" if place_arm_group == "left_arm" else "r_tool",
+                first_return_mode=first_return_mode,
+                selected_slot_name=selected_place_slot,
+                preplanned=post_grasp_plan.place if post_grasp_plan else None,
+                return_to_q1=not (
+                    recognition_state is not None
+                    and start_next_grasp_plan is not None
+                ),
+            ):
+                return False
+
+        else:
+            if not self._place_and_return(
+                place_speed_scale,
+                place_joint_config,
+                group=group,
+                link=link,
+                first_return_mode=first_return_mode,
+                selected_slot_name=selected_place_slot,
+                preplanned=post_grasp_plan.place if post_grasp_plan else None,
+                return_to_q1=not (
+                    recognition_state is not None
+                    and start_next_grasp_plan is not None
+                ),
+            ):
+                return False
+
+        if recognition_state is not None and start_next_grasp_plan is not None:
+            if not self._return_yubei_to_recognition_cached(
+                recognition_state,
+                arm_group=place_arm_group,
+                first_return_mode=first_return_mode,
+                slot_name=selected_place_slot,
+                speed=place_speed_scale,
+            ):
+                log.error("[pipeline] 放置后返回识别位置失败")
+                return False
+
+        log.info("[pick] 抓取流程完成。")
+        return True
+
+    def _plan_exchange_trajectories(
+        self,
+        q2_by_side: dict[str, Sequence[float]],
+        *,
+        source_link: str,
+        pick_group: str,
+        dual_speed: float,
+        cartesian_speed: float,
+        z_down_distance: float | None,
+        start_joints: Mapping[str, float] | None = None,
+    ) -> ExchangeTrajectoryPlan | None:
+        """纯规划交换 Q2 和交接直线，不执行运动或工具命令。"""
+        # 统一减慢交换运动，覆盖后台预规划和现场重规划；退回复用反向直线轨迹。
+        dual_speed *= 0.5
+        cartesian_speed *= 0.5
+        arm_dual_joint_names = joint_names_for_group("dual_arm")
+        if pick_group in ("left_arm", "right_arm"):
+            exchange_group = "dual_arm"
+            exchange_joint_names = arm_dual_joint_names
+            q2_slice_text = "后12个"
+        elif pick_group in ("left_waist", "right_waist"):
+            exchange_group = "dual_arm_waist"
+            exchange_joint_names = ["body_joint2", *arm_dual_joint_names]
+            q2_slice_text = "后13个"
+        elif pick_group in ("left_body", "right_body"):
+            exchange_group = "dual_arm_body"
+            exchange_joint_names = ["body_joint1", "body_joint2", *arm_dual_joint_names]
+            q2_slice_text = "全部14个"
+        else:
+            self.get_logger().error(f"[exchange] 不支持 pick_group={pick_group}")
+            return None
+        source_side = tool_side_for_link(source_link)
+        if source_side is None or source_side not in q2_by_side:
+            self.get_logger().error(f"[exchange] 无法确定 {source_link} 的 Q2 配置")
+            return None
+        receiver_side = "left" if source_side == "right" else "right"
+        source_group = "right_arm" if source_side == "right" else "left_arm"
+        source_plan_frame = SCENE_FRAME
+        source_joint_names = joint_names_for_group(source_group)
+        q2_source = list(q2_by_side[source_side])
+        if len(q2_source) != 14:
+            self.get_logger().error(f"[exchange] EXCHANGE_Q2[{source_side!r}] 长度错误")
+            return None
+        q2 = q2_source[-len(exchange_joint_names):]
+        start = dict(start_joints) if start_joints is not None else self._get_joints(joint_names_for_group("dual_arm_body"))
+        if start is None:
+            return None
+        ok, _, to_q2 = self.plan_joint_motion(
+            exchange_group, q2, joint_names=exchange_joint_names,
+            start_joints=start, speed_scale=dual_speed,
+            num_attempts=50, planning_time_sec=20.0, execute=False,
+        )
+        if not ok or to_q2 is None:
+            return None
+        q2_state = dict(start)
+        q2_state.update(zip(exchange_joint_names, q2))
+        ee_pose = self._get_link_pose_fk(
+            source_link, q2_state, joint_names=source_joint_names,
+            plan_frame=source_plan_frame,
+        )
+        if ee_pose is None:
+            return None
+        distance = z_down_distance
+        if distance is None:
+            distance = -0.117 if source_side == "right" else -0.11
+        down = self.plan_cartesian_line(
+            source_group, source_link,
+            pose_offset_local_z(ee_pose, abs(distance)),
+            speed_scale=cartesian_speed, avoid_collisions=False,
+            start_joints=q2_state, joint_names=source_joint_names,
+            plan_frame=source_plan_frame,
+        )
+        if down is None or not down.joint_trajectory.points:
+            return None
+        return ExchangeTrajectoryPlan(
+            exchange_group, exchange_joint_names, q2_slice_text,
+            source_group, source_plan_frame, source_link, source_joint_names,
+            source_side, receiver_side, distance, to_q2, down,
+        )
+
+    def _execute_exchange_plan(self, plan: ExchangeTrajectoryPlan) -> bool:
+        """只执行已缓存的交换轨迹和工具交接，不调用规划服务。"""
+        log = self.get_logger()
+        source_label = "右臂" if plan.source_side == "right" else "左臂"
+        receiver_label = "左臂" if plan.receiver_side == "left" else "右臂"
+        if not self.set_tool_power(plan.receiver_side, 0):
+            return False
+        log.info(f"[exchange] 1/4 执行缓存轨迹 → Q2（{plan.q2_slice_text}）")
+        if not self._execute_traj(plan.to_q2):
+            return False
+        self.wait_for_operator(
+            "[exchange] 已到交换位置 Q2，按回车再直线下降 …"
+        )
+        log.info(
+            f"[exchange] 2/4 执行缓存直线：{plan.source_group} "
+            f"沿末端 -Z {plan.z_down_distance:.3f} m"
+        )
+        if not self._execute_traj(plan.down):
+            return False
+        if not self.set_tool_power(plan.source_side, 0):
+            return False
+        if not self.set_tool_power(plan.receiver_side, 1):
+            return False
+        print(f"\033[32m{source_label}下电、{receiver_label}上电成功\033[0m")
+        if not self._execute_traj(self._reverse_trajectory(plan.down)):
+            return False
+        log.info("[exchange] 双臂交换流程完成")
+        return True
+
+    def _plan_post_grasp_trajectories(
+        self,
+        *,
+        recognition_state: Mapping[str, float],
+        pick_group: str,
+        pick_link: str,
+        first_return_mode: int,
+        selected_slot_name: str | None,
+        place_joint_config: dict[str, object],
+        speed: float,
+    ) -> PostGraspTrajectoryPlan | None:
+        """从识别位置纯规划当前物体的交换/放置全部轨迹。"""
+        exchange = None
+        place_group = pick_group
+        place_link = pick_link
+        place_start = dict(recognition_state)
+        if first_return_mode == 1:
+            exchange = self._plan_exchange_trajectories(
+                EXCHANGE_Q2, source_link=pick_link, pick_group=pick_group,
+                dual_speed=speed, cartesian_speed=speed,
+                z_down_distance=None, start_joints=recognition_state,
+            )
+            if exchange is None:
+                return None
+            endpoint = exchange.to_q2.joint_trajectory.points[-1]
+            place_start.update(zip(exchange.exchange_joint_names, endpoint.positions))
+            place_group = "left_arm" if exchange.receiver_side == "left" else "right_arm"
+            place_link = "l_tool" if exchange.receiver_side == "left" else "r_tool"
+        arm_context = arm_context_for_group(place_group)
+        if arm_context is None:
+            return None
+        arm_group, arm_plan_frame = arm_context
+        body_group = "left_body" if arm_group == "left_arm" else "right_body"
+        arm_names = joint_names_for_group(arm_group)
+        body_names = joint_names_for_group(body_group)
+        suffix = "_j" if first_return_mode == 1 else ""
+        yubei_config = place_joint_config.get(f"yubei{suffix}")
+        fang_config = place_joint_config.get(f"fang{suffix}")
+        if isinstance(yubei_config, dict) and isinstance(fang_config, dict):
+            if selected_slot_name not in yubei_config or selected_slot_name not in fang_config:
+                return None
+            yubei_values = yubei_config[selected_slot_name]
+            fang_values = fang_config[selected_slot_name]
+        else:
+            yubei_values, fang_values = yubei_config, fang_config
+        if yubei_values is None or fang_values is None:
+            return None
+        slot = selected_slot_name if isinstance(fang_config, dict) else None
+        yubei_name = f"yubei{suffix}.{slot}" if slot else f"yubei{suffix}"
+        place_name = f"fang{suffix}.{slot}" if slot else f"fang{suffix}"
+        place = self._plan_place_trajectories(
+            arm_group=arm_group, arm_plan_frame=arm_plan_frame,
+            body_group=body_group, arm_joint_names=arm_names,
+            body_joint_names=body_names, slot_name=slot,
+            yubei_name=yubei_name, place_name=place_name,
+            start_joints=place_start, yubei_joints=list(yubei_values),
+            fang_joints=list(fang_values), link=place_link, speed=speed,
+        )
+        return None if place is None else PostGraspTrajectoryPlan(exchange, place)
+
+    def dual_arm_exchange(
+        self,
+        q1: Sequence[float],
+        q2_by_side: dict[str, Sequence[float]],
+        *,
+        source_link: str,
+        pick_group: str,
+        dual_speed: float = 0.2,
+        cartesian_speed: float = 0.2,
+        z_down_distance: float | None = None,
+        preplanned: ExchangeTrajectoryPlan | None = None,
+    ) -> bool:
+        """顺序调用交换纯规划和只执行阶段。"""
+        del q1  # 保留旧接口；当前交换流程未执行注释掉的 Q1 段。
+        plan = preplanned
+        if plan is not None:
+            current = self._get_joints(plan.exchange_joint_names, wait_new=True)
+            first = plan.to_q2.joint_trajectory.points[0]
+            start_error = max(
+                (abs(current[name] - value) for name, value in zip(
+                    plan.to_q2.joint_trajectory.joint_names, first.positions
+                ) if current is not None and name in current),
+                default=float("inf") if current is None else 0.0,
+            )
+            if start_error > 0.05:
+                self.get_logger().warning(
+                    f"[pipeline] 交换缓存起点偏差 {start_error:.4f} > 0.05，重新规划"
+                )
+                plan = None
+        plan = plan or self._plan_exchange_trajectories(
+            q2_by_side, source_link=source_link, pick_group=pick_group,
+            dual_speed=dual_speed, cartesian_speed=cartesian_speed,
+            z_down_distance=z_down_distance,
+        )
+        if plan is None:
+            self.get_logger().error("[exchange] 交换纯规划失败")
+            return False
+        return self._execute_exchange_plan(plan)
+
+
+# =============================================================================
+# 主流程
+# =============================================================================
+
+
+def split_runtime_args(
+    argv: list[str] | None = None,
+) -> tuple[bool, bool, bool, bool, list[str]]:
+    """解析本程序参数，并把剩余 ROS 参数交给 rclpy。
+
+    返回 ``(sim_mode, upper_control_mode, keyboard_control_mode, use_force_sensors, ros_args)``：
+
+    - ``--forces``：禁用全部力传感器逻辑。
+    - ``--sim``：跳过真机工具服务并使用仿真输入。
+    - ``--interactive``：保留运动流程内部的按回车确认点。
+    - ``--keyboard``：主循环使用数字菜单，不等待上位机话题命令。
+
+    ``--keyboard`` 和 ``--interactive`` 相互独立：前者选择高层流程，后者控制
+    流程内部是否逐步确认。
+    """
+    raw_args = list(sys.argv if argv is None else argv)
+    sim_mode = "--sim" in raw_args
+    upper_control_mode = "--interactive" not in raw_args
+    keyboard_control_mode = "--keyboard" in raw_args
+    use_force_sensors = "--forces" not in raw_args
+    program_args = {"--sim", "--interactive", "--keyboard", "--forces"}
+    ros_args = [
+        arg for arg in raw_args if arg not in program_args
+    ]
+    return sim_mode, upper_control_mode, keyboard_control_mode, use_force_sensors, ros_args
+
+
+def wait_for_keyboard_steps() -> tuple[int, ...] | None:
+    """读取单步或连续区间，例如 ``1``、``1-3``、``5-8``。"""
+    while rclpy.ok():
+        print("\n========== 键盘流程选择 ==========")
+        for number, description in STEP_DESCRIPTIONS.items():
+            print(f"  {number}. {description}")
+        print("  0. 退出程序")
+        try:
+            choice = input("请输入步骤或区间（如 1、1-3）: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n键盘输入结束，退出程序。")
+            return None
+
+        if choice in {"0", "q", "quit", "exit"}:
+            return None
+        match = re.fullmatch(r"(1[0-5]|[1-9])(?:\s*-\s*(1[0-5]|[1-9]))?", choice)
+        if match is None:
+            print(f"无效输入 {choice!r}，请输入 1~15 或正向区间（如 1-3）。")
+            continue
+
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start > end:
+            print("区间必须从小到大，例如 1-3。")
+            continue
+
+        steps = tuple(range(start, end + 1))
+        print(f"{GREEN}[keyboard] 将顺序执行步骤: {steps}{RESET}")
+        return steps
+
+
+def _run_main(
+    argv: list[str] | None,
+    publish_initialized: Callable[[bool, Sequence[int]], None],
+) -> int:
+    global _runtime_error_reporter
+    (
+        sim_mode,
+        upper_control_mode,
+        keyboard_control_mode,
+        use_force_sensors,
+        ros_args,
+    ) = split_runtime_args(argv)
+    node = G01Demo(
+        sim_mode=sim_mode,
+        use_force_sensors=use_force_sensors,
+        upper_control_mode=upper_control_mode,
+        upper_communication=not keyboard_control_mode,
+    )
+    _runtime_error_reporter = node.publish_error
+    node._defer_error_publish = True
+    planner_node = G01Demo(
+        sim_mode=sim_mode,
+        use_force_sensors=use_force_sensors,
+        upper_control_mode=True,
+        node_name="g01_background_planner",
+        upper_communication=False,
+    )
+    planner_node.publish_error = node.publish_error
+    planner_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grasp-plan")
+    log = node.get_logger()
+    if not use_force_sensors:
+        log.info("[forces] 已禁用力传感器：不读取力数据，不执行力自检、吸附检测和力保护")
+    if sim_mode:
+        log.info(
+            "[sim] 仿真模式：跳过工具电源服务，视觉使用固定 viewer pose，"
+            "SW1~SW4 默认为空；键盘步骤 4 重置为全空(0x78)，"
+            "步骤 7 重置为全满(0x00)"
+        )
+    if keyboard_control_mode:
+        log.info(
+            "[keyboard] 已启用键盘流程选择；主循环不等待上位机命令。"
+            "输入 1~15 执行单步，输入 1-3 等区间顺序执行，输入 0 退出"
+        )
+    code = 1
+    frame_added = False
+    pending_frame_recognition_pose: Pose | None = None
+    frame_recognition_agv_pose: Pose2D | None = None
+    unload_scene_added = False
+    unload_place_poses: dict[int, Pose] | None = None
+    # 两组 SW 各自轮换两个目标对；成功放置后才推进对应游标。
+    unload_cycle_indices = [0] * len(UNLOAD_PAIR_CYCLES)
+
+    def cleanup_grasp_display(remove_scene_objects: bool = True) -> None:
+        node.remove_all_pose_markers()
+        if remove_scene_objects and not node.remove_frame_cutoff():
+            log.warning(f"清理「{FRAME_CUTOFF_ID}」/「{GRASP_OBJECT_COLLISION_ID}」失败")
+
+    def prioritize_upright_grasp_points(
+        first_return_modes: Sequence[int],
+        all_xyz_rpy: Sequence[dict],
+        ungraspable_points: Sequence[Sequence[float]],
+    ) -> tuple[list[int], list[dict]]:
+        """只排序未缓存点：先按物体局部 +Z 的偏离角分组。
+
+        物体平放时局部 +Z 向下，与 moveit_base_link -Z 的偏离角
+        为 0°。偏离角小于 30° 的点优先，然后是大于等于
+        30° 的点；每组都按 moveit_base_link 中的 z 从高到低排序。
+        命中不可抓缓存的点不参与排序，按它们在本次视觉结果中的
+        原始相对顺序放到可抓候选之后。
+        """
+        if len(first_return_modes) != len(all_xyz_rpy):
+            log.error(
+                "[pick-order] first_return_modes 与视觉点数量不一致，"
+                "保留原始顺序"
+            )
+            return list(first_return_modes), list(all_xyz_rpy)
+
+        ranked_points = []
+        tilt_threshold_rad = math.radians(GRASP_UPRIGHT_TILT_THRESHOLD_DEG)
+        for original_index, (first_return_mode, xyz_rpy) in enumerate(
+            zip(first_return_modes, all_xyz_rpy)
+        ):
+            point_position = grasp_point_sj_position(xyz_rpy)
+            cached_match = (
+                find_ungraspable_point_match(point_position, ungraspable_points)
+                if point_position is not None
+                else None
+            )
+            pose_values = xyz_rpy.get("right_body")
+            if cached_match is not None:
+                # 类别 3 使缓存点放在可抓候选之后；第二排序键
+                # 使用原索引，仅保留视觉原顺序，不使用位置或高度排序。
+                ranked_points.append(
+                    (
+                        3,
+                        float(original_index),
+                        original_index,
+                        first_return_mode,
+                        xyz_rpy,
+                        None,
+                        None,
+                        None,
+                        cached_match,
+                    )
+                )
+                continue
+
+            if pose_values is None:
+                # 正常抓取视觉一定包含 right_body；异常点放到可抓候选之后，
+                # 仍保留给后续校验输出明确错误，不在这里静默丢弃。
+                ranked_points.append(
+                    (
+                        2,
+                        float(original_index),
+                        original_index,
+                        first_return_mode,
+                        xyz_rpy,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                )
+                continue
+
+            object_pose = xyz_rpy_to_pose(pose_values)
+            q = object_pose.orientation
+            axis_x, axis_y, axis_z = rotate_xyz_by_quat(
+                0.0,
+                0.0,
+                1.0,
+                q.x,
+                q.y,
+                q.z,
+                q.w,
+            )
+            axis_norm = math.sqrt(axis_x * axis_x + axis_y * axis_y + axis_z * axis_z)
+            if axis_norm <= 1e-12:
+                tilt_rad = math.pi
+            else:
+                # 与基坐标系 -Z 的单位向量 (0, 0, -1) 点积。
+                toward_base_minus_z = max(-1.0, min(1.0, -axis_z / axis_norm))
+                tilt_rad = math.acos(toward_base_minus_z)
+            base_z = float(object_pose.position.z)
+            # 给 30° 边界留极小数值容差，避免 acos/四元数舍入把恰好
+            # 30° 的姿态误分到“<30°”组。
+            posture_group = 0 if tilt_rad + 1e-12 < tilt_threshold_rad else 1
+            ranked_points.append(
+                (
+                    posture_group,
+                    -base_z,
+                    original_index,
+                    first_return_mode,
+                    xyz_rpy,
+                    (axis_x, axis_y, axis_z),
+                    tilt_rad,
+                    base_z,
+                    None,
+                )
+            )
+
+        ranked_points.sort(key=lambda item: item[:3])
+        sorted_modes: list[int] = []
+        sorted_xyz_rpy: list[dict] = []
+        cached_count = 0
+        for sorted_index, item in enumerate(ranked_points):
+            (
+                candidate_rank,
+                _height_sort_key,
+                original_index,
+                first_return_mode,
+                xyz_rpy,
+                local_plus_z_axis,
+                tilt_rad,
+                base_z,
+                cached_match,
+            ) = item
+            sorted_modes.append(first_return_mode)
+            sorted_xyz_rpy.append(xyz_rpy)
+            if cached_match is not None:
+                cached_count += 1
+                cache_index, distance = cached_match
+                log.info(
+                    f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index}, "
+                    f"命中不可抓点 #{cache_index + 1}, "
+                    f"距离={distance * 1000.0:.1f} mm，不参与姿态排序"
+                )
+                continue
+            if candidate_rank not in (0, 1) or local_plus_z_axis is None:
+                log.warning(
+                    f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index} "
+                    "缺少 right_body，已排在可抓候选之后"
+                )
+                continue
+            assert tilt_rad is not None and base_z is not None
+            axis_x, axis_y, axis_z = local_plus_z_axis
+            posture_label = (
+                f"<{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}°"
+                if candidate_rank == 0
+                else f"≥{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}°"
+            )
+            log.info(
+                f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index}, "
+                f"局部 +Z=({axis_x:.4f}, {axis_y:.4f}, {axis_z:.4f}), "
+                f"偏离基坐标 -Z={math.degrees(tilt_rad):.2f}° "
+                f"(姿态组 {posture_label}), 基坐标 z={base_z:.4f} m"
+            )
+
+        log.info(
+            "[pick-order] 排序完成：未缓存点先按物体局部 +Z "
+            f"偏离 moveit_base_link -Z <{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}°/"
+            f"≥{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}° 分组，每组再按 "
+            "moveit_base_link z 从高到低；"
+            f"{cached_count} 个缓存不可抓点未参与姿态排序并放在末尾"
+        )
+        return sorted_modes, sorted_xyz_rpy
+
+    def show_all_grasp_vision_markers(
+        all_xyz_rpy: Sequence[dict],
+        ungraspable_points: Sequence[Sequence[float]],
+    ) -> None:
+        """在 IK 验证前显示全部视觉抓取圆柱及各自 +Z 方向。
+
+        每个物体只用 right_body 在 moveit_base_link 下的公共表达显示
+        一次；这些 Marker 不进入 PlanningScene，不参与碰撞检测。
+        """
+        node.remove_all_pose_markers()
+        shown_count = 0
+        cached_count = 0
+        for point_index, xyz_rpy in enumerate(all_xyz_rpy):
+            pose_values = xyz_rpy.get("right_body")
+            if pose_values is None:
+                log.warning(
+                    f"[pick-display] 物体 {point_index} 缺少 right_body 位姿，"
+                    "跳过显示"
+                )
+                continue
+
+            marker_pose = xyz_rpy_to_pose(pose_values)
+            point_position = grasp_point_sj_position(xyz_rpy)
+            cached_match = (
+                find_ungraspable_point_match(point_position, ungraspable_points)
+                if point_position is not None
+                else None
+            )
+            if cached_match is not None:
+                cylinder_color = UNGRASPABLE_CYLINDER_COLOR
+                z_axis_color = UNGRASPABLE_Z_AXIS_COLOR
+                color_label = "black"
+                cached_count += 1
+            else:
+                color_index = point_index % len(GRASP_VISION_CYLINDER_COLORS)
+                cylinder_color = GRASP_VISION_CYLINDER_COLORS[color_index]
+                z_axis_color = GRASP_VISION_Z_AXIS_COLORS[color_index]
+                color_label = str(color_index)
+            cylinder_id = f"{GRASP_VISION_CYLINDER_MARKER_ID_PREFIX}{point_index}"
+            z_axis_id = f"{GRASP_VISION_Z_AXIS_MARKER_ID_PREFIX}{point_index}"
+            node.show_cylinder_at_pose(
+                marker_pose,
+                object_id=cylinder_id,
+                frame_id=SCENE_FRAME,
+                color=cylinder_color,
+            )
+            node.show_z_axis_at_pose(
+                marker_pose,
+                object_id=z_axis_id,
+                frame_id=SCENE_FRAME,
+                color=z_axis_color,
+            )
+            log.info(
+                f"[pick-display] 视觉物体 {point_index}: "
+                f"color={color_label}，圆柱/+Z 已发布"
+            )
+            shown_count += 1
+
+        log.info(
+            f"[pick-display] IK 验证前已显示 {shown_count}/{len(all_xyz_rpy)} "
+            "个视觉物体的圆柱和 +Z 方向；"
+            "可抓候选交替使用橙/蓝色，"
+            f"缓存不可抓点={cached_count} 个（黑色）"
+        )
+
+    def prompt_exit(message: str) -> bool:
+        if node.upper_control_mode:
+            return False
+        log.info(message)
+        try:
+            return input().strip().lower() == "q"
+        except EOFError:
+            return False
+
+    table_pick_descent: RobotTrajectory | None = None
+    table_pick_top: Pose | None = None
+
+    def read_dual_grasp_fz(stage: str) -> dict[str, float] | None:
+        values = {side: node.wait_for_ft_sensor_z(side) for side in ("left", "right")}
+        if any(value is None or not math.isfinite(value) for value in values.values()):
+            log.error(f"[{stage}] 双臂 Fz 读取失败，停止抓取流程")
+            return None
+        return values
+
+    def check_dual_suction(before: Mapping[str, float], stage: str) -> bool | None:
+        if not node.use_force_sensors:
+            return True
+        after = read_dual_grasp_fz(stage)
+        if after is None:
+            return None
+        increases = {side: after[side] - before[side] for side in before}
+        log.info(
+            f"[{stage}] 吸附检测：左臂 ΔFz={increases['left']:.3f} N，"
+            f"右臂 ΔFz={increases['right']:.3f} N；两侧均须 > "
+            f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N"
+        )
+        return node.sim_mode or all(
+            value > GRASP_FORCE_Z_INCREASE_THRESHOLD for value in increases.values()
+        )
+
+    def run_table_pick_place(*, place: bool) -> bool:
+        while rclpy.ok():
+            result = attempt_table_pick_place(place=place)
+            if result is not None:
+                return result
+            log.warning("[table] 双臂未全部吸附成功，重新识别并抓取料台")
+        return False
+
+    def attempt_table_pick_place(*, place: bool) -> bool | None:
+        """步骤 10 抓起料台；步骤 11 使用本次抓取轨迹原位放回。"""
+        nonlocal table_pick_descent, table_pick_top
+        reset_names = joint_names_for_group("dual_arm_body")
+        if place:
+            if table_pick_descent is None or table_pick_top is None:
+                log.error("[table] 没有输入 10 保存的抓取轨迹，不能执行输入 11")
+                return False
+            current = node._get_joints(TABLE_PICK_DUAL_JOINTS, wait_new=True)
+            first = table_pick_descent.joint_trajectory.points[0]
+            expected = dict(zip(table_pick_descent.joint_trajectory.joint_names, first.positions))
+            if current is None or not _cached_joint_state_matches(expected, current):
+                log.error("[table] 当前双臂不在保存的预抓位置，停止放回")
+                return False
+            log.info("[table] 双臂同步下降到原抓取位置")
+            if not node._execute_traj(table_pick_descent):
+                return False
+            if not set_unload_tool_power(0, "料台放回"):
+                return False
+            if not node._execute_traj(node._reverse_trajectory(table_pick_descent)):
+                return False
+            if not node._apply_scene(
+                [table_pick_make_table_collision(table_pick_top)],
+                [ObjectColor(id=TABLE_PICK_TABLE_ID, color=TABLE_PICK_TABLE_COLOR)],
+            ):
+                return False
+            table_pick_descent = None
+            table_pick_top = None
+            log.info("[table] 料台已放回，双臂复位到识别构型")
+            return node.plan_execute_joint_waypoints(
+                "dual_arm_body", TABLE_PICK_JOINT_PLAN_SPEED, reset_names,
+                [UNLOAD_TABLE_VISION_PREP_Q],
+            )
+
+        if table_pick_descent is not None:
+            log.error("[table] 已有未放回的料台抓取记录，请先执行输入 11")
+            return False
+        if not node.plan_execute_joint_waypoints(
+            "dual_arm_body", TABLE_PICK_JOINT_PLAN_SPEED, reset_names,
+            [UNLOAD_TABLE_VISION_PREP_Q],
+        ):
+            return False
+        recognition = table_pick_acquire_recognition_pose(node, sim_mode)
+        if recognition is None:
+            return False
+        top = table_pick_pose_rotate_local_y(
+            table_pick_pose_rotate_local_z(
+                pose_offset_local(recognition, 0.0, 0.0, TABLE_PICK_RECOGNITION_TO_TABLE_TOP_LOCAL_Z),
+                TABLE_PICK_TABLE_LOCAL_Z_ROTATION,
+            ), TABLE_PICK_TABLE_LOCAL_Y_ROTATION,
+        )
+        if not node._apply_scene(
+            [table_pick_make_table_collision(top)],
+            [ObjectColor(id=TABLE_PICK_TABLE_ID, color=TABLE_PICK_TABLE_COLOR)],
+        ):
+            return False
+        if not hasattr(node, "_table_marker_pub"):
+            node._table_tf_broadcaster = StaticTransformBroadcaster(node)
+            node._table_marker_pub = node.create_publisher(
+                MarkerArray, TABLE_PICK_TABLE_MARKER_TOPIC,
+                QoSProfile(
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
+        table_pick_show_table_markers(
+            node, top,
+            table_pick_make_grasp_pose(top, *TABLE_PICK_LEFT_GRASP_LOCAL_XYZ),
+            table_pick_make_grasp_pose(top, *TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ),
+            table_pick_make_grasp_pose(top, *TABLE_PICK_LEFT_GRASP_LOCAL_XYZ[:2], TABLE_PICK_PRE_GRASP_LOCAL_Z),
+            table_pick_make_grasp_pose(top, *TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ[:2], TABLE_PICK_PRE_GRASP_LOCAL_Z),
+        )
+        planned = move_unload_pair_to_place(
+            {
+                1: table_pick_make_grasp_pose(top, *TABLE_PICK_LEFT_GRASP_LOCAL_XYZ[:2], TABLE_PICK_PRE_GRASP_LOCAL_Z),
+                2: table_pick_make_grasp_pose(top, *TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ[:2], TABLE_PICK_PRE_GRASP_LOCAL_Z),
+            },
+            1, 2, plan_only=True, table_pregrasp_only=True,
+        )
+        if not isinstance(planned, UnloadPlaceTrajectoryPlan) or not node._execute_traj(planned.to_place):
+            return False
+        if not set_unload_tool_power(0, "料台抓取前"):
+            return False
+        # 接触料台时临时移除桌体；仍检查其他障碍物与双臂自碰撞。
+        if not node._apply_scene([CollisionObject(id=TABLE_PICK_TABLE_ID, operation=CollisionObject.REMOVE)]):
+            return False
+        start = node._get_joints(TABLE_PICK_DUAL_JOINTS, wait_new=True)
+        if start is None:
+            return False
+        trajectories = []
+        for group, link, names, offset in (
+            (TABLE_PICK_LEFT_GROUP, TABLE_PICK_LEFT_LINK, TABLE_PICK_LEFT_JOINTS, TABLE_PICK_LEFT_GRASP_LOCAL_XYZ),
+            (TABLE_PICK_RIGHT_GROUP, TABLE_PICK_RIGHT_LINK, TABLE_PICK_RIGHT_JOINTS, TABLE_PICK_RIGHT_GRASP_LOCAL_XYZ),
+        ):
+            trajectory = node.plan_cartesian_line(
+                group, link, table_pick_make_grasp_pose(top, *offset),
+                speed_scale=TABLE_PICK_CARTESIAN_SPEED,
+                avoid_collisions=TABLE_PICK_CARTESIAN_AVOID_COLLISIONS,
+                eef_step=TABLE_PICK_CARTESIAN_EEF_STEP, start_joints=start,
+                joint_names=names, plan_frame=TABLE_PICK_PLAN_FRAME,
+            )
+            if trajectory is None:
+                return False
+            trajectories.append(trajectory)
+        try:
+            descent = table_pick_merge_synchronized_trajectories(*trajectories)
+        except ValueError as exc:
+            log.error(f"[table] 双臂直线合并失败: {exc}")
+            return False
+        if not table_pick_validate_dual_trajectory(node, descent):
+            return False
+        force_before = read_dual_grasp_fz("table")
+        if force_before is None:
+            return False
+        if not node._execute_traj(descent):
+            return False
+        table_pick_descent, table_pick_top = descent, top
+        if not set_unload_tool_power(1, "料台抓取"):
+            return False
+        time.sleep(TABLE_PICK_TOOL_POWER_SETTLE_SEC)
+        if not node._execute_traj(node._reverse_trajectory(descent)):
+            return False
+        suction_ok = check_dual_suction(force_before, "table")
+        if suction_ok is None:
+            return False
+        if not suction_ok:
+            if not set_unload_tool_power(0, "料台吸附失败，已直线退回"):
+                return False
+            table_pick_descent = table_pick_top = None
+            if not node._apply_scene(
+                [table_pick_make_table_collision(top)],
+                [ObjectColor(id=TABLE_PICK_TABLE_ID, color=TABLE_PICK_TABLE_COLOR)],
+            ):
+                return False
+            return None
+        log.info("[table] 双臂已抓起料台并直线返回预抓点，可输入 11 原位放回")
+        return True
+
+    def recognize_and_record_deep_frame(*, add_directly: bool = False) -> bool:
+        """识别深框：记录 AGV 位姿待转换，或直接在当前位置添加模型。"""
+        nonlocal frame_added, pending_frame_recognition_pose, frame_recognition_agv_pose
+        # 一旦开始新识别，旧的待转换数据不再允许被步骤 3 误用。
+        pending_frame_recognition_pose = None
+        frame_recognition_agv_pose = None
+        q1_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
+        vision_q = FRAME_DIRECT_VISION_Q if add_directly else 框_Q1
+        vision_q_name = "FRAME_DIRECT_VISION_Q" if add_directly else "框_Q1"
+        vision_group = "dual_arm_body"
+        if add_directly:
+            node._camera_position_pub.publish(
+                Float32(data=FRAME_DIRECT_CAMERA_POSITION)
+            )
+            log.info(
+                f"[frame-vision] 已发送头部目标 {FRAME_DIRECT_CAMERA_POSITION:.4f} rad"
+            )
+            vision_group = "waist"
+            vision_q = [vision_q[q1_joint_names.index("body_joint2")]]
+            q1_joint_names = ["body_joint2"]
+        log.info(
+            f"[frame-vision] {FRAME_VISION_TRIGGER_COMMAND} 识别前，"
+            f"{vision_group} 先关节空间运动到 {vision_q_name}"
+        )
+        if not node.plan_execute_joint_waypoints(
+            vision_group,
+            0.2,
+            q1_joint_names,
+            [vision_q],
+        ):
+            log.error(
+                f"[frame-vision] 运动到 {vision_q_name} 失败，不发送 "
+                f"{FRAME_VISION_TRIGGER_COMMAND}"
+            )
+            return False
+
+        if add_directly and not node.wait_for_camera_position(FRAME_DIRECT_CAMERA_POSITION):
+            return False
+
+        vision_result = read_scene_vision_object_pose_with_retry(
+            node,
+            log,
+            sim_mode=sim_mode,
+            trigger_command=FRAME_VISION_TRIGGER_COMMAND,
+            required_pose_key=FRAME_VISION_POSE_KEY,
+            scene_label="frame-vision",
+        )
+        if vision_result is None:
+            return False
+
+        _, all_xyz_rpy = vision_result
+
+        recognition_pose = make_pose(*all_xyz_rpy[0][FRAME_VISION_POSE_KEY])
+        recognition_values = pose_to_xyz_rpy(recognition_pose)
+        print(
+            f"{GREEN}[frame-vision] 深框识别点 @ {SCENE_FRAME}: "
+            f"xyz=({recognition_values[0]:.6f}, {recognition_values[1]:.6f}, "
+            f"{recognition_values[2]:.6f}) m, "
+            f"rpy=({recognition_values[3]:.6f}, {recognition_values[4]:.6f}, "
+            f"{recognition_values[5]:.6f}) rad{RESET}"
+        )
+        recognition_agv_pose = None
+        if not add_directly:
+            recognition_agv_pose = node.wait_for_agv_position_snapshot("深框识别位置")
+            if recognition_agv_pose is None:
+                return False
+
+        frame_top_pose, frame_pose = deep_frame_poses_from_recognition(
+            recognition_pose
+        )
+        box_top_pose = box_obstacle_top_pose_from_frame_top(frame_top_pose)
+        neg_y_obstacle_top_pose = (
+            frame_neg_y_obstacle_top_pose_from_frame_top(frame_top_pose)
+        )
+        box_center_pose = pose_offset_local(
+            box_top_pose,
+            0.0,
+            0.0,
+            -BOX_OBSTACLE_SIZE[2] / 2.0,
+        )
+        neg_y_obstacle_center_pose = pose_offset_local(
+            neg_y_obstacle_top_pose,
+            0.0,
+            0.0,
+            -FRAME_NEG_Y_OBSTACLE_SIZE[2] / 2.0,
+        )
+        recognition_rpy = pose_to_xyz_rpy(recognition_pose)[3:]
+        frame_top_rpy = pose_to_xyz_rpy(frame_top_pose)[3:]
+        frame_rpy = pose_to_xyz_rpy(frame_pose)[3:]
+        log.info(
+            f"[frame-vision] {FRAME_VISION_TRIGGER_COMMAND} 识别点 "
+            f"@ {SCENE_FRAME}: "
+            f"pos=({recognition_pose.position.x:.4f}, "
+            f"{recognition_pose.position.y:.4f}, "
+            f"{recognition_pose.position.z:.4f}), "
+            f"rpy=({recognition_rpy[0]:.4f}, "
+            f"{recognition_rpy[1]:.4f}, {recognition_rpy[2]:.4f})"
+        )
+        log.info(
+            f"[frame-vision] 识别点先绕自身 Z +90°，再按 local offset="
+            f"{FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL} m 得到深框顶部空心中心: "
+            f"pos=({frame_top_pose.position.x:.4f}, "
+            f"{frame_top_pose.position.y:.4f}, "
+            f"{frame_top_pose.position.z:.4f}), "
+            f"rpy=({frame_top_rpy[0]:.4f}, "
+            f"{frame_top_rpy[1]:.4f}, {frame_top_rpy[2]:.4f})"
+        )
+        log.info(
+            f"[frame-vision] 深框实体中心（顶部中心沿自身 -Z "
+            f"{FRAME_SIZE[2] / 2.0:.4f} m）: "
+            f"pos=({frame_pose.position.x:.4f}, "
+            f"{frame_pose.position.y:.4f}, "
+            f"{frame_pose.position.z:.4f}), "
+            f"rpy=({frame_rpy[0]:.4f}, "
+            f"{frame_rpy[1]:.4f}, {frame_rpy[2]:.4f})"
+        )
+        log.info(
+            f"[frame-vision] 长方体上表面中心（相对深框顶部 local offset="
+            f"{BOX_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL} m）: "
+            f"pos=({box_top_pose.position.x:.4f}, "
+            f"{box_top_pose.position.y:.4f}, "
+            f"{box_top_pose.position.z:.4f}); "
+            f"碰撞体中心=({box_center_pose.position.x:.4f}, "
+            f"{box_center_pose.position.y:.4f}, "
+            f"{box_center_pose.position.z:.4f})"
+        )
+        log.info(
+            f"[frame-vision] -Y 障碍物上表面中心（相对深框顶部 local offset="
+            f"{FRAME_NEG_Y_OBSTACLE_TOP_FROM_FRAME_TOP_LOCAL} m）: "
+            f"pos=({neg_y_obstacle_top_pose.position.x:.4f}, "
+            f"{neg_y_obstacle_top_pose.position.y:.4f}, "
+            f"{neg_y_obstacle_top_pose.position.z:.4f}); "
+            f"碰撞体中心=({neg_y_obstacle_center_pose.position.x:.4f}, "
+            f"{neg_y_obstacle_center_pose.position.y:.4f}, "
+            f"{neg_y_obstacle_center_pose.position.z:.4f})"
+        )
+
+        if add_directly:
+            node.configure_deep_frame_from_recognition(recognition_pose)
+            planner_node.configure_deep_frame_from_recognition(recognition_pose)
+            node.publish_deep_frame_vision_tf(
+                recognition_pose, frame_top_pose, frame_pose, box_top_pose,
+            )
+            if not node.add_frame():
+                log.error("[frame-vision] 当前位置添加深框碰撞模型失败")
+                return False
+            frame_added = True
+            log.info("[frame-vision] 已在当前位置直接识别并添加深框碰撞模型")
+            return True
+
+        if frame_added:
+            log.info(f"[frame-vision] 移除旧碰撞体「{FRAME_ID}」，等待到抓取点重建 …")
+            if node.remove_frame():
+                frame_added = False
+            else:
+                log.warning(
+                    "[frame-vision] 移除旧深框场景失败，"
+                    "忽略该清理失败并继续保存识别结果"
+                )
+
+        pending_frame_recognition_pose = copy.deepcopy(recognition_pose)
+        frame_recognition_agv_pose = recognition_agv_pose
+        log.info(
+            f"[frame-vision] 已保存 {FRAME_VISION_TRIGGER_COMMAND} 识别位姿和"
+            f"识别工位 {AGV_POSITION_TOPIC} 实际位姿；"
+            "速度控制前进并停车后再转换并添加深框"
+        )
+        return True
+
+    def drive_to_grasp_and_add_deep_frame() -> bool:
+        """速度控制前进并停车，用两次 AGV 实际位姿换算深框后添加场景。"""
+        nonlocal frame_added, pending_frame_recognition_pose, frame_recognition_agv_pose
+        if pending_frame_recognition_pose is None or frame_recognition_agv_pose is None:
+            log.error(
+                "[frame-agv-position] 没有可用的深框识别位姿/识别工位 AGV 位姿记录，"
+                "请先成功执行步骤 2"
+            )
+            return False
+
+        if not node.drive_agv(AGV_GRASP_SPEED_X):
+            return False
+
+        grasp_agv_pose = node.wait_for_agv_position_snapshot("深框抓取位置")
+        if grasp_agv_pose is None:
+            return False
+
+        try:
+            grasp_recognition_pose = transform_pose_between_robot_positions(
+                pending_frame_recognition_pose,
+                frame_recognition_agv_pose,
+                grasp_agv_pose,
+            )
+        except ValueError as exc:
+            log.error(f"[frame-agv-position] 深框位姿转换失败: {exc}")
+            return False
+
+        frame_top_pose, frame_pose = deep_frame_poses_from_recognition(
+            grasp_recognition_pose
+        )
+        box_top_pose = box_obstacle_top_pose_from_frame_top(frame_top_pose)
+        source_values = pose_to_xyz_rpy(pending_frame_recognition_pose)
+        target_values = pose_to_xyz_rpy(grasp_recognition_pose)
+        log.info(
+            f"[frame-agv-position] 深框识别基准已从识别工位转到抓取工位 "
+            f"{SCENE_FRAME}: pos "
+            f"({source_values[0]:.4f}, {source_values[1]:.4f}, {source_values[2]:.4f}) "
+            f"-> ({target_values[0]:.4f}, {target_values[1]:.4f}, {target_values[2]:.4f}), "
+            f"rpy ({source_values[3]:.4f}, {source_values[4]:.4f}, {source_values[5]:.4f}) "
+            f"-> ({target_values[3]:.4f}, {target_values[4]:.4f}, {target_values[5]:.4f})"
+        )
+
+        node.configure_deep_frame_from_recognition(grasp_recognition_pose)
+        planner_node.configure_deep_frame_from_recognition(grasp_recognition_pose)
+        node.publish_deep_frame_vision_tf(
+            grasp_recognition_pose,
+            frame_top_pose,
+            frame_pose,
+            box_top_pose,
+        )
+        log.info(f"[frame-vision] 在抓取工位添加转换后的「{FRAME_ID}」 …")
+        if not node.add_frame():
+            log.error("[frame-vision] 添加转换后的深框场景失败")
+            return False
+
+        frame_added = True
+        pending_frame_recognition_pose = None
+        frame_recognition_agv_pose = None
+        return True
+
+    next_grasp_cache: dict[str, object] = {"future": None}
+
+    def run_one_grasp(
+        ungraspable_points: list[tuple[float, float, float]],
+    ) -> bool | None:
+        """执行一轮抓取；全点不可抓时按 20/30/40/50° 重新识别。"""
+        node.last_pick_failure_reason = None
+        # 在机器人运动和视觉识别之前先确认放置区，避免无空位时仍触发识别。
+        if not node._wait_for_driver_signal(require_new=True):
+            node.last_pick_failure_reason = "no_place_signal"
+            return False
+        empty_place_slots = [
+            slot_name.upper()
+            for slot_name in PLACE_SLOT_MASKS
+            if node._place_slot_is_empty(slot_name)
+        ]
+        empty_slots_text = ", ".join(empty_place_slots) if empty_place_slots else "无"
+        print(f"{GREEN}[pick] 当前空位: {empty_slots_text}{RESET}")
+        if not empty_place_slots:
+            node.last_pick_failure_reason = "no_place"
+            log.info("[pick] SW1~SW4 均无空位，结束连续抓取，不执行视觉识别")
+            return False
+        pipeline_enabled = len(empty_place_slots) > 1
+
+        # --- 2. 腰部多角度 Q1 + 视觉 + 可达性验证 ---
+        targets = JOINT_TARGETS["dual_arm_body"]
+        joint_names = list(targets.keys())
+        reachable = None
+        selected_waist_deg: int | None = None
+        first_return_modes: list[int] = []
+        all_xyz_rpy: list[dict] = []
+        q1_for_waist = list(GRASP_Q1)
+
+        cached_future = next_grasp_cache.pop("future", None)
+        if isinstance(cached_future, Future):
+            log.info("[pipeline] 已回到识别位置，等待下一物体后台解算结果")
+            try:
+                cached_result = cached_future.result()
+            except Exception as exc:
+                report_runtime_exception(exc, "run_one_grasp")
+                log.error(f"[pipeline] 下一物体后台解算异常: {exc}")
+                cached_result = None
+            if cached_result is not None:
+                reachable = cached_result["reachable"]
+                first_return_modes = cached_result["modes"]
+                all_xyz_rpy = cached_result["poses"]
+                selected_waist_deg = cached_result["waist_deg"]
+                q1_for_waist[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(selected_waist_deg)
+                log.info("[pipeline] 下一物体后台解算有解，直接使用缓存抓取轨迹")
+
+        for waist_attempt, waist_deg in enumerate(GRASP_VISION_WAIST_ANGLES_DEG):
+            if reachable is not None:
+                break
+            q1_for_waist = list(GRASP_Q1)
+            q1_for_waist[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(waist_deg)
+            log.info(
+                f"[pick-waist] 第 {waist_attempt + 1}/"
+                f"{len(GRASP_VISION_WAIST_ANGLES_DEG)} 个角度："
+                f"腰部 body_joint2 → {waist_deg}°，然后重新视觉和验证"
+            )
+            node.send_grasp_camera_position()
+            if not node.plan_execute_joint_waypoints(
+                "dual_arm_body",
+                0.2,
+                joint_names,
+                [q1_for_waist],
+            ):
+                node.last_pick_failure_reason = "waist_retry_motion_failed"
+                log.error(f"[pick-waist] 运动到 {waist_deg}° 识别构型失败")
+                return False
+
+            if not node.wait_for_camera_position(GRASP_VISION_CAMERA_POSITION):
+                node.last_pick_failure_reason = "camera_position_wait_failed"
+                return False
+            time.sleep(1)
+            vision_pose = read_vision_object_pose(
+                node,
+                log,
+                sim_mode=sim_mode,
+                sort_by_sj_z=False,
+            )
+            if vision_pose is None:
+                node.last_pick_failure_reason = "vision_failed"
+                return False
+            first_return_modes, all_xyz_rpy = vision_pose
+
+            # 失败点在全部腰角间共享：20° 不可抓的点在
+            # 30/40/50° 重新识别到时显示为黑色并直接跳过 IK。
+            first_return_modes, all_xyz_rpy = prioritize_upright_grasp_points(
+                first_return_modes,
+                all_xyz_rpy,
+                ungraspable_points,
+            )
+            if not all_xyz_rpy:
+                node.last_pick_failure_reason = "vision_no_objects"
+                log.error("[pick-collision] 视觉没有返回物体")
+                return False
+
+            show_all_grasp_vision_markers(
+                all_xyz_rpy,
+                ungraspable_points,
+            )
+            reachable = validate_reachable_grasp(
+                node,
+                all_xyz_rpy,
+                speed_scale=0.4,
+                cutoff_joint_names=joint_names,
+                ungraspable_points=ungraspable_points,
+            )
+            if reachable is not None:
+                selected_waist_deg = waist_deg
+                log.info(f"[pick-waist] {waist_deg}° 找到可抓点，停止切换腰角")
+                break
+
+            cleanup_grasp_display()
+            if waist_attempt + 1 < len(GRASP_VISION_WAIST_ANGLES_DEG):
+                next_waist_deg = GRASP_VISION_WAIST_ANGLES_DEG[waist_attempt + 1]
+                log.warning(
+                    f"[pick-waist] {waist_deg}° 下所有视觉点均不可抓，"
+                    f"切换到 {next_waist_deg}° 重新执行 Q1/视觉/排序/IK"
+                )
+
+        if reachable is None:
+            node.publish_error(8, "全部视觉候选及配置腰角均不可抓取")
+            node.last_pick_failure_reason = "all_waist_angles_unreachable"
+            log.error(
+                "[pick-waist] 20°/30°/40°/50° 全部尝试完成，"
+                "仍没有无碰撞 IK、Cartesian approach、"
+                "OMPL 到 q_pre 均可行的视觉点"
+            )
+            return False
+        if selected_waist_deg is None:
+            node.last_pick_failure_reason = "waist_retry_state_invalid"
+            log.error("[pick-waist] 找到可抓点但腰角重试状态不完整")
+            return False
+
+        point_index = reachable["point_index"]
+        first_return_mode = first_return_modes[point_index]
+        pick_group = reachable["pick_group"]
+        pick_link = reachable["pick_link"]
+        pick_frame = reachable["pick_frame"]
+        pick_joint_names = reachable["pick_joint_names"]
+        pick_target_pose = reachable["pick_target_pose"]
+        pick_collision_pose = reachable["pick_collision_pose"]
+        selected_grasp_object_poses = [pick_collision_pose]
+        pick_label = "左臂" if tool_side_for_link(pick_link) == "left" else "右臂"
+        pick_q_target = reachable.get("pick_q_target", {})
+        waist_pick_angle = (
+            pick_q_target.get("body_joint2") if isinstance(pick_q_target, dict) else None
+        )
+        if waist_pick_angle is not None and pick_group not in ("left_arm", "right_arm"):
+            log.info(
+                f"可达性选中 {pick_group}，后续直接使用该 body 组规划抓取，"
+                f"不再单独动腰和重新视觉识别；"
+                f"body_joint2={waist_pick_angle:.6f} rad "
+                f"({math.degrees(waist_pick_angle):.2f} deg)"
+            )
+
+        selected_msg = (
+            f"可达性选中: 点 {point_index + 1}/{len(all_xyz_rpy)}, "
+            f"vision_waist={selected_waist_deg}°, "
+            f"mode={first_return_mode}, group={pick_group}, "
+            f"link={pick_link}, frame={pick_frame}"
+        )
+        log.info(selected_msg)
+        print(f"\033[32m{selected_msg}\033[0m")
+
+        # 抓取前只显示选中机械臂的实际目标，与传给规划器的位姿和坐标系一致。
+        node.remove_all_pose_markers()
+        node.show_cylinder_at_pose(pick_target_pose, frame_id=pick_frame)
+        node.show_z_axis_at_pose(pick_target_pose, frame_id=pick_frame)
+
+        if prompt_exit("按回车继续，输入 q 回车退出并移除深框 …"):
+            return None
+
+        def start_next_grasp_plan() -> None:
+            if sum(node._place_slot_is_empty(name) for name in PLACE_SLOT_MASKS) <= 1:
+                log.info("[pipeline] 当前放置后将无剩余空位，不预解算下一物体")
+                return
+            vision_pose = read_vision_object_pose(
+                node, log, sim_mode=sim_mode, sort_by_sj_z=False,
+            )
+            if vision_pose is None:
+                log.warning("[pipeline] 下一物体视觉失败，下一轮恢复同步识别")
+                return
+            modes, poses = prioritize_upright_grasp_points(
+                vision_pose[0], vision_pose[1], ungraspable_points,
+            )
+            waist_deg = selected_waist_deg
+            start_state = dict(zip(joint_names, q1_for_waist))
+
+            def solve_next() -> dict | None:
+                result = validate_reachable_grasp(
+                    planner_node, poses, speed_scale=0.4,
+                    cutoff_joint_names=joint_names,
+                    ungraspable_points=list(ungraspable_points),
+                    planning_start_joints=start_state,
+                )
+                if result is None:
+                    return None
+                return {"reachable": result, "modes": modes, "poses": poses, "waist_deg": waist_deg}
+
+            next_grasp_cache["future"] = planner_pool.submit(solve_next)
+            log.info("[pipeline] 已提交下一物体后台 IK/Cartesian/OMPL 解算")
+
+        log.info(f"开始尝试{pick_label}抓取")
+        if not node.pick_and_return(
+            target_pose=pick_target_pose,
+            speed_scale=0.4,
+            group=pick_group,
+            link=pick_link,
+            plan_frame=pick_frame,
+            joint_names=pick_joint_names,
+            place_speed_scale=0.4,
+            cutoff_joint_names=joint_names,
+            first_return_mode=first_return_mode,
+            scene_grasp_object_poses=selected_grasp_object_poses,
+            prevalidated_pair=(
+                reachable["pick_q_pre"],
+                reachable["pick_q_target"],
+                reachable["pick_to_pre_traj"],
+                reachable["pick_approach_traj"],
+            ),
+            background_planner=planner_node,
+            planner_pool=planner_pool,
+            recognition_state=(
+                dict(zip(joint_names, q1_for_waist)) if pipeline_enabled else None
+            ),
+            start_next_grasp_plan=start_next_grasp_plan if pipeline_enabled else None,
+        ):
+            failure_reason = node.last_pick_failure_reason
+            if failure_reason == "q_pre":
+                recovery_side = tool_side_for_link(pick_link)
+                recovery_q1 = list(GRASP_Q1)
+                recovery_q1[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(
+                    selected_waist_deg
+                )
+                recovery_stage = "抓取运动到 q_pre 失败"
+                if recovery_side is None:
+                    log.error(
+                        f"[pick][q-pre-recovery] 无法由 link={pick_link} "
+                        "确定需要清错的机械臂"
+                    )
+                elif not node.clear_arm_alarms_for_recovery(
+                    (recovery_side,),
+                    recovery_stage,
+                ):
+                    log.error("[pick][q-pre-recovery] 清除机械臂错误失败")
+                else:
+                    resume_request_id = node._send_servoj_control(
+                        recovery_side,
+                        "resume",
+                    )
+                    resumed = node._wait_for_servoj_control_state(
+                        recovery_side,
+                        "resume",
+                        resume_request_id,
+                    )
+                    reset_ok = resumed and node.plan_execute_joint_waypoints(
+                        "dual_arm_body",
+                        0.2,
+                        joint_names,
+                        [recovery_q1],
+                    )
+                    if reset_ok:
+                        node.last_pick_failure_reason = "q_pre_alarm_recovered"
+                        log.warning(
+                            f"[pick][q-pre-recovery] 已清错并复位到 "
+                            f"{selected_waist_deg}° 识别位置，"
+                            "继续下一轮视觉抓取"
+                        )
+                    else:
+                        log.error(
+                            f"[pick][q-pre-recovery] 清错后复位到 "
+                            f"{selected_waist_deg}° 识别位置失败"
+                        )
+                if node.last_pick_failure_reason != "q_pre_alarm_recovered":
+                    node.last_pick_failure_reason = "q_pre_recovery_failed"
+            if failure_reason in UNGRASPABLE_POINT_GRASP_FAILURE_REASONS:
+                position, added = remember_ungraspable_point(
+                    all_xyz_rpy[point_index],
+                    ungraspable_points,
+                )
+                if position is None:
+                    log.warning(
+                        f"[reach-cache] {pick_label}抓取失败 "
+                        f"(reason={failure_reason})，但选中点缺少有效 "
+                        "SJ.xyz，无法加入失败点缓存"
+                    )
+                else:
+                    cache_action = "已记录" if added else "已在缓存中"
+                    log.warning(
+                        f"[reach-cache] {pick_label}抓取失败 "
+                        f"(reason={failure_reason})，{cache_action}失败点 "
+                        f"SJ.xyz=({position[0]:.4f}, {position[1]:.4f}, "
+                        f"{position[2]:.4f})；本批次跨腰角缓存共 "
+                        f"{len(ungraspable_points)} 个"
+                    )
+            log.error(f"{pick_label}抓取失败")
+            return False
+
+        return True
+
+    def prepare_force_sensors_for_grasp_batch() -> bool:
+        """双臂上电验证力数据；首轮无新帧时重新上电再验证一次。"""
+        if not node.use_force_sensors:
+            return True
+        sides = (("left", "左臂"), ("right", "右臂"))
+        max_attempts = 2
+
+        for attempt in range(1, max_attempts + 1):
+            log.info(
+                f"[pick][sensor-check] 第 {attempt}/{max_attempts} 次："
+                "给双臂工具上电并等待力传感器新帧"
+            )
+            power_on_results = {
+                side: node.set_tool_power(side, 1) for side, _label in sides
+            }
+            sensor_values: dict[str, float] = {}
+            if all(power_on_results.values()):
+                for side, label in sides:
+                    force_z = node.wait_for_ft_sensor_z(side)
+                    if force_z is None:
+                        log.error(
+                            f"[pick][sensor-check] 第 {attempt}/{max_attempts} 次 "
+                            f"{label}力传感器无法读取新数据"
+                        )
+                        break
+                    sensor_values[side] = force_z
+            else:
+                log.error(
+                    f"[pick][sensor-check] 第 {attempt}/{max_attempts} 次 "
+                    "双臂工具未全部上电："
+                    f"left={power_on_results['left']}, "
+                    f"right={power_on_results['right']}"
+                )
+
+            log.info(
+                f"[pick][sensor-check] 第 {attempt}/{max_attempts} 次读取结束，"
+                "给双臂工具下电"
+            )
+            power_off_results = {
+                side: node.set_tool_power(side, 0) for side, _label in sides
+            }
+            if not all(power_off_results.values()):
+                node.publish_error(5, "批次力传感器初始化失败：双臂未全部下电")
+                log.error(
+                    "[pick][sensor-check] 双臂工具未全部下电，禁止开始抓取："
+                    f"left={power_off_results['left']}, "
+                    f"right={power_off_results['right']}"
+                )
+                return False
+
+            if len(sensor_values) == len(sides):
+                log.info(
+                    "[pick][sensor-check] 双臂力传感器自检通过且已下电："
+                    f"左臂 Fz={sensor_values['left']:.6f} N，"
+                    f"右臂 Fz={sensor_values['right']:.6f} N"
+                )
+                return True
+
+            if attempt < max_attempts:
+                log.warning(
+                    "[pick][sensor-check] 首次自检未收到完整的新力数据，"
+                    "重新给双臂工具上电并读取一次"
+                )
+
+        node.publish_error(5, "批次力传感器初始化重试耗尽")
+        log.error(
+            "[pick][sensor-check] 两次上电均未收到完整的新力数据，"
+            "禁止开始抓取"
+        )
+        return False
+
+    def _run_grasps_until_no_empty_slot(
+        ungraspable_points: list[tuple[float, float, float]],
+    ) -> bool | None:
+        """执行步骤 4 的抓取循环，所有腰角共用当前批次失败点缓存。"""
+        if not prepare_force_sensors_for_grasp_batch():
+            return False
+
+        success_count = 0
+        grasp_index = 0
+        while rclpy.ok():
+            grasp_index += 1
+            log.info(
+                f"[frame-batch] 开始第 {grasp_index} 次抓取，"
+                "抓取前读取最新 SW 空位状态"
+            )
+            try:
+                grasp_result = run_one_grasp(ungraspable_points)
+            finally:
+                pending_next = next_grasp_cache.get("future")
+                cleanup_grasp_display(
+                    remove_scene_objects=(
+                        node.last_pick_failure_reason
+                        not in {"no_place", "no_place_signal"}
+                        and not (
+                            isinstance(pending_next, Future)
+                            and not pending_next.done()
+                        )
+                    )
+                )
+
+            if grasp_result is None:
+                return None
+            if (
+                not grasp_result
+                and node.last_pick_failure_reason == "no_place"
+            ):
+                log.info(
+                    f"[frame-batch] SW1~SW4 已无空位，连续抓取正常结束；"
+                    f"本批次成功 {success_count} 次"
+                )
+                return True
+
+            if grasp_result:
+                success_count += 1
+            if (
+                not grasp_result
+                and node.last_pick_failure_reason in (
+                    "suction_failed",
+                    "approach_obstacle",
+                    "place_obstacle_recovered",
+                    "place_alarm_recovered",
+                    "q_pre_alarm_recovered",
+                )
+            ):
+                if node.last_pick_failure_reason == "approach_obstacle":
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次接近中途碰到障碍物，"
+                        "已退回 pre；直接进入下一次 Q1 复位和视觉识别"
+                    )
+                elif node.last_pick_failure_reason == "place_obstacle_recovered":
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次 SW 放置下降碰到障碍物，"
+                        "已下电、直退并返回 Q1；按最新 SW 信号继续下一次抓取"
+                    )
+                elif node.last_pick_failure_reason == "place_alarm_recovered":
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次 SW 放置去程报警，"
+                        "已清错、下电并直退；按最新 SW 信号继续下一次抓取"
+                    )
+                elif node.last_pick_failure_reason == "q_pre_alarm_recovered":
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次运动到 q_pre 失败，"
+                        "已清错并复位到识别位置；继续下一轮"
+                    )
+                else:
+                    log.warning(
+                        f"[frame-batch] 第 {grasp_index} 次未吸附，"
+                        "不执行放置；直接进入下一次 Q1 复位和视觉识别"
+                    )
+                continue
+            if not grasp_result:
+                log.error(
+                    f"[frame-batch] 第 {grasp_index} 次抓取失败，停止本批次"
+                )
+                return False
+
+            log.info(
+                f"[frame-batch] 第 {grasp_index} 次抓取完成；"
+                f"累计成功 {success_count} 次"
+            )
+
+        return None
+
+    def run_grasps_until_no_empty_slot() -> bool | None:
+        """持续抓取直到四个放置位填满；退出阶段时刷新失败点。"""
+        ungraspable_points: list[tuple[float, float, float]] = []
+        log.info(
+            "[reach-cache] 开始新的步骤 4 批次，"
+            "20°/30°/40°/50° 共用失败点缓存已初始化，"
+            f"匹配容差="
+            f"{UNGRASPABLE_POINT_DISTANCE_TOLERANCE * 1000.0:.1f} mm"
+        )
+        try:
+            return _run_grasps_until_no_empty_slot(ungraspable_points)
+        finally:
+            stale_future = next_grasp_cache.pop("future", None)
+            if isinstance(stale_future, Future):
+                stale_future.cancel()
+                if not stale_future.cancelled():
+                    try:
+                        stale_future.result()
+                    except Exception as exc:
+                        report_runtime_exception(exc, "run_grasps_until_no_empty_slot")
+                        log.warning(f"[pipeline] 清理后台规划任务时收到异常: {exc}")
+            cached_count = len(ungraspable_points)
+            ungraspable_points.clear()
+            log.info(
+                "[reach-cache] 步骤 4 已结束，"
+                f"已刷新 {cached_count} 个跨腰角失败点，"
+                "下一批次将重新验证"
+            )
+
+    def unload_material_slots() -> list[str]:
+        """返回当前实时信号中有料的 SW 名称。"""
+        return [
+            slot_name
+            for slot_name in PLACE_SLOT_MASKS
+            if node._place_slot_has_material(slot_name)
+        ]
+
+    def select_unload_pair() -> tuple[int, str, str, int, int] | None:
+        """优先 SW1+SW3，并返回该料对当前循环对应的放置目标。"""
+        for cycle_index, cycle in enumerate(UNLOAD_PAIR_CYCLES):
+            right_slot, left_slot, point_pairs = cycle
+            if (
+                node._place_slot_has_material(right_slot)
+                and node._place_slot_has_material(left_slot)
+            ):
+                pair_index = unload_cycle_indices[cycle_index] % len(point_pairs)
+                left_point, right_point = point_pairs[pair_index]
+                return (
+                    cycle_index,
+                    right_slot,
+                    left_slot,
+                    left_point,
+                    right_point,
+                )
+        return None
+
+    def set_unload_tool_power(status: int, stage: str) -> bool:
+        """下料流程中依次设置左右末端电源。"""
+        action = "上电" if status else "下电"
+        if not node.set_tool_power("left", status):
+            log.error(f"[unload] {stage}：左臂工具{action}失败")
+            return False
+        if not node.set_tool_power("right", status):
+            log.error(f"[unload] {stage}：右臂工具{action}失败")
+            return False
+        print(f"{GREEN}[unload] {stage}：左右末端{action}成功{RESET}")
+        return True
+
+    def release_unload_pair(left_point: int, right_point: int) -> bool:
+        """逐臂释放物料；循环模式不记录已经使用过的目标点。"""
+        if not node.set_tool_power("left", 0):
+            log.error(f"[unload] 物料台左点{left_point}放置：左臂工具下电失败")
+            return False
+
+        if not node.set_tool_power("right", 0):
+            log.error(
+                f"[unload] 物料台右点{right_point}放置：右臂工具下电失败；"
+                f"左点{left_point}已释放"
+            )
+            return False
+        print(
+            f"{GREEN}[unload] 物料台左点{left_point}/右点{right_point}放置："
+            f"左右末端下电成功{RESET}"
+        )
+        return True
+
+    def execute_unload_pick_pair(
+        right_slot: str,
+        left_slot: str,
+        on_pick_motion_start: Callable[[Mapping[str, float]], None] | None = None,
+        *,
+        planning_start_joints: Mapping[str, float] | None = None,
+        plan_only: bool = False,
+        preplanned: UnloadPickTrajectoryPlan | None = None,
+        use_disk_cache: bool = False,
+        planning_node: G01Demo | None = None,
+    ) -> bool | UnloadPickTrajectoryPlan:
+        """从一对 SW 同步取料，并反向直线返回对应 yubei。"""
+        pair_message = (
+            f"[unload] 选择右臂 {right_slot.upper()} + "
+            f"左臂 {left_slot.upper()}"
+        )
+        log.info(pair_message)
+        print(f"{GREEN}{pair_message}{RESET}")
+
+        try:
+            dual_body_joint_names, yubei_target = (
+                make_unload_yubei_joint_target(right_slot, left_slot)
+            )
+        except (KeyError, ValueError) as exc:
+            log.error(f"[unload] 拼接双臂 yubei 目标失败: {exc}")
+            return False
+
+        left_joint_names = joint_names_for_group("left_arm")
+        right_joint_names = joint_names_for_group("right_arm")
+        dual_arm_joint_names = joint_names_for_group("dual_arm")
+        planner = planning_node or node
+        def execute_pick_plan(plan: UnloadPickTrajectoryPlan) -> bool:
+            actual_start = node._get_joints(
+                list(plan.to_yubei.joint_trajectory.joint_names), wait_new=True,
+            )
+            first_point = plan.to_yubei.joint_trajectory.points[0]
+            start_error = max(
+                (
+                    abs(actual_start[name] - value)
+                    for name, value in zip(
+                        plan.to_yubei.joint_trajectory.joint_names,
+                        first_point.positions,
+                    )
+                    if actual_start is not None and name in actual_start
+                ),
+                default=float("inf") if actual_start is None else 0.0,
+            )
+            if start_error > 0.05:
+                log.error(
+                    f"[unload][pipeline] 抓取缓存起点偏差 {start_error:.4f} > 0.05，"
+                    "禁止执行缓存轨迹"
+                )
+                return False
+            if on_pick_motion_start is not None:
+                on_pick_motion_start(
+                    dict(zip(plan.dual_body_joint_names, plan.yubei_target))
+                )
+            log.info("[unload] 执行缓存轨迹 dual_arm_body → 取料 yubei")
+            if not node._execute_traj(plan.to_yubei):
+                return False
+            node.wait_for_operator("按回车执行双臂同步直线取料: ")
+            if not node._execute_traj(plan.approach):
+                log.error("[unload] 双臂同步直线取料失败")
+                return False
+            node.wait_for_operator("按回车给左右末端上电: ")
+            if not set_unload_tool_power(1, "取料"):
+                return False
+            if node.sim_mode and not node._update_simulated_place_slots(
+                [right_slot, left_slot], has_material=False,
+                reason="双臂完成下料取料",
+            ):
+                return False
+            time.sleep(UNLOAD_TOOL_SETTLE_SEC)
+            log.info("[unload] 反向执行缓存抓取直线，原路复位到 yubei")
+            if not node._execute_traj(node._reverse_trajectory(plan.approach)):
+                return False
+            return True
+
+        if preplanned is not None:
+            return execute_pick_plan(preplanned)
+
+        start_state = (
+            dict(planning_start_joints)
+            if planning_start_joints is not None
+            else planner._get_joints(dual_body_joint_names, wait_new=True)
+        )
+        if start_state is None:
+            log.error("[unload] 读取取料规划起点失败")
+            return False
+        cache_key = f"input7_first_pick_{right_slot}_{left_slot}"
+        if use_disk_cache:
+            cached = _load_trajectory_cache(
+                cache_key,
+                {"to_yubei": RobotTrajectory, "approach": RobotTrajectory},
+            )
+            if cached is not None:
+                metadata, messages = cached
+                if (
+                    _cached_joint_state_matches(
+                        metadata.get("start_joints"), start_state,
+                    )
+                    and metadata.get("yubei_target") == list(yubei_target)
+                ):
+                    plan = UnloadPickTrajectoryPlan(
+                        right_slot,
+                        left_slot,
+                        dual_body_joint_names,
+                        list(yubei_target),
+                        messages["to_yubei"],
+                        messages["approach"],
+                        float(metadata["left_approach_distance"]),
+                        float(metadata["right_approach_distance"]),
+                    )
+                    log.info(f"[trajectory-cache] 命中 {cache_key}")
+                    return plan if plan_only else execute_pick_plan(plan)
+            log.info(
+                f"[trajectory-cache] 未命中或已失效 {cache_key}，正常规划"
+            )
+        ok, _, to_yubei = planner.plan_joint_motion(
+            "dual_arm_body", yubei_target,
+            joint_names=dual_body_joint_names,
+            start_joints=start_state,
+            speed_scale=UNLOAD_JOINT_SPEED,
+            num_attempts=30,
+            planning_time_sec=10.0,
+            execute=False,
+        )
+        if not ok or to_yubei is None:
+            log.error("[unload] dual_arm_body 到 yubei 纯规划失败")
+            return False
+        current = dict(start_state)
+        current.update(zip(dual_body_joint_names, yubei_target))
+
+        left_pose = planner._get_link_pose_fk(
+            "l_tool",
+            joints=current,
+            joint_names=left_joint_names,
+            plan_frame=SCENE_FRAME,
+        )
+        right_pose = planner._get_link_pose_fk(
+            "r_tool",
+            joints=current,
+            joint_names=right_joint_names,
+            plan_frame=SCENE_FRAME,
+        )
+        if left_pose is None or right_pose is None:
+            log.error("[unload] 计算 yubei 处左右末端 FK 失败")
+            return False
+
+        left_approach_distance = (
+            UNLOAD_APPROACH_DISTANCE + UNLOAD_EXTRA_APPROACH_BY_SLOT[left_slot]
+        )
+        right_approach_distance = (
+            UNLOAD_APPROACH_DISTANCE + UNLOAD_EXTRA_APPROACH_BY_SLOT[right_slot]
+        )
+        left_target = pose_offset_local_z(left_pose, left_approach_distance)
+        right_target = pose_offset_local_z(right_pose, right_approach_distance)
+        log.info(
+            f"[unload] 直线下降距离：左臂 {left_slot.upper()}="
+            f"{left_approach_distance * 1000.0:.1f} mm，"
+            f"右臂 {right_slot.upper()}="
+            f"{right_approach_distance * 1000.0:.1f} mm"
+        )
+
+        left_trajectory = planner.plan_cartesian_line(
+            "left_arm",
+            "l_tool",
+            left_target,
+            speed_scale=UNLOAD_CARTESIAN_SPEED,
+            avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
+            start_joints=current,
+            joint_names=left_joint_names,
+            plan_frame=SCENE_FRAME,
+        )
+        right_trajectory = planner.plan_cartesian_line(
+            "right_arm",
+            "r_tool",
+            right_target,
+            speed_scale=UNLOAD_CARTESIAN_SPEED,
+            avoid_collisions=UNLOAD_CARTESIAN_AVOID_COLLISIONS,
+            start_joints=current,
+            joint_names=right_joint_names,
+            plan_frame=SCENE_FRAME,
+        )
+        if left_trajectory is None or right_trajectory is None:
+            log.error("[unload] 至少一只手臂的 Cartesian 规划失败")
+            return False
+
+        try:
+            approach = merge_dual_arm_cartesian_trajectories(
+                left_trajectory,
+                right_trajectory,
+            )
+        except ValueError as exc:
+            log.error(f"[unload] 合并双臂 Cartesian 轨迹失败: {exc}")
+            return False
+
+        plan = UnloadPickTrajectoryPlan(
+            right_slot,
+            left_slot,
+            dual_body_joint_names,
+            list(yubei_target),
+            to_yubei,
+            approach,
+            left_approach_distance,
+            right_approach_distance,
+        )
+        if use_disk_cache:
+            saved = _save_trajectory_cache(
+                cache_key,
+                {
+                    "start_joints": start_state,
+                    "yubei_target": list(yubei_target),
+                    "left_approach_distance": left_approach_distance,
+                    "right_approach_distance": right_approach_distance,
+                },
+                {"to_yubei": to_yubei, "approach": approach},
+            )
+            log.info(
+                f"[trajectory-cache] {'已保存' if saved else '保存失败'} {cache_key}"
+            )
+        return plan if plan_only else execute_pick_plan(plan)
+
+    def move_unload_pair_to_place(
+        place_poses: dict[int, Pose],
+        left_point: int,
+        right_point: int,
+        *,
+        planning_start_joints: Mapping[str, float] | None = None,
+        plan_only: bool = False,
+        preplanned: UnloadPlaceTrajectoryPlan | None = None,
+        on_place_motion_start: Callable[[Mapping[str, float]], None] | None = None,
+        planning_node: G01Demo | None = None,
+        table_pregrasp_only: bool = False,
+    ) -> bool | UnloadPlaceTrajectoryPlan:
+        """吸附取料后验证放置可达性，并执行已经缓存的放置轨迹。
+
+        先保持身体不动分别求左右纯臂 IK；若任一侧无解或所有纯臂组合未
+        通过后续验证，再由 ``left_body`` 联合求左臂、腰部和升降，并在每个
+        候选身体状态下求右纯臂 IK。所有 IK 都保留完整碰撞检测；每个单臂
+        IK 解的下降直线只验证一次，忽略场景物体碰撞但保留机器人自碰撞检查，
+        最终再验证到预备位的 OMPL 路径。执行阶段不重新规划。
+
+        table_pregrasp_only 用于输入 10：仅复用 IK 与 OMPL 到预抓点，
+        后备方案同时加入腰部和升降；下降仍由料台抓取流程单独规划。
+        """
+        left_joint_names = joint_names_for_group("left_arm")
+        right_joint_names = joint_names_for_group("right_arm")
+        dual_arm_joint_names = joint_names_for_group("dual_arm")
+        fallback_left_group = "left_body"
+        fallback_dual_group = "dual_arm_body"
+        fallback_text = "腰部和升降"
+        left_body_joint_names = joint_names_for_group(fallback_left_group)
+        dual_body_joint_names = joint_names_for_group("dual_arm_body")
+        planner = planning_node or node
+        current_full = (
+            dict(planning_start_joints)
+            if planning_start_joints is not None
+            else planner._get_joints(dual_body_joint_names, wait_new=True)
+        )
+        if current_full is None:
+            log.error("[unload] 读取物料台放置规划起点失败")
+            return False
+
+        log.info(
+            "[unload][reach] 双臂已吸附物料并返回取料预备位，"
+            "开始验证物料台放置可达性"
+        )
+
+        left_pose = place_poses[left_point]
+        right_pose = place_poses[right_point]
+        log.info(
+            f"[unload] 物料台目标 @ {SCENE_FRAME}："
+            f"左点{left_point}=({left_pose.position.x:.4f}, "
+            f"{left_pose.position.y:.4f}, {left_pose.position.z:.4f})，"
+            f"右点{right_point}=({right_pose.position.x:.4f}, "
+            f"{right_pose.position.y:.4f}, {right_pose.position.z:.4f})"
+        )
+
+        def plan_arm_place_descent(
+            side: str,
+            endpoint_state: dict[str, float],
+            label: str,
+        ) -> RobotTrajectory | None:
+            """验证并缓存一侧手臂从放置预备位开始的直线下降。
+
+            ``endpoint_state`` 是尚未执行的放置预备位完整关节状态，因此 FK
+            和 Cartesian waypoint 必须统一表达在固定的 ``SCENE_FRAME``。
+            不得使用 l/r_base_link，否则 MoveIt 会用机器人当前 TF 而不是该
+            候选 body 状态转换 waypoint。Cartesian 服务先关闭完整碰撞检查，
+            随后逐点只检查机器人自碰撞；world/attached 物体接触被忽略。返回
+            轨迹会一直缓存到执行阶段。
+            """
+            if table_pregrasp_only:
+                return RobotTrajectory()
+            if side == "left":
+                group = "left_arm"
+                link = "l_tool"
+                joint_names = left_joint_names
+                side_text = "左臂"
+            elif side == "right":
+                group = "right_arm"
+                link = "r_tool"
+                joint_names = right_joint_names
+                side_text = "右臂"
+            else:
+                raise ValueError(f"未知手臂侧别: {side}")
+
+            start_pose = planner._get_link_pose_fk(
+                link,
+                joints=endpoint_state,
+                plan_frame=SCENE_FRAME,
+            )
+            if start_pose is None:
+                log.info(
+                    f"[unload] {label}：{side_text}放置直线起点 FK 失败"
+                )
+                return None
+
+            descent_pose = pose_offset_local_z(
+                start_pose,
+                UNLOAD_PLACE_DESCENT_DISTANCE,
+            )
+            descent = planner.plan_cartesian_line(
+                group,
+                link,
+                descent_pose,
+                speed_scale=UNLOAD_CARTESIAN_SPEED,
+                avoid_collisions=False,
+                start_joints=endpoint_state,
+                joint_names=joint_names,
+                plan_frame=SCENE_FRAME,
+                verbose=False,
+            )
+            if descent is None:
+                log.info(
+                    f"[unload] {label}：{side_text}末端局部 +Z "
+                    f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 不可达"
+                )
+                return None
+            if not planner.validate_trajectory_self_collision(
+                descent,
+                group=group,
+                base_state=endpoint_state,
+                sample_period=None,
+                label=f"[unload] {label} {side_text}放置直线",
+            ):
+                return None
+            return descent
+
+        def plan_place_descent(
+            endpoint_state: dict[str, float],
+            label: str,
+        ) -> RobotTrajectory | None:
+            """按同一完整状态分别验证左右下降，并生成同步执行缓存。"""
+            left_descent = plan_arm_place_descent(
+                "left",
+                endpoint_state,
+                label,
+            )
+            if left_descent is None:
+                return None
+            right_descent = plan_arm_place_descent(
+                "right",
+                endpoint_state,
+                label,
+            )
+            if right_descent is None:
+                return None
+
+            merged = merge_place_descents(
+                left_descent,
+                right_descent,
+                label,
+                endpoint_state,
+                "dual_arm_body",
+            )
+            if merged is None:
+                return None
+            return merged
+
+        def merge_place_descents(
+            left_descent: RobotTrajectory,
+            right_descent: RobotTrajectory,
+            label: str,
+            endpoint_state: Mapping[str, float],
+            collision_group: str,
+        ) -> RobotTrajectory | None:
+            """合并左右下降轨迹，并检查同步运动时的双臂自碰撞。"""
+            if table_pregrasp_only:
+                return RobotTrajectory()
+            try:
+                merged = merge_dual_arm_cartesian_trajectories(
+                    left_descent,
+                    right_descent,
+                )
+            except ValueError as exc:
+                log.info(
+                    f"[unload] {label}：合并双臂放置直线失败 ({exc})，"
+                    "换下一构型"
+                )
+                return None
+
+            if not planner.validate_trajectory_self_collision(
+                merged,
+                group=collision_group,
+                base_state=endpoint_state,
+                sample_period=UNLOAD_PLACE_SELF_COLLISION_SAMPLE_PERIOD,
+                label=f"[unload] {label} 双臂同步放置直线",
+            ):
+                log.info(
+                    f"[unload] {label}：同步下降存在机器人自碰撞，换下一构型"
+                )
+                return None
+
+            log.info(
+                f"[unload] {label}：左右直线和同步自碰撞检查均通过，"
+                "已缓存同步轨迹"
+            )
+            return merged
+
+        def validate_place_candidate(
+            group: str,
+            target: dict[str, float],
+            start: dict[str, float],
+            label: str,
+            left_descent: RobotTrajectory,
+            right_descent: RobotTrajectory,
+        ) -> tuple[RobotTrajectory, RobotTrajectory, Pose | None, Pose | None] | None:
+            """验证一个 IK 组合并缓存到预备位和直线下降轨迹。
+
+            验证顺序为：左右臂分别验证仅考虑自碰撞的 Cartesian 下降，再用
+            OMPL 验证从当前状态到放置预备位。成功时返回
+            到预备位轨迹、同步下降轨迹及左右预备点位姿；本函数绝不执行
+            运动，因此可以安全地继续尝试其他 IK 构型。
+            """
+            candidate_state = dict(current_full)
+            candidate_state.update(target)
+            merged_descent = merge_place_descents(
+                left_descent,
+                right_descent,
+                label,
+                candidate_state,
+                group,
+            )
+            if merged_descent is None:
+                return None
+
+            ok, used_ms, trajectory = planner.plan_joint_motion(
+                group,
+                target,
+                joint_names=joint_names_for_group(group),
+                start_joints=start,
+                speed_scale=UNLOAD_PLACE_JOINT_SPEED,
+                max_retries=1,
+                num_attempts=50,
+                execute=False,
+            )
+            log.info(
+                f"[unload] {label}: {used_ms:.1f} ms "
+                f"({'planned' if ok else 'failed'})"
+            )
+            if not ok or trajectory is None:
+                return None
+            if not trajectory.joint_trajectory.points:
+                log.error(f"[unload] {label} 成功但没有返回轨迹")
+                return None
+
+            # 通常 OMPL 终点就是关节目标。若受目标容差影响出现偏差，则按真实
+            # 轨迹末点重新生成 Cartesian 缓存，确保执行时首点与实际状态一致。
+            endpoint_state = dict(current_full)
+            endpoint_state.update(target)
+            final_point = trajectory.joint_trajectory.points[-1]
+            endpoint_state.update(
+                zip(
+                    trajectory.joint_trajectory.joint_names,
+                    final_point.positions,
+                )
+            )
+
+            endpoint_delta = max(
+                (
+                    abs(endpoint_state[name] - candidate_state[name])
+                    for name in target
+                    if name in endpoint_state and name in candidate_state
+                ),
+                default=0.0,
+            )
+            if endpoint_delta > 1e-4 and not table_pregrasp_only:
+                log.info(
+                    f"[unload] {label}：OMPL 末点与 IK 目标最大偏差 "
+                    f"{endpoint_delta:.6f}，按实际末点更新直线缓存"
+                )
+                merged_descent = plan_place_descent(endpoint_state, label)
+                if merged_descent is None:
+                    return None
+
+            left_return_pose = right_return_pose = None
+            if not table_pregrasp_only:
+                left_return_pose = planner._get_link_pose_fk(
+                    "l_tool", joints=endpoint_state, plan_frame=SCENE_FRAME,
+                )
+                right_return_pose = planner._get_link_pose_fk(
+                    "r_tool", joints=endpoint_state, plan_frame=SCENE_FRAME,
+                )
+                if left_return_pose is None or right_return_pose is None:
+                    log.error(f"[unload] {label} 规划阶段记录放置预备点 FK 失败")
+                    return None
+                for side, actual, expected in (
+                    ("左臂", left_return_pose, left_pose),
+                    ("右臂", right_return_pose, right_pose),
+                ):
+                    position_error = _pose_position_delta(actual, expected)[3]
+                    orientation_error = _pose_orientation_error_rad(actual, expected)
+                    log.info(
+                        f"[unload] {label} {side}规划终点 FK 误差："
+                        f"位置={position_error * 1000.0:.3f} mm，"
+                        f"姿态={math.degrees(orientation_error):.4f}°"
+                    )
+                    if (
+                        not math.isfinite(position_error)
+                        or not math.isfinite(orientation_error)
+                        or position_error > UNLOAD_PLACE_POSITION_TOLERANCE
+                        or orientation_error > UNLOAD_PLACE_ORIENTATION_TOLERANCE
+                    ):
+                        log.warning(f"[unload] {label} {side}规划终点位姿误差超限，拒绝该候选")
+                        return None
+
+            log.info(
+                f"[unload] {label}："
+                + ("IK、OMPL 均通过，" if table_pregrasp_only else "IK、左右 Cartesian、OMPL 均通过，")
+                + "已缓存全部执行轨迹"
+            )
+            return trajectory, merged_descent, left_return_pose, right_return_pose
+
+        def execute_cached_place_plan(
+            group: str,
+            label: str,
+            to_place: RobotTrajectory,
+            descent: RobotTrajectory,
+            left_return_pose: Pose | None,
+            right_return_pose: Pose | None,
+        ) -> bool:
+            """只执行可达性阶段缓存的轨迹，不再调用 IK 或规划服务。"""
+            if left_return_pose is None or right_return_pose is None:
+                log.error(f"[unload] {label} 缺少规划缓存的放置预备点位姿，禁止执行")
+                return False
+            log.info(
+                f"[unload] 已选中 {label}，直接执行缓存的 {group} "
+                "联合轨迹到放置预备位"
+            )
+            if on_place_motion_start is not None:
+                endpoint = to_place.joint_trajectory.points[-1]
+                end_state = dict(current_full)
+                end_state.update(zip(
+                    to_place.joint_trajectory.joint_names,
+                    endpoint.positions,
+                ))
+                on_place_motion_start(end_state)
+            if not node._execute_traj(to_place):
+                log.error(f"[unload] {label} 联合轨迹执行失败")
+                return False
+
+            node.wait_for_operator(
+                f"已到物料台左点{left_point}/右点{right_point}，"
+                f"按回车执行双臂末端局部 +Z "
+                f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 同步下降: "
+            )
+            log.info(
+                "[unload] 直接执行缓存的双臂同步放置直线："
+                f"左右末端局部 +Z {UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m"
+                "（检查机器人自碰撞，忽略物体碰撞）"
+            )
+            left_force_z = node.wait_for_ft_sensor_z("left")
+            right_force_z = node.wait_for_ft_sensor_z("right")
+            if left_force_z is None or right_force_z is None:
+                log.error("[unload] 放置下降前无法读取左右力传感器 Fz，禁止下降")
+                return False
+            log.info(
+                f"[unload] 放置下降前 Fz：左臂={left_force_z:.6f} N，"
+                f"右臂={right_force_z:.6f} N；任一侧全程下降超过 "
+                f"{APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:.3f} N 判定碰撞"
+            )
+            descent_result = node._execute_approach_with_force_guard(
+                descent,
+                ("left", "right"),
+                {"left": left_force_z, "right": right_force_z},
+                UNLOAD_PLACE_DESCENT_DISTANCE,
+                near_force_drop_threshold=None,
+                stage_label="双臂放置直线下降",
+                baseline_label="放置预备点",
+            )
+            if descent_result == "contact":
+                log.warning(
+                    "[unload] 双臂放置下降检测到力碰撞，"
+                    "双末端下电并从实测位置同步直退"
+                )
+                return node.recover_dual_arm_linear_after_alarm(
+                    left_return_pose=left_return_pose,
+                    right_return_pose=right_return_pose,
+                    full_joint_names=dual_body_joint_names,
+                    collision_group=group,
+                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    stage=f"物料台左点{left_point}/右点{right_point}下降力碰撞",
+                    clear_alarms=False,
+                )
+            if descent_result == "safety_failed":
+                log.error("[unload] 双臂放置力碰撞后停止/轨迹终止/恢复确认失败")
+                set_unload_tool_power(0, "放置力碰撞安全停止失败")
+                return False
+            if descent_result != "success":
+                log.error(
+                    "[unload] 双臂同步直线下降放置失败，"
+                    "进入人工清错和实测位置直线退回"
+                )
+                return node.recover_dual_arm_linear_after_alarm(
+                    left_return_pose=left_return_pose,
+                    right_return_pose=right_return_pose,
+                    full_joint_names=dual_body_joint_names,
+                    collision_group=group,
+                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    stage=f"物料台左点{left_point}/右点{right_point}下降放置",
+                )
+
+            node.wait_for_operator(
+                f"已下降到物料台左点{left_point}/右点{right_point}，"
+                "按回车给双臂下电: "
+            )
+
+            if not release_unload_pair(left_point, right_point):
+                return False
+            time.sleep(UNLOAD_TOOL_SETTLE_SEC)
+
+            log.info("[unload] 双臂已下电，反向执行同一条同步直线原路返回")
+            if not node._execute_traj(node._reverse_trajectory(descent)):
+                log.error(
+                    "[unload] 放置后双臂同步直线复位失败，"
+                    "进入人工清错和实测位置直线退回"
+                )
+                return node.recover_dual_arm_linear_after_alarm(
+                    left_return_pose=left_return_pose,
+                    right_return_pose=right_return_pose,
+                    full_joint_names=dual_body_joint_names,
+                    collision_group=group,
+                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    stage=f"物料台左点{left_point}/右点{right_point}放置后返回",
+                )
+            return True
+
+        def prevalidate_arm_solutions(
+            side: str,
+            solutions: Sequence[dict[str, float]],
+            base_state: dict[str, float],
+            label_prefix: str,
+        ) -> list[tuple[dict[str, float], RobotTrajectory]]:
+            """逐个验证单臂 IK 解的下降直线并缓存可行解。
+
+            ``base_state`` 提供另一只手臂以及腰部/升降的固定关节状态；每个
+            IK 解只规划一次 Cartesian 路径，后续左右组合不会重复调用服务。
+            """
+            reachable: list[tuple[dict[str, float], RobotTrajectory]] = []
+            if table_pregrasp_only:
+                return [(solution, RobotTrajectory()) for solution in solutions]
+            for solution_index, solution in enumerate(solutions, start=1):
+                endpoint_state = dict(base_state)
+                endpoint_state.update(solution)
+                trajectory = plan_arm_place_descent(
+                    side,
+                    endpoint_state,
+                    f"{label_prefix} IK {solution_index}/{len(solutions)}",
+                )
+                if trajectory is not None:
+                    reachable.append((solution, trajectory))
+            side_text = "左臂" if side == "left" else "右臂"
+            log.info(
+                f"[unload] {label_prefix}：{side_text}下降直线 "
+                f"{len(reachable)}/{len(solutions)} 组可行"
+                "（检查机器人自碰撞，忽略物体碰撞）"
+            )
+            return reachable
+
+        if preplanned is not None:
+            actual_start = node._get_joints(
+                list(preplanned.to_place.joint_trajectory.joint_names),
+                wait_new=True,
+            )
+            first_point = preplanned.to_place.joint_trajectory.points[0]
+            start_error = max(
+                (
+                    abs(actual_start[name] - value)
+                    for name, value in zip(
+                        preplanned.to_place.joint_trajectory.joint_names,
+                        first_point.positions,
+                    )
+                    if actual_start is not None and name in actual_start
+                ),
+                default=float("inf") if actual_start is None else 0.0,
+            )
+            if start_error > 0.05:
+                log.error(
+                    f"[unload][pipeline] 放置缓存起点偏差 {start_error:.4f} > 0.05，"
+                    "禁止执行缓存轨迹"
+                )
+                return False
+            return execute_cached_place_plan(
+                preplanned.group,
+                preplanned.label,
+                preplanned.to_place,
+                preplanned.descent,
+                preplanned.left_return_pose,
+                preplanned.right_return_pose,
+            )
+
+        # ------------------------------------------------------------------
+        # 第一级：固定预计起点的身体状态，只求左右纯臂多组 IK。
+        # 直接提交固定模型坐标系目标，避免服务使用运动中的实时臂基座 TF。
+        # ------------------------------------------------------------------
+        log.info(
+            f"[unload] 左右纯臂 IK 使用 {SCENE_FRAME} 目标和完整预计关节状态"
+        )
+
+        left_arm_solutions = planner._solve_ik_candidates_from_seed(
+            "left_arm",
+            "l_tool",
+            left_pose,
+            left_joint_names,
+            current_full,
+            plan_frame=SCENE_FRAME,
+            n_attempts=UNLOAD_PLACE_ARM_IK_ATTEMPTS,
+            max_solutions=UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS,
+            random_seed=(
+                UNLOAD_PLACE_IK_RANDOM_SEED + left_point * 100 + 1
+            ),
+            perturb_joint_names=left_joint_names,
+            avoid_collisions=True,
+        )
+        right_arm_solutions = planner._solve_ik_candidates_from_seed(
+            "right_arm",
+            "r_tool",
+            right_pose,
+            right_joint_names,
+            current_full,
+            plan_frame=SCENE_FRAME,
+            n_attempts=UNLOAD_PLACE_ARM_IK_ATTEMPTS,
+            max_solutions=UNLOAD_PLACE_ARM_IK_MAX_SOLUTIONS,
+            random_seed=(
+                UNLOAD_PLACE_IK_RANDOM_SEED + right_point * 100 + 2
+            ),
+            perturb_joint_names=right_joint_names,
+            avoid_collisions=True,
+        )
+        log.info(
+            f"[unload] 纯臂多构型：左点{left_point}="
+            f"{len(left_arm_solutions)} 解，右点{right_point}="
+            f"{len(right_arm_solutions)} 解"
+        )
+        if not left_arm_solutions or not right_arm_solutions:
+            missing_sides = []
+            if not left_arm_solutions:
+                missing_sides.append("左臂")
+            if not right_arm_solutions:
+                missing_sides.append("右臂")
+            log.warning(
+                f"[unload] {'、'.join(missing_sides)}纯臂无 IK，"
+                f"纯臂组合无法成立，将加入{fallback_text}"
+            )
+
+        left_arm_reachable: list[
+            tuple[dict[str, float], RobotTrajectory]
+        ] = []
+        right_arm_reachable: list[
+            tuple[dict[str, float], RobotTrajectory]
+        ] = []
+        if left_arm_solutions and right_arm_solutions:
+            left_arm_reachable = prevalidate_arm_solutions(
+                "left",
+                left_arm_solutions,
+                current_full,
+                f"纯臂左点{left_point}",
+            )
+            right_arm_reachable = prevalidate_arm_solutions(
+                "right",
+                right_arm_solutions,
+                current_full,
+                f"纯臂右点{right_point}",
+            )
+
+        pure_pairs = [
+            (left_solution, left_descent, right_solution, right_descent)
+            for left_solution, left_descent in left_arm_reachable
+            for right_solution, right_descent in right_arm_reachable
+        ]
+        pure_pairs.sort(
+            key=lambda pair: (
+                joint_distance_squared(
+                    pair[0],
+                    current_full,
+                    left_joint_names,
+                )
+                + joint_distance_squared(
+                    pair[2],
+                    current_full,
+                    right_joint_names,
+                )
+            )
+        )
+        pure_pairs_to_validate = spread_sorted_candidates(
+            pure_pairs,
+            UNLOAD_PLACE_MAX_PAIR_PLANS,
+        )
+        log.info(
+            f"[unload] 纯臂共生成 {len(pure_pairs)} 个左右组合，"
+            f"按关节距离全范围分布验证 {len(pure_pairs_to_validate)} 组"
+        )
+        for pair_index, (
+            left_solution,
+            left_descent,
+            right_solution,
+            right_descent,
+        ) in enumerate(
+            pure_pairs_to_validate,
+            start=1,
+        ):
+            target = {
+                **left_solution,
+                **right_solution,
+            }
+            label = (
+                f"dual_arm 纯臂构型 {pair_index}/"
+                f"{len(pure_pairs_to_validate)}"
+            )
+            cached_plan = validate_place_candidate(
+                "dual_arm",
+                target,
+                current_full,
+                label,
+                left_descent,
+                right_descent,
+            )
+            if cached_plan is not None:
+                to_place, descent, left_return_pose, right_return_pose = cached_plan
+                if plan_only:
+                    return UnloadPlaceTrajectoryPlan(
+                        "dual_arm", label, to_place, descent,
+                        left_return_pose, right_return_pose,
+                    )
+                return execute_cached_place_plan(
+                    "dual_arm",
+                    label,
+                    to_place,
+                    descent,
+                    left_return_pose,
+                    right_return_pose,
+                )
+
+        log.warning(
+            f"[unload] 纯臂候选均未通过验证，加入{fallback_text}，"
+            f"开始求 {fallback_left_group} 构型"
+        )
+
+        # ------------------------------------------------------------------
+        # 第二级：左臂先用 left_body 枚举升降+腰部+左臂解。
+        # 对每个左侧解固定 body_joint1/2，再以该完整候选 RobotState 求右纯臂。
+        # 右目标保持在固定 SCENE_FRAME，避免 MoveIt 使用当前 r_base_link TF
+        # 转换尚未执行的候选 body 状态。最终使用 dual_arm_body 联合规划。
+        # ------------------------------------------------------------------
+        left_body_solutions = planner._solve_ik_candidates_from_seed(
+            fallback_left_group,
+            "l_tool",
+            left_pose,
+            left_body_joint_names,
+            current_full,
+            plan_frame=SCENE_FRAME,
+            n_attempts=UNLOAD_PLACE_BODY_IK_ATTEMPTS,
+            max_solutions=UNLOAD_PLACE_BODY_IK_MAX_SOLUTIONS,
+            random_seed=(
+                UNLOAD_PLACE_IK_RANDOM_SEED + left_point * 1000 + 3
+            ),
+            perturb_joint_names=left_body_joint_names,
+            avoid_collisions=True,
+        )
+        if not left_body_solutions:
+            node.publish_error(10, f"物料台左点{left_point}/右点{right_point}：纯臂及身体构型均未找到可行放置方案")
+            log.error(
+                f"[unload] 左点{left_point} 即使加入{fallback_text}仍无 IK"
+            )
+            return False
+
+        body_plan_count = 0
+        for body_index, left_body_solution in enumerate(
+            left_body_solutions,
+            start=1,
+        ):
+            candidate_state = dict(current_full)
+            candidate_state.update(left_body_solution)
+            lift = candidate_state["body_joint1"]
+            waist = left_body_solution["body_joint2"]
+            log.info(
+                f"[unload] 左侧 body 构型 {body_index}/"
+                f"{len(left_body_solutions)}："
+                f"body_joint1={lift:.4f} m，"
+                f"body_joint2={waist:.4f} rad"
+            )
+
+            right_solutions = planner._solve_ik_candidates_from_seed(
+                "right_arm",
+                "r_tool",
+                right_pose,
+                right_joint_names,
+                candidate_state,
+                plan_frame=SCENE_FRAME,
+                n_attempts=UNLOAD_PLACE_RIGHT_IK_ATTEMPTS_PER_BODY,
+                max_solutions=UNLOAD_PLACE_RIGHT_IK_MAX_SOLUTIONS_PER_BODY,
+                random_seed=(
+                    UNLOAD_PLACE_IK_RANDOM_SEED
+                    + right_point * 1000
+                    + body_index
+                    + 100
+                ),
+                perturb_joint_names=right_joint_names,
+                avoid_collisions=True,
+            )
+            if not right_solutions:
+                log.info(
+                    f"[unload] body 构型 {body_index} 下右点{right_point}"
+                    "无纯臂 IK，切换下一组腰部/升降"
+                )
+                continue
+
+            left_descent = plan_arm_place_descent(
+                "left",
+                candidate_state,
+                f"left_body 构型 {body_index}",
+            )
+            if left_descent is None:
+                log.info(
+                    f"[unload] body 构型 {body_index} 左臂下降直线不可行，"
+                    "尝试下一组腰部/升降"
+                )
+                continue
+            right_reachable = prevalidate_arm_solutions(
+                "right",
+                right_solutions,
+                candidate_state,
+                f"body 构型 {body_index} 右点{right_point}",
+            )
+
+            for right_index, (right_solution, right_descent) in enumerate(
+                right_reachable,
+                start=1,
+            ):
+                if body_plan_count >= UNLOAD_PLACE_MAX_PAIR_PLANS:
+                    break
+                body_plan_count += 1
+                target = {
+                    name: (
+                        right_solution[name]
+                        if name in right_solution
+                        else left_body_solution[name]
+                    )
+                    for name in joint_names_for_group(fallback_dual_group)
+                }
+                label = (
+                    f"{fallback_dual_group} 左侧构型{body_index}/"
+                    f"{len(left_body_solutions)}，"
+                    f"右可行解{right_index}/{len(right_reachable)}"
+                )
+                cached_plan = validate_place_candidate(
+                    fallback_dual_group,
+                    target,
+                    current_full,
+                    label,
+                    left_descent,
+                    right_descent,
+                )
+                if cached_plan is not None:
+                    to_place, descent, left_return_pose, right_return_pose = cached_plan
+                    if plan_only:
+                        return UnloadPlaceTrajectoryPlan(
+                            fallback_dual_group, label, to_place, descent,
+                            left_return_pose, right_return_pose,
+                        )
+                    return execute_cached_place_plan(
+                        "dual_arm_body",
+                        label,
+                        to_place,
+                        descent,
+                        left_return_pose,
+                        right_return_pose,
+                    )
+            if body_plan_count >= UNLOAD_PLACE_MAX_PAIR_PLANS:
+                break
+
+        node.publish_error(10, f"物料台左点{left_point}/右点{right_point}：所有放置候选均不可达")
+        log.error(
+            f"[unload] 左点{left_point}/右点{right_point} 的纯臂及 "
+            "dual_arm_body 多构型全部失败"
+        )
+        return False
+
+    def prepare_unload_scene(trigger_command: str = UNLOAD_TRIGGER_COMMAND) -> bool:
+        """步骤 6：运动到识别预备构型，识别物料台并缓存碰撞场景。"""
+        nonlocal frame_added, unload_scene_added, unload_place_poses
+
+        if frame_added:
+            log.info(f"[unload] 移除上料碰撞体「{FRAME_ID}」")
+            if node.remove_frame():
+                frame_added = False
+            else:
+                log.warning(
+                    "[unload] 移除上料碰撞体失败，"
+                    "忽略该清理失败并继续物料台识别"
+                )
+        if unload_scene_added:
+            log.info("[unload] 移除旧物料台碰撞模型后重新识别")
+            if node.remove_unload_scene(report_error=False):
+                unload_scene_added = False
+            else:
+                log.warning(
+                    "[unload] 移除旧物料台碰撞模型失败，继续重新识别；"
+                    "后续将用相同 object ID 覆盖旧模型"
+                )
+            # 刷新流程一旦开始就丢弃旧放置点，避免后续步骤误用旧识别结果。
+            unload_place_poses = None
+
+        vision_prep_group = "dual_arm_body"
+        vision_prep_joint_names = joint_names_for_group(vision_prep_group)
+        log.info(
+            f"[unload] 物料台识别前，{vision_prep_group} 先通过 OMPL "
+            "整机运动到 UNLOAD_TABLE_VISION_PREP_Q"
+        )
+        if not node.plan_execute_joint_waypoints(
+            vision_prep_group,
+            UNLOAD_JOINT_SPEED,
+            vision_prep_joint_names,
+            [UNLOAD_TABLE_VISION_PREP_Q],
+        ):
+            log.error(
+                "[unload] 运动到物料台识别预备构型失败，"
+                f"不发送 {trigger_command}"
+            )
+            return False
+
+        # 场景沿用右标定；左右放置点分别使用各自的标定结果。
+        vision_result = read_scene_vision_object_pose_with_retry(
+            node,
+            log,
+            sim_mode=sim_mode,
+            trigger_command=trigger_command,
+            required_pose_key=UNLOAD_VISION_POSE_KEY,
+            scene_label="unload",
+        )
+        if vision_result is None:
+            return False
+        _, all_xyz_rpy = vision_result
+        recognition_values = all_xyz_rpy[0][UNLOAD_VISION_POSE_KEY]
+        recognition_pose = make_pose(*recognition_values)
+        left_recognition_pose = make_pose(*all_xyz_rpy[0]["left_body"])
+        right_recognition_pose = make_pose(*all_xyz_rpy[0]["right_body"])
+        node.publish_unload_vision_tf(recognition_pose)
+        node.publish_unload_table_top_tf(recognition_pose)
+        place_poses = make_unload_place_poses(left_recognition_pose, right_recognition_pose)
+        node.publish_unload_place_tfs(place_poses)
+        log.info(
+            f"[unload] {trigger_command} 识别点 @ {SCENE_FRAME}: "
+            f"({recognition_pose.position.x:.4f}, "
+            f"{recognition_pose.position.y:.4f}, "
+            f"{recognition_pose.position.z:.4f})"
+        )
+        for point_index, point_pose in place_poses.items():
+            local_offset = UNLOAD_PLACE_LOCAL_OFFSETS[point_index]
+            local_pitch_deg = math.degrees(UNLOAD_PLACE_LOCAL_PITCH)
+            local_yaw_deg = math.degrees(UNLOAD_PLACE_LOCAL_YAWS[point_index])
+            calibration_side = "左" if point_index in UNLOAD_LEFT_PLACE_POINTS else "右"
+            log.info(
+                f"[unload] 物料台点{point_index} 使用{calibration_side}标定，vision_local={local_offset}, "
+                f"local_rpy=(0.0, {local_pitch_deg:.1f}, "
+                f"{local_yaw_deg:.1f}) deg, "
+                f"base=({point_pose.position.x:.4f}, "
+                f"{point_pose.position.y:.4f}, {point_pose.position.z:.4f})"
+            )
+
+        if not node.add_unload_scene(recognition_pose):
+            log.error("[unload] 添加料台/墙状障碍物失败")
+            return False
+
+        unload_scene_added = True
+        unload_place_poses = place_poses
+        table_top_pose = make_unload_table_top_pose(recognition_pose)
+        table_rpy_deg = tuple(
+            math.degrees(value) for value in UNLOAD_TABLE_LOCAL_RPY
+        )
+        log.info(
+            f"[unload] 已添加取料台 size={UNLOAD_TABLE_SIZE} m, "
+            f"top_center=({table_top_pose.position.x:.4f}, "
+            f"{table_top_pose.position.y:.4f}, "
+            f"{table_top_pose.position.z:.4f})，"
+            f"table_local_rpy_deg={table_rpy_deg}；"
+            f"障碍物 size={UNLOAD_OBSTACLE_SIZE} m，"
+            f"沿料台局部 +Y 偏移 {UNLOAD_OBSTACLE_Y_OFFSET:.3f} m"
+        )
+        return True
+
+    def run_table_to_rear_cycle() -> bool:
+        pending: list[Future] = []
+        try:
+            return _run_table_to_rear_cycle(pending)
+        finally:
+            # 退出或报警时收完纯规划任务，避免与后续步骤共用后台节点。
+            for future in pending:
+                if not future.cancel():
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        log.warning(f"[table-to-rear][pipeline] 后台规划异常: {exc}")
+
+    def _run_table_to_rear_cycle(pending: list[Future]) -> bool:
+        """步骤 13：仅取物料台第一排，每对一次，按步骤 7 的对应关系放回 SW。"""
+        if not unload_scene_added or unload_place_poses is None:
+            log.error("[table-to-rear] 请先执行输入 12，识别并添加物料台")
+            return False
+        full_names = joint_names_for_group("dual_arm_body")
+        if not set_unload_tool_power(0, "料台取料开始"):
+            return False
+
+        def pair_empty(right_slot: str, left_slot: str) -> bool:
+            return (
+                node._place_slot_is_empty(right_slot)
+                and node._place_slot_is_empty(left_slot)
+            )
+
+        def submit(function, *args, **kwargs):
+            future = planner_pool.submit(function, *args, **kwargs)
+            pending.append(future)
+            return future
+
+        def endpoint_state(start, trajectory):
+            state = dict(start)
+            state.update(zip(
+                trajectory.joint_trajectory.joint_names,
+                trajectory.joint_trajectory.points[-1].positions,
+            ))
+            return state
+
+        def execute_checked(trajectory):
+            names = list(trajectory.joint_trajectory.joint_names)
+            current = node._get_joints(names, wait_new=True)
+            expected = dict(zip(names, trajectory.joint_trajectory.points[0].positions))
+            if current is None or not _cached_joint_state_matches(expected, current):
+                log.error("[table-to-rear][pipeline] 实际起点与预规划轨迹不匹配，停止执行")
+                return False
+            return node._execute_traj(trajectory)
+
+        def plan_rear_place(right_slot, left_slot, start):
+            rear = execute_unload_pick_pair(
+                right_slot, left_slot, plan_only=True,
+                planning_start_joints=start, planning_node=planner_node,
+            )
+            if not isinstance(rear, UnloadPickTrajectoryPlan):
+                return None
+            # 在后台规划阶段保存固定坐标系下的预备点，供异常直线退回使用。
+            pre_state = endpoint_state(start, rear.to_yubei)
+            left_pre = planner_node._get_link_pose_fk(
+                "l_tool", joints=pre_state, plan_frame=SCENE_FRAME,
+            )
+            right_pre = planner_node._get_link_pose_fk(
+                "r_tool", joints=pre_state, plan_frame=SCENE_FRAME,
+            )
+            if left_pre is None or right_pre is None:
+                log.error("[table-to-rear][pipeline] 后方放置预备点 FK 失败")
+                return None
+            return rear, left_pre, right_pre
+
+        next_pick = None
+        if not node._wait_for_driver_signal(require_new=True):
+            return False
+        pairs = [pair for pair in UNLOAD_PAIR_CYCLES if pair_empty(pair[0], pair[1])]
+        for pair_index, (right_slot, left_slot, point_pairs) in enumerate(pairs):
+            left_point, right_point = point_pairs[0]
+            if not node._wait_for_driver_signal(require_new=True):
+                return False
+            if not pair_empty(right_slot, left_slot):
+                log.info(
+                    f"[table-to-rear] {right_slot}/{left_slot} 未同时为空，跳过该对"
+                )
+                if next_pick is not None:
+                    next_pick.result()
+                    next_pick = None
+                continue
+            log.info(
+                f"[table-to-rear] 左点{left_point} → {left_slot}，"
+                f"右点{right_point} → {right_slot}，只取第一排"
+            )
+            while rclpy.ok():
+                if not node._wait_for_driver_signal(require_new=True):
+                    return False
+                if not pair_empty(right_slot, left_slot):
+                    log.error("[table-to-rear] 抓取前发现后方目标非空，停止抓取")
+                    return False
+                # 同一物料台位置与下降轨迹，反转工具动作即可由放置改为抓取。
+                pick = next_pick.result() if next_pick is not None else move_unload_pair_to_place(
+                    unload_place_poses, left_point, right_point, plan_only=True,
+                )
+                next_pick = None
+                if not isinstance(pick, UnloadPlaceTrajectoryPlan):
+                    return False
+                start = node._get_joints(full_names, wait_new=True)
+                if start is None:
+                    return False
+                pick_end = endpoint_state(start, pick.to_place)
+                rear_future = submit(
+                    plan_rear_place, right_slot, left_slot, pick_end,
+                )
+                log.info("[table-to-rear][pipeline] 执行料台抓取，同时后台规划后方放置")
+                if not execute_checked(pick.to_place):
+                    return False
+                node.wait_for_operator("按回车执行双臂同步直线抓取料台第一排物料: ")
+                force_before = read_dual_grasp_fz("table-to-rear")
+                if force_before is None:
+                    return False
+                if not node._execute_traj(pick.descent):
+                    return False
+                if not set_unload_tool_power(1, "料台第一排取料"):
+                    return False
+                time.sleep(UNLOAD_TOOL_SETTLE_SEC)
+                if not node._execute_traj(node._reverse_trajectory(pick.descent)):
+                    return False
+                suction_ok = check_dual_suction(force_before, "table-to-rear")
+                if suction_ok is None:
+                    return False
+                if suction_ok:
+                    break
+                if not set_unload_tool_power(0, "物料吸附失败，已直线退回"):
+                    return False
+                # 丢弃失败抓取对应的后台轨迹，收完任务后才能更新视觉场景。
+                if not rear_future.cancel():
+                    try:
+                        rear_future.result()
+                    except Exception as exc:
+                        log.warning(f"[table-to-rear][pipeline] 丢弃旧放置规划: {exc}")
+                pending.remove(rear_future)
+                log.warning("[table-to-rear] 双臂未全部吸附成功，重新识别并抓取当前料对")
+                if not prepare_unload_scene(trigger_command=LOAD_TABLE_TRIGGER_COMMAND):
+                    return False
+            else:
+                return False
+
+            # 复用步骤 7 的 SW yubei/直线规划，只执行放置所需的动作顺序。
+            rear_result = rear_future.result()
+            if rear_result is None:
+                return False
+            rear, left_pre, right_pre = rear_result
+            if not node._wait_for_driver_signal(require_new=True):
+                return False
+            if not pair_empty(right_slot, left_slot):
+                log.error("[table-to-rear] 后方目标已被占用，保持工具上电并停止")
+                return False
+            rear_end = endpoint_state(pick_end, rear.to_yubei)
+            if pair_index + 1 < len(pairs):
+                next_right, next_left, next_points = pairs[pair_index + 1]
+                if pair_empty(next_right, next_left):
+                    next_pick = submit(
+                        move_unload_pair_to_place, unload_place_poses,
+                        *next_points[0], planning_start_joints=rear_end,
+                        plan_only=True, planning_node=planner_node,
+                    )
+                    log.info("[table-to-rear][pipeline] 执行后方放置，同时后台规划下一对料台抓取")
+            if not execute_checked(rear.to_yubei):
+                return False
+            node.wait_for_operator("按回车执行双臂同步直线放回后方 SW 位: ")
+            # 必须在实际下降前再次检查，不能仅依赖取料前的空位信号。
+            if not node._wait_for_driver_signal(require_new=True):
+                return False
+            if not pair_empty(right_slot, left_slot):
+                log.error("[table-to-rear] 下降前发现后方目标非空，取消放置并保持上电")
+                return False
+            left_fz = node.wait_for_ft_sensor_z("left")
+            right_fz = node.wait_for_ft_sensor_z("right")
+            if left_fz is None or right_fz is None:
+                return False
+            result = node._execute_approach_with_force_guard(
+                rear.approach, ("left", "right"),
+                {"left": left_fz, "right": right_fz},
+                max(rear.left_approach_distance, rear.right_approach_distance),
+                near_force_drop_threshold=None,
+                stage_label="后方 SW 双臂放置下降", baseline_label="放置预备点",
+            )
+            if result != "success":
+                if result == "safety_failed":
+                    set_unload_tool_power(0, "后方放置安全停止失败")
+                    return False
+                node.recover_dual_arm_linear_after_alarm(
+                    left_return_pose=left_pre, right_return_pose=right_pre,
+                    full_joint_names=full_names, collision_group="dual_arm_body",
+                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    stage="后方 SW 双臂放置", clear_alarms=(result != "contact"),
+                )
+                # 未确认放置成功，不占用 SW、不继续抓取下一对。
+                return False
+            if not set_unload_tool_power(0, "后方 SW 放置"):
+                return False
+            time.sleep(UNLOAD_TOOL_SETTLE_SEC)
+            if node.sim_mode and not node._update_simulated_place_slots(
+                [right_slot, left_slot], has_material=True, reason="输入 13 放回后方",
+            ):
+                return False
+            if not node._execute_traj(node._reverse_trajectory(rear.approach)):
+                return False
+
+        log.info("[table-to-rear] 第一排处理结束，保持直线退回后的后方预备位")
+        return True
+
+    def run_unload_cycle(*, to_frame: bool = False) -> bool:
+        """步骤 7/14：最多放置两对料，正常结束后复位双臂和身体。"""
+        place_targets = unload_place_poses
+        if to_frame:
+            if not frame_added:
+                log.error("[frame-unload] 请先识别并添加深框（输入 9 或步骤 2、3）")
+                return False
+            place_targets = {}
+            for point, local_xyz in (
+                (1, FRAME_UNLOAD_LEFT_LOCAL_XYZ),
+                (3, FRAME_UNLOAD_RIGHT_LOCAL_XYZ),
+            ):
+                target = pose_rotate_local_rpy(
+                    pose_offset_local(node._frame_pose, *local_xyz),
+                    0.0, math.pi, 0.0,
+                )
+                # 共用流程接收下降预备点；反推预备点，使下降终点落在指定偏移。
+                place_targets[point] = pose_offset_local_z(target, -UNLOAD_PLACE_DESCENT_DISTANCE)
+            log.info(
+                f"[frame-unload] 相对深框实体中心：左 {FRAME_UNLOAD_LEFT_LOCAL_XYZ}，"
+                f"右 {FRAME_UNLOAD_RIGHT_LOCAL_XYZ} m；局部 Y 转 180°"
+            )
+        elif not unload_scene_added or place_targets is None:
+            log.error("[unload] 尚未执行步骤 6，缺少物料台碰撞模型和放置位")
+            return False
+
+        if not to_frame:
+            for cycle_index, (_, _, point_pairs) in enumerate(UNLOAD_PAIR_CYCLES):
+                left_point, right_point = point_pairs[
+                    unload_cycle_indices[cycle_index] % len(point_pairs)
+                ]
+                for side, point in (("左臂", left_point), ("右臂", right_point)):
+                    x, y, z, roll, pitch, yaw = pose_to_xyz_rpy(place_targets[point])
+                    print(
+                        f"{GREEN}[unload] {side}放置预备点{point} @ {SCENE_FRAME}: "
+                        f"xyz(m)=({x:.6f}, {y:.6f}, {z:.6f}), "
+                        f"rpy(deg)=({math.degrees(roll):.6f}, "
+                        f"{math.degrees(pitch):.6f}, {math.degrees(yaw):.6f}){RESET}"
+                    )
+
+        used_pairs: set[int] = set()
+
+        def select_cycle_pair():
+            if not to_frame:
+                return select_unload_pair()
+            for index in (1, 0):
+                right_slot, left_slot, _ = UNLOAD_PAIR_CYCLES[index]
+                if index not in used_pairs and node._place_slot_has_material(right_slot) and node._place_slot_has_material(left_slot):
+                    return index, right_slot, left_slot, 1, 3
+            return None
+
+        reset_joint_names = list(JOINT_TARGETS["dual_arm_body"].keys())
+
+        def reset_after_unload_cycle() -> bool:
+            """正常完成本次 SW 循环后复位到抓取流程初始构型。"""
+            log.info(
+                "[unload] SW 优先级循环放置结束，dual_arm_body "
+                "复位到 MOVE_TO_GRASP_RESET_Q"
+            )
+            if not node.plan_execute_joint_waypoints(
+                "dual_arm_body",
+                UNLOAD_JOINT_SPEED,
+                reset_joint_names,
+                [MOVE_TO_GRASP_RESET_Q],
+                num_attempts=30,
+                planning_time_sec=10.0,
+            ):
+                log.error(
+                    "[unload] 循环结束后复位到 MOVE_TO_GRASP_RESET_Q 失败"
+                )
+                return False
+            log.info("[unload] 已复位到 MOVE_TO_GRASP_RESET_Q")
+            return True
+
+        log.info("[unload] 开始放置前先给左右末端下电")
+        if not set_unload_tool_power(0, "放置开始"):
+            log.error("[unload] 双臂未全部下电，禁止执行后续动作")
+            return False
+
+        next_pick_cache: dict[str, object] = {}
+        reset_future: Future[RobotTrajectory | None] | None = None
+
+        for batch_index in range(UNLOAD_MAX_PAIRS_PER_RUN):
+            cached_selected = next_pick_cache.pop("selected", None)
+            cached_pick_future = next_pick_cache.pop("future", None)
+            if cached_selected is None:
+                if not node._wait_for_driver_signal(require_new=True):
+                    return False
+            else:
+                log.info("[unload][pipeline] 使用第一次放置期间选定的第二次取料")
+            material_slots = unload_material_slots()
+            material_text = (
+                ", ".join(slot.upper() for slot in material_slots)
+                if material_slots
+                else "无"
+            )
+            print(f"{GREEN}[unload] 当前有料位置: {material_text}{RESET}")
+
+            selected = cached_selected or select_cycle_pair()
+            if selected is None:
+                log.info(
+                    "[unload] 没有完整料对（需要 SW1+SW3 或 SW2+SW4），"
+                    "结束本次循环放置并复位"
+                )
+                return reset_after_unload_cycle()
+
+            (
+                cycle_index,
+                right_slot,
+                left_slot,
+                left_point,
+                right_point,
+            ) = selected
+            used_pairs.add(cycle_index)
+            log.info(
+                f"[unload] 第 {batch_index + 1} 轮："
+                f"右臂 {right_slot.upper()}→物料台点{right_point}，"
+                f"左臂 {left_slot.upper()}→物料台点{left_point}"
+            )
+            place_future: Future[UnloadPlaceTrajectoryPlan | None] | None = None
+
+            def start_place_plan(start_state: Mapping[str, float]) -> None:
+                nonlocal place_future
+
+                def plan_place() -> UnloadPlaceTrajectoryPlan | None:
+                    result = move_unload_pair_to_place(
+                        place_targets,
+                        left_point,
+                        right_point,
+                        planning_start_joints=dict(start_state),
+                        plan_only=True,
+                        planning_node=planner_node,
+                    )
+                    return (
+                        result
+                        if isinstance(result, UnloadPlaceTrajectoryPlan)
+                        else None
+                    )
+
+                place_future = planner_pool.submit(plan_place)
+                log.info(
+                    "[unload][pipeline] 开始运动到取料 yubei，"
+                    "已提交本轮放置轨迹后台规划"
+                )
+
+            pick_plan = None
+            if isinstance(cached_pick_future, Future):
+                try:
+                    pick_plan = cached_pick_future.result()
+                except Exception as exc:
+                    report_runtime_exception(exc, "run_unload_cycle")
+                    log.error(f"[unload][pipeline] 第二次抓取后台规划异常: {exc}")
+                    return False
+                if not isinstance(pick_plan, UnloadPickTrajectoryPlan):
+                    log.error("[unload][pipeline] 第二次抓取后台纯规划失败")
+                    return False
+            if not execute_unload_pick_pair(
+                right_slot, left_slot,
+                on_pick_motion_start=start_place_plan,
+                preplanned=pick_plan,
+                use_disk_cache=(batch_index == 0 and pick_plan is None),
+            ):
+                return False
+            if place_future is None:
+                log.error("[unload][pipeline] 双臂取料后未提交放置规划")
+                return False
+            try:
+                place_plan = place_future.result()
+            except Exception as exc:
+                report_runtime_exception(exc, "run_unload_cycle")
+                log.error(f"[unload][pipeline] 双臂放置后台规划异常: {exc}")
+                return False
+            if place_plan is None:
+                log.error("[unload][pipeline] 双臂放置后台纯规划失败")
+                return False
+            def plan_next_stage(end_state: Mapping[str, float]) -> None:
+                nonlocal reset_future
+                if batch_index == 0:
+                    if not node._wait_for_driver_signal(require_new=True):
+                        return
+                    next_selected = select_cycle_pair()
+                    if next_selected is None:
+                        return
+                    _, next_right_slot, next_left_slot, _, _ = next_selected
+
+                    def plan_next_pick() -> UnloadPickTrajectoryPlan | None:
+                        result = execute_unload_pick_pair(
+                            next_right_slot,
+                            next_left_slot,
+                            planning_start_joints=dict(end_state),
+                            plan_only=True,
+                            planning_node=planner_node,
+                        )
+                        return (
+                            result
+                            if isinstance(result, UnloadPickTrajectoryPlan)
+                            else None
+                        )
+
+                    next_pick_cache["selected"] = next_selected
+                    next_pick_cache["future"] = planner_pool.submit(plan_next_pick)
+                    log.info("[unload][pipeline] 第一次放置开始，后台规划第二次抓取")
+                    return
+
+                def plan_reset() -> RobotTrajectory | None:
+                    ok, _, trajectory = planner_node.plan_joint_motion(
+                        "dual_arm_body",
+                        MOVE_TO_GRASP_RESET_Q,
+                        joint_names=reset_joint_names,
+                        start_joints=dict(end_state),
+                        speed_scale=UNLOAD_JOINT_SPEED,
+                        num_attempts=30,
+                        planning_time_sec=10.0,
+                        execute=False,
+                    )
+                    return trajectory if ok else None
+
+                reset_future = planner_pool.submit(plan_reset)
+                log.info("[unload][pipeline] 第二次放置开始，后台规划复位轨迹")
+
+            if not move_unload_pair_to_place(
+                place_targets,
+                left_point,
+                right_point,
+                preplanned=place_plan,
+                on_place_motion_start=plan_next_stage,
+            ):
+                return False
+
+            if to_frame:
+                log.info(f"[frame-unload] {right_slot}/{left_slot} 下料完成")
+                continue
+            point_pairs = UNLOAD_PAIR_CYCLES[cycle_index][2]
+            unload_cycle_indices[cycle_index] = (
+                unload_cycle_indices[cycle_index] + 1
+            ) % len(point_pairs)
+            next_left, next_right = point_pairs[unload_cycle_indices[cycle_index]]
+            log.info(
+                f"[unload] 第 {batch_index + 1} 轮完成；"
+                f"该料对下次循环目标=({next_left}, {next_right})"
+            )
+
+        if reset_future is None:
+            return reset_after_unload_cycle()
+        try:
+            reset_plan = reset_future.result()
+        except Exception as exc:
+            report_runtime_exception(exc, "run_unload_cycle")
+            log.error(f"[unload][pipeline] 复位后台规划异常: {exc}")
+            return False
+        if reset_plan is None:
+            log.error("[unload][pipeline] 复位后台纯规划失败")
+            return False
+        actual_reset_start = node._get_joints(
+            list(reset_plan.joint_trajectory.joint_names), wait_new=True,
+        )
+        reset_first = reset_plan.joint_trajectory.points[0]
+        reset_start_error = max(
+            (
+                abs(actual_reset_start[name] - value)
+                for name, value in zip(
+                    reset_plan.joint_trajectory.joint_names,
+                    reset_first.positions,
+                )
+                if actual_reset_start is not None and name in actual_reset_start
+            ),
+            default=float("inf") if actual_reset_start is None else 0.0,
+        )
+        if reset_start_error > 0.05:
+            log.error(
+                f"[unload][pipeline] 复位缓存起点偏差 "
+                f"{reset_start_error:.4f} > 0.05，禁止执行缓存轨迹"
+            )
+            return False
+        log.info("[unload][pipeline] 执行第二次放置期间缓存的复位轨迹")
+        return node._execute_traj(reset_plan)
+
+    def remove_cached_unload_scene() -> bool:
+        """移除步骤 6 创建的场景，并清空对应缓存。"""
+        nonlocal unload_scene_added, unload_place_poses
+        if not unload_scene_added:
+            unload_place_poses = None
+            return True
+        if not node.remove_unload_scene():
+            log.warning(
+                "[unload] 移除物料台碰撞模型失败，"
+                "保留场景缓存以便稍后重试并继续当前流程"
+            )
+            return False
+        unload_scene_added = False
+        unload_place_poses = None
+        return True
+
+    def execute_step(step: int, source: str, payload: dict) -> bool:
+        """执行一个独立步骤；区间和上位机流程均复用此入口。"""
+        nonlocal frame_added
+        nonlocal unload_scene_added, unload_place_poses
+        nonlocal pending_frame_recognition_pose, frame_recognition_agv_pose
+        log.info(f"[{source}][步骤 {step}] {STEP_DESCRIPTIONS[step]}")
+
+        if sim_mode and source == "keyboard":
+            if step == 4:
+                node._update_simulated_place_slots(
+                    list(PLACE_SLOT_MASKS),
+                    has_material=False,
+                    reason="键盘执行步骤 4，初始化四个空位",
+                )
+            elif step in (7, 14):
+                node._update_simulated_place_slots(
+                    list(PLACE_SLOT_MASKS),
+                    has_material=True,
+                    reason=f"键盘执行步骤 {step}，初始化四个有料位",
+                )
+
+        if step == 1:
+            return node.navigate_and_wait(NAV_TARGET_FRAME_RECOGNITION)
+        if step == 2:
+            return recognize_and_record_deep_frame()
+        if step == 3:
+            return drive_to_grasp_and_add_deep_frame()
+        if step == 4:
+            log.info(
+                "[pick] 开始抓满四个放置位；命令参数="
+                f"{json.dumps(payload, ensure_ascii=False)}"
+            )
+            return run_grasps_until_no_empty_slot() is True
+        if step == 5:
+            return node.drive_agv(AGV_PLACE_SPEED_X)
+        if step == 6:
+            return prepare_unload_scene()
+        if step == 7:
+            return run_unload_cycle()
+        if step == 8:
+            # 碰撞模型清理是尽力而为；失败既不阻止导航，也不令步骤失败。
+            remove_cached_unload_scene()
+            return node.navigate_and_wait(NAV_TARGET_INIT)
+
+        if step == 9:
+            return recognize_and_record_deep_frame(add_directly=True)
+        if step == 10:
+            return run_table_pick_place(place=False)
+        if step == 11:
+            return run_table_pick_place(place=True)
+        if step == 12:
+            return prepare_unload_scene(LOAD_TABLE_TRIGGER_COMMAND)
+        if step == 13:
+            return run_table_to_rear_cycle()
+        if step == 14:
+            return run_unload_cycle(to_frame=True)
+        if step == 15:
+            if not node.clear_world_scene_objects(service_timeout=10.0):
+                log.error("[scene-cleanup] 清除环境碰撞物失败，保留场景记录")
+                return False
+            frame_added = False
+            unload_scene_added = False
+            unload_place_poses = None
+            pending_frame_recognition_pose = None
+            frame_recognition_agv_pose = None
+            log.info("[scene-cleanup] 环境碰撞物已全部清除，相关场景记录已清空")
+            return True
+
+        log.error(f"未知步骤: {step}")
+        return False
+
+    try:
+        frame_added = False
+        code = 0
+
+        startup_ok = node.verify_startup_hardware()
+        publish_initialized(startup_ok, node._startup_error_codes)
+        node._defer_error_publish = False
+        if not startup_ok:
+            log.error("[startup-check] 初始化自检失败，不进入等待命令流程")
+            return 1
+        while rclpy.ok():
+            if keyboard_control_mode:
+                steps = wait_for_keyboard_steps()
+                if steps is None:
+                    break
+                command_topic = None
+                payload = {"source": "keyboard", "steps": list(steps)}
+                command_source = "keyboard"
+            else:
+                queued_command = node.wait_for_upper_command()
+                if queued_command is None:
+                    break
+                command_topic, payload = queued_command
+                steps = UPPER_COMMAND_STEPS.get(command_topic)
+                if steps is None:
+                    log.error(f"未处理的上位机命令话题: {command_topic}")
+                    continue
+                command_source = "upper"
+
+            workflow_ok = True
+            try:
+                node._force_task_active = True
+                node._abort_on_force_range()
+                for step in steps:
+                    if not execute_step(step, command_source, payload):
+                        workflow_ok = False
+                        log.error(f"[{command_source}] 步骤 {step} 失败，停止后续步骤")
+                        break
+                    log.info(f"[{command_source}] 步骤 {step} 完成")
+            except ForceRangeAbort as exc:
+                workflow_ok = False
+                node._force_task_active = False
+                log.error(
+                    f"[force-range] {exc}；退出当前任务及后续步骤，"
+                    "保护已锁存，请排除过载并重启脚本后再执行任务"
+                )
+                for side, request_id in node._force_stop_requests.items():
+                    if not node._wait_for_servoj_control_state(side, "stop", request_id):
+                        log.error(f"[force-range] {side} 臂停止确认失败")
+            finally:
+                node._force_task_active = False
+
+            if command_topic is None:
+                result_text = "成功" if workflow_ok else "失败"
+                print(f"{GREEN if workflow_ok else ''}[keyboard] {steps} 执行{result_text}{RESET}")
+
+    except Exception as exc:
+        report_runtime_exception(exc, "主流程")
+        raise
+    finally:
+        cleanup_grasp_display(remove_scene_objects=frame_added)
+        if unload_scene_added:
+            remove_cached_unload_scene()
+        if frame_added:
+            log.info(f"移除「{FRAME_ID}」…")
+            if not node.remove_frame():
+                log.warning(f"移除「{FRAME_ID}」失败，忽略该退出清理失败")
+        planner_pool.shutdown(wait=True, cancel_futures=True)
+        planner_node.shutdown_executor()
+        node.shutdown_executor()
+        planner_node.destroy_node()
+        _runtime_error_reporter = None
+        node.destroy_node()
+
+    return code
+
+
+def main(argv: list[str] | None = None) -> int:
+    """非键盘模式自检结束后等待上位机请求，再反馈初始化结果。"""
+    global _runtime_error_reporter
+    status_node = None
+    status_pub = None
+    error_pub = None
+    initialization_reported = False
+
+    def publish_initialized(success: bool, error_codes: Sequence[int] = ()) -> None:
+        nonlocal initialization_reported
+        if initialization_reported or status_node is None:
+            return
+        requested = False
+
+        def on_request(msg: Bool) -> None:
+            nonlocal requested
+            requested = True
+
+        subscription = status_node.create_subscription(
+            Bool, SELFCHECK_REQUEST_TOPIC, on_request, 1,
+        )
+        status_node.get_logger().info(
+            f"[startup-check] 自检结束（success={success}），等待 {SELFCHECK_REQUEST_TOPIC}"
+        )
+        try:
+            while rclpy.ok() and not requested:
+                rclpy.spin_once(status_node, timeout_sec=0.1)
+            if not requested:
+                return
+            for code in ([0] if success else (list(error_codes) or [99])):
+                error_pub.publish(Int32(data=code))
+        finally:
+            status_node.destroy_subscription(subscription)
+        status_pub.publish(Bool(data=success))
+        initialization_reported = True
+        message = f"{ALGORITHM_INITIALIZED_TOPIC}: {success}"
+        if success:
+            status_node.get_logger().info(message)
+        else:
+            status_node.get_logger().error(message)
+
+    try:
+        _, _, keyboard_control_mode, _, ros_args = split_runtime_args(argv)
+        rclpy.init(args=ros_args)
+        if keyboard_control_mode:
+            return _run_main(argv, publish_initialized)
+        # 在 G01Demo 构造之前创建，主节点构造失败也能反馈 false。
+        status_node = Node("arm_algorithm_initialization")
+        error_pub = status_node.create_publisher(Int32, ERROR_CODE_TOPIC, 100)
+        status_pub = status_node.create_publisher(
+            Bool,
+            ALGORITHM_INITIALIZED_TOPIC,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        return _run_main(argv, publish_initialized)
+    except Exception as exc:
+        report_runtime_exception(exc, "节点初始化/运行/退出")
+        if status_pub is not None and not initialization_reported:
+            try:
+                publish_initialized(False)
+            except Exception as report_exc:
+                status_node.get_logger().error(f"初始化失败状态发布失败: {report_exc}")
+        raise
+    finally:
+        _runtime_error_reporter = None
+        if status_node is not None:
+            status_node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+if __name__ == "__main__":
+    sys.exit(main())
