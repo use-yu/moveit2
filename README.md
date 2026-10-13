@@ -1,4 +1,5 @@
 # moveit2
+58
 
 pgrep -af taihu_motor_node
 kill 10568 11065 691478

@@ -6,9 +6,11 @@ G01 MoveIt 演示脚本
 
 功能按 1~15 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
 1. 导航到深框识别位置。
-2. 运动到深框识别构型，识别深框，并记录当时 /agv_position 实际位姿；
+2. 运动到深框识别构型，接收两点，以中点位置和第一点姿态识别深框，
+   并记录当时 /agv_position 实际位姿；
    未收到有效视觉数据时最多重复发送识别命令 5 次。
-3. 向 /agv_auto_control_speed 以 20 Hz 发布 linear.x=0.1 m/s，持续 3 秒后停车。
+3. 向 /agv_auto_control_speed 以 20 Hz 发布 linear.x=0.1 m/s，
+   持续 max(0, (识别点基座系 x - 0.5) / 0.1) 秒后停车。
    停车后再记录 /agv_position，将识别位置下的深框位姿转换到
    抓取位置的 moveit_base_link 后再添加碰撞模型。
 4. 持续上料，直到 SW1~SW4 没有空位：
@@ -37,7 +39,8 @@ G01 MoveIt 演示脚本
     放置后回识别位，有缓存解则直接抓取，未完成则原地等待。
     SW 放置直线去程/回程若因机械臂报警失败，程序自动调用 servoj_30ms
     清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
-5. 向 /agv_auto_control_speed 以 20 Hz 发布 linear.x=-0.1 m/s，持续 3 秒后停车。
+5. 向 /agv_auto_control_speed 以 20 Hz 发布 linear.x=-0.1 m/s，
+   使用步骤 2 保存的同一时长后停车。
 6. 运动到物料台识别预备构型，识别并添加碰撞模型；未收到有效视觉数据时
    最多重复发送识别命令 5 次。
 7. 循环下料：
@@ -398,10 +401,12 @@ MOVE_TO_GRASP_RESET_Q = [
     0 * math.pi / 180,
 ]
 
+# 输入 2：头部到位后使用实际 head_joint 反馈转换深框视觉坐标。
+FRAME_RECOGNITION_CAMERA_POSITION = 0.7854
 # p,4 深框识别专用预备构型，顺序与 dual_arm_body 一致。
 框_Q1 = [
     0.0,
-    20 * math.pi / 180,
+    10 * math.pi / 180,
     -1.57,
     -0.15,
     -1.578090,
@@ -437,7 +442,7 @@ FRAME_DIRECT_VISION_Q = [
 ]
 # 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
 # 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
-GRASP_VISION_WAIST_ANGLES_DEG = (30,)
+GRASP_VISION_WAIST_ANGLES_DEG = (20,30,)
 # 输入 4：先发送此头部目标，再运动到识别构型；头部到位后才采集视觉。
 GRASP_VISION_CAMERA_POSITION = 0.7854
 # 抓取排序的姿态分组阈值：局部 +Z 与 moveit_base_link -Z
@@ -511,7 +516,7 @@ DEFAULT_SPEED_SCALE = 0.5
 # 深框障碍物（相对于 moveit_base_link 发布）
 SCENE_FRAME = "moveit_base_link"
 FRAME_ID = "深框"
-FRAME_SIZE = (0.86, 0.86, 0.6)  # 深框整体外尺寸：长×宽×高 [m]0.8, 0.8, 0.71
+FRAME_SIZE = (1.1, 1.1, 0.86)  # 深框整体外尺寸：长×宽×高 [m]0.8, 0.8, 0.71
 WALL_T = 0.06  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
 FRAME_Y_OUTER_THICKNESS = 0.05  # 局部 ±Y 两侧向外附加的厚度 [m]
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
@@ -519,15 +524,15 @@ FRAME_RPY_DEG = (0.0, -0.0, 0.0)  # 相对于 moveit_base_link [degree]
 FRAME_COLOR = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.5)
 # p,4 识别位姿先绕自身 Z 轴 +90°，再沿旋转后的自身坐标平移，
 # 得到深框顶部空心区域中心；该坐标点位于开口中，不落在框壁实体上。
-FRAME_VISION_TRIGGER_COMMAND = "p,9"
+FRAME_VISION_TRIGGER_COMMAND = "p,10"
 FRAME_VISION_POSE_KEY = "right_body"
 FRAME_VISION_TF_FRAME = "deep_frame_vision"
 FRAME_TOP_CENTER_TF_FRAME = "deep_frame_top_center"
 FRAME_CENTER_TF_FRAME = "deep_frame_center"
 FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0 *0
 FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
-    -0.367,
-    -0.356,
+    0.51,
+    -0.0,
     0.11, #0.06
 )
 # 原有的深框局部 +Y 大长方体障碍物。
@@ -625,7 +630,7 @@ NAV_RESULT_TOPIC = "/nav_result"
 AGV_SPEED_TOPIC = "/agv_auto_control_speed"
 AGV_GRASP_SPEED_X = 0.1  # m/s
 AGV_PLACE_SPEED_X = -0.1  # m/s
-AGV_DRIVE_DURATION_SEC = 3.0
+AGV_FRAME_TARGET_X = 0.5  # 深框识别点在 moveit_base_link 下的目标 x，单位 m
 AGV_SPEED_PUBLISH_HZ = 20.0
 AGV_POSITION_TOPIC = "/agv_position"
 AGV_POSITION_QUEUE_DEPTH = 100
@@ -652,9 +657,9 @@ UPPER_COMMAND_STEPS = {
 STEP_DESCRIPTIONS = {
     1: "导航到深框识别位置",
     2: "识别深框并记录识别位置的实际 AGV 位姿",
-    3: "AGV 以 0.1 m/s 前进 3 秒（20 Hz），转换并添加深框碰撞模型",
+    3: "AGV 以 0.1 m/s 前进 (识别点 x-0.5)/0.1 秒（20 Hz），转换并添加深框碰撞模型",
     4: "抓满四个放置位",
-    5: "AGV 以 -0.1 m/s 后退 3 秒（20 Hz）",
+    5: "AGV 以 -0.1 m/s 后退，时长与步骤 3 相同（20 Hz）",
     6: "物料台预备构型、识别并添加碰撞模型",
     7: "按 SW 优先级循环放置",
     8: "导航回起点",
@@ -1543,12 +1548,40 @@ def camera_transform_at_head_position(
     return transform
 
 
+def agv_drive_duration_from_frame_x(frame_x: float) -> float:
+    """由识别点基座系 x 计算前进/后退共用时长；已在目标以内时不移动。"""
+    if not math.isfinite(frame_x):
+        raise ValueError("深框识别点 x 必须是有限数值")
+    duration_sec = max(0.0, (frame_x - AGV_FRAME_TARGET_X) / AGV_GRASP_SPEED_X)
+    if not math.isfinite(duration_sec):
+        raise ValueError("深框识别点 x 计算出的 AGV 运动时长无效")
+    return duration_sec
+
+
+def deep_frame_midpoint_pose(
+    vision_results: Sequence[tuple[int, Sequence[float]]],
+) -> tuple[int, list[float]]:
+    """相机系两点 xyz(mm) 取中点，四元数和模式码保留原始第一个点。"""
+    if len(vision_results) != 2:
+        raise ValueError(f"深框识别需要恰好 2 个点，实际收到 {len(vision_results)} 个")
+    first_mode, first_pose = vision_results[0]
+    _, second_pose = vision_results[1]
+    for pose in (first_pose, second_pose):
+        if len(pose) != 7 or not all(math.isfinite(value) for value in pose):
+            raise ValueError("深框点必须包含 7 个有限数值：xyz + quat(wxyz)")
+        if math.hypot(*pose[3:7]) == 0.0:
+            raise ValueError("深框点四元数长度为 0")
+    midpoint = [(first_pose[i] + second_pose[i]) / 2.0 for i in range(3)]
+    return first_mode, midpoint + list(first_pose[3:7])
+
+
 def read_vision_object_pose(
     node,
     log,
     sim_mode: bool = False,
     trigger_command: str = VISION_TRIGGER_COMMAND,
     sort_by_sj_z: bool = True,
+    use_frame_midpoint: bool = False,
 ):
     """视觉识别封装：返回所有点的模式码和 xyz_rpy。
 
@@ -1559,13 +1592,19 @@ def read_vision_object_pose(
     if sim_mode:
         first_return_mode, pose = sim_vision_result_for_trigger(trigger_command)
         vision_results = [(first_return_mode, list(pose))]
+        if use_frame_midpoint:
+            # 两个仿真端点关于原仿真识别位置对称，单位 mm。
+            vision_results = [
+                (first_return_mode, [pose[0] + offset, *pose[1:]])
+                for offset in (-100.0, 100.0)
+            ]
         if trigger_command in (UNLOAD_TRIGGER_COMMAND, LOAD_TABLE_TRIGGER_COMMAND):
             sim_source = f"物料台 {trigger_command}"
         elif trigger_command == FRAME_VISION_TRIGGER_COMMAND:
             sim_source = "深框 p,4"
         else:
             sim_source = "普通抓取"
-        log.info(f"[sim] viewer 点个数: 1，使用{sim_source}固定 pose")
+        log.info(f"[sim] viewer 点个数: {len(vision_results)}，使用{sim_source}固定 pose")
         print(
             f"{GREEN}[sim] viewer point 1: "
             f"first_return_mode = {first_return_mode}, pose = {pose}{RESET}"
@@ -1586,9 +1625,25 @@ def read_vision_object_pose(
             if vision_results is None:
                 return None
 
+        if use_frame_midpoint:
+            try:
+                midpoint_result = deep_frame_midpoint_pose(vision_results)
+            except ValueError as exc:
+                node.publish_error(2, str(exc))
+                log.error(f"[frame-vision] {exc}")
+                return None
+            for index, (_, raw_pose) in enumerate(vision_results, start=1):
+                print(f"{GREEN}[frame-vision] 相机原始点 {index} "
+                      f"xyz(mm)+quat(wxyz): {raw_pose}{RESET}")
+            print(f"{GREEN}[frame-vision] 相机系中点（姿态取原始第一个点） "
+                  f"xyz(mm)+quat(wxyz): {midpoint_result[1]}{RESET}")
+            # 在任何排序或坐标转换之前合并，确保第一个点指接收顺序。
+            vision_results = [midpoint_result]
+
         # 读取实际身体关节：
         #   body_joint2 用于把左/右臂基坐标下的物体位姿转到 SJ；
-        #   body_joint1 用于继续把 SJ 下的位姿转到 moveit_base_link。
+        #   body_joint1 用于继续把 SJ 下的位姿转到 moveit_base_link；
+        #   head_joint 的实际反馈用于更新相机外参，不使用头部指令角代替。
         body_joints = node._get_joints(
             ["body_joint1", "body_joint2", VISION_HEAD_JOINT], wait_new=True,
         )
@@ -1687,7 +1742,17 @@ def read_vision_object_pose(
                 f"\033[32mviewer point {point_index}: "
                 f"first_return_mode = {first_return_mode}, pose = {pose}\033[0m"
             )
-            print(f"xyz_rpy[{point_index}] [m, rad]: {xyz_rpy}")
+            if use_frame_midpoint:
+                for key, frame in (
+                    ("right", "r_base_link"), ("left", "l_base_link"),
+                    ("right_sj", "SJ（右臂链）"), ("left_sj", "SJ（左臂链）"),
+                    ("right_body", "moveit_base_link（右臂链）"),
+                    ("left_body", "moveit_base_link（左臂链）"),
+                ):
+                    print(f"{GREEN}[frame-vision] 中点 @ {frame} "
+                          f"xyz+rpy [m, rad]: {xyz_rpy[key]}{RESET}")
+            else:
+                print(f"xyz_rpy[{point_index}] [m, rad]: {xyz_rpy}")
 
         return first_return_modes, all_xyz_rpy
     finally:
@@ -1703,6 +1768,7 @@ def read_scene_vision_object_pose_with_retry(
     required_pose_key: str,
     scene_label: str,
     max_attempts: int = SCENE_VISION_MAX_ATTEMPTS,
+    use_frame_midpoint: bool = False,
 ):
     """场景识别失败时重新发送命令，返回首个包含所需位姿的数据。"""
     max_attempts = max(1, int(max_attempts))
@@ -1716,6 +1782,7 @@ def read_scene_vision_object_pose_with_retry(
             log,
             sim_mode=sim_mode,
             trigger_command=trigger_command,
+            use_frame_midpoint=use_frame_midpoint,
         )
         if vision_result is not None:
             first_return_modes, all_xyz_rpy = vision_result
@@ -3851,8 +3918,11 @@ class G01Demo(Node):
             f"message={self._latest_nav_message!r}"
         )
 
-    def drive_agv(self, speed_x: float) -> bool:
-        """以 20 Hz 发送指定 X 速度 3 秒，结束或异常退出时发送零速度。"""
+    def drive_agv(self, speed_x: float, duration_sec: float) -> bool:
+        """以 20 Hz 按指定时长发送 X 速度，结束或异常退出时发送零速度。"""
+        if not math.isfinite(duration_sec) or duration_sec < 0.0:
+            self.get_logger().error(f"[agv] 无效运动时长: {duration_sec}")
+            return False
         if self.sim_mode:
             self.get_logger().info("[sim][agv] 跳过 AGV 速度控制")
             return True
@@ -3862,11 +3932,11 @@ class G01Demo(Node):
         period = 1.0 / AGV_SPEED_PUBLISH_HZ
         self.get_logger().info(
             f"[agv] {AGV_SPEED_TOPIC}: linear.x={speed_x:.3f} m/s, "
-            f"持续 {AGV_DRIVE_DURATION_SEC:.1f}s, "
+            f"持续 {duration_sec:.6f}s, "
             f"发布频率 {AGV_SPEED_PUBLISH_HZ:.1f} Hz"
         )
         start = time.monotonic()
-        deadline = start + AGV_DRIVE_DURATION_SEC
+        deadline = start + duration_sec
         next_publish = start
         try:
             while rclpy.ok():
@@ -7573,6 +7643,99 @@ class G01Demo(Node):
         )
         return plan
 
+    def _execute_yubei_with_recovery(
+        self,
+        trajectory: RobotTrajectory,
+        *,
+        body_group: str,
+        body_joint_names: list[str],
+        yubei_joints: list[float],
+        yubei_name: str,
+        side: str,
+        speed: float,
+    ) -> bool:
+        """到 yubei 执行失败或实测未到位时，清错并从实测状态重规划一次。"""
+        log = self.get_logger()
+        stage = f"{body_group} OMPL → {yubei_name}"
+
+        def fail(message: str) -> bool:
+            self.last_pick_failure_reason = "yubei_recovery_failed"
+            self.publish_error(99, f"[yubei-recovery] {stage}：{message}，停止本批次")
+            return False
+
+        def reached_target() -> bool:
+            # action 成功不等于真机到位；用新反馈检查升降、腰部和放置臂。
+            deadline = time.monotonic() + 2.0
+            while rclpy.ok() and time.monotonic() < deadline:
+                self._abort_on_force_range()
+                actual = self._get_joints(
+                    body_joint_names, wait_new=True,
+                    timeout=max(0.0, deadline - time.monotonic()),
+                )
+                if actual is None:
+                    return False
+                errors = {
+                    name: abs(actual[name] - target)
+                    for name, target in zip(body_joint_names, yubei_joints)
+                }
+                if all(
+                    error <= (0.005 if name == "body_joint1" else 0.02)
+                    for name, error in errors.items()
+                ):
+                    return True
+            log.error(f"[yubei-recovery] {stage} 实测关节未到位")
+            return False
+
+        def stop_active_motion() -> bool:
+            # 超时的 action 可能仍在运行，确认结束后才能恢复 ServoJ 入口。
+            request_id = self._send_servoj_control(side, "stop")
+            stopped = self._wait_for_servoj_control_state(side, "stop", request_id)
+            for handle in list(self._force_action_goals):
+                result = handle.get_result_async()
+                if not result.done():
+                    cancel = handle.cancel_goal_async()
+                    if not self._spin_until(cancel, 5.0):
+                        stopped = False
+                    if not self._spin_until(result, 10.0):
+                        stopped = False
+            return stopped
+
+        if self._execute_traj(trajectory) and reached_target():
+            return True
+        self._abort_on_force_range()
+        log.warning(f"[yubei-recovery] {stage} 执行失败或未到位，清错后仅重试一次")
+        if not stop_active_motion():
+            return fail("无法确认原轨迹停止")
+        # 保持工具电源，继续持料；只恢复负责本次放置的机械臂。
+        if not self.clear_arm_alarm(side):
+            return fail("机械臂清错/恢复使能失败")
+        current = self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True)
+        if current is None:
+            return fail("读取清错后的实测关节失败")
+        ok, _, retry_trajectory = self.plan_joint_motion(
+            body_group,
+            yubei_joints,
+            joint_names=body_joint_names,
+            start_joints=current,
+            speed_scale=speed,
+            num_attempts=50,
+            max_retries=1,
+            planning_time_sec=20.0,
+            avoid_collisions=True,
+            execute=False,
+        )
+        if not ok or retry_trajectory is None:
+            return fail("从实测位置重新规划到 yubei 失败")
+        request_id = self._send_servoj_control(side, "resume")
+        if not self._wait_for_servoj_control_state(side, "resume", request_id):
+            stop_active_motion()
+            return fail("ServoJ 指令入口恢复失败")
+        if not self._execute_traj(retry_trajectory) or not reached_target():
+            stop_active_motion()
+            return fail("唯一一次重试执行失败或实测仍未到位")
+        log.info(f"[yubei-recovery] 已从实测位置到达 {yubei_name}，继续放置")
+        return True
+
     def _place_and_return(
         self,
         speed: float,
@@ -7730,8 +7893,15 @@ class G01Demo(Node):
         if plan is None:
             log.error(f"[pick] {yubei_name}/{place_name}/Q1 纯规划失败")
             return False
-        if not self._execute_traj(plan.to_yubei):
-            log.error(f"[pick] 执行缓存轨迹到 {yubei_name} 失败")
+        if not self._execute_yubei_with_recovery(
+            plan.to_yubei,
+            body_group=body_group,
+            body_joint_names=body_joint_names,
+            yubei_joints=yubei_joints,
+            yubei_name=yubei_name,
+            side="left" if arm_group == "left_arm" else "right",
+            speed=speed,
+        ):
             return False
 
         self.wait_for_operator()
@@ -8782,6 +8952,8 @@ def _run_main(
     frame_added = False
     pending_frame_recognition_pose: Pose | None = None
     frame_recognition_agv_pose: Pose2D | None = None
+    # 步骤 3 转换后保留，步骤 5 复用识别时计算的时长。
+    frame_agv_drive_duration_sec: float | None = None
     unload_scene_added = False
     unload_place_poses: dict[int, Pose] | None = None
     # 两组 SW 各自轮换两个目标对；成功放置后才推进对应游标。
@@ -9202,6 +9374,8 @@ def _run_main(
     def recognize_and_record_deep_frame(*, add_directly: bool = False) -> bool:
         """识别深框：记录 AGV 位姿待转换，或直接在当前位置添加模型。"""
         nonlocal frame_added, pending_frame_recognition_pose, frame_recognition_agv_pose
+        nonlocal frame_agv_drive_duration_sec
+        frame_agv_drive_duration_sec = None
         # 一旦开始新识别，旧的待转换数据不再允许被步骤 3 误用。
         pending_frame_recognition_pose = None
         frame_recognition_agv_pose = None
@@ -9209,13 +9383,13 @@ def _run_main(
         vision_q = FRAME_DIRECT_VISION_Q if add_directly else 框_Q1
         vision_q_name = "FRAME_DIRECT_VISION_Q" if add_directly else "框_Q1"
         vision_group = "dual_arm_body"
+        camera_target = (
+            FRAME_DIRECT_CAMERA_POSITION
+            if add_directly else FRAME_RECOGNITION_CAMERA_POSITION
+        )
+        node._camera_position_pub.publish(Float32(data=camera_target))
+        log.info(f"[frame-vision] 已发送头部目标 {camera_target:.4f} rad")
         if add_directly:
-            node._camera_position_pub.publish(
-                Float32(data=FRAME_DIRECT_CAMERA_POSITION)
-            )
-            log.info(
-                f"[frame-vision] 已发送头部目标 {FRAME_DIRECT_CAMERA_POSITION:.4f} rad"
-            )
             vision_group = "waist"
             vision_q = [vision_q[q1_joint_names.index("body_joint2")]]
             q1_joint_names = ["body_joint2"]
@@ -9235,7 +9409,7 @@ def _run_main(
             )
             return False
 
-        if add_directly and not node.wait_for_camera_position(FRAME_DIRECT_CAMERA_POSITION):
+        if not node.wait_for_camera_position(camera_target):
             return False
 
         vision_result = read_scene_vision_object_pose_with_retry(
@@ -9245,6 +9419,7 @@ def _run_main(
             trigger_command=FRAME_VISION_TRIGGER_COMMAND,
             required_pose_key=FRAME_VISION_POSE_KEY,
             scene_label="frame-vision",
+            use_frame_midpoint=not add_directly,
         )
         if vision_result is None:
             return False
@@ -9261,7 +9436,13 @@ def _run_main(
             f"{recognition_values[5]:.6f}) rad{RESET}"
         )
         recognition_agv_pose = None
+        drive_duration_sec = None
         if not add_directly:
+            try:
+                drive_duration_sec = agv_drive_duration_from_frame_x(recognition_pose.position.x)
+            except ValueError as exc:
+                log.error(f"[frame-vision] {exc}")
+                return False
             recognition_agv_pose = node.wait_for_agv_position_snapshot("深框识别位置")
             if recognition_agv_pose is None:
                 return False
@@ -9361,6 +9542,12 @@ def _run_main(
 
         pending_frame_recognition_pose = copy.deepcopy(recognition_pose)
         frame_recognition_agv_pose = recognition_agv_pose
+        frame_agv_drive_duration_sec = drive_duration_sec
+        log.info(
+            f"[agv] 深框识别点 x={recognition_pose.position.x:.6f} m；"
+            f"步骤 3/5 共用时长=max(0, (x-{AGV_FRAME_TARGET_X})/"
+            f"{AGV_GRASP_SPEED_X})={frame_agv_drive_duration_sec:.6f}s"
+        )
         log.info(
             f"[frame-vision] 已保存 {FRAME_VISION_TRIGGER_COMMAND} 识别位姿和"
             f"识别工位 {AGV_POSITION_TOPIC} 实际位姿；"
@@ -9378,7 +9565,10 @@ def _run_main(
             )
             return False
 
-        if not node.drive_agv(AGV_GRASP_SPEED_X):
+        if frame_agv_drive_duration_sec is None:
+            log.error("[agv] 未保存运动时长，请先成功执行步骤 2")
+            return False
+        if not node.drive_agv(AGV_GRASP_SPEED_X, frame_agv_drive_duration_sec):
             return False
 
         grasp_agv_pose = node.wait_for_agv_position_snapshot("深框抓取位置")
@@ -9433,7 +9623,7 @@ def _run_main(
     def run_one_grasp(
         ungraspable_points: list[tuple[float, float, float]],
     ) -> bool | None:
-        """执行一轮抓取；全点不可抓时按 20/30/40/50° 重新识别。"""
+        """执行一轮抓取；无物体或全点不可抓时按配置的下一腰角重新识别。"""
         node.last_pick_failure_reason = None
         # 在机器人运动和视觉识别之前先确认放置区，避免无空位时仍触发识别。
         if not node._wait_for_driver_signal(require_new=True):
@@ -9522,9 +9712,19 @@ def _run_main(
                 ungraspable_points,
             )
             if not all_xyz_rpy:
-                node.last_pick_failure_reason = "vision_no_objects"
-                log.error("[pick-collision] 视觉没有返回物体")
-                return False
+                cleanup_grasp_display()
+                if waist_attempt + 1 < len(GRASP_VISION_WAIST_ANGLES_DEG):
+                    next_waist_deg = GRASP_VISION_WAIST_ANGLES_DEG[waist_attempt + 1]
+                    log.warning(
+                        f"[pick-waist] {waist_deg}° 视觉返回 0 个物体，"
+                        f"切换到 {next_waist_deg}° 重新执行 Q1/视觉/排序/IK"
+                    )
+                else:
+                    log.warning(
+                        f"[pick-waist] {waist_deg}° 视觉返回 0 个物体，"
+                        "已无下一个配置腰角"
+                    )
+                continue
 
             show_all_grasp_vision_markers(
                 all_xyz_rpy,
@@ -9554,7 +9754,8 @@ def _run_main(
             node.publish_error(8, "全部视觉候选及配置腰角均不可抓取")
             node.last_pick_failure_reason = "all_waist_angles_unreachable"
             log.error(
-                "[pick-waist] 20°/30°/40°/50° 全部尝试完成，"
+                f"[pick-waist] {'/'.join(f'{angle}°' for angle in GRASP_VISION_WAIST_ANGLES_DEG)} "
+                "全部尝试完成（无物体或候选不可抓），"
                 "仍没有无碰撞 IK、Cartesian approach、"
                 "OMPL 到 q_pre 均可行的视觉点"
             )
@@ -9900,7 +10101,7 @@ def _run_main(
         ungraspable_points: list[tuple[float, float, float]] = []
         log.info(
             "[reach-cache] 开始新的步骤 4 批次，"
-            "20°/30°/40°/50° 共用失败点缓存已初始化，"
+            f"配置腰角 {GRASP_VISION_WAIST_ANGLES_DEG}° 共用失败点缓存已初始化，"
             f"匹配容差="
             f"{UNGRASPABLE_POINT_DISTANCE_TOLERANCE * 1000.0:.1f} mm"
         )
@@ -9920,7 +10121,7 @@ def _run_main(
             ungraspable_points.clear()
             log.info(
                 "[reach-cache] 步骤 4 已结束，"
-                f"已刷新 {cached_count} 个跨腰角失败点，"
+                f"已清空 {cached_count} 个跨腰角失败点缓存（此数值不是尝试腰角数），"
                 "下一批次将重新验证"
             )
 
@@ -11588,7 +11789,7 @@ def _run_main(
 
     def execute_step(step: int, source: str, payload: dict) -> bool:
         """执行一个独立步骤；区间和上位机流程均复用此入口。"""
-        nonlocal frame_added
+        nonlocal frame_added, frame_agv_drive_duration_sec
         nonlocal unload_scene_added, unload_place_poses
         nonlocal pending_frame_recognition_pose, frame_recognition_agv_pose
         log.info(f"[{source}][步骤 {step}] {STEP_DESCRIPTIONS[step]}")
@@ -11620,7 +11821,10 @@ def _run_main(
             )
             return run_grasps_until_no_empty_slot() is True
         if step == 5:
-            return node.drive_agv(AGV_PLACE_SPEED_X)
+            if frame_agv_drive_duration_sec is None:
+                log.error("[agv] 未保存运动时长，请先成功执行步骤 2")
+                return False
+            return node.drive_agv(AGV_PLACE_SPEED_X, frame_agv_drive_duration_sec)
         if step == 6:
             return prepare_unload_scene()
         if step == 7:
@@ -11651,6 +11855,7 @@ def _run_main(
             unload_place_poses = None
             pending_frame_recognition_pose = None
             frame_recognition_agv_pose = None
+            frame_agv_drive_duration_sec = None
             log.info("[scene-cleanup] 环境碰撞物已全部清除，相关场景记录已清空")
             return True
 
