@@ -64,8 +64,10 @@ G01 MoveIt 演示脚本
 8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
 
 上位机步骤映射：
-  /move_to_grasp_pose_cmd = 1~3，/grasp_cmd = 4，
-  /move_to_place_pose_cmd = 5~6，/place_cmd = 7~8。
+  /grasp_cmd = 2→3→4→5，完成后回复 /grasp_cmd_result（JSON String）；
+  持料或复位失败时回复失败并退出命令循环。
+  /move_to_grasp_pose_cmd = 1~8，/move_to_place_pose_cmd = 5~8；
+  /place_cmd、/return_init_pose 保留订阅但不执行动作。
 前提：
   - 已启动 move_group： ros2 launch g01_moveit_config demo.launch.py
   - 本节点与 move_group 在同一 ROS 域
@@ -101,6 +103,12 @@ G01 MoveIt 演示脚本
 4. 臂直接抓不可达
 加上腰部关节求解，先ik验证逆解可达，再只用臂验证直线退回，直线退回的ik初始值用带腰部关节求解的值
 
+命令循环和 /grasp_cmd_result 已接入，正在验证失败分支：
+- 深框识别失败：直接回复失败，继续等待命令。
+- 抓取失败且双末端为空：复位到 GRASP_Q1，执行 5 退回后回复失败。
+- 机械臂运动异常且双末端为空：先清错，再复位、退回；失败则回复并退出循环。
+- 仍持料或持料状态未知：保持工具电源，停止运动，回复失败并退出循环。
+
 """
 # solution_rad: r_arm_joint1=-1.944364063, r_arm_joint2=-1.597215489, r_arm_joint3=-0.565983840, r_arm_joint4=-0.979311147, r_arm_joint5=0.851759446, r_arm_joint6=3.140000000
 # solution_deg: r_arm_joint1=-111.403854650, r_arm_joint2=-91.513706512, r_arm_joint3=-32.428485315, r_arm_joint4=-56.110395575, r_arm_joint5=48.802221443, r_arm_joint6=179.908747671
@@ -120,6 +128,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
@@ -156,6 +165,7 @@ from moveit_msgs.srv import (
 )
 from rclpy.action import ActionClient
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.serialization import deserialize_message, serialize_message
@@ -188,6 +198,10 @@ ERROR_CODES = {
 
 
 _runtime_error_reporter = None
+
+
+class UpperGraspMotionFailure(BaseException):
+    """上位机抓取运动失败，跳过旧流程的下电/无限恢复分支。"""
 
 
 class ForceRangeAbort(BaseException):
@@ -622,6 +636,7 @@ SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
 MOTOR_COMMAND_TOPIC = "/g01/motor_commands"
 MOVE_TO_GRASP_POSE_CMD_TOPIC = "/move_to_grasp_pose_cmd"
 GRASP_CMD_TOPIC = "/grasp_cmd"
+GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
 MOVE_TO_PLACE_POSE_CMD_TOPIC = "/move_to_place_pose_cmd"
 PLACE_CMD_TOPIC = "/place_cmd"
 RETURN_INIT_POSE_TOPIC = "/return_init_pose"
@@ -649,7 +664,7 @@ UPPER_COMMAND_EXPECTED_TYPES = {
 }
 UPPER_COMMAND_STEPS = {
     MOVE_TO_GRASP_POSE_CMD_TOPIC: (1, 2, 3,4,5,6,7,8),
-    GRASP_CMD_TOPIC: (),
+    GRASP_CMD_TOPIC: (2, 3, 4, 5),
     MOVE_TO_PLACE_POSE_CMD_TOPIC: (5,6,7,8),
     PLACE_CMD_TOPIC: (),
     # 保留旧接口的订阅，但收到后不执行任何步骤，也不发布结果。
@@ -3543,8 +3558,15 @@ class G01Demo(Node):
         # 缓存最新 joint_states，供规划起点使用
         self._joints: dict[str, float] = {}
         self._js_count = 0
-        # 上位机命令只保留最近收到的一条；新命令直接覆盖尚未处理的旧命令。
-        self._latest_upper_command: tuple[str, dict] | None = None
+        # 已接收的上位机命令按顺序处理，执行期间收到的命令等待下一轮。
+        self._upper_commands: deque[tuple[str, dict]] = deque()
+        self._upper_grasp_active = False
+        self._upper_grasp_recovering = False
+        self._upper_grasp_forward_done = False
+        self._upper_grasp_placed_slots: set[str] = set()
+        # None=持料不确定；只在确认工具下电后标为空。
+        self._tool_load_state: dict[str, bool | None] = {"left": None, "right": None}
+        self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
         self.last_pick_failure_reason: str | None = None
         # UInt8 会在回调中显式限制到 uint8 范围。真实模式在收到首帧前为未知，
         # 未知状态按“没有安全空位”处理；仿真默认四个 SW 均为空。
@@ -4405,11 +4427,81 @@ class G01Demo(Node):
                 )
                 return
 
-        self._latest_upper_command = (command_topic, payload)
+        self._upper_commands.append((command_topic, payload))
         log.info(
             f"收到上位机命令 {command_topic}: "
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
+
+    def stop_upper_grasp_motion(self) -> bool:
+        """停止双臂指令入口并确认旧 action 结束，工具电源保持不变。"""
+        ok = True
+        requests = {side: self._send_servoj_control(side, "stop") for side in ("left", "right")}
+        for side, request_id in requests.items():
+            if not self._wait_for_servoj_control_state(side, "stop", request_id):
+                ok = False
+        for handle in list(self._force_action_goals):
+            result = handle.get_result_async()
+            if not result.done():
+                cancel = handle.cancel_goal_async()
+                if not self._spin_until(cancel, 5.0):
+                    ok = False
+                if not self._spin_until(result, 10.0):
+                    ok = False
+        return ok
+
+    def reset_empty_arms_for_upper_grasp(self, *, clear_alarms: bool) -> bool:
+        """仅确认双末端为空时，有限次清错并从实测状态复位到 GRASP_Q1。"""
+        log = self.get_logger()
+        if not all(state is False for state in self._tool_load_state.values()):
+            log.error(f"[upper-grasp] 末端持料/未知，禁止自动复位: {self._tool_load_state}")
+            return False
+        self._upper_grasp_recovering = True
+        try:
+            if not self.stop_upper_grasp_motion():
+                log.error("[upper-grasp] 不能确认旧轨迹停止，取消复位")
+                return False
+            if clear_alarms:
+                results = [self.clear_arm_alarm(side) for side in ("left", "right")]
+                if not all(results):
+                    log.error("[upper-grasp] 双臂清错失败，不再重试")
+                    return False
+            names = joint_names_for_group("dual_arm_body")
+            current = self._get_joints(names, wait_new=True)
+            if current is None:
+                return False
+            for side in ("left", "right"):
+                request_id = self._send_servoj_control(side, "resume")
+                if not self._wait_for_servoj_control_state(side, "resume", request_id):
+                    return False
+            log.info("[upper-grasp] 双末端为空，从实测位置复位到 GRASP_Q1")
+            if not self.plan_execute_joint_waypoints(
+                "dual_arm_body", 0.2, names, [GRASP_Q1],
+                start_joints=current, max_retries=1,
+                num_attempts=30, planning_time_sec=10.0,
+            ):
+                return False
+            actual = self._get_joints(names, wait_new=True)
+            if actual is None or any(
+                abs(actual[name] - target) > (0.005 if name == "body_joint1" else 0.02)
+                for name, target in zip(names, GRASP_Q1)
+            ):
+                log.error("[upper-grasp] GRASP_Q1 实测未到位，禁止底盘退回")
+                return False
+            log.info("[upper-grasp] GRASP_Q1 复位成功")
+            return True
+        finally:
+            self._upper_grasp_recovering = False
+
+    def publish_grasp_command_result(self, success: bool) -> None:
+        payload = {
+            "result": bool(success),
+            "grasp_success_number": len(self._upper_grasp_placed_slots),
+        }
+        self._grasp_result_pub.publish(String(data=json.dumps(payload)))
+        self.get_logger().info(f"[upper-grasp] {GRASP_CMD_RESULT_TOPIC}: {json.dumps(payload)}")
+        if not self._grasp_result_pub.wait_for_all_acked(timeout=Duration(seconds=2.0)):
+            self.get_logger().warning("[upper-grasp] 结果消息等待 DDS 确认超时")
 
     def wait_for_upper_command(self) -> tuple[str, dict] | None:
         """阻塞等待下一条上位机命令。"""
@@ -4418,10 +4510,8 @@ class G01Demo(Node):
             "move_to_place_pose/place/return_init_pose"
         )
         while rclpy.ok():
-            if self._latest_upper_command is not None:
-                latest_command = self._latest_upper_command
-                self._latest_upper_command = None
-                return latest_command
+            if self._upper_commands:
+                return self._upper_commands.popleft()
             self._executor.spin_once(timeout_sec=0.1)
         return None
 
@@ -4620,8 +4710,11 @@ class G01Demo(Node):
     def set_tool_power(self, side: str, status: int, timeout: float = 10.0) -> bool:
         """调用左右工具电源服务，要求返回 res=0。"""
         log = self.get_logger()
+        if side in self._tool_load_state:
+            self._tool_load_state[side] = None
         if self.sim_mode:
             log.info(f"[sim] 跳过 {side} SetToolPower({status})")
+            self._tool_load_state[side] = None if status else False
             return True
 
         if side == "left":
@@ -4654,6 +4747,7 @@ class G01Demo(Node):
         except Exception as exc:
             self.publish_error(error_code, f"{side}: {service_name}: {exc}")
             return False
+        self._tool_load_state[side] = None if status else False
         log.info(f"{service_name} SetToolPower({status}) 成功")
         return True
 
@@ -5987,7 +6081,15 @@ class G01Demo(Node):
             planning_time_sec=planning_time_sec,
         )
 
-    def plan_execute_joint_waypoints(
+    def plan_execute_joint_waypoints(self, *args, **kwargs):
+        if self._upper_grasp_active:
+            kwargs["max_retries"] = 1
+        result = self.plan_execute_joint_waypoints_impl(*args, **kwargs)
+        if self._upper_grasp_active and not self._upper_grasp_recovering and not result:
+            raise UpperGraspMotionFailure("plan_execute_joint_waypoints 失败")
+        return result
+
+    def plan_execute_joint_waypoints_impl(
         self,
         group: str,
         speed_scale: float,
@@ -6412,7 +6514,13 @@ class G01Demo(Node):
         )
         return True
 
-    def _execute_traj(self, traj, timeout: float = 60.0) -> bool:
+    def _execute_traj(self, *args, **kwargs):
+        result = self._execute_traj_impl(*args, **kwargs)
+        if self._upper_grasp_active and not self._upper_grasp_recovering and not result:
+            raise UpperGraspMotionFailure("_execute_traj 失败")
+        return result
+
+    def _execute_traj_impl(self, traj, timeout: float = 60.0) -> bool:
         """直接把一条 RobotTrajectory 发给 execute_trajectory action。
 
         traj 必须已是「速度缩放后」的最终轨迹（plan_cartesian_line 或
@@ -6443,7 +6551,13 @@ class G01Demo(Node):
             return False
         return True
 
-    def _execute_approach_with_force_guard(
+    def _execute_approach_with_force_guard(self, *args, **kwargs):
+        result = self._execute_approach_with_force_guard_impl(*args, **kwargs)
+        if self._upper_grasp_active and not self._upper_grasp_recovering and result in ("failed", "safety_failed"):
+            raise UpperGraspMotionFailure("_execute_approach_with_force_guard 失败")
+        return result
+
+    def _execute_approach_with_force_guard_impl(
         self,
         traj: RobotTrajectory,
         side: str | Sequence[str],
@@ -7684,6 +7798,8 @@ class G01Demo(Node):
         if self._execute_traj(trajectory) and reached_target():
             return True
         self._abort_on_force_range()
+        if self._upper_grasp_active and not self._upper_grasp_recovering:
+            raise UpperGraspMotionFailure(f"{stage} 实测未到位")
         log.warning(f"[yubei-recovery] {stage} 执行失败或未到位，清错后仅重试一次")
         if not stop_active_motion():
             return fail("无法确认原轨迹停止")
@@ -8011,6 +8127,12 @@ class G01Demo(Node):
             if not self.set_tool_power(tool_side, 0):
                 log.error(f"[pick] {tool_label}工具下电失败")
                 return False
+            if self._upper_grasp_active:
+                self._upper_grasp_placed_slots.add(slot_name or place_name)
+                log.info(
+                    f"[upper-grasp] 已放置到 {place_name}，本次成功放置数量="
+                    f"{len(self._upper_grasp_placed_slots)}"
+                )
             print(f"\033[32m{tool_label}下电成功\033[0m")
             if self.sim_mode:
                 if slot_name is None:
@@ -8507,6 +8629,7 @@ class G01Demo(Node):
                 f"[pick] {tool_label}Fz 增加超过 "
                 f"{GRASP_FORCE_Z_INCREASE_THRESHOLD:.3f} N，判定吸附成功，继续放置"
             )
+        self._tool_load_state[tool_side] = True
         # 全部视觉候选 Marker 仅用于抓取前/抓取中观察；
         # 吸附确认成功后立即删除，不等到后续放置流程结束。
         self.remove_all_pose_markers()
@@ -8717,6 +8840,7 @@ class G01Demo(Node):
             return False
         if not self.set_tool_power(plan.receiver_side, 1):
             return False
+        self._tool_load_state[plan.receiver_side] = True
         print(f"\033[32m{source_label}下电、{receiver_label}上电成功\033[0m")
         if not self._execute_traj(self._reverse_trajectory(plan.down)):
             return False
@@ -9552,6 +9676,8 @@ def _run_main(
         if not node.drive_agv(AGV_GRASP_SPEED_X, frame_agv_drive_duration_sec):
             return False
 
+        if node._upper_grasp_active:
+            node._upper_grasp_forward_done = True
         grasp_agv_pose = node.wait_for_agv_position_snapshot("深框抓取位置")
         if grasp_agv_pose is None:
             return False
@@ -9841,7 +9967,7 @@ def _run_main(
             start_next_grasp_plan=start_next_grasp_plan if pipeline_enabled else None,
         ):
             failure_reason = node.last_pick_failure_reason
-            if failure_reason == "q_pre":
+            if failure_reason == "q_pre" and not node._upper_grasp_active:
                 recovery_side = tool_side_for_link(pick_link)
                 recovery_q1 = list(GRASP_Q1)
                 recovery_q1[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(
@@ -10014,6 +10140,12 @@ def _run_main(
                     )
                 )
 
+            if node._upper_grasp_active and not grasp_result and node.last_pick_failure_reason != "no_place":
+                log.error("[upper-grasp] 抓取失败，交由命令流程判断持料状态并处理退回")
+                return False
+            if node._upper_grasp_active and len(node._upper_grasp_placed_slots) >= 4:
+                log.info("[upper-grasp] 本次已成功放置 4 个，结束步骤 4")
+                return True
             if grasp_result is None:
                 return None
             if (
@@ -11852,6 +11984,96 @@ def _run_main(
         log.error(f"未知步骤: {step}")
         return False
 
+    def run_upper_grasp_command(payload: dict) -> bool:
+        """执行一条 /grasp_cmd；返回是否继续等待下一条命令，每条只回复一次。"""
+        result = False
+        keep_running = True
+        stage = 2
+        previous_operator_mode = node.upper_control_mode
+        node.upper_control_mode = True
+        node._upper_grasp_active = True
+        node._upper_grasp_forward_done = False
+        node._upper_grasp_placed_slots.clear()
+        node._force_task_active = True
+        log.info("[upper-grasp] 开始新命令：2 → 3 → 4 → 5")
+
+        def failed(*, motion_error: bool) -> bool:
+            log.error(
+                f"[upper-grasp] 步骤 {stage} 失败，reason={node.last_pick_failure_reason}，"
+                f"末端持料状态={node._tool_load_state}（False=空，True=持料，None=未知）"
+            )
+            if not all(state is False for state in node._tool_load_state.values()):
+                log.error("[upper-grasp] 末端仍持料或状态未知，保持工具上电，不退回；回复失败后退出命令循环")
+                node.stop_upper_grasp_motion()
+                return False
+            if stage == 5:
+                log.error("[upper-grasp] 底盘退回失败，回复失败并退出命令循环")
+                return False
+            if motion_error or stage == 4:
+                if not node.reset_empty_arms_for_upper_grasp(clear_alarms=motion_error):
+                    node.stop_upper_grasp_motion()
+                    log.error("[upper-grasp] 双臂恢复/GRASP_Q1 复位失败，回复失败后退出命令循环")
+                    return False
+            if node._upper_grasp_forward_done:
+                log.info("[upper-grasp] 失败处理：执行步骤 5 退回后再回复失败")
+                if not execute_step(5, "upper-grasp-recovery", payload):
+                    log.error("[upper-grasp] 失败后的退回未完成，退出命令循环")
+                    return False
+                node._upper_grasp_forward_done = False
+            elif stage == 3:
+                log.error("[upper-grasp] 步骤 3 未确认前进完成，禁止按完整时长盲目退回；退出命令循环")
+                return False
+            log.info("[upper-grasp] 失败处理完成，回复后继续等待下一条 /grasp_cmd")
+            return True
+
+        try:
+            if not all(state is False for state in node._tool_load_state.values()):
+                keep_running = failed(motion_error=False)
+            else:
+                for stage in (2, 3, 4, 5):
+                    node._abort_on_force_range()
+                    if not execute_step(stage, "upper-grasp", payload):
+                        # 识别失败且没有运动异常：直接回复，不执行 3/4/5。
+                        if stage == 2:
+                            log.error("[upper-grasp] 深框识别失败，直接回复失败并继续等待命令")
+                        else:
+                            keep_running = failed(motion_error=False)
+                        break
+                    log.info(f"[upper-grasp] 步骤 {stage} 完成")
+                    if stage == 4 and not all(state is False for state in node._tool_load_state.values()):
+                        keep_running = failed(motion_error=False)
+                        break
+                else:
+                    result = True
+                    node._upper_grasp_forward_done = False
+        except UpperGraspMotionFailure as exc:
+            log.error(f"[upper-grasp] 机械臂运动异常：{exc}")
+            node.publish_error(99, str(exc))
+            try:
+                keep_running = failed(motion_error=True)
+            except (UpperGraspMotionFailure, ForceRangeAbort, Exception) as recovery_exc:
+                log.error(f"[upper-grasp] 恢复过程异常：{recovery_exc}，退出命令循环")
+                keep_running = False
+        except ForceRangeAbort as exc:
+            node._force_task_active = False
+            log.error(f"[upper-grasp] 力保护锁存：{exc}，回复失败后退出命令循环")
+            keep_running = False
+        except Exception as exc:
+            report_runtime_exception(exc, "上位机抓取流程")
+            log.error(f"[upper-grasp] 未处理异常：{exc}，回复失败后退出命令循环")
+            keep_running = False
+        finally:
+            node._force_task_active = False
+            if not keep_running:
+                try:
+                    node.stop_upper_grasp_motion()
+                except Exception as exc:
+                    log.error(f"[upper-grasp] 退出前停止失败：{exc}")
+            node._upper_grasp_active = False
+            node.upper_control_mode = previous_operator_mode
+            node.publish_grasp_command_result(result)
+        return keep_running
+
     try:
         frame_added = False
         code = 0
@@ -11880,6 +12102,14 @@ def _run_main(
                     log.error(f"未处理的上位机命令话题: {command_topic}")
                     continue
                 command_source = "upper"
+
+            if command_topic == GRASP_CMD_TOPIC:
+                if not run_upper_grasp_command(payload):
+                    code = 1
+                    log.error("[upper-grasp] 已回复结果，退出上位机命令循环")
+                    break
+                log.info("[upper-grasp] 已回复结果，继续等待上位机命令")
+                continue
 
             workflow_ok = True
             try:
