@@ -3569,8 +3569,9 @@ class G01Demo(Node):
         self._upper_grasp_recovering = False
         self._upper_grasp_forward_done = False
         self._upper_grasp_placed_slots: set[str] = set()
-        # None=持料不确定；只在确认工具下电后标为空。
-        self._tool_load_state: dict[str, bool | None] = {"left": None, "right": None}
+        # 无启动自检：以双末端空载作为启动前提；运行中按工具操作/吸附检测更新。
+        # None 表示操作后持料状态不确定，不允许自动复位。
+        self._tool_load_state: dict[str, bool | None] = {"left": False, "right": False}
         self._grasp_result_pub = self.create_publisher(String, GRASP_CMD_RESULT_TOPIC, 10)
         self.last_pick_failure_reason: str | None = None
         # UInt8 会在回调中显式限制到 uint8 范围。真实模式在收到首帧前为未知，
@@ -9046,7 +9047,7 @@ def _run_main(
         upper_communication=not keyboard_control_mode,
     )
     _runtime_error_reporter = node.publish_error
-    node._defer_error_publish = True
+    node._defer_error_publish = False
     planner_node = G01Demo(
         sim_mode=sim_mode,
         use_force_sensors=use_force_sensors,
@@ -12186,12 +12187,8 @@ def _run_main(
         frame_added = False
         code = 0
 
-        startup_ok = node.verify_startup_hardware()
-        publish_initialized(startup_ok, node._startup_error_codes)
-        node._defer_error_publish = False
-        if not startup_ok:
-            log.error("[startup-check] 初始化自检失败，不进入等待命令流程")
-            return 1
+        log.info("[startup] 跳过启动硬件自检及自检请求等待，按双末端空载启动，直接进入命令循环")
+        publish_initialized(True)
         while rclpy.ok():
             if keyboard_control_mode:
                 steps = wait_for_keyboard_steps()
@@ -12276,7 +12273,7 @@ def _run_main(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """非键盘模式自检结束后等待上位机请求，再反馈初始化结果。"""
+    """创建节点后直接进入命令循环；初始化状态只表示程序就绪。"""
     global _runtime_error_reporter
     status_node = None
     status_pub = None
@@ -12287,27 +12284,9 @@ def main(argv: list[str] | None = None) -> int:
         nonlocal initialization_reported
         if initialization_reported or status_node is None:
             return
-        requested = False
-
-        def on_request(msg: Bool) -> None:
-            nonlocal requested
-            requested = True
-
-        subscription = status_node.create_subscription(
-            Bool, SELFCHECK_REQUEST_TOPIC, on_request, 1,
-        )
-        status_node.get_logger().info(
-            f"[startup-check] 自检结束（success={success}），等待 {SELFCHECK_REQUEST_TOPIC}"
-        )
-        try:
-            while rclpy.ok() and not requested:
-                rclpy.spin_once(status_node, timeout_sec=0.1)
-            if not requested:
-                return
-            for code in ([0] if success else (list(error_codes) or [99])):
-                error_pub.publish(Int32(data=code))
-        finally:
-            status_node.destroy_subscription(subscription)
+        # 不等待 /selfcheck_request；这里只报告节点初始化结果，不执行硬件自检。
+        for code in ([0] if success else (list(error_codes) or [99])):
+            error_pub.publish(Int32(data=code))
         status_pub.publish(Bool(data=success))
         initialization_reported = True
         message = f"{ALGORITHM_INITIALIZED_TOPIC}: {success}"
