@@ -774,14 +774,14 @@ UNLOAD_OBSTACLE_SIZE = (1.0, 0.1, 2.5)
 UNLOAD_OBSTACLE_Y_OFFSET = 0.95
 UNLOAD_OBSTACLE_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.55, a=0.85)
 UNLOAD_APPROACH_DISTANCE = 0.1
-UNLOAD_PLACE_DESCENT_DISTANCE = 0.13
+UNLOAD_PLACE_DESCENT_DISTANCE = 0.15
 # 输入 14：最终放置点相对深框实体中心的局部 (x, y, z) 偏移，单位 m。
 FRAME_UNLOAD_LEFT_LOCAL_XYZ = (-0.3, 0.1, 0.4)
 FRAME_UNLOAD_RIGHT_LOCAL_XYZ = (-0.3, -0.1, 0.4)
 # 上料放置位抓取
 UNLOAD_EXTRA_APPROACH_BY_SLOT = {
     "sw1": 0.001,  # 右臂：多降 4 mm
-    "sw2": -0.001,  # 左臂：多降 1 mm
+    "sw2": 0.001,  # 左臂：多降 1 mm
     "sw3": 0.001,  # 左臂：多降 4 mm
     "sw4": 0.003,  # 右臂：多降 8 mm
 }
@@ -789,17 +789,17 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
 # 和局部旋转，不再叠加 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL。
 UNLOAD_PLACE_LOCAL_PITCH = math.pi
 UNLOAD_PLACE_LOCAL_YAWS = {
-    1: math.radians(204.5+112),
-    2: math.radians(204.5+112),
-    3: math.radians(204.5+112),
-    4: math.radians(204.5+112),
+    1: math.radians(204.5+112-3),
+    2: math.radians(204.5+112-3),
+    3: math.radians(204.5+112-3),
+    4: math.radians(204.5+112-3),
 }
 # 注意这里四个物料台点编号和机器人 SW 编号不一样。
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    1: (0.0-0.012, 0.225+0.1125-0.0015+0.1125, 0.1-0.015+0.09),
+    1: (0.0-0.012-0.004, 0.225+0.1125-0.0015+0.1125-0.0025, 0.1-0.015+0.09),
     2: (0.0-0.009, 0.1125-0.0025+0.1125, 0.1-0.014+0.09),
-    3: (0.0-0.0045, -0.1125-0.001+0.1125, 0.1+0.09),
-    4: (0.0-0.0015, -0.225-0.001 - 0.1125+0.1125, 0.1+0.09),   
+    3: (0.0-0.0045+0.002, -0.1125-0.001+0.1125-0.002, 0.1-0.01+0.09),
+    4: (0.0-0.0015, -0.225-0.001 - 0.1125+0.1125, 0.1-0.01+0.09),   
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
@@ -3521,6 +3521,7 @@ class G01Demo(Node):
         self._move_cli = ActionClient(self, MoveGroup, ACT_MOVE_GROUP)
         self._exec_cli = ActionClient(self, ExecuteTrajectory, ACT_EXEC_TRAJ)
         self._vision_tf_broadcaster = StaticTransformBroadcaster(self)
+        self._vision_static_transforms: dict[str, TransformStamped] = {}
         frame_roll, frame_pitch, frame_yaw = (
             math.radians(value) for value in FRAME_RPY_DEG
         )
@@ -5153,7 +5154,7 @@ class G01Demo(Node):
             transform.transform.translation.z = pose.position.z
             transform.transform.rotation = copy.deepcopy(pose.orientation)
             transforms.append(transform)
-        self._vision_tf_broadcaster.sendTransform(transforms)
+        self._send_vision_static_transforms(transforms)
         self.get_logger().info(
             f"[frame-vision] 已发布 TF: {SCENE_FRAME} → "
             f"{FRAME_VISION_TF_FRAME}、{FRAME_TOP_CENTER_TF_FRAME}、"
@@ -5175,68 +5176,57 @@ class G01Demo(Node):
             colors,
         )
 
-    def publish_unload_vision_tf(self, recognition_pose: Pose) -> None:
-        """发布 moveit_base_link → 上料台视觉识别坐标系的固定 TF。"""
-        transform = TransformStamped()
-        transform.header.frame_id = SCENE_FRAME
-        transform.header.stamp = self.get_clock().now().to_msg()
-        transform.child_frame_id = UNLOAD_VISION_TF_FRAME
-        transform.transform.translation.x = recognition_pose.position.x
-        transform.transform.translation.y = recognition_pose.position.y
-        transform.transform.translation.z = recognition_pose.position.z
-        transform.transform.rotation = copy.deepcopy(
-            recognition_pose.orientation
-        )
-        self._vision_tf_broadcaster.sendTransform(transform)
-        self.get_logger().info(
-            f"[unload] 已发布视觉坐标系 TF: "
-            f"{SCENE_FRAME} → {UNLOAD_VISION_TF_FRAME}"
+    def _send_vision_static_transforms(
+        self, transforms: Sequence[TransformStamped],
+    ) -> None:
+        """每次发布完整静态 TF 集合，使后启动的订阅者也能收到识别坐标系。"""
+        # 当前 Humble 广播器仅保留最后一条 TFMessage，不自动累积历史 TF。
+        # 按 child 去重更新，避免发布台面/放置点时覆盖识别点的持久化消息。
+        for transform in transforms:
+            self._vision_static_transforms[transform.child_frame_id] = copy.deepcopy(transform)
+        self._vision_tf_broadcaster.sendTransform(
+            list(self._vision_static_transforms.values())
         )
 
-    def publish_unload_table_top_tf(self, recognition_pose: Pose) -> None:
-        """发布物料台上表面中心的固定 TF。"""
-        table_top_pose = make_unload_table_top_pose(recognition_pose)
-        transform = TransformStamped()
-        transform.header.frame_id = SCENE_FRAME
-        transform.header.stamp = self.get_clock().now().to_msg()
-        transform.child_frame_id = UNLOAD_TABLE_TOP_TF_FRAME
-        transform.transform.translation.x = table_top_pose.position.x
-        transform.transform.translation.y = table_top_pose.position.y
-        transform.transform.translation.z = table_top_pose.position.z
-        transform.transform.rotation = copy.deepcopy(table_top_pose.orientation)
-        self._vision_tf_broadcaster.sendTransform(transform)
-        mode_prefix = "[sim] " if self.sim_mode else ""
-        self.get_logger().info(
-            f"[unload] {mode_prefix}已发布上料桌上表面中心 TF: "
-            f"{SCENE_FRAME} → {UNLOAD_TABLE_TOP_TF_FRAME}"
-        )
-
-    def publish_unload_place_tfs(self, place_poses: dict[int, Pose]) -> None:
-        """发布物料台四个放置点的固定 TF，位姿与下料规划目标一致。"""
+    def _publish_unload_tfs(self, poses: Mapping[str, Pose]) -> bool:
+        """直接发布 moveit_base_link 下的物料台位姿 TF。"""
+        if not poses:
+            return True
         stamp = self.get_clock().now().to_msg()
-        transforms: list[TransformStamped] = []
-        for point_index, pose in sorted(place_poses.items()):
+        transforms = []
+        for child_frame, pose in poses.items():
             transform = TransformStamped()
             transform.header.frame_id = SCENE_FRAME
             transform.header.stamp = stamp
-            transform.child_frame_id = (
-                f"{UNLOAD_PLACE_TF_FRAME_PREFIX}{point_index}"
-            )
+            transform.child_frame_id = child_frame
             transform.transform.translation.x = pose.position.x
             transform.transform.translation.y = pose.position.y
             transform.transform.translation.z = pose.position.z
             transform.transform.rotation = copy.deepcopy(pose.orientation)
             transforms.append(transform)
-
-        if not transforms:
-            return
-        self._vision_tf_broadcaster.sendTransform(transforms)
-        frame_names = "、".join(
-            transform.child_frame_id for transform in transforms
-        )
+        self._send_vision_static_transforms(transforms)
         self.get_logger().info(
-            f"[unload] 已发布物料台放置点 TF: {frame_names}"
+            f"[unload] 已发布 TF: {SCENE_FRAME} → "
+            + "、".join(poses)
         )
+        return True
+
+    def publish_unload_vision_tf(self, recognition_pose: Pose) -> bool:
+        """发布视觉识别原点，不叠加放置点偏移。"""
+        return self._publish_unload_tfs({UNLOAD_VISION_TF_FRAME: recognition_pose})
+
+    def publish_unload_table_top_tf(self, recognition_pose: Pose) -> bool:
+        """发布物料台上表面中心的固定 TF。"""
+        return self._publish_unload_tfs({
+            UNLOAD_TABLE_TOP_TF_FRAME: make_unload_table_top_pose(recognition_pose),
+        })
+
+    def publish_unload_place_tfs(self, place_poses: dict[int, Pose]) -> bool:
+        """发布四个放置点 TF，父坐标系及位姿与规划目标一致。"""
+        return self._publish_unload_tfs({
+            f"{UNLOAD_PLACE_TF_FRAME_PREFIX}{point_index}": pose
+            for point_index, pose in sorted(place_poses.items())
+        })
 
     def remove_unload_scene(self, *, report_error: bool = True) -> bool:
         """移除料台及旧版本可能残留的场景物体。"""
@@ -11238,10 +11228,13 @@ def _run_main(
         recognition_pose = make_pose(*recognition_values)
         left_recognition_pose = make_pose(*all_xyz_rpy[0]["left_body"])
         right_recognition_pose = make_pose(*all_xyz_rpy[0]["right_body"])
-        node.publish_unload_vision_tf(recognition_pose)
-        node.publish_unload_table_top_tf(recognition_pose)
+        if not node.publish_unload_vision_tf(recognition_pose):
+            return False
+        if not node.publish_unload_table_top_tf(recognition_pose):
+            return False
         place_poses = make_unload_place_poses(left_recognition_pose, right_recognition_pose)
-        node.publish_unload_place_tfs(place_poses)
+        if not node.publish_unload_place_tfs(place_poses):
+            return False
         log.info(
             f"[unload] {trigger_command} 识别点 @ {SCENE_FRAME}: "
             f"({recognition_pose.position.x:.4f}, "
