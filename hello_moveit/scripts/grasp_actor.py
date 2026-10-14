@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # 关节空间规划不到1s，给末端位姿4s左右
+# 识别框位置58cm
 """
 G01 MoveIt 演示脚本
 
@@ -41,7 +42,7 @@ G01 MoveIt 演示脚本
     清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
 5. 向 /agv_auto_control_speed 以 20 Hz 发布 linear.x=-0.1 m/s，
    使用步骤 2 保存的同一时长后停车。
-6. 运动到物料台识别预备构型，识别并添加碰撞模型；未收到有效视觉数据时
+6. 仅腰部和升降运动到物料台识别预备构型，识别并添加碰撞模型；未收到有效视觉数据时
    最多重复发送识别命令 5 次。
 7. 循环下料：
     下料读取最新 SW 信号，0=有料。
@@ -55,10 +56,10 @@ G01 MoveIt 演示脚本
     轨迹，执行阶段不重新规划。
     双臂同步下降前读取左右 Fz；任一侧 Fz 下降超过 210N 时，
     双末端下电并从实测位置同步直退到放置预备点后继续。
-    优先 SW1+SW3，目标按 (1,3)→(11,13) 循环；SW2+SW4 按
-    (2,4)→(12,14) 循环，不记录已经放过的位置。循环正常结束后，
+    优先 SW1+SW3，目标固定为 (1,3)；SW2+SW4
+    目标固定为 (2,4)，不记录已经放过的位置。循环正常结束后，
     dual_arm_body 复位到 MOVE_TO_GRASP_RESET_Q。
-    八点放置直线去程/回程报警时同样自动恢复；双臂清错、末端下电后，
+    四点放置直线去程/回程报警时同样自动恢复；双臂清错、末端下电后，
     从实测位置同步直退，忽略场景物体碰撞但保留机器人自碰撞检查。
 8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
 
@@ -470,7 +471,7 @@ GRASP_Q1 = [
 ]
 # 下料流程识别物料台前的预备构型，顺序与 dual_arm_body 一致。
 UNLOAD_TABLE_VISION_PREP_Q = [
-    0.05,
+    0.0,
     0 * math.pi / 180,
     -1.57,
     -0.15,
@@ -660,7 +661,7 @@ STEP_DESCRIPTIONS = {
     3: "AGV 以 0.1 m/s 前进 (识别点 x-0.5)/0.1 秒（20 Hz），转换并添加深框碰撞模型",
     4: "抓满四个放置位",
     5: "AGV 以 -0.1 m/s 后退，时长与步骤 3 相同（20 Hz）",
-    6: "物料台预备构型、识别并添加碰撞模型",
+    6: "仅腰部和升降到物料台预备构型、识别并添加碰撞模型",
     7: "按 SW 优先级循环放置",
     8: "导航回起点",
     9: "运动到独立识别构型，直接识别并添加深框碰撞模型",
@@ -741,28 +742,28 @@ ALL_PLACE_SLOTS_EMPTY_SIGNAL = (
 ALL_PLACE_SLOTS_MATERIAL_SIGNAL = 0x00
 DRIVER_SIGNAL_WAIT_TIMEOUT_SEC = 2.0
 
-# 下料流程：优先选择 SW1+SW3；两组目标各自循环，不记录已放置点。
+# 下料流程：优先选择 SW1+SW3；固定使用四个目标点，不记录已放置点。
 # 格式：(右臂 SW, 左臂 SW, ((左臂点, 右臂点), ...))
-#   SW1+SW3: (1,3) → (11,13) → (1,3) → ...
-#   SW2+SW4: (2,4) → (12,14) → (2,4) → ...
-UNLOAD_TRIGGER_COMMAND = "p,4"
+#   SW1+SW3: 固定 (1,3)
+#   SW2+SW4: 固定 (2,4)
+UNLOAD_TRIGGER_COMMAND = "p,8"
 LOAD_TABLE_TRIGGER_COMMAND = "p,6"
 UNLOAD_VISION_POSE_KEY = "right_body"  # 料台碰撞模型和视觉基准 TF 使用右标定。
 UNLOAD_VISION_TF_FRAME = "material_table_vision"
 UNLOAD_TABLE_TOP_TF_FRAME = "material_table_top"
 UNLOAD_PLACE_TF_FRAME_PREFIX = "material_table_place_point_"
 UNLOAD_PAIR_CYCLES = (
-    ("sw1", "sw3", ((1, 3), (11, 13))),
-    ("sw4", "sw2", ((2, 4), (12, 14))),
+    ("sw1", "sw3", ((1, 3),)),
+    ("sw4", "sw2", ((2, 4),)),
 )
-UNLOAD_LEFT_PLACE_POINTS = (1, 2, 11, 12)
+UNLOAD_LEFT_PLACE_POINTS = (1, 2)
 UNLOAD_MAX_PAIRS_PER_RUN = 2
 UNLOAD_TABLE_ID = "unload_table"
-UNLOAD_TABLE_SIZE = (0.57, 1.7, 1.0) #0.5
+UNLOAD_TABLE_SIZE = (0.64, 1.2, 0.98) #0.5
 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL = (
-    -0.1,
-    0.125,
-    0.06,
+    0.0,
+    0.1125,
+    0.09,
 )
 UNLOAD_TABLE_LOCAL_RPY = (0.0, 0.0, 0.0)
 UNLOAD_TABLE_COLOR = ColorRGBA(r=0.48, g=0.30, b=0.14, a=0.85)
@@ -788,27 +789,17 @@ UNLOAD_EXTRA_APPROACH_BY_SLOT = {
 # 和局部旋转，不再叠加 UNLOAD_RECOGNITION_TO_TABLE_TOP_LOCAL。
 UNLOAD_PLACE_LOCAL_PITCH = math.pi
 UNLOAD_PLACE_LOCAL_YAWS = {
-    11: math.radians(151),
-    12: math.radians(159),
-    13: math.radians(153),
-    14: math.radians(158),
-
-    1: math.radians(158),
-    2: math.radians(155),
-    3: math.radians(154),
-    4: math.radians(155),
+    1: math.radians(204.5+112),
+    2: math.radians(204.5+112),
+    3: math.radians(204.5+112),
+    4: math.radians(204.5+112),
 }
-# 注意这里八个物料台点编号和机器人 SW 编号不一样。
+# 注意这里四个物料台点编号和机器人 SW 编号不一样。
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    11: (0.0-0.0065, 0.45-0.0025, 0.146),
-    12: (0.0-0.0035, 0.25-0.0015, 0.146),
-    13: (0.0+0.001, 0.0-0.0055, 0.152),
-    14: (0.0+0.0015, -0.2-0.004, 0.152),
-
-    1: (-0.2-0.0065, 0.45-0.004, 0.146),
-    2: (-0.2-0.0015, 0.25-0.0015, 0.146),
-    3: (-0.2+0.002, 0.0-0.006, 0.152),
-    4: (-0.2+0.002, -0.2-0.004, 0.152),
+    1: (0.0-0.012, 0.225+0.1125-0.0015+0.1125, 0.1-0.015+0.09),
+    2: (0.0-0.009, 0.1125-0.0025+0.1125, 0.1-0.014+0.09),
+    3: (0.0-0.0045, -0.1125-0.001+0.1125, 0.1+0.09),
+    4: (0.0-0.0015, -0.225-0.001 - 0.1125+0.1125, 0.1+0.09),   
 }
 UNLOAD_JOINT_SPEED = 0.2
 UNLOAD_PLACE_JOINT_SPEED = 0.2
@@ -4830,7 +4821,7 @@ class G01Demo(Node):
         stage: str,
         clear_alarms: bool = True,
     ) -> bool:
-        """双臂八点放置报警恢复：忽略物体碰撞，但保留自碰撞检查。"""
+        """双臂四点放置报警恢复：忽略物体碰撞，但保留自碰撞检查。"""
         left_joint_names = joint_names_for_group("left_arm")
         right_joint_names = joint_names_for_group("right_arm")
         full_joint_names = list(full_joint_names)
@@ -5221,7 +5212,7 @@ class G01Demo(Node):
         )
 
     def publish_unload_place_tfs(self, place_poses: dict[int, Pose]) -> None:
-        """发布物料台八个放置点的固定 TF，位姿与下料规划目标一致。"""
+        """发布物料台四个放置点的固定 TF，位姿与下料规划目标一致。"""
         stamp = self.get_clock().now().to_msg()
         transforms: list[TransformStamped] = []
         for point_index, pose in sorted(place_poses.items()):
@@ -11182,7 +11173,9 @@ def _run_main(
         )
         return False
 
-    def prepare_unload_scene(trigger_command: str = UNLOAD_TRIGGER_COMMAND) -> bool:
+    def prepare_unload_scene(
+        trigger_command: str = UNLOAD_TRIGGER_COMMAND, *, body_only: bool = False,
+    ) -> bool:
         """步骤 6：运动到识别预备构型，识别物料台并缓存碰撞场景。"""
         nonlocal frame_added, unload_scene_added, unload_place_poses
 
@@ -11207,17 +11200,21 @@ def _run_main(
             # 刷新流程一旦开始就丢弃旧放置点，避免后续步骤误用旧识别结果。
             unload_place_poses = None
 
-        vision_prep_group = "dual_arm_body"
+        vision_prep_group = "body" if body_only else "dual_arm_body"
         vision_prep_joint_names = joint_names_for_group(vision_prep_group)
+        prep_targets = dict(zip(
+            joint_names_for_group("dual_arm_body"), UNLOAD_TABLE_VISION_PREP_Q,
+        ))
+        vision_prep_q = [prep_targets[name] for name in vision_prep_joint_names]
         log.info(
-            f"[unload] 物料台识别前，{vision_prep_group} 先通过 OMPL "
-            "整机运动到 UNLOAD_TABLE_VISION_PREP_Q"
+            f"[unload] 物料台识别前，{vision_prep_group} 通过 OMPL "
+            f"运动到识别预备构型：{dict(zip(vision_prep_joint_names, vision_prep_q))}"
         )
         if not node.plan_execute_joint_waypoints(
             vision_prep_group,
             UNLOAD_JOINT_SPEED,
             vision_prep_joint_names,
-            [UNLOAD_TABLE_VISION_PREP_Q],
+            [vision_prep_q],
         ):
             log.error(
                 "[unload] 运动到物料台识别预备构型失败，"
@@ -11826,7 +11823,7 @@ def _run_main(
                 return False
             return node.drive_agv(AGV_PLACE_SPEED_X, frame_agv_drive_duration_sec)
         if step == 6:
-            return prepare_unload_scene()
+            return prepare_unload_scene(body_only=True)
         if step == 7:
             return run_unload_cycle()
         if step == 8:
