@@ -64,7 +64,7 @@ G01 MoveIt 演示脚本
 8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
 
 上位机步骤映射：
-  /grasp_cmd = 2→3→4→5，完成后回复 /grasp_cmd_result（JSON String）；
+  /grasp_cmd = 2→3→4→5→15，完成后回复 /grasp_cmd_result（JSON String）；
   持料或复位失败时回复失败并退出命令循环。
   /move_to_grasp_pose_cmd = 1~8，/move_to_place_pose_cmd = 5~8；
   /place_cmd = 6→7，回复 /place_cmd_result（result、release_success_number）；
@@ -10882,6 +10882,9 @@ def _run_main(
                 log.error(f"[unload] {label} 联合轨迹执行失败")
                 return False
 
+            log.info("[unload] 双臂已到放置预备位，等待 2 秒后执行直线下降")
+            time.sleep(2.0)
+
             node.wait_for_operator(
                 f"已到物料台左点{left_point}/右点{right_point}，"
                 f"按回车执行双臂末端局部 +Z "
@@ -12019,13 +12022,16 @@ def _run_main(
         node._upper_grasp_forward_done = False
         node._upper_grasp_placed_slots.clear()
         node._force_task_active = True
-        log.info("[upper-grasp] 开始新命令：2 → 3 → 4 → 5")
+        log.info("[upper-grasp] 开始新命令：2 → 3 → 4 → 5 → 15")
 
         def failed(*, motion_error: bool) -> bool:
             log.error(
                 f"[upper-grasp] 步骤 {stage} 失败，reason={node.last_pick_failure_reason}，"
                 f"末端持料状态={node._tool_load_state}（False=空，True=持料，None=未知）"
             )
+            if stage == 15:
+                log.error("[upper-grasp] 场景清理失败，底盘已退回，回复失败并继续等待命令")
+                return True
             if not all(state is False for state in node._tool_load_state.values()):
                 log.error("[upper-grasp] 末端仍持料或状态未知，保持工具上电，不退回；回复失败后退出命令循环")
                 node.stop_upper_grasp_motion()
@@ -12054,7 +12060,7 @@ def _run_main(
             if not all(state is False for state in node._tool_load_state.values()):
                 keep_running = failed(motion_error=False)
             else:
-                for stage in (2, 3, 4, 5):
+                for stage in (2, 3, 4, 5, 15):
                     node._abort_on_force_range()
                     if not execute_step(stage, "upper-grasp", payload):
                         # 识别失败且没有运动异常：直接回复，不执行 3/4/5。
@@ -12064,6 +12070,8 @@ def _run_main(
                             keep_running = failed(motion_error=False)
                         break
                     log.info(f"[upper-grasp] 步骤 {stage} 完成")
+                    if stage == 5:
+                        node._upper_grasp_forward_done = False
                     if stage == 4 and not all(state is False for state in node._tool_load_state.values()):
                         keep_running = failed(motion_error=False)
                         break
