@@ -422,7 +422,7 @@ FRAME_RECOGNITION_CAMERA_POSITION = 0.7854
 # p,4 深框识别专用预备构型，顺序与 dual_arm_body 一致。
 框_Q1 = [
     0.0,
-    10 * math.pi / 180,
+    5 * math.pi / 180,
     -1.57,
     -0.15,
     -1.578090,
@@ -458,7 +458,7 @@ FRAME_DIRECT_VISION_Q = [
 ]
 # 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
 # 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
-GRASP_VISION_WAIST_ANGLES_DEG = (20,30,)
+GRASP_VISION_WAIST_ANGLES_DEG = (10,20,30,)
 # 输入 4：先发送此头部目标，再运动到识别构型；头部到位后才采集视觉。
 GRASP_VISION_CAMERA_POSITION = 0.7854
 # 抓取排序的姿态分组阈值：局部 +Z 与 moveit_base_link -Z
@@ -532,7 +532,7 @@ DEFAULT_SPEED_SCALE = 0.5
 # 深框障碍物（相对于 moveit_base_link 发布）
 SCENE_FRAME = "moveit_base_link"
 FRAME_ID = "深框"
-FRAME_SIZE = (1.1, 1.1, 0.86)  # 深框整体外尺寸：长×宽×高 [m]0.8, 0.8, 0.71
+FRAME_SIZE = (1.1, 1.2, 0.86)  # 深框整体外尺寸：长×宽×高 [m]0.8, 0.8, 0.71
 WALL_T = 0.06  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
 FRAME_Y_OUTER_THICKNESS = 0.05  # 局部 ±Y 两侧向外附加的厚度 [m]
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
