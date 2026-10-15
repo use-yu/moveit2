@@ -819,7 +819,7 @@ UNLOAD_PLACE_LOCAL_OFFSETS = {
     4: (0.0-0.0015+0.001, -0.225-0.001 - 0.1125+0.1125+0.003, 0.1-0.01+0.09),   
 }
 UNLOAD_JOINT_SPEED = 0.2
-UNLOAD_PLACE_JOINT_SPEED = 0.2
+UNLOAD_PLACE_JOINT_SPEED = 0.1
 UNLOAD_PLACE_POSITION_TOLERANCE = 0.001  # 规划终点 FK 位置误差上限：1 mm。
 UNLOAD_PLACE_ORIENTATION_TOLERANCE = math.radians(0.1)  # 姿态误差上限：0.1°。
 UNLOAD_PLACE_ARM_IK_ATTEMPTS = 200
@@ -843,6 +843,7 @@ ARM_JOINT_LIMITS_BY_INDEX = {
     6: (-3.14, 3.14),
 }
 UNLOAD_CARTESIAN_SPEED = 0.2
+UNLOAD_PLACE_CARTESIAN_SPEED = 0.1
 UNLOAD_CARTESIAN_AVOID_COLLISIONS = False
 UNLOAD_SYNC_SAMPLE_PERIOD = 0.005
 # 放置同步轨迹按 20 ms 抽样做整机自碰撞检查，并始终检查首末点。
@@ -10646,7 +10647,7 @@ def _run_main(
                 group,
                 link,
                 descent_pose,
-                speed_scale=UNLOAD_CARTESIAN_SPEED,
+                speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED,
                 avoid_collisions=False,
                 start_joints=endpoint_state,
                 joint_names=joint_names,
@@ -10924,7 +10925,7 @@ def _run_main(
                     right_return_pose=right_return_pose,
                     full_joint_names=dual_body_joint_names,
                     collision_group=group,
-                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED,
                     stage=f"物料台左点{left_point}/右点{right_point}下降力碰撞",
                     clear_alarms=False,
                 )
@@ -10942,7 +10943,7 @@ def _run_main(
                     right_return_pose=right_return_pose,
                     full_joint_names=dual_body_joint_names,
                     collision_group=group,
-                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED,
                     stage=f"物料台左点{left_point}/右点{right_point}下降放置",
                 )
 
@@ -10966,7 +10967,7 @@ def _run_main(
                     right_return_pose=right_return_pose,
                     full_joint_names=dual_body_joint_names,
                     collision_group=group,
-                    speed_scale=UNLOAD_CARTESIAN_SPEED,
+                    speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED,
                     stage=f"物料台左点{left_point}/右点{right_point}放置后返回",
                 )
             return True
@@ -11370,6 +11371,9 @@ def _run_main(
                 f"不发送 {trigger_command}"
             )
             return False
+
+        log.info("[unload] 已到识别预备构型，等待 1 秒后识别物料台")
+        time.sleep(1.0)
 
         # 场景沿用右标定；左右放置点分别使用各自的标定结果。
         vision_result = read_scene_vision_object_pose_with_retry(
