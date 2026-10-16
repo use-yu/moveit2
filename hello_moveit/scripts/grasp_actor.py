@@ -219,6 +219,7 @@ def report_runtime_exception(exc, context):
 
 
 _SOURCE_DATA_DIR = Path("/home/ws_moveit/src/hello_moveit/data")
+TRAJECTORY_CACHE_ENABLED = False
 TRAJECTORY_CACHE_DIR = (
     _SOURCE_DATA_DIR
     if _SOURCE_DATA_DIR.parent.is_dir()
@@ -3090,6 +3091,8 @@ def _save_trajectory_cache(
     metadata: Mapping[str, object],
     messages: Mapping[str, object],
 ) -> bool:
+    if not TRAJECTORY_CACHE_ENABLED:
+        return False
     try:
         TRAJECTORY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -3114,6 +3117,8 @@ def _load_trajectory_cache(
     key: str,
     message_types: Mapping[str, type],
 ) -> tuple[dict[str, object], dict[str, object]] | None:
+    if not TRAJECTORY_CACHE_ENABLED:
+        return None
     path = _trajectory_cache_path(key)
     if not path.is_file():
         return None
@@ -7727,7 +7732,7 @@ class G01Demo(Node):
             )
             self.get_logger().info(
                 f"[trajectory-cache] "
-                f"{'已保存' if saved_return else '保存失败'} {return_cache_key}"
+                f"{('已保存' if saved_return else '保存失败') if TRAJECTORY_CACHE_ENABLED else '未启用，不保存'} {return_cache_key}"
             )
         plan = PlaceTrajectoryPlan(
             arm_group, arm_plan_frame, body_group, arm_joint_names,
@@ -7753,7 +7758,7 @@ class G01Demo(Node):
             },
         )
         self.get_logger().info(
-            f"[trajectory-cache] {'已保存' if saved else '保存失败'} {cache_key}"
+            f"[trajectory-cache] {('已保存' if saved else '保存失败') if TRAJECTORY_CACHE_ENABLED else '未启用，不保存'} {cache_key}"
         )
         return plan
 
@@ -8292,7 +8297,7 @@ class G01Demo(Node):
                 {"trajectory": trajectory},
             )
             self.get_logger().info(
-                f"[trajectory-cache] {'已保存' if saved else '保存失败'} {cache_key}"
+                f"[trajectory-cache] {('已保存' if saved else '保存失败') if TRAJECTORY_CACHE_ENABLED else '未启用，不保存'} {cache_key}"
             )
         return self._execute_traj(trajectory)
 
@@ -10413,7 +10418,7 @@ def _run_main(
             log.error("[unload] 读取取料规划起点失败")
             return False
         cache_key = f"input7_first_pick_{right_slot}_{left_slot}"
-        if use_disk_cache:
+        if use_disk_cache and TRAJECTORY_CACHE_ENABLED:
             cached = _load_trajectory_cache(
                 cache_key,
                 {"to_yubei": RobotTrajectory, "approach": RobotTrajectory},
@@ -10530,7 +10535,7 @@ def _run_main(
             left_approach_distance,
             right_approach_distance,
         )
-        if use_disk_cache:
+        if use_disk_cache and TRAJECTORY_CACHE_ENABLED:
             saved = _save_trajectory_cache(
                 cache_key,
                 {
