@@ -196,10 +196,10 @@ class fankuis():
             tool_v = feedback['tool_vector_actual'].copy()
             tool_j = feedback['q_actual'].copy()
             tool_i = feedback['i_actual'].copy()
-            tcp_force = feedback['TCP_force'].copy()
+            actual_tcp_force = feedback['actual_TCP_force'].copy()
             ft_sensor = feedback['six_force_value'].copy()
             ft_sensor_online = int(feedback['six_force_online'])
-            return [tool_v, tool_j, tool_i, tcp_force, ft_sensor, ft_sensor_online]
+            return [tool_v, tool_j, tool_i, actual_tcp_force, ft_sensor, ft_sensor_online]
         except (OSError, ConnectionError, ValueError) as error:
             self._log_feedback_error(error)
             return ["NG"]
@@ -210,7 +210,7 @@ class ArmRosBridge(Node):
         self.arm_clients = clients
         self.right_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/state", 10)
         self.right_i_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/i_actual", 10)
-        self.right_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/TCP_force", 10)
+        self.right_actual_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/actual_TCP_force", 10)
         self.right_ft_sensor_pub = self.create_publisher(Float32MultiArray, "/g01/right/FTSensor", 10)
         # 200Hz输入只保留最新一条，30ms定时器按固定频率下发最新完整目标。
         self._latest_arm_commands = {"right": None}
@@ -265,11 +265,11 @@ class ArmRosBridge(Node):
         if side == "right":
             self.right_i_pub.publish(msg)
 
-    def publish_arm_tcp_force(self, side, tcp_force):
+    def publish_arm_actual_tcp_force(self, side, actual_tcp_force):
         msg = Float32MultiArray()
-        msg.data = [float(num) for num in tcp_force]
+        msg.data = [float(num) for num in actual_tcp_force]
         if side == "right":
-            self.right_tcp_force_pub.publish(msg)
+            self.right_actual_tcp_force_pub.publish(msg)
 
     def publish_ft_sensor(self, side, force):
         msg = Float32MultiArray()
@@ -506,10 +506,10 @@ class ArmRosBridge(Node):
 
 q_actual = {"right": []}
 i_actual = {"right": []}
-TCP_force = {"right": []}
+actual_TCP_force = {"right": []}
 FT_sensor = {"right": []}
 def joint(feed_v, side, state_node):
-    global q_actual, i_actual, TCP_force, FT_sensor
+    global q_actual, i_actual, actual_TCP_force, FT_sensor
     last_ft_state = None
     while stop:
         actual = feed_v.feed()
@@ -519,10 +519,10 @@ def joint(feed_v, side, state_node):
 
         q_actual[side] = [round(num, 6) for num in actual[1]]
         i_actual[side] = [round(num, 6) for num in actual[2]]
-        TCP_force[side] = [float(num) for num in actual[3]]
+        actual_TCP_force[side] = [float(num) for num in actual[3]]
         state_node.publish_arm_state(side, q_actual[side])
         state_node.publish_arm_i_actual(side, i_actual[side])
-        state_node.publish_arm_tcp_force(side, TCP_force[side])
+        state_node.publish_arm_actual_tcp_force(side, actual_TCP_force[side])
 
         ft_sensor_status = int(actual[5])
         force_values = [float(num) for num in actual[4]]
