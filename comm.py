@@ -78,7 +78,7 @@ def _load_topics() -> HwTopics:
         waist_state_topic="/driver_report/waist_motor_info",
         head_state_topic="/driver_report/camera_motor_info",
     )
-
+    
 
 class G01Comm(Node):
     def __init__(self) -> None:
