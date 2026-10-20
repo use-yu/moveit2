@@ -30,9 +30,9 @@ def admittance_ctrl_REI_classical(fd, fe, Be, dt):
         raise ValueError("dt 必须为大于 0 的有限数")
 
     Me = np.array([20.0, 20.0, 20.0])
-    Be = np.array([60.0, 60.0, 60.0])  # 保留原代码覆盖 Be 的行为。
-    Ke = np.array([45.0, 45.0, 45.0])
-    ki = 0.5
+    Be = np.array([120.0, 120.0, 120.0])  # 保留原代码覆盖 Be 的行为。
+    Ke = np.array([0.0, 0.0, 0.0])
+    ki = 0.0
 
     error = fe - fd
     _integral += error * dt
@@ -83,14 +83,16 @@ def main(args=None):
             self.dt = float(parameter("dt", 0.03))
             self.timeout = float(parameter("feedback_timeout", 0.2))
             self.service_timeout = float(parameter("service_timeout", 0.3))
-            self.max_offset = float(parameter("max_offset", 0.02))
-            self.max_velocity = float(parameter("max_velocity", 0.02))
-            self.max_joint_step = float(parameter("max_joint_step", 0.05))
+            self.force_filter_cutoff_hz = float(parameter("force_filter_cutoff_hz", 5.0))
+            self.max_offset = float(parameter("max_offset", 0.1))
+            self.max_velocity = float(parameter("max_velocity", 0.1))
+            self.max_joint_step = float(parameter("max_joint_step", 0.5))
             self.fd = None  # 初始化 R6 参考位姿时，自动采集当前 XYZ 力。
             for value in (self.dt, self.timeout, self.service_timeout,
-                          self.max_offset, self.max_velocity, self.max_joint_step):
+                          self.max_offset, self.max_velocity, self.max_joint_step,
+                          self.force_filter_cutoff_hz):
                 if not np.isfinite(value) or value <= 0:
-                    raise ValueError("周期、超时和限值参数必须为大于零的有限数")
+                    raise ValueError("周期、超时、限值和滤波截止频率必须为大于零的有限数")
 
             self.base_frame = "r_base_link"
             self.link = "R6"
@@ -114,6 +116,7 @@ def main(args=None):
             self.get_logger().info(
                 "等待右臂状态、R6 力反馈和 MoveIt FK/IK；就绪后沿每次反馈的当前 R6 轴进行导纳移动。"
                 "自动记录初始 XYZ 力作为 desired_force，位移单位 m，关节命令单位 rad。"
+                f"力反馈一阶低通截止频率为 {self.force_filter_cutoff_hz:g} Hz。"
             )
 
         def on_state(self, msg):
@@ -129,8 +132,16 @@ def main(args=None):
             if force.size < 3 or not np.all(np.isfinite(force[:3])):
                 self.stop("力反馈 XYZ 无效")
                 return
-            self.force = force[:3].copy()
-            self.force_time = time.monotonic()
+            now = time.monotonic()
+            if self.force is None:
+                # 第一帧直接初始化，避免从零起步造成虚假的力误差。
+                self.force = force[:3].copy()
+            else:
+                # 按力反馈实际到达间隔计算系数，不依赖 FK/IK 控制周期。
+                dt = max(0.0, now - self.force_time)
+                alpha = -np.expm1(-2.0 * np.pi * self.force_filter_cutoff_hz * dt)
+                self.force += alpha * (force[:3] - self.force)
+            self.force_time = now
 
         def fresh(self):
             now = time.monotonic()
