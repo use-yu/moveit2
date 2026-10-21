@@ -2,6 +2,8 @@
 # /g01/joint_commands 中完整的右臂 6 关节目标每 30 ms 最多发送一次 ServoJ。
 # 右臂状态、力传感器、工具电源、清错及停止/恢复接口沿用原脚本。
 # 兼容保留 /g01/dual_arm/disable_robot；在本版本中仅使右臂掉使能。
+# /g01/right_arm/observer_state 为同一反馈帧的 JSON：包含位置、速度、
+# 扭矩、电流和原始控制器时间戳，供离线辨识/动量观测器使用。
 import json
 import socket
 from time import sleep
@@ -14,7 +16,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32MultiArray, String
+from std_msgs.msg import Float32MultiArray, Float64MultiArray, String
 from dobot_msgs_v4.srv import (
     ClearError,
     DisableRobot,
@@ -199,7 +201,12 @@ class fankuis():
             actual_tcp_force = feedback['actual_TCP_force'].copy()
             ft_sensor = feedback['six_force_value'].copy()
             ft_sensor_online = int(feedback['six_force_online'])
-            return [tool_v, tool_j, tool_i, actual_tcp_force, ft_sensor, ft_sensor_online]
+            tool_dq = feedback['qd_actual'].copy()
+            tool_torque = feedback['m_actual'].copy()
+            controller_timestamp = int(feedback['time_stamp'])
+            # 仅在尾部追加，保持原有力传感器初始化逻辑的索引不变。
+            return [tool_v, tool_j, tool_i, actual_tcp_force, ft_sensor, ft_sensor_online,
+                    tool_dq, tool_torque, controller_timestamp]
         except (OSError, ConnectionError, ValueError) as error:
             self._log_feedback_error(error)
             return ["NG"]
@@ -212,6 +219,9 @@ class ArmRosBridge(Node):
         self.right_i_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/i_actual", 10)
         self.right_actual_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/actual_TCP_force", 10)
         self.right_ft_sensor_pub = self.create_publisher(Float32MultiArray, "/g01/right/FTSensor", 10)
+        self.right_qd_pub = self.create_publisher(Float64MultiArray, "/g01/right_arm/qd_actual", 10)
+        self.right_torque_pub = self.create_publisher(Float64MultiArray, "/g01/right_arm/m_actual", 10)
+        self.right_observer_pub = self.create_publisher(String, "/g01/right_arm/observer_state", 10)
         # 200Hz输入只保留最新一条，30ms定时器按固定频率下发最新完整目标。
         self._latest_arm_commands = {"right": None}
         self._new_arm_commands = {"right": False}
@@ -264,6 +274,54 @@ class ArmRosBridge(Node):
         msg.data = [float(num) for num in i_actual]
         if side == "right":
             self.right_i_pub.publish(msg)
+
+    def publish_observer_state(self, side, q, dq, torque, current, controller_timestamp):
+        """发布同帧、未舍入的观测器输入；速度、扭矩、电流保留协议原值。
+
+        time_stamp 是控制器原始 uint64，不能当作本机 ROS 时间。
+        observer_state 中的 position_rad 已从 q_actual 的角度值换算；
+        *_raw 的单位/比例须按所用固件确认，不在此猜测力矩换算系数。
+        """
+        if side != "right":
+            return
+        vectors = [np.asarray(value, dtype=float) for value in (q, dq, torque, current)]
+        if any(value.shape != (6,) or not np.all(np.isfinite(value)) for value in vectors):
+            self.get_logger().warning("观测器反馈包含无效关节数据，跳过该帧")
+            return
+        timestamp = int(controller_timestamp)
+        if not 0 <= timestamp < 2**64:
+            self.get_logger().warning("观测器反馈时间戳超出 uint64 范围，跳过该帧")
+            return
+        q, dq, torque, current = vectors
+        stamp = self.get_clock().now().to_msg()
+
+        observer_msg = String()
+        observer_msg.data = json.dumps({
+            "joint_names": list(RIGHT_JOINTS),
+            "ros_stamp": {"sec": stamp.sec, "nanosec": stamp.nanosec},
+            "controller_time_stamp": timestamp,
+            "q_actual_raw": q.tolist(),
+            "position_rad": np.deg2rad(q).tolist(),
+            "qd_actual_raw": dq.tolist(),
+            "m_actual_raw": torque.tolist(),
+            "i_actual_raw": current.tolist(),
+            "units": {
+                "q_actual_raw": "deg",
+                "position_rad": "rad",
+                "qd_actual_raw": "controller_raw",
+                "m_actual_raw": "controller_raw",
+                "i_actual_raw": "controller_raw",
+                "controller_time_stamp": "controller_raw",
+            },
+        }, allow_nan=False, separators=(",", ":"))
+
+        dq_msg = Float64MultiArray()
+        dq_msg.data = dq.tolist()
+        torque_msg = Float64MultiArray()
+        torque_msg.data = torque.tolist()
+        self.right_qd_pub.publish(dq_msg)
+        self.right_torque_pub.publish(torque_msg)
+        self.right_observer_pub.publish(observer_msg)
 
     def publish_arm_actual_tcp_force(self, side, actual_tcp_force):
         msg = Float32MultiArray()
@@ -523,6 +581,9 @@ def joint(feed_v, side, state_node):
         state_node.publish_arm_state(side, q_actual[side])
         state_node.publish_arm_i_actual(side, i_actual[side])
         state_node.publish_arm_actual_tcp_force(side, actual_TCP_force[side])
+        state_node.publish_observer_state(
+            side, actual[1], actual[6], actual[7], actual[2], actual[8]
+        )
 
         ft_sensor_status = int(actual[5])
         force_values = [float(num) for num in actual[4]]
