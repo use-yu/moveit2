@@ -7,6 +7,31 @@ import numpy as np
 
 RIGHT_JOINTS = [f"r_arm_joint{i}" for i in range(1, 7)]
 
+# 导纳调参区：修改这里的默认值，重启节点生效；ROS 启动参数可覆盖。
+ADMITTANCE_DEFAULTS = {
+    'xyz': {
+        #                   X       Y       Z（沿当前 R6 局部轴）
+        'M':              [20.0,   20.0,   20.0],
+        'B':              [5000.0, 5000.0, 5000.0],
+        'K':              [0.0,    0.0,    0.0],
+        'ki': 0.0,
+        'max_offset': 0.3,       # 每轴累计位移限幅，m
+        'max_velocity': 0.1,     # 每轴线速度限幅，m/s
+    },
+    'rz': {
+        'M': 1.0,               # 虚拟转动惯量，kg*m^2
+        'B': 10.0,              # 旋转阻尼，N*m*s/rad
+        'K': 0.0,               # 旋转刚度，N*m/rad
+        'ki': 0.0,
+        'max_angle_deg': 10.0,   # 累计转角限幅，度；ROS max_angle_rz 仍用 rad
+        'max_velocity': 0.07,    # 绕 Z 角速度限幅，rad/s
+    },
+    'joint': {
+        'max_velocity': 0.07,    # 每关节速度限幅，rad/s；会限制平移和旋转
+        'max_tracking_error': 0.5,  # 关节目标与反馈的允许偏差，rad
+    },
+}
+
 
 def axis_rotation(axis, angle):
     x, y, z = axis
@@ -98,29 +123,47 @@ class RightArmKinematics:
         return transform, jacobian
 
 
-def joint_velocity(jacobian, velocity_r6, rotation, damping):
-    """R6 线速度转关节速度，目标角速度为零，阻尼抑制奇异放大。"""
-    twist = np.concatenate((rotation @ velocity_r6, np.zeros(3)))
+def joint_velocity(jacobian, velocity_r6, rotation, damping, angular_velocity_r6=None):
+    """R6 线速度、角速度转关节速度，阻尼抑制奇异放大。"""
+    if angular_velocity_r6 is None:
+        angular_velocity_r6 = np.zeros(3)
+    twist = np.concatenate((rotation @ velocity_r6, rotation @ angular_velocity_r6))
     return jacobian.T @ np.linalg.solve(
         jacobian @ jacobian.T + damping**2*np.eye(6), twist)
 
 
 class AdmittanceController:
-    """M*a+B*v+K*x=e+ki*integral，状态分量沿 R6 局部轴定义。"""
+    """M*a+B*v+K*x=e+ki*integral，可用于平移或旋转局部轴。"""
 
     def __init__(self, mass=20., damping=120., stiffness=0., ki=0.,
-                 max_offset=0.3, max_velocity=0.1):
-        self.mass, self.damping, self.stiffness, self.ki = mass, damping, stiffness, ki
+                 max_offset=0.3, max_velocity=0.1, dimensions=3):
+        def xyz(value, name, allow_zero=False):
+            value = np.asarray(value, dtype=float)
+            if value.ndim == 0:
+                value = np.full(dimensions, float(value))
+            if (value.shape != (dimensions,) or not np.all(np.isfinite(value))
+                    or np.any(value < 0 if allow_zero else value <= 0)):
+                raise ValueError(f'{name} 必须为 {dimensions} 个有效的' + ('非负数' if allow_zero else '正数'))
+            return value.copy()
+
+        self.mass = xyz(mass, 'mass')
+        self.damping = xyz(damping, 'damping')
+        self.stiffness = xyz(stiffness, 'stiffness', allow_zero=True)
+        self.ki = ki
         self.max_offset, self.max_velocity = max_offset, max_velocity
-        self.x = np.zeros(3)
-        self.velocity = np.zeros(3)
-        self.integral = np.zeros(3)
+        self.x = np.zeros(dimensions)
+        self.velocity = np.zeros(dimensions)
+        self.integral = np.zeros(dimensions)
 
     def step(self, fd, fe, dt):
         self.integral = np.clip(self.integral+(fe-fd)*dt, -1000., 1000.)
-        acceleration = (fe-fd+self.ki*self.integral
-                        - self.damping*self.velocity-self.stiffness*self.x)/self.mass
-        self.velocity = np.clip(self.velocity+acceleration*dt,
+        drive = fe-fd+self.ki*self.integral-self.stiffness*self.x
+        # 周期内保持 drive 不变，精确离散 M*dv/dt+B*v=drive。
+        # 当前 K=0、ki=0 时，这是恒定力输入下速度的精确解。
+        # expm1 避免 dt 很小时计算 1-exp(-B*dt/M) 的精度损失。
+        alpha = -np.expm1(-self.damping*dt/self.mass)
+        velocity = self.velocity+alpha*(drive/self.damping-self.velocity)
+        self.velocity = np.clip(velocity,
                                 -self.max_velocity, self.max_velocity)
         candidate = self.x+self.velocity*dt
         next_x = np.clip(candidate, -self.max_offset, self.max_offset)
@@ -154,23 +197,53 @@ def main(args=None):
                     raise ValueError(f'{name} 必须为大于零的有限数')
                 return value
 
+            def nonnegative(name, default):
+                value = float(parameter(name, default))
+                if not np.isfinite(value) or value < 0:
+                    raise ValueError(f'{name} 必须为非负有限数')
+                return value
+
             self.dt = positive('dt', 0.03)
             self.timeout = positive('feedback_timeout', 0.2)
             self.force_filter_cutoff_hz = positive('force_filter_cutoff_hz', 5.)
             self.jacobian_damping = positive('jacobian_damping', 0.01)
-            self.max_joint_velocity = positive('max_joint_velocity', 0.05)
-            self.max_tracking_error = positive('max_tracking_error', 0.5)
-            mass = positive('mass', 20.)
-            damping = positive('damping', 1000.)
-            stiffness = float(parameter('stiffness', 0.))
-            ki = float(parameter('ki', 0.0))
-            if not np.isfinite(stiffness) or stiffness < 0 or not np.isfinite(ki) or ki < 0:
-                raise ValueError('stiffness 和 ki 必须为非负有限数')
+            xyz_defaults = ADMITTANCE_DEFAULTS['xyz']
+            rz_defaults = ADMITTANCE_DEFAULTS['rz']
+            joint_defaults = ADMITTANCE_DEFAULTS['joint']
+            self.max_joint_velocity = positive('max_joint_velocity', joint_defaults['max_velocity'])
+            self.max_tracking_error = positive('max_tracking_error', joint_defaults['max_tracking_error'])
+            # R6 局部 X、Y、Z 三轴分别设置 M、B、K。
+            mass = np.array([
+                positive('mass_x', xyz_defaults['M'][0]),
+                positive('mass_y', xyz_defaults['M'][1]),
+                positive('mass_z', xyz_defaults['M'][2]),
+            ])
+            damping = np.array([
+                positive('damping_x', xyz_defaults['B'][0]),
+                positive('damping_y', xyz_defaults['B'][1]),
+                positive('damping_z', xyz_defaults['B'][2]),
+            ])
+            stiffness = np.array([
+                nonnegative('stiffness_x', xyz_defaults['K'][0]),
+                nonnegative('stiffness_y', xyz_defaults['K'][1]),
+                nonnegative('stiffness_z', xyz_defaults['K'][2]),
+            ])
+            ki = nonnegative('ki', xyz_defaults['ki'])
             self.controller = AdmittanceController(
                 mass, damping, stiffness, ki,
-                positive('max_offset', 0.3), positive('max_velocity', 0.1))
+                positive('max_offset', xyz_defaults['max_offset']),
+                positive('max_velocity', xyz_defaults['max_velocity']))
+            # R6 绕 Z 轴：Mz(N*m) -> 角速度(rad/s)，M 为虚拟转动惯量。
+            mass_rz = positive('mass_rz', rz_defaults['M'])
+            damping_rz = positive('damping_rz', rz_defaults['B'])
+            stiffness_rz = nonnegative('stiffness_rz', rz_defaults['K'])
+            self.rotation_controller = AdmittanceController(
+                mass_rz, damping_rz, stiffness_rz, nonnegative('ki_rz', rz_defaults['ki']),
+                positive('max_angle_rz', float(np.deg2rad(rz_defaults['max_angle_deg']))),
+                positive('max_angular_velocity_rz', rz_defaults['max_velocity']), dimensions=1)
             self.model = None
             self.q = self.force = self.fd = self.q_command = None
+            self.mz = self.initial_mz = None
             self.q_time = self.force_time = 0.
             self.last_update = None
             self.fault = False
@@ -187,7 +260,8 @@ def main(args=None):
             self.create_timer(self.dt, self.tick)
             self.get_logger().info(
                 f'等待 URDF、右臂关节和 R6 力；周期 {self.dt:g}s，力低通 {self.force_filter_cutoff_hz:g}Hz。'
-                f'导纳 M={mass:g}, B={damping:g}, K={stiffness:g}, ki={ki:g}。'
+                f'导纳 XYZ：M={mass.tolist()}, B={damping.tolist()}, K={stiffness.tolist()}, ki={ki:g}。'
+                f'绕 R6 Z：M={mass_rz:g}, B={damping_rz:g}, K={stiffness_rz:g}；由第六项 Mz 驱动。'
                 '使用雅可比关节速度积分，不调用 FK/IK 服务。')
 
         def on_description(self, msg):
@@ -213,19 +287,22 @@ def main(args=None):
 
         def on_force(self, msg):
             force = np.asarray(msg.data, dtype=float)
-            if force.size < 3 or not np.all(np.isfinite(force[:3])):
-                self.stop('力反馈 XYZ 无效')
+            if force.ndim != 1 or force.size < 6 or not np.all(np.isfinite(force[[0, 1, 2, 5]])):
+                self.stop('六维反馈缺少有效的 XYZ 力或 Mz 力矩')
                 return
             now = time.monotonic()
             if self.force is None:
                 self.force = force[:3].copy()
+                self.mz = float(force[5])
             else:
                 alpha = -np.expm1(-2*np.pi*self.force_filter_cutoff_hz*max(0., now-self.force_time))
                 self.force += alpha*(force[:3]-self.force)
+                self.mz += alpha*(float(force[5])-self.mz)
             self.force_time = now
 
         def tick(self):
-            if self.fault or self.model is None or self.q is None or self.force is None:
+            if (self.fault or self.model is None or self.q is None
+                    or self.force is None or self.mz is None):
                 return
             now = time.monotonic()
             if now-self.q_time > self.timeout or now-self.force_time > self.timeout:
@@ -234,9 +311,11 @@ def main(args=None):
                 return
             if self.q_command is None:
                 self.fd = self.force.copy()
+                self.initial_mz = self.mz
                 self.q_command = self.q.copy()
                 self.last_update = now
-                self.get_logger().info(f'初始力 desired_force={self.fd.tolist()} N，开始速度导纳。')
+                self.get_logger().info(
+                    f'初始力 desired_force={self.fd.tolist()} N，初始 Mz={self.initial_mz:g} N*m，开始速度导纳。')
                 return
             dt = now-self.last_update
             self.last_update = now
@@ -248,8 +327,12 @@ def main(args=None):
                 return
             transform, jacobian = self.model.evaluate(self.q)
             velocity_r6 = self.controller.step(self.fd, self.force, dt)
+            omega_z = self.rotation_controller.step(
+                np.array([self.initial_mz]), np.array([self.mz]), dt)[0]
+            angular_velocity_r6 = np.array([0.0, 0.0, omega_z])
             try:
-                dq = joint_velocity(jacobian, velocity_r6, transform[:3, :3], self.jacobian_damping)
+                dq = joint_velocity(jacobian, velocity_r6, transform[:3, :3],
+                                    self.jacobian_damping, angular_velocity_r6)
             except np.linalg.LinAlgError:
                 self.stop('雅可比求解失败')
                 return
