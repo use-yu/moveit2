@@ -6,7 +6,10 @@ kill 10568 11065 691478
 
 运行代码：
 
-python3 /home/ws_moveit/src/hello_moveit/scripts/grasp_test.py --sim --keyboard --interactive --forces
+python3 /home/ws_moveit/src/hello_moveit/scripts/grasp_test.py --sim --keyboard --interactive --noforces
+
+`grasp_actor.py` 默认启用力传感器，输入4/7使用导纳放置，并从实测位置重新规划直线退回。
+加 `--noforces` 时禁用力传感器，输入4/7沿原规划直线下降，放置后反向执行该直线退回。
 
 g01实际部署：
 

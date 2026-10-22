@@ -176,7 +176,7 @@ class DynamicsAndControlTests(unittest.TestCase):
 
 
 class PlaceOrchestrationTests(unittest.TestCase):
-    def make_node(self, *, failure=False, return_plan=True):
+    def make_node(self, *, failure=False, return_plan=True, use_force_sensors=True):
         events = []
         arms = g.joint_names_for_group('right_arm')
         body = g.joint_names_for_group('right_body')
@@ -184,6 +184,8 @@ class PlaceOrchestrationTests(unittest.TestCase):
         state = {name: 0. for name in all_names}
         to_yubei, to_q1 = trajectory(body), trajectory(arms)
         dynamic_return = trajectory(arms, [.2]*6, [.1]*6)
+        linear_descent = trajectory(arms, [0.]*6, [.25]*6)
+        linear_return = trajectory(arms, [.25]*6, [0.]*6)
         reset = trajectory(arms, [.1]*6, [.3]*6)
         saved_pose = g.Pose()
         place_pose = g.Pose()
@@ -198,8 +200,8 @@ class PlaceOrchestrationTests(unittest.TestCase):
                 return pose
             return saved_pose
         plan = NS(arm_group='right_arm', slot_name='sw1', to_yubei=to_yubei,
-                  descent=g.RobotTrajectory(), to_q1=to_q1)
-        node = NS(get_logger=logger, _place_slot_is_empty=lambda name: True,
+                  descent=g.RobotTrajectory() if use_force_sensors else linear_descent, to_q1=to_q1)
+        node = NS(get_logger=logger, use_force_sensors=use_force_sensors, _place_slot_is_empty=lambda name: True,
                   _has_any_empty_place_slot=lambda: True, _upper_grasp_active=False,
                   _upper_place_active=False, sim_mode=False, last_pick_failure_reason=None,
                   wait_for_operator=lambda *a: None, _wait_for_driver_signal=lambda **kw: True,
@@ -209,11 +211,13 @@ class PlaceOrchestrationTests(unittest.TestCase):
                   set_tool_power=lambda side, status: events.append(('tool', status)) or True,
                   validate_trajectory_self_collision=lambda *a, **kw: events.append('check_return') or True)
         def admittance(group, *, height_stop):
+            self.assertTrue(use_force_sensors)
             self.assertAlmostEqual(height_stop['target_z'], place_pose.position.z + .002)
             events.append('admittance')
             state.update({name: .2 for name in arms})
             return not failure
         def cartesian(*a, **kw):
+            self.assertTrue(use_force_sensors)
             events.append('plan_return')
             self.assertIs(a[2], saved_pose)
             np.testing.assert_allclose([kw['start_joints'][name] for name in arms], [.2]*6)
@@ -225,13 +229,19 @@ class PlaceOrchestrationTests(unittest.TestCase):
             np.testing.assert_allclose([kw['start_joints'][name] for name in arms], [.1]*6)
             return True, None, reset
         def execute(traj):
-            events.append('return' if traj is dynamic_return else 'q1')
+            events.append('descent' if traj is linear_descent else
+                          'return' if traj in (dynamic_return, linear_return) else 'q1')
             state.update(zip(traj.joint_trajectory.joint_names, traj.joint_trajectory.points[-1].positions))
             return True
         node._execute_input4_admittance = admittance
         node.plan_cartesian_line = cartesian
         node.plan_joint_motion = joint_plan
         node._execute_traj = execute
+        def reverse(traj):
+            self.assertIs(traj, linear_descent)
+            events.append('reverse')
+            return linear_return
+        node._reverse_trajectory = reverse
         config = {'yubei': {'sw1': [0.]*len(body)}, 'fang': {'sw1': [.25]*6}}
         return node, config, plan, events
 
@@ -251,6 +261,11 @@ class PlaceOrchestrationTests(unittest.TestCase):
         self.assertEqual(events[-1], 'return')
         self.assertNotIn('q1', events)
 
+    def test_noforces_uses_cached_linear_descent_and_reverse_without_admittance(self):
+        node, config, plan, events = self.make_node(use_force_sensors=False)
+        self.assertTrue(self.run_place(node, config, plan))
+        self.assertEqual(events, ['to_yubei', 'descent', ('tool', 0), 'reverse', 'return', 'q1'])
+
     def test_admittance_failure_keeps_tool_power_and_skips_return(self):
         node, config, plan, events = self.make_node(failure=True)
         self.assertFalse(self.run_place(node, config, plan))
@@ -269,7 +284,7 @@ class PlaceOrchestrationTests(unittest.TestCase):
         def joint_plan(group, *a, **kw):
             calls.append(group)
             return True, None, trajectory(body if group == 'right_body' else names)
-        node = NS(get_logger=logger, plan_joint_motion=joint_plan,
+        node = NS(get_logger=logger, use_force_sensors=True, plan_joint_motion=joint_plan,
                   _get_link_pose_fk=lambda *a, **kw: g.Pose(),
                   plan_cartesian_line=lambda *a, **kw: self.fail('fixed fang descent must not be planned'))
         with patch.object(g, '_load_trajectory_cache', return_value=None), patch.object(g, '_save_trajectory_cache', return_value=False):
@@ -280,6 +295,42 @@ class PlaceOrchestrationTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertFalse(plan.descent.joint_trajectory.points)
         self.assertEqual(calls, ['right_body','right_arm'])
+
+    def test_noforces_preplans_original_fang_branch_and_rejects_wrong_endpoint(self):
+        names = g.joint_names_for_group('right_arm')
+        body = g.joint_names_for_group('right_body')
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                errors, cartesian_calls = [], []
+                def cartesian(group, link, pose, **kw):
+                    cartesian_calls.append(kw)
+                    np.testing.assert_allclose([kw['start_joints'][n] for n in names], [.25]*6)
+                    return trajectory(names, [.25]*6, [0. if valid else .4]*6)
+                def joint_plan(group, *a, **kw):
+                    return True, None, trajectory(body if group == 'right_body' else names)
+                node = NS(use_force_sensors=False, get_logger=logger,
+                    plan_joint_motion=joint_plan, plan_cartesian_line=cartesian,
+                    _get_link_pose_fk=lambda *a, **kw: g.Pose(),
+                    _reverse_trajectory=g.G01Demo._reverse_trajectory,
+                    publish_error=lambda *a: errors.append(a))
+                with patch.object(g, '_load_trajectory_cache', return_value=None) as cache, \
+                     patch.object(g, '_save_trajectory_cache', return_value=False):
+                    plan = g.G01Demo._plan_place_trajectories(node, arm_group='right_arm',
+                        arm_plan_frame='r_base_link', body_group='right_body',
+                        arm_joint_names=names, body_joint_names=body, slot_name='sw1',
+                        yubei_name='yubei.sw1', place_name='fang.sw1',
+                        start_joints={name: .1 for name in body}, yubei_joints=[0.]*len(body),
+                        fang_joints=[.25]*6, link='r_tool', speed=.4)
+                self.assertEqual(len(cartesian_calls), 1)
+                self.assertTrue(cache.call_args_list[0].args[0].startswith('input4_linear_place_'))
+                if valid:
+                    self.assertIsNotNone(plan)
+                    np.testing.assert_allclose(plan.descent.joint_trajectory.points[0].positions, [0.]*6)
+                    np.testing.assert_allclose(plan.descent.joint_trajectory.points[-1].positions, [.25]*6)
+                    self.assertFalse(errors)
+                else:
+                    self.assertIsNone(plan)
+                    self.assertTrue(errors)
 
 
 if __name__ == '__main__':

@@ -165,7 +165,7 @@ class DualAdmittanceTests(unittest.TestCase):
             self.assertEqual(group, 'dual_arm_body')
             events.append('plan_return')
             return retreat
-        node = NS(_execute_traj=execute, wait_for_operator=lambda *a: None,
+        node = NS(use_force_sensors=True, _execute_traj=execute, wait_for_operator=lambda *a: None,
             wait_for_ft_sensor_z=lambda side: 1. if side == 'left' else 2.,
             _get_joints=lambda *a, **kw: actual,
             _get_link_pose_fk=lambda link, **kw: actual_poses[link],
@@ -185,6 +185,31 @@ class DualAdmittanceTests(unittest.TestCase):
         function = nested_function('validate_place_candidate', current_full={}, table_pregrasp_only=False,
             merge_place_descents=lambda *a: None, planner=planner)
         self.assertIsNone(function('dual_arm', {}, {}, 'unreachable', g.RobotTrajectory(), g.RobotTrajectory()))
+
+    def test_noforces_dual_place_executes_original_descent_and_reverse_without_force_reads(self):
+        events = []
+        names = g.joint_names_for_group('dual_arm_body')
+        to_place, descent, retreat = (trajectory(names) for _ in range(3))
+        def execute(path):
+            events.append('to_place' if path is to_place else 'descent' if path is descent else 'retreat')
+            return True
+        def reverse(path):
+            self.assertIs(path, descent)
+            events.append('reverse')
+            return retreat
+        def forbidden(*a, **kw):
+            self.fail('no-force placement must not read sensors, run admittance or replan retreat')
+        node = NS(use_force_sensors=False, _execute_traj=execute, _reverse_trajectory=reverse,
+            wait_for_operator=lambda *a: None, wait_for_ft_sensor_z=forbidden,
+            _get_joints=forbidden, _get_link_pose_fk=forbidden,
+            _execute_dual_place_admittance=forbidden, _plan_dual_place_retreat=forbidden)
+        function = nested_function('execute_cached_place_plan', node=node, log=logger(),
+            current_full={}, dual_body_joint_names=names, left_point=1, right_point=3,
+            on_place_motion_start=lambda state: events.append('next_stage'),
+            release_unload_pair=lambda *a: events.append('release') or True)
+        with patch.object(g.time, 'sleep'):
+            self.assertTrue(function('dual_arm_body', 'test', to_place, descent, g.Pose(), g.Pose()))
+        self.assertEqual(events, ['next_stage', 'to_place', 'descent', 'release', 'reverse', 'retreat'])
 
 
 if __name__ == '__main__':

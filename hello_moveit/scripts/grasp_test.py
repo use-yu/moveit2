@@ -73,7 +73,7 @@ G01 MoveIt 演示脚本
 
 控制方式：
   默认：等待上位机话题命令。
-  --forces：禁用力传感器读取、自检、吸附检测及力保护。
+  --noforces：禁用力传感器读取、自检、吸附检测及力保护。
   --keyboard：不等待上位机命令，每轮通过数字菜单选择要执行的流程。
   --interactive：运动流程中的人工确认点也等待按回车；可与 --keyboard 同时使用。
 
@@ -8634,7 +8634,7 @@ def split_runtime_args(
 
     返回 ``(sim_mode, upper_control_mode, keyboard_control_mode, use_force_sensors, ros_args)``：
 
-    - ``--forces``：禁用全部力传感器逻辑。
+    - ``--noforces``：禁用全部力传感器逻辑。
     - ``--sim``：跳过真机工具服务并使用仿真输入。
     - ``--interactive``：保留运动流程内部的按回车确认点。
     - ``--keyboard``：主循环使用数字菜单，不等待上位机话题命令。
@@ -8646,8 +8646,8 @@ def split_runtime_args(
     sim_mode = "--sim" in raw_args
     upper_control_mode = "--interactive" not in raw_args
     keyboard_control_mode = "--keyboard" in raw_args
-    use_force_sensors = "--forces" not in raw_args
-    program_args = {"--sim", "--interactive", "--keyboard", "--forces"}
+    use_force_sensors = "--noforces" not in raw_args
+    program_args = {"--sim", "--interactive", "--keyboard", "--noforces"}
     ros_args = [
         arg for arg in raw_args if arg not in program_args
     ]
