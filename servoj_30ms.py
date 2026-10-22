@@ -229,7 +229,8 @@ class fankuis():
             tcp_force = feedback['TCP_force'].copy()
             ft_sensor = feedback['six_force_value'].copy()
             ft_sensor_online = int(feedback['six_force_online'])
-            return [tool_v, tool_j, tool_i, tcp_force, ft_sensor, ft_sensor_online]
+            actual_tcp_force = feedback['actual_TCP_force'].copy()
+            return [tool_v, tool_j, tool_i, tcp_force, ft_sensor, ft_sensor_online, actual_tcp_force]
         except (OSError, ConnectionError, ValueError) as error:
             self._log_feedback_error(error)
             return ["NG"]
@@ -244,6 +245,8 @@ class ArmRosBridge(Node):
         self.right_i_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/i_actual", 10)
         self.left_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/TCP_force", 10)
         self.right_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/TCP_force", 10)
+        self.left_actual_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/actual_TCP_force", 10)
+        self.right_actual_tcp_force_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/actual_TCP_force", 10)
         self.left_ft_sensor_pub = self.create_publisher(Float32MultiArray, "/g01/left/FTSensor", 10)
         self.right_ft_sensor_pub = self.create_publisher(Float32MultiArray, "/g01/right/FTSensor", 10)
         # 200Hz输入只保留最新一条，30ms定时器按固定频率下发最新完整目标。
@@ -334,6 +337,17 @@ class ArmRosBridge(Node):
             self.left_ft_sensor_pub.publish(msg)
         elif side == "right":
             self.right_ft_sensor_pub.publish(msg)
+
+    def publish_actual_tcp_force(self, side, force):
+        values = [float(value) for value in force]
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            return
+        msg = Float32MultiArray()
+        msg.data = values
+        if side == "left":
+            self.left_actual_tcp_force_pub.publish(msg)
+        elif side == "right":
+            self.right_actual_tcp_force_pub.publish(msg)
 
     def _extract_arm_command(self, name_to_pos, joints):
         out = []
@@ -655,6 +669,7 @@ def joint(feed_v, side, state_node):
         if ft_sensor_status == 1 and force_valid:
             FT_sensor[side] = force_values
             state_node.publish_ft_sensor(side, FT_sensor[side])
+            state_node.publish_actual_tcp_force(side, actual[6])
         else:
             # 清空内部缓存，避免其他代码误把下电前的最后一帧当作实时数据。
             FT_sensor[side] = []

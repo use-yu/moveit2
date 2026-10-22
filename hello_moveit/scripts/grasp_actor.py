@@ -38,8 +38,11 @@ G01 MoveIt 演示脚本
     同时计算当前物体的直接/交换放置轨迹；抓取后带料到识别位，
     采集下一物体视觉并后台解算，前台同时放置当前物体；
     放置后回识别位，有缓存解则直接抓取，未完成则原地等待。
-    SW 放置直线去程/回程若因机械臂报警失败，程序自动调用 servoj_30ms
-    清错服务、末端下电，再从实测当前位置按不检查碰撞的直线退回。
+    输入4到yubei后不执行到fang的固定直线：读取actual_TCP_force，先100N的
+    Z向导纳接近，Fz变化超过30N后切换60N并启用XY/Rz；接触后15s或
+    到原fang放点基坐标系Z+2mm结束。
+    完成后工具下电，从实测位置重新规划直线退回yubei，再执行原Q1/识别位复位。
+    导纳失败保持工具上电并停止；不执行缓存的固定下降或反向回放轨迹。
 5. 向 /agv_auto_control_speed 以 20 Hz 发布 linear.x=-0.1 m/s，
    使用步骤 2 保存的同一时长后停车。
 6. 仅腰部和升降运动到物料台识别预备构型，识别并添加碰撞模型；未收到有效视觉数据时
@@ -53,13 +56,14 @@ G01 MoveIt 演示脚本
     吸附完成后先做物料台放置可达性验证：纯臂 IK 优先；必要时先求
     left_body，再固定该腰部/升降状态求右臂 IK。左右下降分别预检：忽略
     world 物体碰撞，但保留机器人自碰撞检查；通过后缓存 OMPL 和同步下降
-    轨迹，执行阶段不重新规划。
-    双臂同步下降前读取左右 Fz；任一侧 Fz 下降超过 210N 时，
-    双末端下电并从实测位置同步直退到放置预备点后继续。
+    轨迹用于可达性检查。到预备位后双臂分别运行100N Z导纳，接触后各自
+    切换60N及XY/Rz；接触后15s或到原下降末点基坐标系Z+2mm停止该臂。
+    双臂都完成后下电，从实测位置重新规划同步直线退回预备位；
+    保留原始 Fz 下降超过210N及传感器量程保护。
     优先 SW1+SW3，目标固定为 (1,3)；SW2+SW4
     目标固定为 (2,4)，不记录已经放过的位置。循环正常结束后，
     dual_arm_body 复位到 MOVE_TO_GRASP_RESET_Q。
-    四点放置直线去程/回程报警时同样自动恢复；双臂清错、末端下电后，
+    四点导纳放置/直线回程报警时同样自动恢复；双臂清错、末端下电后，
     从实测位置同步直退，忽略场景物体碰撞但保留机器人自碰撞检查。
 8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
 
@@ -129,6 +133,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+import numpy as np
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -175,6 +180,22 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Bool, ColorRGBA, Float32, Float32MultiArray, Int32, String, UInt8
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
+
+# 输入4/7放置共用导纳：与 insert.py 独立实现，参数在这里集中修改。
+INPUT4_ADMITTANCE = {
+    "period": 0.03, "feedback_timeout": 0.2, "startup_timeout": 5.0,
+    "approach_force": 100.0, "contact_force": 60.0, "force_threshold": 30.0,
+    "down_direction": 1.0, "reaction_sign": -1.0,
+    "contact_duration": 15.0, "approach_timeout": 30.0,
+    "M": [20.0, 20.0, 20.0], "B": [5000.0, 5000.0, 5000.0], "K": [0.0, 0.0, 0.0],
+    "ki": 0.0, "max_offset": 0.3, "max_velocity": 0.1,
+    "M_rz": 1.0, "B_rz": 10.0, "K_rz": 0.0, "ki_rz": 0.0,
+    "max_angle_rz": math.radians(10.0), "max_velocity_rz": 0.07,
+    "force_filter_hz": 5.0, "jacobian_damping": 0.01,
+    "max_joint_velocity": 0.07, "max_tracking_error": 0.5,
+    "position_gain": 2.0, "orientation_gain": 2.0,
+    "max_linear_speed": 0.03, "max_angular_speed": 0.2,
+}
 from visualization_msgs.msg import Marker, MarkerArray
 from dobot_msgs_v4.srv import ClearError, SetToolPower
 
@@ -3018,6 +3039,257 @@ def merge_dual_arm_cartesian_trajectories(
 # =============================================================================
 
 
+# 输入4专用：本文件内的独立运动学及导纳实现，不导入 insert.py。
+def input4_limit_norm(value, maximum):
+    return value / max(1.0, float(np.linalg.norm(value)) / maximum)
+
+def input4_axis_rotation(axis, angle):
+    x, y, z = axis
+    skew = np.array([[0., -z, y], [z, 0., -x], [-y, x, 0.]])
+    return np.eye(3) + np.sin(angle)*skew + (1-np.cos(angle))*(skew @ skew)
+
+class Input4ArmKinematics:
+    """读取展开后的 URDF，计算选中臂基座到 L6/R6 的几何雅可比。"""
+
+    def __init__(self, description, side):
+        if side not in ("left", "right"):
+            raise ValueError("放置臂必须为 left 或 right")
+        self.joint_names = [f"{side[0]}_arm_joint{i}" for i in range(1, 7)]
+        self.base = f"{side[0]}_base_link"
+        self.tip = "L6" if side == "left" else "R6"
+        root = ET.fromstring(description)
+        if any('xacro' in e.tag for e in root.iter()):
+            raise ValueError('需要展开后的 URDF，请先用 xacro 展开')
+        parents = {j.find('child').get('link'): j for j in root.findall('joint')}
+        chain, visited = [], set()
+        child = self.tip
+        while child != self.base:
+            if child in visited or child not in parents:
+                raise ValueError(f'URDF 缺少有效的 {self.base} -> {self.tip} 链')
+            visited.add(child)
+            joint = parents[child]
+            chain.append(joint)
+            child = joint.find('parent').get('link')
+        self.chain = []
+        self.lower = np.full(6, -np.inf)
+        self.upper = np.full(6, np.inf)
+        self.velocity_limits = np.full(6, np.inf)
+        names = []
+        for joint in reversed(chain):
+            kind = joint.get('type')
+            if kind not in ('fixed', 'revolute', 'continuous'):
+                raise ValueError(f'不支持的关节类型：{kind}')
+            origin, axis_element = joint.find('origin'), joint.find('axis')
+            xyz = np.fromstring(origin.get('xyz', '0 0 0') if origin is not None else '0 0 0', sep=' ')
+            rpy = np.fromstring(origin.get('rpy', '0 0 0') if origin is not None else '0 0 0', sep=' ')
+            axis = np.fromstring(axis_element.get('xyz', '1 0 0') if axis_element is not None else '1 0 0', sep=' ')
+            if any(v.shape != (3,) or not np.all(np.isfinite(v)) for v in (xyz, rpy, axis)):
+                raise ValueError('URDF 中存在无效关节变换')
+            if np.linalg.norm(axis) < 1e-12:
+                raise ValueError('URDF 中存在零关节轴')
+            axis /= np.linalg.norm(axis)
+            transform = np.eye(4)
+            transform[:3, :3] = (input4_axis_rotation([0, 0, 1], rpy[2])
+                                  @ input4_axis_rotation([0, 1, 0], rpy[1])
+                                  @ input4_axis_rotation([1, 0, 0], rpy[0]))
+            transform[:3, 3] = xyz
+            index = None
+            if kind != 'fixed':
+                name = joint.get('name')
+                if name not in self.joint_names:
+                    raise ValueError(f'{self.tip} 链中包含额外活动关节：{name}')
+                index = self.joint_names.index(name)
+                names.append(name)
+                limit = joint.find('limit')
+                if kind == 'revolute':
+                    if limit is None:
+                        raise ValueError(f'关节 {name} 缺少位置限位')
+                    self.lower[index] = float(limit.get('lower'))
+                    self.upper[index] = float(limit.get('upper'))
+                    if not self.lower[index] < self.upper[index]:
+                        raise ValueError(f'关节 {name} 的位置限位无效')
+                # 本项目 URDF 的 velocity=0 是占位值，只使用正速度限值。
+                if limit is not None and float(limit.get('velocity', '0')) > 0:
+                    self.velocity_limits[index] = float(limit.get('velocity'))
+            self.chain.append((transform, axis, index))
+        if names != self.joint_names:
+            raise ValueError(f'URDF 关节顺序必须为 {self.joint_names}')
+
+    def evaluate(self, q):
+        """返回末端变换和基座系表达的 [线速度; 角速度] 雅可比。"""
+        q = np.asarray(q, dtype=float)
+        if q.shape != (6,) or not np.all(np.isfinite(q)):
+            raise ValueError('关节位置必须为六维有限数')
+        transform = np.eye(4)
+        origins, axes = {}, {}
+        for origin, axis, index in self.chain:
+            transform = transform @ origin
+            if index is not None:
+                origins[index] = transform[:3, 3].copy()
+                axes[index] = transform[:3, :3] @ axis
+                rotation = np.eye(4)
+                rotation[:3, :3] = input4_axis_rotation(axis, q[index])
+                transform = transform @ rotation
+        jacobian = np.zeros((6, 6))
+        for index in range(6):
+            jacobian[:3, index] = np.cross(axes[index], transform[:3, 3]-origins[index])
+            jacobian[3:, index] = axes[index]
+        return transform, jacobian
+
+def input4_joint_velocity(jacobian, velocity_r6, rotation, damping, angular_velocity_r6=None):
+    """R6 线速度、角速度转关节速度，阻尼抑制奇异放大。"""
+    if angular_velocity_r6 is None:
+        angular_velocity_r6 = np.zeros(3)
+    twist = np.concatenate((rotation @ velocity_r6, rotation @ angular_velocity_r6))
+    return jacobian.T @ np.linalg.solve(
+        jacobian @ jacobian.T + damping**2*np.eye(6), twist)
+
+class Input4AdmittanceController:
+    """M*a+B*v+K*x=e+ki*integral，可用于平移或旋转局部轴。"""
+
+    def __init__(self, mass=20., damping=120., stiffness=0., ki=0.,
+                 max_offset=0.3, max_velocity=0.1, dimensions=3):
+        def xyz(value, name, allow_zero=False):
+            value = np.asarray(value, dtype=float)
+            if value.ndim == 0:
+                value = np.full(dimensions, float(value))
+            if (value.shape != (dimensions,) or not np.all(np.isfinite(value))
+                    or np.any(value < 0 if allow_zero else value <= 0)):
+                raise ValueError(f'{name} 必须为 {dimensions} 个有效的' + ('非负数' if allow_zero else '正数'))
+            return value.copy()
+
+        self.mass = xyz(mass, 'mass')
+        self.damping = xyz(damping, 'damping')
+        self.stiffness = xyz(stiffness, 'stiffness', allow_zero=True)
+        self.ki = ki
+        self.max_offset, self.max_velocity = max_offset, max_velocity
+        self.x = np.zeros(dimensions)
+        self.velocity = np.zeros(dimensions)
+        self.integral = np.zeros(dimensions)
+
+    def step(self, fd, fe, dt):
+        self.integral = np.clip(self.integral+(fe-fd)*dt, -1000., 1000.)
+        drive = fe-fd+self.ki*self.integral-self.stiffness*self.x
+        # 周期内保持 drive 不变，精确离散 M*dv/dt+B*v=drive。
+        # 当前 K=0、ki=0 时，这是恒定力输入下速度的精确解。
+        # expm1 避免 dt 很小时计算 1-exp(-B*dt/M) 的精度损失。
+        alpha = -np.expm1(-self.damping*dt/self.mass)
+        velocity = self.velocity+alpha*(drive/self.damping-self.velocity)
+        self.velocity = np.clip(velocity,
+                                -self.max_velocity, self.max_velocity)
+        candidate = self.x+self.velocity*dt
+        next_x = np.clip(candidate, -self.max_offset, self.max_offset)
+        # 边界处最后一步只输出剩余位移所允许的速度。
+        actual_velocity = (next_x-self.x)/dt
+        limited = candidate != next_x
+        self.x = next_x
+        self.velocity[limited] = 0.
+        self.integral[limited] = 0.
+        return actual_velocity
+
+
+class Input4PlacementControl:
+    """从 yubei 开始的纯计算控制器，所有速度沿当前 L6/R6 局部轴定义。"""
+
+    def __init__(self, model, q, wrench, now, config=None, *,
+                 target_z=None, base_transform=None, tool_offset=None):
+        self.config = copy.deepcopy(INPUT4_ADMITTANCE if config is None else config)
+        c = self.config
+        self.model = model
+        self.command = np.asarray(q, dtype=float).copy()
+        self.baseline = np.asarray(wrench, dtype=float).copy()
+        if self.command.shape != (6,) or self.baseline.shape != (4,):
+            raise ValueError("放置控制器需要6关节、Fx/Fy/Fz/Mz四项反馈")
+        self.initial, _ = model.evaluate(self.command)
+        self.target_z = target_z
+        self.base_transform = np.eye(4) if base_transform is None else np.asarray(base_transform, dtype=float)
+        self.tool_offset = np.zeros(3) if tool_offset is None else np.asarray(tool_offset, dtype=float)
+        self.height_direction = 0.
+        if target_z is not None:
+            if (not np.isfinite(target_z) or self.base_transform.shape != (4, 4)
+                    or self.tool_offset.shape != (3,)
+                    or not np.all(np.isfinite(self.base_transform))
+                    or not np.all(np.isfinite(self.tool_offset))):
+                raise ValueError("放置高度或坐标变换无效")
+            initial_z = self.tool_height(self.initial)
+            self.height_direction = float(np.sign(target_z-initial_z))
+        self.xyz = Input4AdmittanceController(c["M"], c["B"], c["K"], c["ki"],
+                                              c["max_offset"], c["max_velocity"])
+        self.rz = Input4AdmittanceController(c["M_rz"], c["B_rz"], c["K_rz"], c["ki_rz"],
+                                             c["max_angle_rz"], c["max_velocity_rz"], dimensions=1)
+        self.started = self.previous_time = now
+        self.contact_time = None
+        self.reaction_sign = c["reaction_sign"]
+        self.xy_offset = np.zeros(3)
+        self.finished = False
+        self.finish_reason = None
+
+    def tool_height(self, transform):
+        """由实测关节计算工具原点在公共基坐标系中的高度。"""
+        point = transform @ np.append(self.tool_offset, 1.)
+        return float((self.base_transform @ point)[2])
+
+    def step(self, q, wrench, now):
+        c = self.config
+        q, wrench = np.asarray(q, dtype=float), np.asarray(wrench, dtype=float)
+        if q.shape != (6,) or wrench.shape != (4,) or not all(np.all(np.isfinite(v)) for v in (q, wrench)):
+            raise ValueError("导纳反馈维度或数值无效")
+        transform, J = self.model.evaluate(q)
+        if (self.target_z is not None
+                and self.height_direction*(self.tool_height(transform)-self.target_z) >= 0.):
+            self.finished = True
+            self.finish_reason = "height"
+            return None
+        delta_fz = wrench[2]-self.baseline[2]
+        if self.contact_time is None and abs(delta_fz) > c["force_threshold"]:
+            self.contact_time = now
+            self.reaction_sign = float(np.sign(delta_fz))
+        if self.contact_time is not None and now-self.contact_time >= c["contact_duration"]:
+            self.finished = True
+            self.finish_reason = "duration"
+            return None
+        if self.contact_time is None and now-self.started > c["approach_timeout"]:
+            raise ValueError("100N接近阶段超时，未检测到接触")
+        dt = now-self.previous_time
+        self.previous_time = now
+        if dt <= 0 or dt > min(c["feedback_timeout"], 3*c["period"]):
+            raise ValueError("导纳控制周期异常")
+        if np.max(np.abs(self.command-q)) > c["max_tracking_error"]:
+            raise ValueError("导纳关节目标与实际反馈偏差过大")
+        error = np.zeros(3)
+        force = c["approach_force"] if self.contact_time is None else c["contact_force"]
+        error[2] = c["down_direction"]*(force-self.reaction_sign*delta_fz)
+        omega_z = 0.
+        if self.contact_time is not None:
+            error[:2] = wrench[:2]-self.baseline[:2]
+            omega_z = self.rz.step(self.baseline[3:4], wrench[3:4], dt)[0]
+        velocity = self.xyz.step(np.zeros(3), error, dt)
+        z_axis = self.initial[:3, 2]
+        vxy = transform[:3, :3] @ np.array([velocity[0], velocity[1], 0.])
+        vxy -= z_axis*np.dot(z_axis, vxy)
+        self.xy_offset += vxy*dt
+        position = self.initial[:3, 3]+self.xy_offset
+        rotation = self.initial[:3, :3] @ input4_axis_rotation([0, 0, 1], self.rz.x[0])
+        command_transform, _ = self.model.evaluate(self.command)
+        position_error = position-command_transform[:3, 3]
+        position_error -= z_axis*np.dot(z_axis, position_error)
+        rotation_error = 0.5*sum((np.cross(command_transform[:3, i], rotation[:, i])
+                                  for i in range(3)), np.zeros(3))
+        v = input4_limit_norm(z_axis*velocity[2]+vxy+c["position_gain"]*position_error,
+                              c["max_linear_speed"])
+        w = input4_limit_norm(z_axis*omega_z+c["orientation_gain"]*rotation_error,
+                              c["max_angular_speed"])
+        dq = input4_joint_velocity(J, transform[:3, :3].T @ v, transform[:3, :3],
+                                   c["jacobian_damping"], transform[:3, :3].T @ w)
+        limits = np.minimum(c["max_joint_velocity"], self.model.velocity_limits)
+        dq /= max(1., float(np.max(np.abs(dq)/limits)))
+        target = self.command+dq*dt
+        if not np.all(np.isfinite(target)) or np.any(target < self.model.lower) or np.any(target > self.model.upper):
+            raise ValueError("导纳目标无效或超出关节限位")
+        self.command = target
+        return target.copy(), dq.copy()
+
+
 @dataclass
 class PlaceTrajectoryPlan:
     arm_group: str
@@ -3600,6 +3872,20 @@ class G01Demo(Node):
             "right": None,
         }
         self._ft_sensor_count = {"left": 0, "right": 0}
+        self._input4_description = None
+        self._input4_models = {}
+        self._input4_active_side = None
+        self._input4_wrench = {"left": None, "right": None}
+        self._input4_wrench_time = {"left": 0., "right": 0.}
+        self._input4_joint_time = {"left": 0., "right": 0.}
+        self._input4_command_pub = self.create_publisher(JointState, "/g01/joint_commands", 1)
+        description_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                     reliability=ReliabilityPolicy.RELIABLE)
+        self.create_subscription(String, "/robot_description", self._on_input4_description, description_qos)
+        for side in ("left", "right"):
+            self.create_subscription(
+                Float32MultiArray, f"/g01/{side}_arm/actual_TCP_force",
+                lambda msg, side=side: self._on_input4_wrench(msg, side), 1)
         self._active_approach_guard: dict | None = None
         self._servoj_request_id = 0
         self._servoj_control_acks: dict[tuple[str, str, int], dict] = {}
@@ -4553,6 +4839,12 @@ class G01Demo(Node):
         for i, name in enumerate(msg.name):
             if i < len(msg.position):
                 self._joints[name] = msg.position[i]
+        if hasattr(self, "_input4_joint_time"):
+            snapshot = dict(zip(msg.name, msg.position))
+            for side in ("left", "right"):
+                names = [f"{side[0]}_arm_joint{i}" for i in range(1, 7)]
+                if all(name in snapshot and math.isfinite(snapshot[name]) for name in names):
+                    self._input4_joint_time[side] = time.monotonic()
 
         guard = self._active_approach_guard
         if guard is None or not guard["monitoring"] or guard["contact"]:
@@ -7559,6 +7851,201 @@ class G01Demo(Node):
         )
         return True
 
+    def _on_input4_description(self, msg: String) -> None:
+        self._input4_description = msg.data
+        self._input4_models.clear()
+
+    def _on_input4_wrench(self, msg: Float32MultiArray, side: str) -> None:
+        """actual_TCP_force 按 L6/R6 解释，绝不与旧 FTSensor 原始帧混用。"""
+        active = self._input4_active_side
+        if active != side and (not isinstance(active, tuple) or side not in active):
+            return
+        values = np.asarray(msg.data, dtype=float)
+        if values.shape != (6,) or not np.all(np.isfinite(values)):
+            self._input4_wrench[side] = None
+            self._input4_wrench_time[side] = 0.
+            return
+        now = time.monotonic()
+        sample = values[[0, 1, 2, 5]]
+        previous = self._input4_wrench[side]
+        if previous is None:
+            filtered = sample.copy()
+        else:
+            dt = max(0., now-self._input4_wrench_time[side])
+            alpha = -np.expm1(-2*np.pi*INPUT4_ADMITTANCE["force_filter_hz"]*dt)
+            filtered = previous+alpha*(sample-previous)
+        self._input4_wrench[side] = filtered
+        self._input4_wrench_time[side] = now
+
+    def _execute_input4_admittance(self, arm_group: str, *, height_stop=None,
+                                   force_baselines=None) -> bool:
+        """单/双臂共用：100N Z 接近，接触后60N+XY/Rz；完成时仍持料。"""
+        log = self.get_logger()
+        if arm_group not in ("left_arm", "right_arm", "dual_arm") or not self.use_force_sensors:
+            log.error("导纳放置需要启用力传感器及手臂规划组，不能使用 --forces")
+            return False
+        sides = ("left", "right") if arm_group == "dual_arm" else (
+            "left" if arm_group == "left_arm" else "right",)
+        c = INPUT4_ADMITTANCE
+        self._input4_active_side = sides
+        for side in sides:
+            self._input4_wrench[side] = None
+            self._input4_wrench_time[side] = 0.
+        controllers = {}
+        held_positions = {}
+        success = False
+        try:
+            deadline = time.monotonic()+c["startup_timeout"]
+            while rclpy.ok() and time.monotonic() < deadline:
+                self._executor.spin_once(timeout_sec=0.01)
+                self._abort_on_force_range()
+                now = time.monotonic()
+                if self._input4_description is not None and all(
+                        self._input4_wrench[side] is not None
+                        and now-self._input4_joint_time[side] <= c["feedback_timeout"]
+                        and now-self._input4_wrench_time[side] <= c["feedback_timeout"] for side in sides):
+                    break
+            else:
+                log.error(f"{sides} 导纳初始化超时，检查 /robot_description、joint_states 和 actual_TCP_force")
+                return False
+            # 到yubei的action必须已经结束，避免action和直接关节命令竞争。
+            if any(handle.status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING,
+                                      GoalStatus.STATUS_CANCELING) for handle in self._force_action_goals):
+                log.error("仍有未结束的运动action，禁止开始导纳")
+                return False
+            started = time.monotonic()
+            for side in sides:
+                if side not in self._input4_models:
+                    self._input4_models[side] = Input4ArmKinematics(self._input4_description, side)
+                model = self._input4_models[side]
+                q = np.array([self._joints[name] for name in model.joint_names])
+                stop = (height_stop or {}).get(side, {}) if len(sides) == 2 else (height_stop or {})
+                controller = Input4PlacementControl(model, q, self._input4_wrench[side], started, **stop)
+                controllers[side] = controller
+                log.info(f"[place][admittance] {side} 初始 Fx/Fy/Fz/Mz={controller.baseline.tolist()}；开始100N Z导纳")
+            next_tick = time.monotonic()+c["period"]
+            contact_logged = set()
+            while rclpy.ok():
+                now = time.monotonic()
+                self._executor.spin_once(timeout_sec=min(0.01, max(0., next_tick-now)))
+                self._abort_on_force_range()
+                now = time.monotonic()
+                if now < next_tick:
+                    continue
+                msg = JointState()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                for side, controller in controllers.items():
+                    if (self._input4_wrench[side] is None
+                            or now-self._input4_wrench_time[side] > c["feedback_timeout"]
+                            or now-self._input4_joint_time[side] > c["feedback_timeout"]):
+                        raise ValueError(f"{side} 导纳力或关节反馈超时/无效")
+                    # 保留输入7原有整段 Fz 下降210N保护，使用原始FTSensor通道。
+                    if force_baselines is not None:
+                        raw_z = self._ft_sensor_z[side]
+                        if raw_z is None or not math.isfinite(raw_z):
+                            raise ValueError(f"{side} 原始Fz反馈无效")
+                        if force_baselines[side]-raw_z > APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:
+                            self._motor_command_pub.publish(UInt8(data=1))
+                            raise ValueError(f"{side} 放置Fz下降超过210N，停止双臂导纳")
+                    model = controller.model
+                    q = np.array([self._joints[name] for name in model.joint_names])
+                    if not controller.finished:
+                        command = controller.step(q, self._input4_wrench[side], now)
+                        if controller.contact_time is not None and side not in contact_logged:
+                            log.info(f"[place][admittance] {side} 检测到接触，切换60N并开启XY/Rz，持续{c['contact_duration']:g}s")
+                            contact_logged.add(side)
+                        if command is None:
+                            held_positions[side] = q.copy()
+                            log.info(f"[place][admittance] {side} " + (
+                                f"末端已到达放置高度 Z={controller.target_z:.6f}m，结束导纳"
+                                if controller.finish_reason == "height" else "接触后导纳时长已到，结束导纳"))
+                    target, velocity = ((held_positions[side], np.zeros(6))
+                                        if controller.finished else command)
+                    msg.name.extend(model.joint_names)
+                    msg.position.extend(target.tolist())
+                    msg.velocity.extend(velocity.tolist())
+                self._input4_command_pub.publish(msg)
+                if all(controller.finished for controller in controllers.values()):
+                    success = True
+                    break
+                next_tick = now+c["period"]
+        except (ValueError, KeyError, TypeError, ET.ParseError, np.linalg.LinAlgError) as exc:
+            log.error(f"[pick][admittance] 放置导纳失败，保持工具上电：{exc}")
+        finally:
+            self._input4_active_side = None
+            if controllers and self._force_range_fault is None:
+                # 停止继续积分；用实测位置消除尚未跟上的目标积累。
+                hold = JointState()
+                hold.header.stamp = self.get_clock().now().to_msg()
+                hold.name = [name for controller in controllers.values() for name in controller.model.joint_names]
+                hold.position = [float(self._joints[name]) for name in hold.name]
+                hold.velocity = [0.]*len(hold.name)
+                self._input4_command_pub.publish(hold)
+                deadline = time.monotonic()+2*c["period"]
+                while rclpy.ok() and time.monotonic() < deadline:
+                    self._executor.spin_once(timeout_sec=0.01)
+            if controllers and not success and self._force_range_fault is None:
+                requests = {side: self._send_servoj_control(side, "stop") for side in sides}
+                for side, request in requests.items():
+                    self._wait_for_servoj_control_state(side, "stop", request)
+        return success
+
+    def _execute_dual_place_admittance(self, descent: RobotTrajectory, *, force_baselines) -> bool:
+        """输入7保留下降轨迹可解验证，仅用缓存末点确定双臂停止高度。"""
+        if not descent.joint_trajectory.points:
+            self.get_logger().error("双臂放置缺少已验证的下降轨迹，禁止导纳下降")
+            return False
+        current = self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True)
+        if current is None:
+            return False
+        endpoint = dict(current)
+        endpoint.update(zip(descent.joint_trajectory.joint_names,
+                            descent.joint_trajectory.points[-1].positions))
+        height_stops = {}
+        for side, prefix, tip in (("left", "l", "L6"), ("right", "r", "R6")):
+            place_pose = self._get_link_pose_fk(f"{prefix}_tool", joints=endpoint, plan_frame=SCENE_FRAME)
+            base_pose = self._get_link_pose_fk(f"{prefix}_base_link", joints=current, plan_frame=SCENE_FRAME)
+            tool_in_tip = self._get_link_pose_fk(f"{prefix}_tool", joints=current, plan_frame=tip)
+            if any(pose is None for pose in (place_pose, base_pose, tool_in_tip)):
+                self.get_logger().error(f"{side} 无法计算放置目标高度或工具变换，禁止导纳下降")
+                return False
+            height_stops[side] = dict(
+                target_z=float(place_pose.position.z)+0.002,
+                base_transform=np.asarray(pose_to_matrix(base_pose)),
+                tool_offset=np.array([tool_in_tip.position.x, tool_in_tip.position.y, tool_in_tip.position.z]))
+            self.get_logger().info(
+                f"[unload][admittance] {side} 接触后{INPUT4_ADMITTANCE['contact_duration']:g}s"
+                f"或末端到达 {SCENE_FRAME} 放点Z+0.002m={height_stops[side]['target_z']:.6f}m结束")
+        return self._execute_input4_admittance("dual_arm", height_stop=height_stops,
+                                              force_baselines=force_baselines)
+
+    def _plan_dual_place_retreat(self, left_pose: Pose, right_pose: Pose,
+                                 collision_group: str) -> RobotTrajectory | None:
+        """导纳放置后从同一实测完整状态分别规划直退，并校验同步自碰撞。"""
+        current = self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True)
+        if current is None:
+            return None
+        paths = []
+        for group, link, pose in (("left_arm", "l_tool", left_pose), ("right_arm", "r_tool", right_pose)):
+            path = self.plan_cartesian_line(
+                group, link, pose, speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED,
+                avoid_collisions=False, start_joints=current,
+                joint_names=joint_names_for_group(group), plan_frame=SCENE_FRAME)
+            if path is None:
+                return None
+            paths.append(path)
+        try:
+            retreat = merge_dual_arm_cartesian_trajectories(*paths)
+        except ValueError as exc:
+            self.get_logger().error(f"[unload] 合并导纳后双臂直线退回失败：{exc}")
+            return None
+        if not self.validate_trajectory_self_collision(
+                retreat, group=collision_group, base_state=current,
+                sample_period=UNLOAD_PLACE_SELF_COLLISION_SAMPLE_PERIOD,
+                label="[unload] 导纳后双臂实测起点直线退回"):
+            return None
+        return retreat
+
     def _plan_place_trajectories(
         self,
         *,
@@ -7576,9 +8063,9 @@ class G01Demo(Node):
         link: str,
         speed: float,
     ) -> PlaceTrajectoryPlan | None:
-        """纯规划放置去程、下降和 Q1 复位轨迹，不执行任何运动。"""
+        """纯规划去yubei和Q1复位；放置使用导纳，不预规划fang固定下降。"""
         arm_plan_frame = SCENE_FRAME
-        cache_key = f"input4_place_{arm_group}_{yubei_name}_{place_name}"
+        cache_key = f"input4_admittance_place_{arm_group}_{yubei_name}_{place_name}"
         cached = _load_trajectory_cache(
             cache_key,
             {
@@ -7634,62 +8121,9 @@ class G01Demo(Node):
         )
         if yubei_pose is None:
             return None
-        fang_state = dict(yubei_state)
-        fang_state.update(zip(arm_joint_names, fang_joints))
-        fang_to_yubei = self.plan_cartesian_line(
-            arm_group,
-            link,
-            yubei_pose,
-            speed_scale=speed,
-            avoid_collisions=False,
-            start_joints=fang_state,
-            joint_names=arm_joint_names,
-            plan_frame=arm_plan_frame,
-        )
-        if fang_to_yubei is None:
-            self.publish_error(10, f"{arm_group}: {place_name} 放置直线不可达")
-            return None
-        descent = self._reverse_trajectory(fang_to_yubei)
-        if not descent.joint_trajectory.points:
-            self.publish_error(10, f"{arm_group}: {place_name} 放置轨迹为空")
-            return None
-        trajectory_names = list(descent.joint_trajectory.joint_names)
-        yubei_target = dict(zip(body_joint_names, yubei_joints))
-        fang_target = dict(zip(arm_joint_names, fang_joints))
-        yubei_error = max(
-            (
-                abs(value - yubei_target[name])
-                for name, value in zip(
-                    trajectory_names,
-                    descent.joint_trajectory.points[0].positions,
-                )
-                if name in yubei_target
-            ),
-            default=float("inf"),
-        )
-        fang_error = max(
-            (
-                abs(value - fang_target[name])
-                for name, value in zip(
-                    trajectory_names,
-                    descent.joint_trajectory.points[-1].positions,
-                )
-                if name in fang_target
-            ),
-            default=float("inf"),
-        )
-        if yubei_error > 0.05 or fang_error > 0.05:
-            self.publish_error(10, f"{arm_group}: {place_name} 放置轨迹端点不匹配")
-            self.get_logger().error(
-                f"[pick] {place_name} 反向 Cartesian 分支不匹配："
-                f"yubei 误差={yubei_error:.4f}, fang 误差={fang_error:.4f}"
-            )
-            return None
-        self.get_logger().info(
-            f"[pick] {place_name} 使用 fang 锁定 IK 分支反向规划，"
-            f"执行方向 yubei → fang；端点误差="
-            f"{yubei_error:.4f}/{fang_error:.4f}"
-        )
+        # fang 仅用于SW配置身份；实际放置由本文件导纳控制器执行。
+        # 保留空descent字段兼容计划结构，禁止执行旧固定下降轨迹。
+        descent = RobotTrajectory()
         q1_source = list(EXCHANGE_Q1[:6] if arm_group == "left_arm" else EXCHANGE_Q1[-6:])
         q1_joints = q1_source[:len(arm_joint_names)] if arm_group == "left_arm" else q1_source[-len(arm_joint_names):]
         return_cache_key = f"input4_return_{arm_group}_{yubei_name}"
@@ -7869,7 +8303,7 @@ class G01Demo(Node):
         preplanned: PlaceTrajectoryPlan | None = None,
         return_to_q1: bool = True,
     ) -> bool:
-        """body+手臂到 yubei，纯臂放置并原路返回，可选再运动到 Q1。"""
+        """body+手臂到yubei，导纳放置，实测起点规划直退，再执行原Q1/识别位复位。"""
         log = self.get_logger()
         arm_context = arm_context_for_group(group)
         if arm_context is None:
@@ -8048,7 +8482,7 @@ class G01Demo(Node):
             )
             return False
 
-        log.info(f"[pick] 6/9  {arm_group} 笛卡尔直线 → {place_name}（不考虑碰撞）")
+        log.info(f"[pick] 6/9  {arm_group} 从yubei开始导纳放置 → {place_name}")
         current = self._get_joints(arm_joint_names, wait_new=True)
         if current is None:
             log.error("[pick] 读取当前手臂关节失败")
@@ -8060,66 +8494,87 @@ class G01Demo(Node):
             plan_frame=arm_plan_frame,
         )
         if yubei_return_pose is None:
-            log.error(f"[pick] 无法记录 {yubei_name} 处末端位姿用于报警退回")
+            log.error(f"[pick] 无法记录 {yubei_name} 处末端位姿用于放置后直线退回")
             return False
-        to_fang_traj = plan.descent
         tool_side = tool_side_for_link(link)
         if tool_side is None:
-            log.error(f"[pick] link={link} 不是 l_tool 或 r_tool，无法判断工具侧")
+            log.error(f"[pick] link={link} 无法判断工具侧")
             return False
         tool_label = "左臂" if tool_side == "left" else "右臂"
-        force_z_before_place = self.wait_for_ft_sensor_z(tool_side)
-        if force_z_before_place is None:
-            log.error(f"[pick] {place_name} 下降前无法读取{tool_label} Fz，取消放置")
+        # 用同一公共基坐标系比较原 fang 放点与实测工具高度；控制循环只做本地FK。
+        height_state = self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True)
+        if height_state is None:
             return False
-        log.info(
-            f"[pick] {place_name} 下降前{tool_label} Fz="
-            f"{force_z_before_place:.6f} N，全程下降阈值="
-            f"{APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:.3f} N"
-        )
-        alarm_recovered = False
-        place_contact_recovered = False
-        place_result = self._execute_approach_with_force_guard(
-            to_fang_traj,
-            tool_side,
-            force_z_before_place,
-            _pose_distance(yubei_return_pose, self._get_link_pose_fk(
-                link,
-                joints=dict(zip(arm_joint_names, fang_joints)),
-                plan_frame=arm_plan_frame,
-            ) or yubei_return_pose),
-            near_force_drop_threshold=None,
-            stage_label="放置直线下降",
-            baseline_label="放置预备点",
-        )
-        if place_result == "contact":
-            log.warning(
-                f"[pick] {place_name} 直线下降检测到碰撞；"
-                f"先将{tool_label}工具下电，再从实测位置直线退回放置预备点"
+        goal_state = dict(height_state)
+        goal_state.update(zip(arm_joint_names, fang_joints))
+        base_link = "l_base_link" if tool_side == "left" else "r_base_link"
+        tip_link = "L6" if tool_side == "left" else "R6"
+        place_pose = self._get_link_pose_fk(link, joints=goal_state, plan_frame=SCENE_FRAME)
+        base_pose = self._get_link_pose_fk(base_link, joints=height_state, plan_frame=SCENE_FRAME)
+        tool_in_tip = self._get_link_pose_fk(link, joints=height_state, plan_frame=tip_link)
+        if any(pose is None for pose in (place_pose, base_pose, tool_in_tip)):
+            log.error("无法计算原放置点高度或工具坐标变换，中止导纳放置")
+            return False
+        height_stop = dict(target_z=float(place_pose.position.z) + 0.002,
+                           base_transform=np.asarray(pose_to_matrix(base_pose)),
+                           tool_offset=np.array([tool_in_tip.position.x, tool_in_tip.position.y,
+                                                 tool_in_tip.position.z]))
+        log.info(f"[pick][admittance] 结束条件：接触后{INPUT4_ADMITTANCE['contact_duration']:g}s，"
+                 f"或末端到达 {SCENE_FRAME} 中原放点 Z+0.002m={height_stop['target_z']:.6f}m")
+        if not self._execute_input4_admittance(arm_group, height_stop=height_stop):
+            self.last_pick_failure_reason = "place_admittance_failed"
+            if self._upper_grasp_active or self._upper_place_active:
+                raise UpperGraspMotionFailure("输入4导纳放置失败，保持工具上电")
+            return False
+
+        self.wait_for_operator()
+
+        log.info(f"[pick] 7/9  {tool_label}工具下电，放置到 {place_name}")
+        if not self.set_tool_power(tool_side, 0):
+            log.error(f"[pick] {tool_label}工具下电失败")
+            return False
+        if self._upper_grasp_active:
+            self._upper_grasp_placed_slots.add(slot_name or place_name)
+            log.info(
+                f"[upper-grasp] 已放置到 {place_name}，本次成功放置数量="
+                f"{len(self._upper_grasp_placed_slots)}"
             )
-            if not self.set_tool_power(tool_side, 0):
-                log.error(f"[pick] {place_name} 碰撞后{tool_label}工具下电失败")
+        print(f"\033[32m{tool_label}下电成功\033[0m")
+        if self.sim_mode:
+            if slot_name is None:
+                log.error(
+                    "[sim][SW] 当前放置配置没有对应的 SW 名称，"
+                    "无法模拟上料后的占用状态"
+                )
                 return False
-            if not self._return_to_pre_after_approach_contact(
-                arm_group,
-                link,
-                yubei_return_pose,
-                arm_joint_names,
-                arm_plan_frame,
-                speed,
-                return_label="放置预备点",
+            if not self._update_simulated_place_slots(
+                [slot_name],
+                has_material=True,
+                reason=f"{tool_label}完成上料",
             ):
-                log.error(f"[pick] {place_name} 碰撞后直线退回放置预备点失败")
                 return False
-            place_contact_recovered = True
-        elif place_result == "safety_failed":
-            log.error(f"[pick] {place_name} 碰撞后停止/轨迹终止/恢复确认失败")
-            if not self.set_tool_power(tool_side, 0):
-                log.error(f"[pick] {place_name} 安全停止失败后{tool_label}工具下电失败")
+
+        log.info(f"[pick] 8/9 从导纳后实测位置重新规划直线 → {yubei_name}")
+        return_start = self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True)
+        if return_start is None:
             return False
-        elif place_result != "success":
+        return_trajectory = self.plan_cartesian_line(
+            arm_group, link, yubei_return_pose,
+            speed_scale=speed, avoid_collisions=False,
+            start_joints=return_start, joint_names=arm_joint_names,
+            plan_frame=arm_plan_frame,
+        )
+        if return_trajectory is None:
+            log.error("导纳后从实际位置直线返回yubei规划失败")
+            return False
+        if not self.validate_trajectory_self_collision(
+            return_trajectory, group=arm_group, base_state=return_start,
+            label="输入4导纳后直线返回yubei",
+        ):
+            return False
+        if not self._execute_traj(return_trajectory):
             log.error(
-                f"[pick] 直线运动到 {place_name} 执行失败，"
+                "[pick] 8/9 直线返回yubei执行失败，"
                 "进入人工清错和实测位置直线退回"
             )
             if not self.recover_single_arm_linear_after_alarm(
@@ -8131,68 +8586,9 @@ class G01Demo(Node):
                 plan_frame=arm_plan_frame,
                 speed_scale=speed,
                 avoid_collisions=False,
-                stage=f"抓取后放到 {place_name}",
+                stage=f"{place_name} 放置后返回",
             ):
                 return False
-            alarm_recovered = True
-
-        if not alarm_recovered and not place_contact_recovered:
-            log.info(
-                f"[pick] {place_name} 关节: "
-                + ", ".join(
-                    f"{n}={v:.3f}"
-                    for n, v in zip(arm_joint_names, fang_joints)
-                )
-            )
-
-            self.wait_for_operator()
-
-            log.info(f"[pick] 7/9  {tool_label}工具下电，放置到 {place_name}")
-            if not self.set_tool_power(tool_side, 0):
-                log.error(f"[pick] {tool_label}工具下电失败")
-                return False
-            if self._upper_grasp_active:
-                self._upper_grasp_placed_slots.add(slot_name or place_name)
-                log.info(
-                    f"[upper-grasp] 已放置到 {place_name}，本次成功放置数量="
-                    f"{len(self._upper_grasp_placed_slots)}"
-                )
-            print(f"\033[32m{tool_label}下电成功\033[0m")
-            if self.sim_mode:
-                if slot_name is None:
-                    log.error(
-                        "[sim][SW] 当前放置配置没有对应的 SW 名称，"
-                        "无法模拟上料后的占用状态"
-                    )
-                    return False
-                if not self._update_simulated_place_slots(
-                    [slot_name],
-                    has_material=True,
-                    reason=f"{tool_label}完成上料",
-                ):
-                    return False
-
-            log.info(
-                f"[pick] 8/9  反向播放到 {place_name} 的轨迹原路返回 "
-                f"（{len(to_fang_traj.joint_trajectory.points)} 点）"
-            )
-            if not self._execute_traj(self._reverse_trajectory(to_fang_traj)):
-                log.error(
-                    "[pick] 8/9 原路返回失败，"
-                    "进入人工清错和实测位置直线退回"
-                )
-                if not self.recover_single_arm_linear_after_alarm(
-                    side=tool_side,
-                    group=arm_group,
-                    link=link,
-                    return_pose=yubei_return_pose,
-                    joint_names=arm_joint_names,
-                    plan_frame=arm_plan_frame,
-                    speed_scale=speed,
-                    avoid_collisions=False,
-                    stage=f"{place_name} 放置后返回",
-                ):
-                    return False
 
         if not return_to_q1:
             log.info("[pick] 放置直线返回 yubei 后跳过 Q1，直接进入识别位置运动")
@@ -8221,29 +8617,28 @@ class G01Demo(Node):
             f"[pick] 9/9  从当前位置运动到 Q1 固定点 "
             f"（{q1_slice_text} 个数，使用 {q1_count} 个关节）"
         )
-        if not self._execute_traj(plan.to_q1):
+        q1_trajectory = plan.to_q1
+        actual = self._get_joints(arm_joint_names, wait_new=True)
+        if actual is None:
+            return False
+        first = q1_trajectory.joint_trajectory.points[0]
+        start_error = max((abs(actual[name]-value) for name, value in zip(
+            q1_trajectory.joint_trajectory.joint_names, first.positions) if name in actual), default=0.)
+        if start_error > 0.05:
+            log.info("[pick] 导纳直退后Q1缓存起点不匹配，从实测状态重新规划相同Q1目标")
+            ok, _, q1_trajectory = self.plan_joint_motion(
+                arm_group, q1_joints, joint_names=arm_joint_names,
+                start_joints=actual, speed_scale=speed, execute=False,
+            )
+            if not ok or q1_trajectory is None:
+                return False
+        if not self._execute_traj(q1_trajectory):
             log.error("[pick] 9/9 执行缓存轨迹到 Q1 固定点失败")
             return False
         log.info(
             "[pick] Q1 固定点返回完成: "
             + ", ".join(f"{n}={v:.3f}" for n, v in zip(arm_joint_names, q1_joints))
         )
-        if alarm_recovered:
-            # 去程中断时物体可能尚未真正进入 SW，不计作一次成功放置；下一轮
-            # 重新读取真实 SW 信号后继续抓取，避免软件擅自占用该槽位。
-            self.last_pick_failure_reason = "place_alarm_recovered"
-            log.warning(
-                f"[pick] {place_name} 去程报警已恢复并返回 Q1；"
-                "本次不计为成功放置，下一轮按最新 SW 信号继续抓取"
-            )
-            return False
-        if place_contact_recovered:
-            self.last_pick_failure_reason = "place_obstacle_recovered"
-            log.warning(
-                f"[pick] {place_name} 下降碰撞后已下电、直退并返回 Q1；"
-                "本次不计为成功放置，下一轮按最新 SW 信号继续抓取"
-            )
-            return False
         return True
 
     def _return_yubei_to_recognition_cached(
@@ -10569,7 +10964,8 @@ def _run_main(
         通过后续验证，再由 ``left_body`` 联合求左臂、腰部和升降，并在每个
         候选身体状态下求右纯臂 IK。所有 IK 都保留完整碰撞检测；每个单臂
         IK 解的下降直线只验证一次，忽略场景物体碰撞但保留机器人自碰撞检查，
-        最终再验证到预备位的 OMPL 路径。执行阶段不重新规划。
+        最终再验证到预备位的 OMPL 路径。执行时到预备位后改用双臂导纳，
+        已验证下降的末点用于高度结束条件；放置后从实测状态重新规划直线退回。
 
         table_pregrasp_only 用于输入 10：仅复用 IK 与 OMPL 到预抓点，
         后备方案同时加入腰部和升降；下降仍由料台抓取流程单独规划。
@@ -10619,7 +11015,7 @@ def _run_main(
             不得使用 l/r_base_link，否则 MoveIt 会用机器人当前 TF 而不是该
             候选 body 状态转换 waypoint。Cartesian 服务先关闭完整碰撞检查，
             随后逐点只检查机器人自碰撞；world/attached 物体接触被忽略。返回
-            轨迹会一直缓存到执行阶段。
+            轨迹保留作为下降可解证明和导纳停止高度依据，不直接执行下降轨迹。
             """
             if table_pregrasp_only:
                 return RobotTrajectory()
@@ -10859,7 +11255,7 @@ def _run_main(
             log.info(
                 f"[unload] {label}："
                 + ("IK、OMPL 均通过，" if table_pregrasp_only else "IK、左右 Cartesian、OMPL 均通过，")
-                + "已缓存全部执行轨迹"
+                + "已缓存到预备位轨迹及下降可解验证路径"
             )
             return trajectory, merged_descent, left_return_pose, right_return_pose
 
@@ -10871,7 +11267,7 @@ def _run_main(
             left_return_pose: Pose | None,
             right_return_pose: Pose | None,
         ) -> bool:
-            """只执行可达性阶段缓存的轨迹，不再调用 IK 或规划服务。"""
+            """执行缓存到预备位轨迹，导纳放置后从实测位置重新规划直退。"""
             if left_return_pose is None or right_return_pose is None:
                 log.error(f"[unload] {label} 缺少规划缓存的放置预备点位姿，禁止执行")
                 return False
@@ -10891,18 +11287,16 @@ def _run_main(
                 log.error(f"[unload] {label} 联合轨迹执行失败")
                 return False
 
-            log.info("[unload] 双臂已到放置预备位，等待 2 秒后执行直线下降")
+            log.info("[unload] 双臂已到放置预备位，等待 2 秒后开始导纳下降")
             time.sleep(2.0)
 
             node.wait_for_operator(
                 f"已到物料台左点{left_point}/右点{right_point}，"
-                f"按回车执行双臂末端局部 +Z "
-                f"{UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m 同步下降: "
+                "按回车读取左右力并开始双臂导纳放置: "
             )
             log.info(
-                "[unload] 直接执行缓存的双臂同步放置直线："
-                f"左右末端局部 +Z {UNLOAD_PLACE_DESCENT_DISTANCE:.3f} m"
-                "（检查机器人自碰撞，忽略物体碰撞）"
+                "[unload] 左右臂同时开始100N Z导纳；各自接触后切换60N及XY/Rz，"
+                "各自达到放置高度或接触后15s则保持，等待双臂均完成"
             )
             left_force_z = node.wait_for_ft_sensor_z("left")
             right_force_z = node.wait_for_ft_sensor_z("right")
@@ -10914,38 +11308,23 @@ def _run_main(
                 f"右臂={right_force_z:.6f} N；任一侧全程下降超过 "
                 f"{APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:.3f} N 判定碰撞"
             )
-            descent_result = node._execute_approach_with_force_guard(
-                descent,
-                ("left", "right"),
-                {"left": left_force_z, "right": right_force_z},
-                UNLOAD_PLACE_DESCENT_DISTANCE,
-                near_force_drop_threshold=None,
-                stage_label="双臂放置直线下降",
-                baseline_label="放置预备点",
-            )
-            if descent_result == "contact":
-                log.warning(
-                    "[unload] 双臂放置下降检测到力碰撞，"
-                    "双末端下电并从实测位置同步直退"
-                )
-                return node.recover_dual_arm_linear_after_alarm(
-                    left_return_pose=left_return_pose,
-                    right_return_pose=right_return_pose,
-                    full_joint_names=dual_body_joint_names,
-                    collision_group=group,
-                    speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED,
-                    stage=f"物料台左点{left_point}/右点{right_point}下降力碰撞",
-                    clear_alarms=False,
-                )
-            if descent_result == "safety_failed":
-                log.error("[unload] 双臂放置力碰撞后停止/轨迹终止/恢复确认失败")
-                set_unload_tool_power(0, "放置力碰撞安全停止失败")
+            # 记录到位后的实际工具位姿；导纳会调整末端，返回不能反放下降缓存。
+            actual_yubei = node._get_joints(dual_body_joint_names, wait_new=True)
+            if actual_yubei is None:
                 return False
-            if descent_result != "success":
+            left_return_pose = node._get_link_pose_fk("l_tool", joints=actual_yubei, plan_frame=SCENE_FRAME)
+            right_return_pose = node._get_link_pose_fk("r_tool", joints=actual_yubei, plan_frame=SCENE_FRAME)
+            if left_return_pose is None or right_return_pose is None:
+                log.error("[unload] 无法记录双臂实际放置预备点，禁止导纳下降")
+                return False
+            if not node._execute_dual_place_admittance(
+                    descent, force_baselines={"left": left_force_z, "right": right_force_z}):
                 log.error(
-                    "[unload] 双臂同步直线下降放置失败，"
+                    "[unload] 双臂导纳放置失败，"
                     "进入人工清错和实测位置直线退回"
                 )
+                if node._upper_place_active or node._upper_grasp_active:
+                    raise UpperGraspMotionFailure("双臂导纳放置失败，保持工具电源并交由上位机流程处理")
                 return node.recover_dual_arm_linear_after_alarm(
                     left_return_pose=left_return_pose,
                     right_return_pose=right_return_pose,
@@ -10964,8 +11343,9 @@ def _run_main(
                 return False
             time.sleep(UNLOAD_TOOL_SETTLE_SEC)
 
-            log.info("[unload] 双臂已下电，反向执行同一条同步直线原路返回")
-            if not node._execute_traj(node._reverse_trajectory(descent)):
+            log.info("[unload] 双臂已下电，从导纳后实测位置重新规划同步直线退回预备位")
+            retreat = node._plan_dual_place_retreat(left_return_pose, right_return_pose, group)
+            if retreat is None or not node._execute_traj(retreat):
                 log.error(
                     "[unload] 放置后双臂同步直线复位失败，"
                     "进入人工清错和实测位置直线退回"
