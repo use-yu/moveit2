@@ -1,4 +1,4 @@
-"""沿初始 R6 Z 轴直线运动 5cm，叠加 X/Y/Rz 导纳。运行：python3 insert.py。"""
+"""Z 向 60N 恒力导纳运行 10s，叠加 X/Y/Rz 导纳。运行：python3 insert.py。"""
 
 from pathlib import Path
 from datetime import datetime, timezone
@@ -28,10 +28,16 @@ PREPARE_DEFAULTS = {
     'extra_timeout': 30.0,      # 超过期望准备时长后的额外跟随时间
 }
 
-# 期望轨迹参数：距离正值沿初始 R6 +Z，负值沿 -Z。
+# 恒力阶段：以准备完成后的力为基准；不再给定 Z 向距离或速度轨迹。
+FORCE_CONTROL_DEFAULTS = {
+    'desired_force': 60.0,       # 去除初始 Fz 后的目标接触力幅值，N
+    'duration': 10.0,            # s，从开始力控制时计时，不含准备阶段
+    'down_direction': 1.0,       # +1：沿 R6 +Z 下压；-1：沿 R6 -Z 下压
+    'reaction_sign': -1.0,      # 环境反力在 Fz 读数中的符号，默认沿 -Z
+}
+
+# 准备运动和 XY/Rz 参考跟踪参数。
 TRAJECTORY_DEFAULTS = {
-    'distance': 0.05,             # m
-    'duration':7.0,             # s；五次曲线，起止速度/加速度为零，结束后退出程序
     'position_gain': 2.0,         # 位姿参考跟踪增益，1/s
     'orientation_gain': 2.0,
     'max_linear_speed': 0.03,     # 合成后的末端速度范数上限，m/s
@@ -41,7 +47,7 @@ TRAJECTORY_DEFAULTS = {
 # 导纳调参区：修改这里的默认值，重启节点生效；ROS 启动参数可覆盖。
 ADMITTANCE_DEFAULTS = {
     'xyz': {
-        #                   X       Y       Z（当前任务只使用 X/Y，Z 参数保留）
+        #                   X       Y       Z（Z 根据 60N 力误差生成速度）
         'M':              [20.0,   20.0,   20.0],
         'B':              [5000.0, 5000.0, 5000.0],
         'K':              [0.0,    0.0,    0.0],
@@ -159,24 +165,21 @@ class CartesianStartReference:
 
 
 class InsertionReference:
-    """直线期望轨迹 + 沿当前 R6 X/Y 的导纳偏移 + 绕初始 Z 的转角。"""
+    """XY 柔顺位姿参考及 Z 力导纳速度；Z 位置不追踪固定轨迹。"""
 
-    def __init__(self, initial_transform, distance, duration):
+    def __init__(self, initial_transform):
         self.initial = initial_transform.copy()
-        self.distance, self.duration = distance, duration
         self.xy_offset_base = np.zeros(3)
 
-    def step(self, elapsed, dt, rotation, velocity_xy, yaw, omega_z):
-        z, vz = z_reference(elapsed, self.distance, self.duration)
+    def step(self, dt, rotation, velocity_xyz, yaw, omega_z):
         z_axis = self.initial[:3, 2]
         # 将当前局部横向增量累计为期望轨迹上的柔顺偏移。
-        velocity_xy_base = rotation @ np.array([velocity_xy[0], velocity_xy[1], 0.0])
-        # 数值姿态误差不能让横向导纳改变期望的轴向插入深度。
+        velocity_xy_base = rotation @ np.array([velocity_xyz[0], velocity_xyz[1], 0.0])
         velocity_xy_base -= z_axis * np.dot(z_axis, velocity_xy_base)
         self.xy_offset_base += velocity_xy_base * dt
-        position = self.initial[:3, 3] + z_axis*z + self.xy_offset_base
+        position = self.initial[:3, 3] + self.xy_offset_base
         orientation = self.initial[:3, :3] @ axis_rotation([0, 0, 1], yaw)
-        velocity = z_axis*vz + velocity_xy_base
+        velocity = z_axis*velocity_xyz[2] + velocity_xy_base
         angular_velocity = z_axis*omega_z
         return position, orientation, velocity, angular_velocity
 
@@ -366,10 +369,12 @@ def main(args=None):
             self.prepare_options = {
                 name: positive('prepare_'+name, value) for name, value in PREPARE_DEFAULTS.items()
             }
-            self.trajectory_distance = float(parameter('trajectory_distance', TRAJECTORY_DEFAULTS['distance']))
-            if not np.isfinite(self.trajectory_distance):
-                raise ValueError('trajectory_distance 必须为有限数')
-            self.trajectory_duration = positive('trajectory_duration', TRAJECTORY_DEFAULTS['duration'])
+            self.desired_down_force = positive('desired_down_force', FORCE_CONTROL_DEFAULTS['desired_force'])
+            self.trajectory_duration = positive('force_duration', FORCE_CONTROL_DEFAULTS['duration'])
+            self.down_direction = float(parameter('down_direction', FORCE_CONTROL_DEFAULTS['down_direction']))
+            self.reaction_sign = float(parameter('reaction_sign', FORCE_CONTROL_DEFAULTS['reaction_sign']))
+            if self.down_direction not in (-1., 1.) or self.reaction_sign not in (-1., 1.):
+                raise ValueError('down_direction 和 reaction_sign 只能为 +1 或 -1')
             self.position_gain = positive('position_gain', TRAJECTORY_DEFAULTS['position_gain'])
             self.orientation_gain = positive('orientation_gain', TRAJECTORY_DEFAULTS['orientation_gain'])
             self.max_task_linear_speed = positive('max_task_linear_speed', TRAJECTORY_DEFAULTS['max_linear_speed'])
@@ -392,9 +397,9 @@ def main(args=None):
             ])
             ki = nonnegative('ki', xyz_defaults['ki'])
             self.controller = AdmittanceController(
-                mass[:2], damping[:2], stiffness[:2], ki,
+                mass, damping, stiffness, ki,
                 positive('max_offset', xyz_defaults['max_offset']),
-                positive('max_velocity', xyz_defaults['max_velocity']), dimensions=2)
+                positive('max_velocity', xyz_defaults['max_velocity']), dimensions=3)
             # R6 绕 Z 轴：Mz(N*m) -> 角速度(rad/s)，M 为虚拟转动惯量。
             mass_rz = positive('mass_rz', rz_defaults['M'])
             damping_rz = positive('damping_rz', rz_defaults['B'])
@@ -432,11 +437,11 @@ def main(args=None):
             self.create_timer(self.dt, self.tick)
             self.get_logger().info(
                 f'等待 URDF、右臂关节和 R6 力；周期 {self.dt:g}s，力低通 {self.force_filter_cutoff_hz:g}Hz。'
-                f'导纳 XY：M={mass[:2].tolist()}, B={damping[:2].tolist()}, K={stiffness[:2].tolist()}, ki={ki:g}；Z 力不参与导纳。'
+                f'导纳 XYZ：M={mass.tolist()}, B={damping.tolist()}, K={stiffness.tolist()}, ki={ki:g}。'
                 f'绕 R6 Z：M={mass_rz:g}, B={damping_rz:g}, K={stiffness_rz:g}；由第六项 Mz 驱动。'
-                f'沿初始 R6 Z 轴期望位移 {self.trajectory_distance:g}m，时长 {self.trajectory_duration:g}s。'
+                f'沿 R6 {self.down_direction:+g}Z 施加 {self.desired_down_force:g}N 目标力，运行 {self.trajectory_duration:g}s。'
                 f'开始前先直线到达 start_joints={self.start_joints.tolist()} 对应位姿并停稳。'
-                '使用雅可比跟踪叠加导纳后的位姿，轨迹结束后停止发布并退出程序。')
+                'Z 轴只使用力导纳速度；到时停止发布并退出程序。')
 
         def on_description(self, msg):
             if self.model is not None or self.fault:
@@ -511,15 +516,27 @@ def main(args=None):
                     return
             if self.q_command is None:
                 self.fd = self.force.copy()
+                self.fd[2] += self.reaction_sign*self.desired_down_force
                 self.initial_mz = self.mz
                 self.q_command = self.q.copy()
                 transform, _ = self.model.evaluate(self.q)
-                self.trajectory = InsertionReference(
-                    transform, self.trajectory_distance, self.trajectory_duration)
+                self.trajectory = InsertionReference(transform)
                 self.trajectory_start = now
                 self.last_update = now
                 self.get_logger().info(
-                    f'初始力 desired_force={self.fd.tolist()} N，初始 Mz={self.initial_mz:g} N*m，开始速度导纳。')
+                    f'期望传感器力={self.fd.tolist()} N，初始 Mz={self.initial_mz:g} N*m；'
+                    f'开始 {self.desired_down_force:g}N 向下力控制。')
+                return
+            if not self.preparing and now-self.trajectory_start >= self.trajectory_duration:
+                # 运行时间到即结束，不再多积分一步 Z 向运动。
+                hold = JointState()
+                hold.header.stamp = self.get_clock().now().to_msg()
+                hold.name = list(RIGHT_JOINTS)
+                hold.position = self.q_command.tolist()
+                hold.velocity = [0.0]*6
+                self.command_pub.publish(hold)
+                self.trajectory_finished = True
+                self.get_logger().info(f'{self.trajectory_duration:g}s 力控制结束，保持最后关节目标并退出。')
                 return
             dt = now-self.last_update
             self.last_update = now
@@ -538,12 +555,15 @@ def main(args=None):
                     return
                 position, orientation, feedforward_v, feedforward_w = self.prepare_reference.step(elapsed)
             else:
-                velocity_xy = self.controller.step(self.fd[:2], self.force[:2], dt)
+                error = self.force-self.fd
+                # 按环境反力符号构造负反馈：接触力不足时下压，超出时卸载。
+                error[2] *= -self.down_direction*self.reaction_sign
+                velocity_xyz = self.controller.step(np.zeros(3), error, dt)
                 omega_z = self.rotation_controller.step(
                     np.array([self.initial_mz]), np.array([self.mz]), dt)[0]
                 elapsed = now - self.trajectory_start
                 position, orientation, feedforward_v, feedforward_w = self.trajectory.step(
-                    elapsed, dt, transform[:3, :3], velocity_xy,
+                    dt, transform[:3, :3], velocity_xyz,
                     self.rotation_controller.x[0], omega_z)
             # 对连续关节目标对应的位姿做参考跟踪，避免将实际跟随滞后反复积分。
             command_transform, _ = self.model.evaluate(self.q_command)
@@ -555,8 +575,13 @@ def main(args=None):
             if self.preparing:
                 linear_limit = min(linear_limit, self.prepare_options['linear_speed'])
                 angular_limit = min(angular_limit, self.prepare_options['angular_speed'])
+            position_error = position-command_transform[:3, 3]
+            if not self.preparing:
+                # 接触阻挡后不追赶旧的 Z 位移，只保留横向位姿误差修正。
+                z_axis = self.trajectory.initial[:3, 2]
+                position_error -= z_axis*np.dot(z_axis, position_error)
             velocity_base = limit_norm(
-                feedforward_v + self.position_gain*(position-command_transform[:3, 3]),
+                feedforward_v + self.position_gain*position_error,
                 linear_limit)
             angular_velocity_base = limit_norm(
                 feedforward_w + self.orientation_gain*orientation_error,
@@ -605,11 +630,7 @@ def main(args=None):
                     self.force = self.mz = None
                     self.force_time = 0.
                     self.get_logger().info(
-                        f'准备位姿已到达并停稳，等待新力反馈后开始 {self.trajectory_duration:g} 秒导纳轨迹。')
-            elif elapsed >= self.trajectory_duration and not self.trajectory_finished:
-                self.trajectory_finished = True
-                self.get_logger().info(
-                    f'{self.trajectory_distance*100:g}cm 期望轨迹时间结束，停止发布并退出程序。')
+                        f'准备位姿已到达并停稳，等待新力反馈后开始 {self.trajectory_duration:g} 秒恒力导纳。')
 
     rclpy.init(args=args)
     node = None
