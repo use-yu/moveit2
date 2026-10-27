@@ -186,7 +186,7 @@ INPUT4_ADMITTANCE = {
     "period": 0.03, "feedback_timeout": 0.2, "startup_timeout": 5.0,
     "approach_force": 100.0, "contact_force": 60.0, "force_threshold": 30.0,
     "down_direction": 1.0, "reaction_sign": -1.0,
-    "contact_duration": 15.0, "approach_timeout": 30.0,
+    "contact_duration": 10.0, "approach_timeout": 30.0,
     "M": [20.0, 20.0, 20.0], "B": [5000.0, 5000.0, 5000.0], "K": [0.0, 0.0, 0.0],
     "ki": 0.0, "max_offset": 0.3, "max_velocity": 0.1,
     "M_rz": 1.0, "B_rz": 10.0, "K_rz": 0.0, "ki_rz": 0.0,
@@ -819,7 +819,7 @@ FRAME_UNLOAD_LEFT_LOCAL_XYZ = (-0.3, 0.1, 0.4)
 FRAME_UNLOAD_RIGHT_LOCAL_XYZ = (-0.3, -0.1, 0.4)
 # 上料放置位抓取
 UNLOAD_EXTRA_APPROACH_BY_SLOT = {
-    "sw1": 0.001,  # 右臂：多降 4 mm
+    "sw1": 0.0025,  # 右臂：多降 4 mm
     "sw2": 0.001,  # 左臂：多降 1 mm
     "sw3": 0.001,  # 左臂：多降 4 mm
     "sw4": 0.003,  # 右臂：多降 8 mm
@@ -840,8 +840,10 @@ UNLOAD_PLACE_LOCAL_OFFSETS = {
     3: (0.0-0.0045-0.001, -0.1125-0.001+0.1125-0.001, 0.1-0.01+0.09),
     4: (0.0-0.0015-0.001, -0.225-0.001 - 0.1125+0.1125+0.003, 0.1-0.01+0.09),   
 }
+# 取料预备位 yubei
 UNLOAD_JOINT_SPEED = 0.2
-UNLOAD_PLACE_JOINT_SPEED = 0.1
+# 物料台放置预备位
+UNLOAD_PLACE_JOINT_SPEED = 0.15
 UNLOAD_PLACE_POSITION_TOLERANCE = 0.001  # 规划终点 FK 位置误差上限：1 mm。
 UNLOAD_PLACE_ORIENTATION_TOLERANCE = math.radians(0.1)  # 姿态误差上限：0.1°。
 UNLOAD_PLACE_ARM_IK_ATTEMPTS = 200
@@ -8009,13 +8011,14 @@ class G01Demo(Node):
             if any(pose is None for pose in (place_pose, base_pose, tool_in_tip)):
                 self.get_logger().error(f"{side} 无法计算放置目标高度或工具变换，禁止导纳下降")
                 return False
+            height_offset = 0.002 if side == "left" else 0.004
             height_stops[side] = dict(
-                target_z=float(place_pose.position.z)+0.002,
+                target_z=float(place_pose.position.z)+height_offset,
                 base_transform=np.asarray(pose_to_matrix(base_pose)),
                 tool_offset=np.array([tool_in_tip.position.x, tool_in_tip.position.y, tool_in_tip.position.z]))
             self.get_logger().info(
                 f"[unload][admittance] {side} 接触后{INPUT4_ADMITTANCE['contact_duration']:g}s"
-                f"或末端到达 {SCENE_FRAME} 放点Z+0.002m={height_stops[side]['target_z']:.6f}m结束")
+                f"或末端到达 {SCENE_FRAME} 放点Z+{height_offset:.3f}m={height_stops[side]['target_z']:.6f}m结束")
         return self._execute_input4_admittance("dual_arm", height_stop=height_stops,
                                               force_baselines=force_baselines)
 

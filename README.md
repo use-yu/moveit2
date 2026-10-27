@@ -1,6 +1,6 @@
 # moveit2
-58
-
+抓取：55cm
+放置：25cm
 pgrep -af taihu_motor_node
 kill 10568 11065 691478
 
