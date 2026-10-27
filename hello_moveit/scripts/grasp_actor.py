@@ -7,7 +7,7 @@ G01 MoveIt 演示脚本
 
 功能按 1~15 拆分，键盘可输入单步 ``1`` 或区间 ``1-3``：
 1. 导航到深框识别位置。
-2. 运动到深框识别构型，接收两点，以中点位置和第一点姿态识别深框，
+2. 运动到深框识别构型，使用单个识别点的位置和姿态识别深框，
    并记录当时 /agv_position 实际位姿；
    未收到有效视觉数据时最多重复发送识别命令 5 次。
 3. 向 /agv_auto_control_speed 以 20 Hz 发布 linear.x=0.1 m/s，
@@ -444,7 +444,7 @@ FRAME_RECOGNITION_CAMERA_POSITION = 0.7854
 # p,4 深框识别专用预备构型，顺序与 dual_arm_body 一致。
 框_Q1 = [
     0.0,
-    5 * math.pi / 180,
+    10 * math.pi / 180,
     -1.57,
     -0.15,
     -1.578090,
@@ -554,7 +554,7 @@ DEFAULT_SPEED_SCALE = 0.5
 # 深框障碍物（相对于 moveit_base_link 发布）
 SCENE_FRAME = "moveit_base_link"
 FRAME_ID = "深框"
-FRAME_SIZE = (1.1, 1.2, 0.86)  # 深框整体外尺寸：长×宽×高 [m]0.8, 0.8, 0.71
+FRAME_SIZE = (1.098, 1.098, 0.86)  # 深框整体外尺寸：长×宽×高 [m]0.8, 0.8, 0.71
 WALL_T = 0.06  # 壁厚向内部收缩，外轮廓尺寸保持 FRAME_SIZE
 FRAME_Y_OUTER_THICKNESS = 0.05  # 局部 ±Y 两侧向外附加的厚度 [m]
 FRAME_CENTER = (0.92, 0.01, 0.4545)  # 相对于 moveit_base_link [m]
@@ -569,8 +569,8 @@ FRAME_TOP_CENTER_TF_FRAME = "deep_frame_top_center"
 FRAME_CENTER_TF_FRAME = "deep_frame_center"
 FRAME_RECOGNITION_LOCAL_YAW = math.pi / 2.0 *0
 FRAME_RECOGNITION_TO_TOP_CENTER_LOCAL = (
-    0.51,
-    -0.0,
+    0.509,
+    0.02,
     0.11, #0.06
 )
 # 原有的深框局部 +Y 大长方体障碍物。
@@ -10031,7 +10031,6 @@ def _run_main(
             trigger_command=FRAME_VISION_TRIGGER_COMMAND,
             required_pose_key=FRAME_VISION_POSE_KEY,
             scene_label="frame-vision",
-            use_frame_midpoint=not add_directly,
         )
         if vision_result is None:
             return False
