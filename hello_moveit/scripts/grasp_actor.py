@@ -4444,38 +4444,31 @@ class G01Demo(Node):
 
     def _recover_input4_force_stop(self) -> bool:
         active = self._force_task_active
+        previous_ignore_limits = getattr(self, "_input4_retreat_ignore_limits", False)
         self._force_task_active = False
+        self._input4_retreat_ignore_limits = True
         try:
             if not self.stop_upper_grasp_motion():
                 return False
-            started = time.monotonic()
-            deadline = started + FT_SENSOR_SAMPLE_TIMEOUT_SEC
-            while rclpy.ok() and time.monotonic() < deadline:
-                self._executor.spin_once(timeout_sec=0.02)
-                now = time.monotonic()
-                if all(
-                    side in self._force_range_samples
-                    and self._force_range_samples[side][0] > started
-                    and now-self._force_range_samples[side][0] <= INPUT4_ADMITTANCE["feedback_timeout"]
-                    and ft_range_violation(
-                        self._force_range_samples[side][1],
-                        ignore_limits=getattr(self, "_input4_retreat_ignore_limits", False),
-                    ) is None
-                    for side in ("left", "right")
-                ):
-                    self._force_range_fault = None
-                    requests = {side: self._send_servoj_control(side, "resume")
-                                for side in ("left", "right")}
-                    resumed = all([self._wait_for_servoj_control_state(side, "resume", request)
-                                   for side, request in requests.items()])
-                    if resumed and self._force_range_fault is None:
-                        return True
-                    self._force_range_fault = self._force_range_fault or "力保护后 ServoJ 恢复未全部确认"
-                    self.stop_upper_grasp_motion()
-                    return False
-            self.get_logger().error("[pick][force-guard] 力数据未恢复保护范围，保持停止及工具电源")
+            if any(
+                ft_range_violation(values, ignore_limits=True) is not None
+                for _, values in self._force_range_samples.values()
+            ):
+                self.get_logger().error("[pick][force-guard] 力传感器数据无效，保持停止及工具电源")
+                return False
+            self.get_logger().warning("[pick][force-guard] 双臂已停稳，不等待力/力矩幅值恢复，恢复 ServoJ 入口")
+            self._force_range_fault = None
+            requests = {side: self._send_servoj_control(side, "resume")
+                        for side in ("left", "right")}
+            resumed = all([self._wait_for_servoj_control_state(side, "resume", request)
+                           for side, request in requests.items()])
+            if resumed and self._force_range_fault is None:
+                return True
+            self._force_range_fault = self._force_range_fault or "力保护后 ServoJ 恢复未全部确认"
+            self.stop_upper_grasp_motion()
             return False
         finally:
+            self._input4_retreat_ignore_limits = previous_ignore_limits
             self._force_task_active = active
 
     def _send_force_guarded_goal(self, client, goal):

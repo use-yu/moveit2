@@ -33,14 +33,17 @@ class Input4ForceRecoveryTests(unittest.TestCase):
             self.assertEqual(events, [True, True])
             self.assertFalse(node._input4_retreat_ignore_limits)
 
-    def test_resume_requires_confirmed_stop_and_new_safe_samples(self):
-        for case in ('safe', 'overload', 'stale', 'stop_failed', 'resume_failed'):
+    def test_resume_requires_confirmed_stop_but_does_not_wait_for_force_samples(self):
+        for case in ('safe', 'overload', 'stale', 'invalid', 'stop_failed', 'resume_failed'):
             with self.subTest(case=case):
                 clock = SimpleNamespace(now=1.)
                 commands = []
                 node = SimpleNamespace(
                     _force_task_active=True, _force_range_fault='overload',
-                    _force_range_samples={}, get_logger=logger,
+                    _force_range_samples=(
+                        {'left': (0., [0., 0., float('nan'), 0., 0., 0.])}
+                        if case == 'invalid' else {}
+                    ), get_logger=logger,
                     stop_upper_grasp_motion=lambda: case != 'stop_failed',
                     _send_servoj_control=lambda side, command: commands.append((side, command)) or 1,
                     _wait_for_servoj_control_state=lambda *args: case != 'resume_failed')
@@ -56,11 +59,15 @@ class Input4ForceRecoveryTests(unittest.TestCase):
                 with patch.object(g.time, 'monotonic', lambda: clock.now), \
                      patch.object(g.rclpy, 'ok', return_value=True):
                     result = g.G01Demo._recover_input4_force_stop(node)
-                self.assertEqual(result, case == 'safe')
+                self.assertEqual(result, case not in ('invalid', 'stop_failed', 'resume_failed'))
                 self.assertTrue(node._force_task_active)
-                if case in ('overload', 'stale', 'stop_failed'):
+                self.assertFalse(node._input4_retreat_ignore_limits)
+                self.assertEqual(clock.now, 1.)
+                if case in ('invalid', 'stop_failed'):
                     self.assertEqual(commands, [])
                     self.assertEqual(node._force_range_fault, 'overload')
+                else:
+                    self.assertEqual(commands, [('left', 'resume'), ('right', 'resume')])
 
 
 if __name__ == '__main__':
