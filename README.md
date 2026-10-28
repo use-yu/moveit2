@@ -1,4 +1,5 @@
 # moveit2
+第一个位置后退一点
 抓取：55cm
 放置：25cm
 pgrep -af taihu_motor_node

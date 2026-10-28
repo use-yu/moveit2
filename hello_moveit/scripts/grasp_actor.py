@@ -63,8 +63,8 @@ G01 MoveIt 演示脚本
     优先 SW1+SW3，目标固定为 (1,3)；SW2+SW4
     目标固定为 (2,4)，不记录已经放过的位置。循环正常结束后，
     dual_arm_body 复位到 MOVE_TO_GRASP_RESET_Q。
-    四点导纳放置/直线回程报警时同样自动恢复；双臂清错、末端下电后，
-    从实测位置同步直退，忽略场景物体碰撞但保留机器人自碰撞检查。
+    四点导纳放置失败时停止双臂并保持末端上电，中止本次流程等待人工处理。
+    正常释放后的直线回程报警仍按原恢复流程处理。
 8. 导航到 map 起点 (0, 0, 0, 0, 0, 0, 1)。
 
 上位机步骤映射：
@@ -184,9 +184,9 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 # 输入4/7放置共用导纳：与 insert.py 独立实现，参数在这里集中修改。
 INPUT4_ADMITTANCE = {
     "period": 0.03, "feedback_timeout": 0.2, "startup_timeout": 5.0,
-    "approach_force": 100.0, "contact_force": 60.0, "force_threshold": 30.0,
+    "approach_force": 100.0, "contact_force": 100.0, "force_threshold": 30.0,
     "down_direction": 1.0, "reaction_sign": -1.0,
-    "contact_duration": 10.0, "approach_timeout": 30.0,
+    "contact_duration": 15.0, "approach_timeout": 30.0,
     "M": [20.0, 20.0, 20.0], "B": [5000.0, 5000.0, 5000.0], "K": [0.0, 0.0, 0.0],
     "ki": 0.0, "max_offset": 0.3, "max_velocity": 0.1,
     "M_rz": 1.0, "B_rz": 10.0, "K_rz": 0.0, "ki_rz": 0.0,
@@ -8011,7 +8011,7 @@ class G01Demo(Node):
             if any(pose is None for pose in (place_pose, base_pose, tool_in_tip)):
                 self.get_logger().error(f"{side} 无法计算放置目标高度或工具变换，禁止导纳下降")
                 return False
-            height_offset = 0.002 if side == "left" else 0.004
+            height_offset = 0.003 if side == "left" else 0.004
             height_stops[side] = dict(
                 target_z=float(place_pose.position.z)+height_offset,
                 base_transform=np.asarray(pose_to_matrix(base_pose)),
@@ -11410,18 +11410,11 @@ def _run_main(
                         descent, force_baselines={"left": left_force_z, "right": right_force_z}):
                     log.error(
                         "[unload] 双臂导纳放置失败，"
-                        "进入人工清错和实测位置直线退回"
+                        "保持双臂末端上电，中止本次流程，等待人工处理"
                     )
                     if node._upper_place_active or node._upper_grasp_active:
                         raise UpperGraspMotionFailure("双臂导纳放置失败，保持工具电源并交由上位机流程处理")
-                    return node.recover_dual_arm_linear_after_alarm(
-                        left_return_pose=left_return_pose,
-                        right_return_pose=right_return_pose,
-                        full_joint_names=dual_body_joint_names,
-                        collision_group=group,
-                        speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED,
-                        stage=f"物料台左点{left_point}/右点{right_point}下降放置",
-                    )
+                    return False
 
             else:
                 log.info("[unload] --noforces：执行缓存的双臂同步直线下降")
@@ -11880,6 +11873,13 @@ def _run_main(
         _, all_xyz_rpy = vision_result
         recognition_values = all_xyz_rpy[0][UNLOAD_VISION_POSE_KEY]
         recognition_pose = make_pose(*recognition_values)
+        print(
+            f"{GREEN}[unload] {trigger_command} 识别点 @ {SCENE_FRAME}: "
+            f"xyz=({recognition_values[0]:.6f}, {recognition_values[1]:.6f}, "
+            f"{recognition_values[2]:.6f}) m, "
+            f"rpy=({recognition_values[3]:.6f}, {recognition_values[4]:.6f}, "
+            f"{recognition_values[5]:.6f}) rad{RESET}"
+        )
         left_recognition_pose = make_pose(*all_xyz_rpy[0]["left_body"])
         right_recognition_pose = make_pose(*all_xyz_rpy[0]["right_body"])
         if not node.publish_unload_vision_tf(recognition_pose):
@@ -11889,12 +11889,6 @@ def _run_main(
         place_poses = make_unload_place_poses(left_recognition_pose, right_recognition_pose)
         if not node.publish_unload_place_tfs(place_poses):
             return False
-        log.info(
-            f"[unload] {trigger_command} 识别点 @ {SCENE_FRAME}: "
-            f"({recognition_pose.position.x:.4f}, "
-            f"{recognition_pose.position.y:.4f}, "
-            f"{recognition_pose.position.z:.4f})"
-        )
         for point_index, point_pose in place_poses.items():
             local_offset = UNLOAD_PLACE_LOCAL_OFFSETS[point_index]
             local_pitch_deg = math.degrees(UNLOAD_PLACE_LOCAL_PITCH)
