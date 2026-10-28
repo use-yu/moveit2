@@ -1078,18 +1078,19 @@ FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的
 FT_FORCE_RANGE_N = 200.0
 FT_FORCE_STOP_N = 180.0
 FT_TORQUE_RANGE_NM = 8.0
+FT_TORQUE_STOP_NM = 10.0
 FT_RANGE_STOP_RATIO = 0.8
 
 
-def ft_range_violation(values: Sequence[float]) -> str | None:
+def ft_range_violation(values: Sequence[float], *, ignore_limits: bool = False) -> str | None:
     """按六个分量的绝对值检查量程，不使用相对基准的增减量。"""
     if len(values) < 6:
         return f"六维力数据不足：{len(values)} < 6"
     for index, name in enumerate(("Fx", "Fy", "Fz", "Mx", "My", "Mz")):
         value = float(values[index])
-        limit = FT_FORCE_STOP_N if index < 3 else FT_TORQUE_RANGE_NM * FT_RANGE_STOP_RATIO
+        limit = FT_FORCE_STOP_N if index < 3 else FT_TORQUE_STOP_NM
         unit = "N" if index < 3 else "N·m"
-        if not math.isfinite(value) or abs(value) >= limit:
+        if not math.isfinite(value) or (not ignore_limits and abs(value) >= limit):
             return f"{name}={value:.6f} {unit}，保护阈值 ±{limit:g} {unit}"
     return None
 APPROACH_FORCE_GUARD_DISTANCE = 0.07  # 从 q_pre 起前 9 cm 使用小阈值 [m]
@@ -4456,7 +4457,10 @@ class G01Demo(Node):
                     side in self._force_range_samples
                     and self._force_range_samples[side][0] > started
                     and now-self._force_range_samples[side][0] <= INPUT4_ADMITTANCE["feedback_timeout"]
-                    and ft_range_violation(self._force_range_samples[side][1]) is None
+                    and ft_range_violation(
+                        self._force_range_samples[side][1],
+                        ignore_limits=getattr(self, "_input4_retreat_ignore_limits", False),
+                    ) is None
                     for side in ("left", "right")
                 ):
                     self._force_range_fault = None
@@ -4505,7 +4509,9 @@ class G01Demo(Node):
             if not hasattr(self, "_force_range_samples"):
                 self._force_range_samples = {}
             self._force_range_samples[side] = (time.monotonic(), tuple(msg.data))
-            violation = ft_range_violation(msg.data)
+            violation = ft_range_violation(
+                msg.data, ignore_limits=getattr(self, "_input4_retreat_ignore_limits", False),
+            )
             if violation is not None and self._force_range_fault is None:
                 self._force_range_fault = f"{side} 臂力传感器保护：{violation}"
                 self.get_logger().error(self._force_range_fault)
@@ -7132,6 +7138,23 @@ class G01Demo(Node):
             if self._active_approach_guard is guard:
                 self._active_approach_guard = None
 
+    def _continue_input4_retreat_after_force_stop(
+        self, group, link, pre_pose, joint_names, plan_frame, speed_scale,
+    ) -> bool:
+        self._input4_retreat_ignore_limits = True
+        try:
+            if not self._recover_input4_force_stop():
+                return False
+            self.get_logger().warning(
+                "[pick] 直线抓取/退回触发保护：不等待力或力矩恢复，保持工具上电，"
+                "从实测位置直退 q_pre；该恢复段忽略力及力矩超限，保留无效数据保护"
+            )
+            return self._return_to_pre_after_approach_contact(
+                group, link, pre_pose, joint_names, plan_frame, speed_scale,
+            )
+        finally:
+            self._input4_retreat_ignore_limits = False
+
     def _return_to_pre_after_approach_contact(
         self,
         group: str,
@@ -9123,13 +9146,11 @@ class G01Demo(Node):
                 approach_distance,
             )
         except ForceRangeAbort:
-            if not self._recover_input4_force_stop():
-                self._abort_on_force_range()
-                return False
-            if not self._return_to_pre_after_approach_contact(
+            if not self._continue_input4_retreat_after_force_stop(
                 group, link, pre_pose, joint_names, plan_frame, speed_scale,
             ):
                 self.last_pick_failure_reason = "approach_force_guard_failed"
+                self._abort_on_force_range()
                 return False
             force_range_retreated = True
             approach_result = "success"
@@ -9188,9 +9209,18 @@ class G01Demo(Node):
 
         log.info("[pick] 4/9  反向播放 approach，直线复位回 q_pre")
         retreat_approach = self._reverse_trajectory(approach_traj)
-        if not force_range_retreated and not self._execute_traj(retreat_approach):
-            log.error("[pick] 反向播放 approach 失败")
-            return False
+        if not force_range_retreated:
+            try:
+                if not self._execute_traj(retreat_approach):
+                    log.error("[pick] 反向播放 approach 失败")
+                    return False
+            except ForceRangeAbort:
+                if not self._continue_input4_retreat_after_force_stop(
+                    group, link, pre_pose, joint_names, plan_frame, speed_scale,
+                ):
+                    self.last_pick_failure_reason = "approach_force_guard_failed"
+                    self._abort_on_force_range()
+                    return False
 
         if self.use_force_sensors:
             force_z_after = self.wait_for_ft_sensor_z(tool_side)
