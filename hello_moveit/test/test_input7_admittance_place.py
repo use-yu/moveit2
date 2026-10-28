@@ -25,7 +25,7 @@ class DualAdmittanceTests(unittest.TestCase):
         cls.xml = xacro.process_file(str(SCRIPT.parents[2] /
             'moveit_resources/g01_description/urdf/G01-URDF888.urdf')).toxml()
 
-    def test_spiral_force_starts_on_contact_and_expires_after_six_seconds(self):
+    def test_spiral_force_starts_on_contact_and_expires_after_ten_seconds(self):
         model = g.Input4ArmKinematics(self.xml, 'right')
         initial = np.array([.2, -.7, .8, .6, .9, -.4])
         controller = g.Input4PlacementControl(
@@ -33,11 +33,11 @@ class DualAdmittanceTests(unittest.TestCase):
         np.testing.assert_array_equal(controller.xy_target_force(2.), [0., 0.])
         controller.contact_time = 2.
         np.testing.assert_allclose(controller.xy_target_force(2.), [0., 30.], atol=1e-10)
-        np.testing.assert_allclose(controller.xy_target_force(2.5), [32.5, 0.], atol=1e-10)
-        self.assertAlmostEqual(np.linalg.norm(controller.xy_target_force(5.)), 45.)
-        self.assertAlmostEqual(np.linalg.norm(controller.xy_target_force(7.999)), 59.995)
-        np.testing.assert_array_equal(controller.xy_target_force(8.), [0., 0.])
-        np.testing.assert_array_equal(controller.xy_target_force(9.), [0., 0.])
+        np.testing.assert_allclose(controller.xy_target_force(2.5), [33., 0.], atol=1e-10)
+        self.assertAlmostEqual(np.linalg.norm(controller.xy_target_force(7.)), 60.)
+        self.assertAlmostEqual(np.linalg.norm(controller.xy_target_force(11.999)), 89.994)
+        np.testing.assert_array_equal(controller.xy_target_force(12.), [0., 0.])
+        np.testing.assert_array_equal(controller.xy_target_force(13.), [0., 0.])
         ordinary = g.Input4PlacementControl(model, initial, np.zeros(4), 1.)
         ordinary.contact_time = 2.
         np.testing.assert_array_equal(ordinary.xy_target_force(3.), [0., 0.])

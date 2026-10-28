@@ -57,7 +57,7 @@ G01 MoveIt 演示脚本
     left_body，再固定该腰部/升降状态求右臂 IK。左右下降分别预检：忽略
     world 物体碰撞，但保留机器人自碰撞检查；通过后缓存 OMPL 和同步下降
     轨迹用于可达性检查。到预备位后双臂分别运行100N Z导纳，接触后各自
-    接触后启用XY/Rz及6s局部XY螺旋期望力，幅值30→60N、频率0.5Hz；
+    接触后启用XY/Rz及10s局部XY螺旋期望力，幅值30→90N、频率0.5Hz；
     接触超时或到配置的放置停止高度时停止该臂。
     双臂都完成后下电，从实测位置重新规划同步直线退回预备位；
     保留原始 Fz 下降超过210N及传感器量程保护。
@@ -198,8 +198,8 @@ INPUT4_ADMITTANCE = {
     "max_linear_speed": 0.03, "max_angular_speed": 0.2,
 }
 INPUT7_XY_SPIRAL = {
-    "duration": 6.0, "frequency": 0.5,
-    "start_force": 30.0, "end_force": 60.0,
+    "duration": 10.0, "frequency": 0.5,
+    "start_force": 30.0, "end_force": 90.0,
 }
 from visualization_msgs.msg import Marker, MarkerArray
 from dobot_msgs_v4.srv import ClearError, SetToolPower
@@ -840,7 +840,7 @@ UNLOAD_PLACE_LOCAL_YAWS = {
 }
 # 注意这里四个物料台点编号和机器人 SW 编号不一样。
 UNLOAD_PLACE_LOCAL_OFFSETS = {
-    1: (0.0-0.012-0.007, 0.225+0.1125-0.0015+0.1125-0.001, 0.1-0.015+0.09),
+    1: (0.0-0.012-0.01, 0.225+0.1125-0.0015+0.1125-0.001, 0.1-0.015+0.09),
     2: (0.0-0.009-0.0085, 0.1125-0.0025+0.1125, 0.1-0.014+0.09),
     3: (0.0-0.0045-0.001, -0.1125-0.001+0.1125-0.001, 0.1-0.01+0.09),
     4: (0.0-0.0015-0.001, -0.225-0.001 - 0.1125+0.1125+0.003, 0.1-0.01+0.09),   
@@ -8044,7 +8044,7 @@ class G01Demo(Node):
             if any(pose is None for pose in (place_pose, base_pose, tool_in_tip)):
                 self.get_logger().error(f"{side} 无法计算放置目标高度或工具变换，禁止导纳下降")
                 return False
-            height_offset = 0.006 if side == "left" else 0.006
+            height_offset = 0.006 if side == "left" else 0.005
             height_stops[side] = dict(
                 xy_spiral=INPUT7_XY_SPIRAL,
                 target_z=float(place_pose.position.z)+height_offset,
