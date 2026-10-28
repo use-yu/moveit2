@@ -14,6 +14,9 @@ python3 /home/ws_moveit/src/hello_moveit/scripts/grasp_test.py --sim --keyboard 
 该抓取脚本通过 `/g01/left/tool_do_instant`、`/g01/right/tool_do_instant` 服务控制吸附/松开，
 类型为 `dobot_msgs_v4/srv/ToolDOInstant`，固定 `index: 1`，`status: 1` 吸附、`status: 0` 松开。
 传感器常在线，启动及批次自检只等待读取左右力话题的新帧，不操作工具电源或吸附输出。
+抓取后从 `q_pre` 搬运到识别位/下一位置、到交换位 Q2、以及从交换位到放置预备位，
+规划请求均加入本次 `q_pre` 高度的隔板和当前候选圆柱；模型只作用于该请求，
+前台与后台规划互不清理，旧的无障碍物缓存不会用于这些搬运路径。
 
 g01实际部署：
 

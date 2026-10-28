@@ -2567,6 +2567,11 @@ def make_grasp_objects_collision(poses: Sequence[Pose]) -> CollisionObject:
     return obj
 
 
+def transfer_obstacle_signature(obstacles: Sequence[CollisionObject] | None) -> list[str] | None:
+    """以完整几何和位姿区分缓存，旧的无搬运障碍物缓存不能混用。"""
+    return [serialize_message(obj).hex() for obj in obstacles] if obstacles else None
+
+
 def cylinder_half_extent_z(pose: Pose) -> float:
     """圆柱按当前姿态投影到 Z 轴后的半尺寸，用于让水平隔板与圆柱相切。"""
     return cylinder_half_extent_z_from_shape(pose, CYLINDER_DIAMETER / 2.0, CYLINDER_HEIGHT)
@@ -3340,6 +3345,7 @@ class PlaceTrajectoryPlan:
     descent: RobotTrajectory
     to_q1: RobotTrajectory
     yubei_pose: Pose
+    transfer_signature: list[str] | None = None
 
 
 @dataclass
@@ -3356,6 +3362,7 @@ class ExchangeTrajectoryPlan:
     z_down_distance: float
     to_q2: RobotTrajectory
     down: RobotTrajectory
+    transfer_signature: list[str] | None = None
 
 
 @dataclass
@@ -5945,6 +5952,32 @@ class G01Demo(Node):
         )
         return self._apply_scene([removal], report_error=False)
 
+    def _make_grasp_transfer_obstacles(
+        self, target_pose: Pose, plan_frame: str, link: str,
+        q_pre_state: Mapping[str, float], scene_grasp_object_poses: Sequence[Pose] | None,
+    ) -> list[CollisionObject] | None:
+        """固定在本次抓取q_pre高度的隔板及候选圆柱，供各搬运规划独立使用。"""
+        scene_pose = self._pose_in_frame(
+            target_pose, source_frame=plan_frame, target_frame=SCENE_FRAME,
+            joints=dict(q_pre_state))
+        if scene_pose is None:
+            return None
+        link_surface = self._link_collision_min_z(
+            link, target_frame=SCENE_FRAME, joints=dict(q_pre_state))
+        if link_surface is None:
+            return None
+        poses = list(scene_grasp_object_poses) if scene_grasp_object_poses is not None else [scene_pose]
+        if not poses:
+            self.get_logger().error("搬运规划缺少当前候选圆柱，禁止省略物体障碍")
+            return None
+        height = link_surface[0]-FRAME_CUTOFF_BELOW_COLLISION
+        obstacles = [make_deep_frame_cutoff(height, self._frame_pose),
+                     make_grasp_objects_collision(poses)]
+        self.get_logger().info(
+            f"[transfer-collision] 固定本次q_pre隔板上表面Z={height:.4f}m，"
+            f"包含{len(poses)}个候选圆柱；抓取后搬运、交换去程和离开交换位均检查")
+        return obstacles
+
     def _plan_q_pre_with_temporary_collisions(
         self,
         group: str,
@@ -6143,10 +6176,12 @@ class G01Demo(Node):
         avoid_collisions: bool = True,
         num_attempts: int | None = None,
         planning_time_sec: float | None = None,
+        planning_obstacles: Sequence[CollisionObject] | None = None,
     ) -> tuple[bool, float, RobotTrajectory | None, int | None]:
         """执行一次 MoveGroup 请求。
 
         ``avoid_collisions=True`` 使用 move_group 当前规划场景的正常碰撞检查。
+        ``planning_obstacles`` 只加入本次请求的场景diff，前台/后台不会互相清理。
         ``False`` 只在本次请求的 planning_scene_diff 中临时允许机器人 collision
         link 与其他对象相交，不会写入或污染全局规划场景。关闭碰撞检查具有真实
         机械臂撞击风险，调用方必须明确承担安全责任。
@@ -6178,6 +6213,16 @@ class G01Demo(Node):
             g.request.start_state.joint_state.name = list(start.keys())
             g.request.start_state.joint_state.position = list(start.values())
         g.planning_options.plan_only = plan_only
+        if planning_obstacles:
+            if not avoid_collisions:
+                log.error(f"[{group}] 搬运障碍物不能与关闭碰撞检查同时使用")
+                return False, elapsed_ms(), None, MoveItErrorCodes.FAILURE
+            scene_diff = g.planning_options.planning_scene_diff
+            scene_diff.is_diff = True
+            scene_diff.robot_state.is_diff = True
+            scene_diff.world.collision_objects.extend(copy.deepcopy(list(planning_obstacles)))
+            log.info(f"[{group}] 本次规划加入隔板和物体："
+                     + ", ".join(obj.id for obj in planning_obstacles))
         if not avoid_collisions:
             try:
                 collision_links = _urdf_collision_link_names()
@@ -6256,6 +6301,7 @@ class G01Demo(Node):
         max_retries: int | None = None,
         num_attempts: int | None = None,
         planning_time_sec: float | None = None,
+        planning_obstacles: Sequence[CollisionObject] | None = None,
     ) -> tuple[bool, float, RobotTrajectory | None]:
         """
         调用 move_action：规划（plan_only=True）或规划并执行（False）。
@@ -6270,6 +6316,7 @@ class G01Demo(Node):
         avoid_collisions：是否使用规划场景做碰撞检查；False 仅影响本次请求。
         planning_time_sec：每个 MoveGroup 请求的规划时间上限；None 使用
         PLAN_TIME_SEC。
+        planning_obstacles：仅本次请求使用的隔板/物体，不修改共享场景。
         """
         log = self.get_logger()
         retries = MOVE_MAX_RETRIES if max_retries is None else max(1, max_retries)
@@ -6302,6 +6349,7 @@ class G01Demo(Node):
                 avoid_collisions,
                 num_attempts,
                 planning_time,
+                planning_obstacles,
             )
             last_code = code
             if ok:
@@ -6341,6 +6389,7 @@ class G01Demo(Node):
         planning_time_sec: float | None = None,
         avoid_collisions: bool = True,
         execute: bool = False,
+        planning_obstacles: Sequence[CollisionObject] | None = None,
     ) -> tuple[bool, float, RobotTrajectory | None]:
         """通用关节空间规划入口，可选择只规划或规划并执行。
 
@@ -6373,6 +6422,8 @@ class G01Demo(Node):
                 不修改全局场景，但真实机器人使用时有撞击风险。
             execute:
                 False 只规划并返回轨迹；True 由 MoveGroup 规划后立即执行。
+            planning_obstacles:
+                仅在本次MoveGroup请求内加入的障碍物，要求保持碰撞检查开启。
 
         返回：
             ``(是否成功, 总耗时毫秒, RobotTrajectory 或 None)``。
@@ -6449,6 +6500,7 @@ class G01Demo(Node):
             max_retries=max_retries,
             num_attempts=num_attempts,
             planning_time_sec=planning_time_sec,
+            planning_obstacles=planning_obstacles,
         )
 
     def plan_execute_joint_waypoints(self, *args, **kwargs):
@@ -6471,6 +6523,7 @@ class G01Demo(Node):
         max_retries: int | None = None,
         planning_time_sec: float | None = None,
         avoid_collisions: bool = True,
+        planning_obstacles: Sequence[CollisionObject] | None = None,
     ) -> bool:
         """按顺序规划并执行多个关节空间路径点。
 
@@ -6513,6 +6566,7 @@ class G01Demo(Node):
                 planning_time_sec=planning_time,
                 avoid_collisions=avoid_collisions,
                 execute=True,
+                planning_obstacles=planning_obstacles,
             )
             log.info(
                 f"[{group}] segment {idx + 1}/{len(waypoints)} plan+exec: {used_ms:.3f} ms "
@@ -8144,11 +8198,15 @@ class G01Demo(Node):
         fang_joints: list[float],
         link: str,
         speed: float,
+        transfer_obstacles: Sequence[CollisionObject] | None = None,
     ) -> PlaceTrajectoryPlan | None:
         """规划yubei/Q1；启用力时使用导纳，无力时另规划原fang直线下降。"""
         arm_plan_frame = SCENE_FRAME
         place_mode = "admittance" if self.use_force_sensors else "linear"
         cache_key = f"input4_{place_mode}_place_{arm_group}_{yubei_name}_{place_name}"
+        signature = transfer_obstacle_signature(transfer_obstacles)
+        if signature is not None:
+            cache_key += "_transfer_v1"
         cached = _load_trajectory_cache(
             cache_key,
             {
@@ -8169,6 +8227,7 @@ class G01Demo(Node):
                     metadata.get("start_joints"), start_joints,
                 )
                 and metadata.get("speed") == speed
+                and metadata.get("transfer_signature") == signature
             ):
                 self.get_logger().info(f"[trajectory-cache] 命中 {cache_key}")
                 return PlaceTrajectoryPlan(
@@ -8177,6 +8236,7 @@ class G01Demo(Node):
                     dict(start_joints), yubei_joints, fang_joints,
                     messages["to_yubei"], messages["descent"],
                     messages["to_q1"], messages["yubei_pose"],
+                    transfer_signature=signature,
                 )
         self.get_logger().info(
             f"[trajectory-cache] 未命中或已失效 {cache_key}，正常规划"
@@ -8190,6 +8250,7 @@ class G01Demo(Node):
             num_attempts=50,
             planning_time_sec=20.0,
             execute=False,
+            planning_obstacles=transfer_obstacles,
         )
         if not ok or to_yubei is None:
             self.publish_error(10, f"{arm_group}: {yubei_name} 放置预备位不可达")
@@ -8311,6 +8372,7 @@ class G01Demo(Node):
             body_joint_names, slot_name, yubei_name, place_name,
             dict(start_joints), yubei_joints, fang_joints,
             to_yubei, descent, to_q1, yubei_pose,
+            transfer_signature=signature,
         )
         saved = _save_trajectory_cache(
             cache_key,
@@ -8321,6 +8383,7 @@ class G01Demo(Node):
                 "fang_joints": fang_joints,
                 "start_joints": dict(start_joints),
                 "speed": speed,
+                "transfer_signature": signature,
             },
             {
                 "to_yubei": to_yubei,
@@ -8344,6 +8407,7 @@ class G01Demo(Node):
         yubei_name: str,
         side: str,
         speed: float,
+        transfer_obstacles: Sequence[CollisionObject] | None = None,
     ) -> bool:
         """到 yubei 执行失败或实测未到位时，清错并从实测状态重规划一次。"""
         log = self.get_logger()
@@ -8416,6 +8480,7 @@ class G01Demo(Node):
             planning_time_sec=20.0,
             avoid_collisions=True,
             execute=False,
+            planning_obstacles=transfer_obstacles,
         )
         if not ok or retry_trajectory is None:
             return fail("从实测位置重新规划到 yubei 失败")
@@ -8440,6 +8505,7 @@ class G01Demo(Node):
         selected_slot_name: str | None = None,
         preplanned: PlaceTrajectoryPlan | None = None,
         return_to_q1: bool = True,
+        transfer_obstacles: Sequence[CollisionObject] | None = None,
     ) -> bool:
         """到yubei后按力传感器模式选择导纳/原直线放置，再执行Q1/识别位复位。"""
         log = self.get_logger()
@@ -8541,6 +8607,9 @@ class G01Demo(Node):
             log.error("[pick] 读取放置规划当前实测关节状态失败")
             return False
         plan = preplanned
+        if plan is not None and getattr(plan, "transfer_signature", None) != transfer_obstacle_signature(transfer_obstacles):
+            log.info("[pick] 放置缓存的隔板/物体配置不同，重新规划")
+            plan = None
         if clearance_moved:
             plan = None
         if plan is not None and (
@@ -8585,6 +8654,7 @@ class G01Demo(Node):
                 fang_joints=fang_joints,
                 link=link,
                 speed=speed,
+                transfer_obstacles=transfer_obstacles,
             )
         if plan is None:
             log.error(f"[pick] {yubei_name}/{place_name}/Q1 纯规划失败")
@@ -8597,6 +8667,7 @@ class G01Demo(Node):
             yubei_name=yubei_name,
             side="left" if arm_group == "left_arm" else "right",
             speed=speed,
+            transfer_obstacles=transfer_obstacles,
         ):
             return False
 
@@ -8994,6 +9065,17 @@ class G01Demo(Node):
             self.last_pick_failure_reason = "no_ik"
             return False
         q_pre, q_target, to_pre_traj, approach_traj = picked
+        # 在运动前固定本次抓取的障碍物快照。前台/后台规划通过请求内diff独立使用。
+        transfer_state = self._get_joints(joint_names_for_group("dual_arm_body"), wait_new=True)
+        if transfer_state is None:
+            self.last_pick_failure_reason = "transfer_collision_state_failed"
+            return False
+        transfer_state.update(q_pre)
+        transfer_obstacles = self._make_grasp_transfer_obstacles(
+            target_pose, plan_frame, link, transfer_state, scene_grasp_object_poses)
+        if transfer_obstacles is None:
+            self.last_pick_failure_reason = "transfer_collision_setup_failed"
+            return False
         post_grasp_future: Future[PostGraspTrajectoryPlan | None] | None = None
         post_grasp_start = dict(recognition_state) if recognition_state is not None else None
         if post_grasp_start is None and background_planner is not None and planner_pool is not None:
@@ -9012,6 +9094,7 @@ class G01Demo(Node):
                 selected_slot_name=selected_place_slot,
                 place_joint_config=place_joint_config,
                 speed=place_speed_scale,
+                transfer_obstacles=copy.deepcopy(transfer_obstacles),
             )
             log.info("[pipeline] 抓取运动开始前已提交当前物体交换/放置后台规划")
         log.info(
@@ -9255,6 +9338,7 @@ class G01Demo(Node):
             if not self.plan_execute_joint_waypoints(
                 "dual_arm_body", place_speed_scale * 0.5, recognition_names,
                 [recognition_state], num_attempts=30, planning_time_sec=10.0,
+                planning_obstacles=transfer_obstacles,
             ):
                 log.error("[pipeline] 抓取成功后运动到识别位置失败")
                 return False
@@ -9271,13 +9355,7 @@ class G01Demo(Node):
             log.error("[pipeline] 当前物体交换/放置后台纯规划失败")
             return False
 
-        scene_node = background_planner or self
-        if not scene_node.remove_frame_cutoff_only():
-            log.warning(
-                "[pipeline] 当前物体交换/放置轨迹规划完成后移除隔离板失败，继续流程"
-            )
-        else:
-            log.info("[pipeline] 当前物体交换/放置轨迹已规划完成，隔离板已移除")
+        log.info("[pipeline] 当前物体交换/放置规划结束，请求内隔板和物体随规划场景释放")
 
         if recognition_state is not None and start_next_grasp_plan is not None:
             start_next_grasp_plan()
@@ -9301,6 +9379,7 @@ class G01Demo(Node):
                 dual_speed=place_speed_scale,
                 cartesian_speed=speed_scale,
                 preplanned=post_grasp_plan.exchange if post_grasp_plan else None,
+                transfer_obstacles=transfer_obstacles,
             ):
                 return False
 
@@ -9312,6 +9391,7 @@ class G01Demo(Node):
                 first_return_mode=first_return_mode,
                 selected_slot_name=selected_place_slot,
                 preplanned=post_grasp_plan.place if post_grasp_plan else None,
+                transfer_obstacles=transfer_obstacles,
                 return_to_q1=not (
                     recognition_state is not None
                     and start_next_grasp_plan is not None
@@ -9328,6 +9408,7 @@ class G01Demo(Node):
                 first_return_mode=first_return_mode,
                 selected_slot_name=selected_place_slot,
                 preplanned=post_grasp_plan.place if post_grasp_plan else None,
+                transfer_obstacles=transfer_obstacles,
                 return_to_q1=not (
                     recognition_state is not None
                     and start_next_grasp_plan is not None
@@ -9359,6 +9440,7 @@ class G01Demo(Node):
         cartesian_speed: float,
         z_down_distance: float | None,
         start_joints: Mapping[str, float] | None = None,
+        transfer_obstacles: Sequence[CollisionObject] | None = None,
     ) -> ExchangeTrajectoryPlan | None:
         """纯规划交换 Q2 和交接直线，不执行运动或工具命令。"""
         # 统一减慢交换运动，覆盖后台预规划和现场重规划；退回复用反向直线轨迹。
@@ -9400,6 +9482,7 @@ class G01Demo(Node):
             exchange_group, q2, joint_names=exchange_joint_names,
             start_joints=start, speed_scale=dual_speed,
             num_attempts=50, planning_time_sec=20.0, execute=False,
+            planning_obstacles=transfer_obstacles,
         )
         if not ok or to_q2 is None:
             return None
@@ -9427,6 +9510,7 @@ class G01Demo(Node):
             exchange_group, exchange_joint_names, q2_slice_text,
             source_group, source_plan_frame, source_link, source_joint_names,
             source_side, receiver_side, distance, to_q2, down,
+            transfer_signature=transfer_obstacle_signature(transfer_obstacles),
         )
 
     def _execute_exchange_plan(self, plan: ExchangeTrajectoryPlan) -> bool:
@@ -9469,6 +9553,7 @@ class G01Demo(Node):
         selected_slot_name: str | None,
         place_joint_config: dict[str, object],
         speed: float,
+        transfer_obstacles: Sequence[CollisionObject] | None = None,
     ) -> PostGraspTrajectoryPlan | None:
         """从识别位置纯规划当前物体的交换/放置全部轨迹。"""
         exchange = None
@@ -9480,6 +9565,7 @@ class G01Demo(Node):
                 EXCHANGE_Q2, source_link=pick_link, pick_group=pick_group,
                 dual_speed=speed, cartesian_speed=speed,
                 z_down_distance=None, start_joints=recognition_state,
+                transfer_obstacles=transfer_obstacles,
             )
             if exchange is None:
                 return None
@@ -9516,6 +9602,7 @@ class G01Demo(Node):
             yubei_name=yubei_name, place_name=place_name,
             start_joints=place_start, yubei_joints=list(yubei_values),
             fang_joints=list(fang_values), link=place_link, speed=speed,
+            transfer_obstacles=transfer_obstacles,
         )
         return None if place is None else PostGraspTrajectoryPlan(exchange, place)
 
@@ -9530,10 +9617,14 @@ class G01Demo(Node):
         cartesian_speed: float = 0.2,
         z_down_distance: float | None = None,
         preplanned: ExchangeTrajectoryPlan | None = None,
+        transfer_obstacles: Sequence[CollisionObject] | None = None,
     ) -> bool:
         """顺序调用交换纯规划和只执行阶段。"""
         del q1  # 保留旧接口；当前交换流程未执行注释掉的 Q1 段。
         plan = preplanned
+        if plan is not None and getattr(plan, "transfer_signature", None) != transfer_obstacle_signature(transfer_obstacles):
+            self.get_logger().info("[exchange] 交换缓存的隔板/物体配置不同，重新规划")
+            plan = None
         if plan is not None:
             current = self._get_joints(plan.exchange_joint_names, wait_new=True)
             first = plan.to_q2.joint_trajectory.points[0]
@@ -9552,6 +9643,7 @@ class G01Demo(Node):
             q2_by_side, source_link=source_link, pick_group=pick_group,
             dual_speed=dual_speed, cartesian_speed=cartesian_speed,
             z_down_distance=z_down_distance,
+            transfer_obstacles=transfer_obstacles,
         )
         if plan is None:
             self.get_logger().error("[exchange] 交换纯规划失败")
