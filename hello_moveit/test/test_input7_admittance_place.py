@@ -25,6 +25,32 @@ class DualAdmittanceTests(unittest.TestCase):
         cls.xml = xacro.process_file(str(SCRIPT.parents[2] /
             'moveit_resources/g01_description/urdf/G01-URDF888.urdf')).toxml()
 
+    def test_spiral_force_starts_on_contact_and_expires_after_six_seconds(self):
+        model = g.Input4ArmKinematics(self.xml, 'right')
+        initial = np.array([.2, -.7, .8, .6, .9, -.4])
+        controller = g.Input4PlacementControl(
+            model, initial, np.zeros(4), 1., xy_spiral=g.INPUT7_XY_SPIRAL)
+        np.testing.assert_array_equal(controller.xy_target_force(2.), [0., 0.])
+        controller.contact_time = 2.
+        np.testing.assert_allclose(controller.xy_target_force(2.), [0., 30.], atol=1e-10)
+        np.testing.assert_allclose(controller.xy_target_force(2.5), [32.5, 0.], atol=1e-10)
+        self.assertAlmostEqual(np.linalg.norm(controller.xy_target_force(5.)), 45.)
+        self.assertAlmostEqual(np.linalg.norm(controller.xy_target_force(7.999)), 59.995)
+        np.testing.assert_array_equal(controller.xy_target_force(8.), [0., 0.])
+        np.testing.assert_array_equal(controller.xy_target_force(9.), [0., 0.])
+        ordinary = g.Input4PlacementControl(model, initial, np.zeros(4), 1.)
+        ordinary.contact_time = 2.
+        np.testing.assert_array_equal(ordinary.xy_target_force(3.), [0., 0.])
+
+    def test_spiral_force_is_used_as_xy_admittance_target(self):
+        model = g.Input4ArmKinematics(self.xml, 'right')
+        initial = np.array([.2, -.7, .8, .6, .9, -.4])
+        controller = g.Input4PlacementControl(
+            model, initial, np.zeros(4), 1., xy_spiral=g.INPUT7_XY_SPIRAL)
+        with patch.object(controller.xyz, 'step', return_value=np.zeros(3)) as step:
+            controller.step(initial, [0., 0., -40., 0.], 1.03)
+        np.testing.assert_allclose(step.call_args.args[1][:2], [0., -30.], atol=1e-10)
+
     def test_dual_loop_holds_finished_arm_and_stops_both_on_failure(self):
         for case in ('success', 'stale', 'force_limit'):
             with self.subTest(case=case):

@@ -57,7 +57,8 @@ G01 MoveIt 演示脚本
     left_body，再固定该腰部/升降状态求右臂 IK。左右下降分别预检：忽略
     world 物体碰撞，但保留机器人自碰撞检查；通过后缓存 OMPL 和同步下降
     轨迹用于可达性检查。到预备位后双臂分别运行100N Z导纳，接触后各自
-    切换60N及XY/Rz；接触后15s或到原下降末点基坐标系Z+2mm停止该臂。
+    接触后启用XY/Rz及6s局部XY螺旋期望力，幅值30→60N、频率0.5Hz；
+    接触超时或到配置的放置停止高度时停止该臂。
     双臂都完成后下电，从实测位置重新规划同步直线退回预备位；
     保留原始 Fz 下降超过210N及传感器量程保护。
     优先 SW1+SW3，目标固定为 (1,3)；SW2+SW4
@@ -195,6 +196,10 @@ INPUT4_ADMITTANCE = {
     "max_joint_velocity": 0.07, "max_tracking_error": 0.5,
     "position_gain": 2.0, "orientation_gain": 2.0,
     "max_linear_speed": 0.03, "max_angular_speed": 0.2,
+}
+INPUT7_XY_SPIRAL = {
+    "duration": 6.0, "frequency": 0.5,
+    "start_force": 30.0, "end_force": 60.0,
 }
 from visualization_msgs.msg import Marker, MarkerArray
 from dobot_msgs_v4.srv import ClearError, SetToolPower
@@ -3194,8 +3199,17 @@ class Input4PlacementControl:
     """从 yubei 开始的纯计算控制器，所有速度沿当前 L6/R6 局部轴定义。"""
 
     def __init__(self, model, q, wrench, now, config=None, *,
-                 target_z=None, base_transform=None, tool_offset=None):
+                 target_z=None, base_transform=None, tool_offset=None, xy_spiral=None):
         self.config = copy.deepcopy(INPUT4_ADMITTANCE if config is None else config)
+        self.xy_spiral = copy.deepcopy(xy_spiral)
+        if self.xy_spiral is not None:
+            if (not all(np.isfinite(self.xy_spiral[key]) for key in
+                        ("duration", "frequency", "start_force", "end_force"))
+                    or self.xy_spiral["duration"] <= 0
+                    or self.xy_spiral["frequency"] <= 0
+                    or self.xy_spiral["start_force"] < 0
+                    or self.xy_spiral["end_force"] < self.xy_spiral["start_force"]):
+                raise ValueError("XY螺旋期望力参数无效")
         c = self.config
         self.model = model
         self.command = np.asarray(q, dtype=float).copy()
@@ -3231,6 +3245,18 @@ class Input4PlacementControl:
         point = transform @ np.append(self.tool_offset, 1.)
         return float((self.base_transform @ point)[2])
 
+    def xy_target_force(self, now):
+        if self.xy_spiral is None or self.contact_time is None:
+            return np.zeros(2)
+        elapsed = now-self.contact_time
+        spiral = self.xy_spiral
+        if elapsed < 0 or elapsed >= spiral["duration"]:
+            return np.zeros(2)
+        amplitude = spiral["start_force"] + (
+            spiral["end_force"]-spiral["start_force"])*elapsed/spiral["duration"]
+        phase = 2*math.pi*spiral["frequency"]*elapsed
+        return amplitude*np.array([math.sin(phase), math.cos(phase)])
+
     def step(self, q, wrench, now):
         c = self.config
         q, wrench = np.asarray(q, dtype=float), np.asarray(wrench, dtype=float)
@@ -3263,7 +3289,7 @@ class Input4PlacementControl:
         error[2] = c["down_direction"]*(force-self.reaction_sign*delta_fz)
         omega_z = 0.
         if self.contact_time is not None:
-            error[:2] = wrench[:2]-self.baseline[:2]
+            error[:2] = wrench[:2]-self.baseline[:2]-self.xy_target_force(now)
             omega_z = self.rz.step(self.baseline[3:4], wrench[3:4], dt)[0]
         velocity = self.xyz.step(np.zeros(3), error, dt)
         z_axis = self.initial[:3, 2]
@@ -7954,7 +7980,14 @@ class G01Demo(Node):
                     if not controller.finished:
                         command = controller.step(q, self._input4_wrench[side], now)
                         if controller.contact_time is not None and side not in contact_logged:
-                            log.info(f"[place][admittance] {side} 检测到接触，切换60N并开启XY/Rz，持续{c['contact_duration']:g}s")
+                            log.info(f"[place][admittance] {side} 检测到接触，切换{c['contact_force']:g}N并开启XY/Rz，持续{c['contact_duration']:g}s")
+                            if controller.xy_spiral is not None:
+                                spiral = controller.xy_spiral
+                                log.info(
+                                    f"[unload][admittance] {side} 开始局部XY螺旋期望力："
+                                    f"Fx=A*sin(2πft)，Fy=A*cos(2πft)，"
+                                    f"A={spiral['start_force']:g}→{spiral['end_force']:g}N，"
+                                    f"f={spiral['frequency']:g}Hz，持续{spiral['duration']:g}s")
                             contact_logged.add(side)
                         if command is None:
                             held_positions[side] = q.copy()
@@ -8011,8 +8044,9 @@ class G01Demo(Node):
             if any(pose is None for pose in (place_pose, base_pose, tool_in_tip)):
                 self.get_logger().error(f"{side} 无法计算放置目标高度或工具变换，禁止导纳下降")
                 return False
-            height_offset = 0.003 if side == "left" else 0.004
+            height_offset = 0.006 if side == "left" else 0.006
             height_stops[side] = dict(
+                xy_spiral=INPUT7_XY_SPIRAL,
                 target_z=float(place_pose.position.z)+height_offset,
                 base_transform=np.asarray(pose_to_matrix(base_pose)),
                 tool_offset=np.array([tool_in_tip.position.x, tool_in_tip.position.y, tool_in_tip.position.z]))
