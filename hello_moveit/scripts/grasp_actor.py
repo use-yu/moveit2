@@ -483,9 +483,9 @@ FRAME_DIRECT_VISION_Q = [
     1.672852,
     0.588477,
 ]
-# 每轮抓取使用的腰部识别/重试角度。当前角度全部点不可抓时，
-# 才进入下一角度重新执行 Q1、视觉、排序、显示和可达性验证。
-GRASP_VISION_WAIST_ANGLES_DEG = (10,20,30,)
+# 每轮抓取使用的识别/重试构型（升降绝对位置 m，腰部角度 deg）。
+# 当前构型全部点不可抓时，进入下一构型重新执行 Q1、视觉和可达性验证。
+GRASP_VISION_BODY_POSES = ((0.0, 10.0), (0.05, 10.0), (0.1, 10.0))
 # 输入 4：先发送此头部目标，再运动到识别构型；头部到位后才采集视觉。
 GRASP_VISION_CAMERA_POSITION = 0.7854
 # 抓取排序的姿态分组阈值：局部 +Z 与 moveit_base_link -Z
@@ -494,10 +494,13 @@ GRASP_UPRIGHT_TILT_THRESHOLD_DEG = 30.0
 GRASP_Q1_WAIST_JOINT_INDEX = list(JOINT_TARGETS["dual_arm_body"]).index(
     "body_joint2"
 )
-# 每轮抓取使用的预备构型；body_joint2 由上述重试序列动态覆盖。
+GRASP_Q1_LIFT_JOINT_INDEX = list(JOINT_TARGETS["dual_arm_body"]).index(
+    "body_joint1"
+)
+# 每轮抓取使用的预备构型；升降和腰部由上述重试序列动态覆盖。
 GRASP_Q1 = [
-    0.0,
-    GRASP_VISION_WAIST_ANGLES_DEG[0] * math.pi / 180,
+    GRASP_VISION_BODY_POSES[0][0],
+    GRASP_VISION_BODY_POSES[0][1] * math.pi / 180,
     -1.57,
     -0.15,
     -1.578090,
@@ -1073,6 +1076,7 @@ UNGRASPABLE_POINT_GRASP_FAILURE_REASONS = frozenset({
 })
 FT_SENSOR_SAMPLE_TIMEOUT_SEC = 5.0  # 阻塞等待对应臂一帧新力数据的超时 [s]
 FT_FORCE_RANGE_N = 200.0
+FT_FORCE_STOP_N = 180.0
 FT_TORQUE_RANGE_NM = 8.0
 FT_RANGE_STOP_RATIO = 0.8
 
@@ -1083,7 +1087,7 @@ def ft_range_violation(values: Sequence[float]) -> str | None:
         return f"六维力数据不足：{len(values)} < 6"
     for index, name in enumerate(("Fx", "Fy", "Fz", "Mx", "My", "Mz")):
         value = float(values[index])
-        limit = (FT_FORCE_RANGE_N if index < 3 else FT_TORQUE_RANGE_NM) * FT_RANGE_STOP_RATIO
+        limit = FT_FORCE_STOP_N if index < 3 else FT_TORQUE_RANGE_NM * FT_RANGE_STOP_RATIO
         unit = "N" if index < 3 else "N·m"
         if not math.isfinite(value) or abs(value) >= limit:
             return f"{name}={value:.6f} {unit}，保护阈值 ±{limit:g} {unit}"
@@ -3814,6 +3818,7 @@ class G01Demo(Node):
         # 后台节点只做规划；保护和硬件停臂由前台节点统一执行。
         self._force_range_enabled = upper_communication and use_force_sensors
         self._force_range_fault: str | None = None
+        self._force_range_samples: dict[str, tuple[float, Sequence[float]]] = {}
         self._force_task_active = False
         self._force_stop_requests: dict[str, int] = {}
         self._force_action_goals: list = []
@@ -4436,6 +4441,39 @@ class G01Demo(Node):
         if self._force_range_fault is not None:
             raise ForceRangeAbort(self._force_range_fault)
 
+    def _recover_input4_force_stop(self) -> bool:
+        active = self._force_task_active
+        self._force_task_active = False
+        try:
+            if not self.stop_upper_grasp_motion():
+                return False
+            started = time.monotonic()
+            deadline = started + FT_SENSOR_SAMPLE_TIMEOUT_SEC
+            while rclpy.ok() and time.monotonic() < deadline:
+                self._executor.spin_once(timeout_sec=0.02)
+                now = time.monotonic()
+                if all(
+                    side in self._force_range_samples
+                    and self._force_range_samples[side][0] > started
+                    and now-self._force_range_samples[side][0] <= INPUT4_ADMITTANCE["feedback_timeout"]
+                    and ft_range_violation(self._force_range_samples[side][1]) is None
+                    for side in ("left", "right")
+                ):
+                    self._force_range_fault = None
+                    requests = {side: self._send_servoj_control(side, "resume")
+                                for side in ("left", "right")}
+                    resumed = all([self._wait_for_servoj_control_state(side, "resume", request)
+                                   for side, request in requests.items()])
+                    if resumed and self._force_range_fault is None:
+                        return True
+                    self._force_range_fault = self._force_range_fault or "力保护后 ServoJ 恢复未全部确认"
+                    self.stop_upper_grasp_motion()
+                    return False
+            self.get_logger().error("[pick][force-guard] 力数据未恢复保护范围，保持停止及工具电源")
+            return False
+        finally:
+            self._force_task_active = active
+
     def _send_force_guarded_goal(self, client, goal):
         """登记运动目标，包括保护触发时尚未返回接受结果的目标。"""
         self._abort_on_force_range()
@@ -4464,6 +4502,9 @@ class G01Demo(Node):
         if not self.use_force_sensors or side not in self._ft_sensor_z:
             return
         if self._force_range_enabled:
+            if not hasattr(self, "_force_range_samples"):
+                self._force_range_samples = {}
+            self._force_range_samples[side] = (time.monotonic(), tuple(msg.data))
             violation = ft_range_violation(msg.data)
             if violation is not None and self._force_range_fault is None:
                 self._force_range_fault = f"{side} 臂力传感器保护：{violation}"
@@ -8683,11 +8724,7 @@ class G01Demo(Node):
                 if return_trajectory is None:
                     log.error("导纳后从实际位置直线返回yubei规划失败")
                     return False
-                if not self.validate_trajectory_self_collision(
-                    return_trajectory, group=arm_group, base_state=return_start,
-                    label="输入4导纳后直线返回yubei",
-                ):
-                    return False
+                log.info("[pick] 输入4导纳后直线返回yubei：不检查场景碰撞及机器人自碰撞")
             else:
                 log.info(f"[pick] 8/9 --noforces：反向执行下降轨迹直线返回 {yubei_name}")
                 return_trajectory = self._reverse_trajectory(plan.descent)
@@ -9009,7 +9046,15 @@ class G01Demo(Node):
         )
         # 缓存的 OMPL 轨迹已在带隔板场景下通过预检，直接执行。
         execute_started = time.monotonic()
-        ok = self._execute_traj(to_pre_traj)
+        try:
+            ok = self._execute_traj(to_pre_traj)
+        except ForceRangeAbort:
+            if not self._recover_input4_force_stop():
+                self._abort_on_force_range()
+                return False
+            self.last_pick_failure_reason = "q_pre_force_recovered"
+            log.warning("[pick] 到预抓位途中力保护，已停止并恢复，开始下一次抓取")
+            return False
 
         used_ms = (time.monotonic() - execute_started) * 1000.0
         log.info(f"[pick] 缓存轨迹 → q_pre: {used_ms:.3f} ms ({'success' if ok else 'failed'})")
@@ -9018,7 +9063,7 @@ class G01Demo(Node):
             self.last_pick_failure_reason = "q_pre"
             return False
 
-        time.sleep(2)
+        time.sleep(1)
         self.wait_for_operator(
             f"[pick] 1/9  已到 q_pre，按回车给{tool_label}工具上电 …"
         )
@@ -9069,12 +9114,26 @@ class G01Demo(Node):
         self.wait_for_operator()
 
         approach_distance = _pose_distance(pre_pose, target_pose)
-        approach_result = self._execute_approach_with_force_guard(
-            approach_traj,
-            tool_side,
-            force_z_before,
-            approach_distance,
-        )
+        force_range_retreated = False
+        try:
+            approach_result = self._execute_approach_with_force_guard(
+                approach_traj,
+                tool_side,
+                force_z_before,
+                approach_distance,
+            )
+        except ForceRangeAbort:
+            if not self._recover_input4_force_stop():
+                self._abort_on_force_range()
+                return False
+            if not self._return_to_pre_after_approach_contact(
+                group, link, pre_pose, joint_names, plan_frame, speed_scale,
+            ):
+                self.last_pick_failure_reason = "approach_force_guard_failed"
+                return False
+            force_range_retreated = True
+            approach_result = "success"
+            log.warning("[pick] 直线抓取力保护后已从实测位置直退 q_pre，保持上电并检查吸附")
         if approach_result == "contact":
             log.warning(
                 "[pick] 直线接近中途接触障碍物；接近轨迹和 ServoJ 状态均已确认，"
@@ -9117,18 +9176,19 @@ class G01Demo(Node):
                 log.error(f"[pick] 直线接近失败后{tool_label}工具下电失败")
             return False
 
-        self._log_actual_fk_error(
-            "[pick] 3/9",
-            link=link,
-            target_pose=target_pose,
-            plan_frame=plan_frame,
-            joint_names=joint_names,
-        )
-        self.wait_for_operator("[pick] 3/9  到达抓取位置，工具已上电，按回车继续 …")
+        if not force_range_retreated:
+            self._log_actual_fk_error(
+                "[pick] 3/9",
+                link=link,
+                target_pose=target_pose,
+                plan_frame=plan_frame,
+                joint_names=joint_names,
+            )
+            self.wait_for_operator("[pick] 3/9  到达抓取位置，工具已上电，按回车继续 …")
 
         log.info("[pick] 4/9  反向播放 approach，直线复位回 q_pre")
         retreat_approach = self._reverse_trajectory(approach_traj)
-        if not self._execute_traj(retreat_approach):
+        if not force_range_retreated and not self._execute_traj(retreat_approach):
             log.error("[pick] 反向播放 approach 失败")
             return False
 
@@ -10292,11 +10352,12 @@ def _run_main(
             return False
         pipeline_enabled = len(empty_place_slots) > 1
 
-        # --- 2. 腰部多角度 Q1 + 视觉 + 可达性验证 ---
+        # --- 2. 升降/腰部组合 Q1 + 视觉 + 可达性验证 ---
         targets = JOINT_TARGETS["dual_arm_body"]
         joint_names = list(targets.keys())
         reachable = None
         selected_waist_deg: int | None = None
+        selected_lift_height: float | None = None
         first_return_modes: list[int] = []
         all_xyz_rpy: list[dict] = []
         q1_for_waist = list(GRASP_Q1)
@@ -10315,17 +10376,21 @@ def _run_main(
                 first_return_modes = cached_result["modes"]
                 all_xyz_rpy = cached_result["poses"]
                 selected_waist_deg = cached_result["waist_deg"]
+                selected_lift_height = cached_result["lift_height"]
+                q1_for_waist[GRASP_Q1_LIFT_JOINT_INDEX] = selected_lift_height
                 q1_for_waist[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(selected_waist_deg)
                 log.info("[pipeline] 下一物体后台解算有解，直接使用缓存抓取轨迹")
 
-        for waist_attempt, waist_deg in enumerate(GRASP_VISION_WAIST_ANGLES_DEG):
+        for waist_attempt, (lift_height, waist_deg) in enumerate(GRASP_VISION_BODY_POSES):
             if reachable is not None:
                 break
             q1_for_waist = list(GRASP_Q1)
+            q1_for_waist[GRASP_Q1_LIFT_JOINT_INDEX] = lift_height
             q1_for_waist[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(waist_deg)
             log.info(
                 f"[pick-waist] 第 {waist_attempt + 1}/"
-                f"{len(GRASP_VISION_WAIST_ANGLES_DEG)} 个角度："
+                f"{len(GRASP_VISION_BODY_POSES)} 组识别构型："
+                f"升降 body_joint1 → {lift_height:.3f}m，"
                 f"腰部 body_joint2 → {waist_deg}°，然后重新视觉和验证"
             )
             node.send_grasp_camera_position()
@@ -10336,7 +10401,7 @@ def _run_main(
                 [q1_for_waist],
             ):
                 node.last_pick_failure_reason = "waist_retry_motion_failed"
-                log.error(f"[pick-waist] 运动到 {waist_deg}° 识别构型失败")
+                log.error(f"[pick-waist] 运动到升降 {lift_height:.3f}m / 腰部 {waist_deg}° 识别构型失败")
                 return False
 
             if not node.wait_for_camera_position(GRASP_VISION_CAMERA_POSITION):
@@ -10354,8 +10419,7 @@ def _run_main(
                 return False
             first_return_modes, all_xyz_rpy = vision_pose
 
-            # 失败点在全部腰角间共享：20° 不可抓的点在
-            # 30/40/50° 重新识别到时显示为黑色并直接跳过 IK。
+            # 失败点在全部识别构型间共享，重新识别到时直接跳过 IK。
             first_return_modes, all_xyz_rpy = prioritize_upright_grasp_points(
                 first_return_modes,
                 all_xyz_rpy,
@@ -10363,16 +10427,16 @@ def _run_main(
             )
             if not all_xyz_rpy:
                 cleanup_grasp_display()
-                if waist_attempt + 1 < len(GRASP_VISION_WAIST_ANGLES_DEG):
-                    next_waist_deg = GRASP_VISION_WAIST_ANGLES_DEG[waist_attempt + 1]
+                if waist_attempt + 1 < len(GRASP_VISION_BODY_POSES):
+                    next_lift, next_waist_deg = GRASP_VISION_BODY_POSES[waist_attempt + 1]
                     log.warning(
-                        f"[pick-waist] {waist_deg}° 视觉返回 0 个物体，"
-                        f"切换到 {next_waist_deg}° 重新执行 Q1/视觉/排序/IK"
+                        f"[pick-waist] 升降 {lift_height:.3f}m / 腰部 {waist_deg}° 视觉返回 0 个物体，"
+                        f"切换到 {next_lift:.3f}m / {next_waist_deg}° 重新执行 Q1/视觉/排序/IK"
                     )
                 else:
                     log.warning(
                         f"[pick-waist] {waist_deg}° 视觉返回 0 个物体，"
-                        "已无下一个配置腰角"
+                        "已无下一组升降/腰部构型"
                     )
                 continue
 
@@ -10389,30 +10453,31 @@ def _run_main(
             )
             if reachable is not None:
                 selected_waist_deg = waist_deg
-                log.info(f"[pick-waist] {waist_deg}° 找到可抓点，停止切换腰角")
+                selected_lift_height = lift_height
+                log.info(f"[pick-waist] 升降 {lift_height:.3f}m / 腰部 {waist_deg}° 找到可抓点，停止切换构型")
                 break
 
             cleanup_grasp_display()
-            if waist_attempt + 1 < len(GRASP_VISION_WAIST_ANGLES_DEG):
-                next_waist_deg = GRASP_VISION_WAIST_ANGLES_DEG[waist_attempt + 1]
+            if waist_attempt + 1 < len(GRASP_VISION_BODY_POSES):
+                next_lift, next_waist_deg = GRASP_VISION_BODY_POSES[waist_attempt + 1]
                 log.warning(
-                    f"[pick-waist] {waist_deg}° 下所有视觉点均不可抓，"
-                    f"切换到 {next_waist_deg}° 重新执行 Q1/视觉/排序/IK"
+                    f"[pick-waist] 升降 {lift_height:.3f}m / 腰部 {waist_deg}° 下所有视觉点均不可抓，"
+                    f"切换到 {next_lift:.3f}m / {next_waist_deg}° 重新执行 Q1/视觉/排序/IK"
                 )
 
         if reachable is None:
-            node.publish_error(8, "全部视觉候选及配置腰角均不可抓取")
+            node.publish_error(8, "全部视觉候选及配置升降/腰部构型均不可抓取")
             node.last_pick_failure_reason = "all_waist_angles_unreachable"
             log.error(
-                f"[pick-waist] {'/'.join(f'{angle}°' for angle in GRASP_VISION_WAIST_ANGLES_DEG)} "
+                f"[pick-waist] 配置升降/腰部构型 {GRASP_VISION_BODY_POSES} "
                 "全部尝试完成（无物体或候选不可抓），"
                 "仍没有无碰撞 IK、Cartesian approach、"
                 "OMPL 到 q_pre 均可行的视觉点"
             )
             return False
-        if selected_waist_deg is None:
+        if selected_waist_deg is None or selected_lift_height is None:
             node.last_pick_failure_reason = "waist_retry_state_invalid"
-            log.error("[pick-waist] 找到可抓点但腰角重试状态不完整")
+            log.error("[pick-waist] 找到可抓点但升降/腰部重试状态不完整")
             return False
 
         point_index = reachable["point_index"]
@@ -10440,6 +10505,7 @@ def _run_main(
         selected_msg = (
             f"可达性选中: 点 {point_index + 1}/{len(all_xyz_rpy)}, "
             f"vision_waist={selected_waist_deg}°, "
+            f"vision_lift={selected_lift_height:.3f}m, "
             f"mode={first_return_mode}, group={pick_group}, "
             f"link={pick_link}, frame={pick_frame}"
         )
@@ -10479,7 +10545,8 @@ def _run_main(
                 )
                 if result is None:
                     return None
-                return {"reachable": result, "modes": modes, "poses": poses, "waist_deg": waist_deg}
+                return {"reachable": result, "modes": modes, "poses": poses,
+                        "waist_deg": waist_deg, "lift_height": selected_lift_height}
 
             next_grasp_cache["future"] = planner_pool.submit(solve_next)
             log.info("[pipeline] 已提交下一物体后台 IK/Cartesian/OMPL 解算")
@@ -10513,6 +10580,7 @@ def _run_main(
             if failure_reason == "q_pre" and not node._upper_grasp_active:
                 recovery_side = tool_side_for_link(pick_link)
                 recovery_q1 = list(GRASP_Q1)
+                recovery_q1[GRASP_Q1_LIFT_JOINT_INDEX] = selected_lift_height
                 recovery_q1[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(
                     selected_waist_deg
                 )
@@ -10547,13 +10615,13 @@ def _run_main(
                         node.last_pick_failure_reason = "q_pre_alarm_recovered"
                         log.warning(
                             f"[pick][q-pre-recovery] 已清错并复位到 "
-                            f"{selected_waist_deg}° 识别位置，"
+                            f"升降 {selected_lift_height:.3f}m / 腰部 {selected_waist_deg}° 识别位置，"
                             "继续下一轮视觉抓取"
                         )
                     else:
                         log.error(
                             f"[pick][q-pre-recovery] 清错后复位到 "
-                            f"{selected_waist_deg}° 识别位置失败"
+                            f"升降 {selected_lift_height:.3f}m / 腰部 {selected_waist_deg}° 识别位置失败"
                         )
                 if node.last_pick_failure_reason != "q_pre_alarm_recovered":
                     node.last_pick_failure_reason = "q_pre_recovery_failed"
@@ -10683,7 +10751,9 @@ def _run_main(
                     )
                 )
 
-            if node._upper_grasp_active and not grasp_result and node.last_pick_failure_reason != "no_place":
+            if node._upper_grasp_active and not grasp_result and node.last_pick_failure_reason not in (
+                "no_place", "q_pre_force_recovered", "suction_failed",
+            ):
                 log.error("[upper-grasp] 抓取失败，交由命令流程判断持料状态并处理退回")
                 return False
             if node._upper_grasp_active and len(node._upper_grasp_placed_slots) >= 4:
@@ -10711,6 +10781,7 @@ def _run_main(
                     "place_obstacle_recovered",
                     "place_alarm_recovered",
                     "q_pre_alarm_recovered",
+                    "q_pre_force_recovered",
                 )
             ):
                 if node.last_pick_failure_reason == "approach_obstacle":
@@ -10728,7 +10799,7 @@ def _run_main(
                         f"[frame-batch] 第 {grasp_index} 次 SW 放置去程报警，"
                         "已清错、下电并直退；按最新 SW 信号继续下一次抓取"
                     )
-                elif node.last_pick_failure_reason == "q_pre_alarm_recovered":
+                elif node.last_pick_failure_reason in ("q_pre_alarm_recovered", "q_pre_force_recovered"):
                     log.warning(
                         f"[frame-batch] 第 {grasp_index} 次运动到 q_pre 失败，"
                         "已清错并复位到识别位置；继续下一轮"
@@ -10757,7 +10828,7 @@ def _run_main(
         ungraspable_points: list[tuple[float, float, float]] = []
         log.info(
             "[reach-cache] 开始新的步骤 4 批次，"
-            f"配置腰角 {GRASP_VISION_WAIST_ANGLES_DEG}° 共用失败点缓存已初始化，"
+            f"配置升降/腰部构型 {GRASP_VISION_BODY_POSES} 共用失败点缓存已初始化，"
             f"匹配容差="
             f"{UNGRASPABLE_POINT_DISTANCE_TOLERANCE * 1000.0:.1f} mm"
         )
