@@ -16,6 +16,16 @@ g01实际部署：
 
 启动tcp-ros通信：
     python3 servoj_30ms.py
+
+右臂单臂桥接 `servoj_30ms_right.py` 支持末端 DO 立即输出服务：
+
+```bash
+# DO1 打开；status 改成 0 则关闭
+ros2 service call /g01/right/tool_do_instant dobot_msgs_v4/srv/ToolDOInstant "{index: 1, status: 1}"
+```
+
+返回 `res: 0` 表示控制器接受指令；其他值为控制器错误码，参数或通信失败返回 `-1`。
+
 启动真机话题桥接：
     python3 comm.py
 启动腰部控制通信：
@@ -31,10 +41,20 @@ ros2 topic pub -r 50 /driver_report/taihu_motor_info pkg_msg_define/msg/MotorRun
     export DISPLAY=:0
     ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true
     
-ros2 service call /dobot_right/dobot_bringup_ros2/srv/GetForce SetToolPower "{status: 0}"
+`servoj_30ms.py` 左右臂工具电源服务（`status: 1` 上电，`status: 0` 下电）：
 
-ros2 service call /g01/right/tool_commands dobot_msgs_v4/srv/SetToolPower "{status: 0}"
-ros2 service call /g01/left/tool_commands dobot_msgs_v4/srv/GetForce "{status: 0}"
+```bash
+ros2 service call /g01/left/tool_commands dobot_msgs_v4/srv/SetToolPower "{status: 1}"
+ros2 service call /g01/right/tool_commands dobot_msgs_v4/srv/SetToolPower "{status: 1}"
+```
+
+`servoj_30ms.py` 左右臂末端 DO 立即输出（`status: 1` 打开，`status: 0` 关闭）：
+
+```bash
+ros2 service call /g01/left/tool_do_instant dobot_msgs_v4/srv/ToolDOInstant "{index: 1, status: 1}"
+ros2 service call /g01/right/tool_do_instant dobot_msgs_v4/srv/ToolDOInstant "{index: 1, status: 1}"
+```
+
 官方 ros2 SDK：
     ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py
 

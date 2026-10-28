@@ -1,6 +1,7 @@
 # 单臂版本：仅连接 192.168.1.1（右臂）。
 # /g01/joint_commands 中完整的右臂 6 关节目标每 30 ms 最多发送一次 ServoJ。
 # 右臂状态、力传感器、工具电源、清错及停止/恢复接口沿用原脚本。
+# /g01/right/tool_do_instant 使用 dobot_msgs_v4/srv/ToolDOInstant 设置末端DO。
 # 兼容保留 /g01/dual_arm/disable_robot；在本版本中仅使右臂掉使能。
 # /g01/right_arm/observer_state 为同一反馈帧的 JSON：包含位置、速度、
 # 扭矩、电流和原始控制器时间戳，供离线辨识/动量观测器使用。
@@ -22,6 +23,7 @@ from dobot_msgs_v4.srv import (
     DisableRobot,
     EnableFTSensor,
     SetToolPower,
+    ToolDOInstant,
 )
 
 MyType = np.dtype([('len', np.int64,), ('digital_input_bits', np.uint64,), ('digital_output_bits',
@@ -119,6 +121,7 @@ SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
 SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
 SERVOJ_RESUME_GUARD_SEC = 0.1
 RIGHT_TOOL_COMMAND_SERVICE = "/g01/right/tool_commands"
+RIGHT_TOOL_DO_INSTANT_SERVICE = "/g01/right/tool_do_instant"
 RIGHT_FT_SENSOR_COMMAND_SERVICE = "/g01/right/ft_sensor_commands"
 RIGHT_CLEAR_ERROR_SERVICE = "/g01/right/clear_error"
 RIGHT_DISABLE_ROBOT_SERVICE = "/g01/right/disable_robot"
@@ -242,6 +245,11 @@ class ArmRosBridge(Node):
         )
         self.create_timer(SERVOJ_SEND_PERIOD_SEC, self._send_latest_joint_commands)
         self.create_service(SetToolPower, RIGHT_TOOL_COMMAND_SERVICE, self._on_right_tool_command)
+        self.create_service(
+            ToolDOInstant,
+            RIGHT_TOOL_DO_INSTANT_SERVICE,
+            self._on_right_tool_do_instant,
+        )
         self.create_service(
             EnableFTSensor,
             RIGHT_FT_SENSOR_COMMAND_SERVICE,
@@ -471,6 +479,27 @@ class ArmRosBridge(Node):
 
     def _on_right_tool_command(self, request, response):
         return self._on_tool_command(request, response, "right", self.arm_clients[0])
+
+    def _on_right_tool_do_instant(self, request, response):
+        """通过现有Dashboard连接设置末端DO，由worker统一接收实际返回。"""
+        index, status = int(request.index), int(request.status)
+        if index < 1 or status not in (0, 1):
+            response.res = -1
+            self.get_logger().error(
+                f"ToolDOInstant 参数非法：index={index}, status={status}；"
+                "index须为正整数，status只允许0/1"
+            )
+            return response
+        command = f"ToolDOInstant({index},{status})"
+        try:
+            response.res, reply = runtime_dashboard_command(self.arm_clients[0], command, name="右臂")
+        except (ConnectionError, TimeoutError, OSError, RuntimeError) as exc:
+            response.res = -1
+            self.get_logger().error(f"{RIGHT_TOOL_DO_INSTANT_SERVICE}: {command} 通信失败：{exc}")
+            return response
+        log = self.get_logger().info if response.res == 0 else self.get_logger().error
+        log(f"{RIGHT_TOOL_DO_INSTANT_SERVICE}: {command}, res={response.res}, reply={reply}")
+        return response
 
     def _on_ft_sensor_command(self, request, response, side, client):
         """通过对应机械臂的 29999 端口开启或关闭六维力传感器。"""
