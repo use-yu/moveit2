@@ -878,7 +878,7 @@ UNLOAD_SYNC_SAMPLE_PERIOD = 0.005
 # 放置同步轨迹按 20 ms 抽样做整机自碰撞检查，并始终检查首末点。
 # 单臂下降仍检查 compute_cartesian_path 返回的每一个离散点。
 UNLOAD_PLACE_SELF_COLLISION_SAMPLE_PERIOD = 0.02
-UNLOAD_TOOL_SETTLE_SEC = 1.0
+UNLOAD_TOOL_SETTLE_SEC = 0.5
 
 BODY_GROUP = "body"
 ACT_MOVE_GROUP = "move_action"
@@ -11410,7 +11410,7 @@ def _run_main(
 
             descent_mode = "导纳下降" if node.use_force_sensors else "直线下降"
             log.info(f"[unload] 双臂已到放置预备位，等待 2 秒后开始{descent_mode}")
-            time.sleep(2.0)
+            time.sleep(0.5)
 
             node.wait_for_operator(
                 f"已到物料台左点{left_point}/右点{right_point}，"
