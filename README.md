@@ -11,11 +11,17 @@ python3 /home/ws_moveit/src/hello_moveit/scripts/grasp_test.py --sim --keyboard 
 
 `grasp_actor.py` 默认启用力传感器，输入4/7使用导纳放置，并从实测位置重新规划直线退回。
 加 `--noforces` 时禁用力传感器，输入4/7沿原规划直线下降，放置后反向执行该直线退回。
+该抓取脚本通过 `/g01/left/tool_do_instant`、`/g01/right/tool_do_instant` 服务控制吸附/松开，
+类型为 `dobot_msgs_v4/srv/ToolDOInstant`，固定 `index: 1`，`status: 1` 吸附、`status: 0` 松开。
+传感器常在线，启动及批次自检只等待读取左右力话题的新帧，不操作工具电源或吸附输出。
 
 g01实际部署：
 
 启动tcp-ros通信：
     python3 servoj_30ms.py
+
+`servoj_30ms.py` 初始化直接读取左右力传感器数据，不自动切换工具电源；
+最多等待10秒，读数无效或超时会提示并继续启动。
 
 右臂单臂桥接 `servoj_30ms_right.py` 支持末端 DO 立即输出服务：
 

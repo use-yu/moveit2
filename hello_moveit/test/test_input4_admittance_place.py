@@ -208,7 +208,7 @@ class PlaceOrchestrationTests(unittest.TestCase):
                   _get_joints=lambda names, **kw: {name: state[name] for name in names},
                   _get_link_pose_fk=fk,
                   _execute_yubei_with_recovery=lambda *a, **kw: events.append('to_yubei') or True,
-                  set_tool_power=lambda side, status: events.append(('tool', status)) or True,
+                  set_tool_do=lambda side, status: events.append(('tool', status)) or True,
                   validate_trajectory_self_collision=lambda *a, **kw: events.append('check_return') or True)
         def admittance(group, *, height_stop):
             self.assertTrue(use_force_sensors)

@@ -778,8 +778,8 @@ def set_both_tool_power(client_sockets, status):
         raise RuntimeError(f"双臂末端{action}失败：" + "；".join(failures))
     print(f"左右机械臂末端已{action}")
 
-def wait_for_ft_sensors_online(feedback_connections, timeout):
-    """等待双臂六维力传感器上线；超时只打印信息，不中止程序。"""
+def wait_for_ft_sensor_data(feedback_connections, timeout):
+    """直接检查双臂能否读取有效六维力；不操作工具电源。"""
     pending_sides = set(feedback_connections)
     deadline = time.monotonic() + timeout
 
@@ -793,48 +793,26 @@ def wait_for_ft_sensors_online(feedback_connections, timeout):
             force_valid = len(force_values) == 6 and all(
                 math.isfinite(value) for value in force_values
             )
-            if int(actual[5]) == 1 and force_valid:
+            if force_valid:
                 pending_sides.remove(side)
-                print(f"{side} 力传感器已在线")
+                print(f"{side} 已读取有效六维力数据：{force_values}")
 
     if pending_sides:
         pending_text = ", ".join(sorted(pending_sides))
         print(
-            f"警告：等待力传感器上线超时（{timeout:.1f}s），"
-            f"未上线：{pending_text}；程序继续运行，离线侧暂不发布力数据"
+            f"警告：等待读取力传感器数据超时（{timeout:.1f}s），"
+            f"未读到有效数据：{pending_text}；程序继续运行"
         )
         return False
     return True
 
-def initialize_ft_sensor_power(client_sockets, feedback_connections):
-    """短暂给双臂末端上电确认力传感器在线，完成后保证尝试双侧下电。"""
-    startup_error = None
-    try:
-        print("开始给双臂末端上电，等待力传感器上线")
-        set_both_tool_power(client_sockets, 1)
-        sensors_online = wait_for_ft_sensors_online(
-            feedback_connections,
-            timeout=FT_SENSOR_STARTUP_TIMEOUT_SEC,
-        )
-        if sensors_online:
-            print("左右力传感器均已在线，开始给双臂末端下电")
-        else:
-            print("力传感器未全部在线，仍开始给双臂末端下电并继续启动")
-    except Exception as exc:
-        startup_error = exc
-
-    try:
-        set_both_tool_power(client_sockets, 0)
-    except Exception as power_off_error:
-        if startup_error is not None:
-            raise RuntimeError(
-                f"力传感器初始化失败：{startup_error}；"
-                f"随后末端下电也失败：{power_off_error}"
-            ) from power_off_error
-        raise
-
-    if startup_error is not None:
-        raise startup_error
+def initialize_ft_sensor_feedback(feedback_connections):
+    """传感器常在线，启动时只读取数据确认，不切换末端电源。"""
+    print("检查左右力传感器数据")
+    return wait_for_ft_sensor_data(
+        feedback_connections,
+        timeout=FT_SENSOR_STARTUP_TIMEOUT_SEC,
+    )
 
 DASHBOARD_COMMAND_TIMEOUT = 5.0
 DASHBOARD_POWERON_TIMEOUT = 15.0
@@ -1427,7 +1405,7 @@ try:
         feed_v = fankuis(ip, 30004)
         feedback_connections[side] = feed_v
 
-    initialize_ft_sensor_power(client_sockets, feedback_connections)
+    initialize_ft_sensor_feedback(feedback_connections)
 
     for side in ["left", "right"]:
         feed_thread1 = threading.Thread(
