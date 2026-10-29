@@ -483,7 +483,7 @@ FRAME_DIRECT_VISION_Q = [
     0.588477,
 ]
 # 每轮抓取先按这些构型寻找物体（升降绝对位置 m，腰部角度 deg）。
-# 找到物体后按最高识别点的 SJ Z 选择升降高度；无物体或不可抓时切换腰角。
+# 找到物体后先验证当前构型；不可抓时按最高识别点的 SJ Z 选择重试构型。
 GRASP_VISION_BODY_POSES = ((0.0, 10.0), (0.0, 20.0), (0.05, 10.0))
 
 
@@ -10532,16 +10532,13 @@ def _run_main(
                 return False
             log.info(
                 f"[pick-waist] 识别点最高 SJ Z={highest_sj_z:.3f}m，"
-                f"选择升降 {selected_body_poses[0][0]:.3f}m；"
-                "无物体或所有点不可抓时切换腰部角度"
+                f"先验证当前升降 {initial_body_pose[0]:.3f}m / 腰部 {initial_body_pose[1]}°；"
+                f"若不可抓，再按升降 {selected_body_poses[0][0]:.3f}m 重试"
             )
 
-            # 初始构型已处于选定高度时先复用结果，失败后再试该高度的另一腰角。
-            candidate_body_poses = (
-                (initial_body_pose,)
-                + tuple(pose for pose in selected_body_poses if pose != initial_body_pose)
-                if initial_body_pose in selected_body_poses
-                else selected_body_poses
+            # 先验证初始识别点；仅在不可抓时按 SJ Z 选出的构型重新识别。
+            candidate_body_poses = (initial_body_pose,) + tuple(
+                pose for pose in selected_body_poses if pose != initial_body_pose
             )
             for waist_attempt, (lift_height, waist_deg) in enumerate(candidate_body_poses):
                 if initial_body_pose == (lift_height, waist_deg):
