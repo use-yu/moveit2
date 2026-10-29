@@ -115,6 +115,69 @@ class Input4ForceRecoveryTests(unittest.TestCase):
                 else:
                     self.assertEqual(commands, [('left', 'resume'), ('right', 'resume')])
 
+    def test_upper_q_pre_motion_alarm_returns_recovery_reason(self):
+        names = list(g.JOINT_TARGETS['right_arm'])
+        trajectory = g.RobotTrajectory()
+        trajectory.joint_trajectory.joint_names = names
+        trajectory.joint_trajectory.points.append(
+            g.JointTrajectoryPoint(positions=[0.0] * len(names))
+        )
+        q_pre = {name: 0.0 for name in names}
+        node = SimpleNamespace(
+            get_logger=logger,
+            last_pick_failure_reason=None,
+            _upper_grasp_active=True,
+            _wait_for_driver_signal=lambda: True,
+            _select_available_place_target=lambda *args: (True, 'sw1'),
+            set_tool_do=lambda *args: True,
+            _get_joints=lambda requested, **kwargs: {name: 0.0 for name in requested},
+            _make_grasp_transfer_obstacles=lambda *args: [],
+            _execute_traj=lambda *args: (_ for _ in ()).throw(
+                g.UpperGraspMotionFailure('arm alarm')
+            ),
+        )
+        result = g.G01Demo.pick_and_return(
+            node,
+            target_pose=g.make_pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            speed_scale=0.4,
+            group='right_arm',
+            link='r_tool',
+            plan_frame=g.SCENE_FRAME,
+            joint_names=names,
+            first_return_mode=2,
+            prevalidated_pair=(q_pre, q_pre, trajectory, trajectory),
+        )
+        self.assertFalse(result)
+        self.assertEqual(node.last_pick_failure_reason, 'q_pre')
+
+    def test_upper_empty_arm_alarm_recovery_clears_and_returns_to_q1(self):
+        names = g.joint_names_for_group('dual_arm_body')
+        joint_state = {name: 0.0 for name in names}
+        cleared = []
+
+        def move_to_q1(group, speed, joint_names, waypoints, **kwargs):
+            self.assertTrue(node._upper_grasp_recovering)
+            self.assertEqual(group, 'dual_arm_body')
+            joint_state.update(dict(zip(joint_names, waypoints[0])))
+            return True
+
+        node = SimpleNamespace(
+            get_logger=logger,
+            _tool_load_state={'left': False, 'right': False},
+            _upper_grasp_recovering=False,
+            stop_upper_grasp_motion=lambda: True,
+            clear_arm_alarm=lambda side: cleared.append(side) or True,
+            _get_joints=lambda requested, **kwargs: {
+                name: joint_state[name] for name in requested
+            },
+            _send_servoj_control=lambda *args: 1,
+            _wait_for_servoj_control_state=lambda *args: True,
+            plan_execute_joint_waypoints=move_to_q1,
+        )
+        self.assertTrue(g.G01Demo.reset_empty_arms_for_upper_grasp(node, clear_alarms=True))
+        self.assertEqual(cleared, ['left', 'right'])
+        self.assertFalse(node._upper_grasp_recovering)
+
 
 if __name__ == '__main__':
     unittest.main()

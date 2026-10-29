@@ -35,7 +35,8 @@ G01 MoveIt 演示脚本
     │  空载臂沿末端局部 -Z 无碰撞检查直移 2cm → 读取新状态 → 接物臂放置
     └─ mode=0/2：抓取臂直接放置
     执行抓取轨迹时，独立规划节点同时计算当前物体的直接/交换放置轨迹；
-    每轮抓取重新识别，以便根据该轮最高 SJ Z 选择升降高度。
+    抓取后带料到识别位，识别并后台解算下一件，同时放置当前件。
+    后台未找到可抓点时，按该轮最高 SJ Z 切换构型重新识别。
     默认启用力时，输入4到yubei后不执行到fang的固定直线：读取actual_TCP_force，先100N的
     Z向导纳接近，Fz变化超过30N后切换60N并启用XY/Rz；接触后15s或
     到原fang放点基坐标系Z+2mm结束。
@@ -505,6 +506,7 @@ GRASP_VISION_CAMERA_POSITION = 0.7854
 # 抓取排序的姿态分组阈值：局部 +Z 与 moveit_base_link -Z
 # 的偏离角小于该值时，优先于其他物体抓取。
 GRASP_UPRIGHT_TILT_THRESHOLD_DEG = 30.0
+GRASP_MAX_GRASP_TILT_DEG = 50.0
 GRASP_Q1_WAIST_JOINT_INDEX = list(JOINT_TARGETS["dual_arm_body"]).index(
     "body_joint2"
 )
@@ -1957,6 +1959,23 @@ def grasp_point_sj_position(xyz_rpy: Mapping) -> tuple[float, float, float] | No
     return position
 
 
+def grasp_point_tilt_from_base_minus_z(
+    xyz_rpy: Mapping,
+) -> tuple[float, tuple[float, float, float]] | None:
+    """返回物体局部 +Z 与 moveit_base_link -Z 的夹角和局部 +Z 方向。"""
+    pose_values = xyz_rpy.get("right_body")
+    if pose_values is None:
+        return None
+    object_pose = xyz_rpy_to_pose(pose_values)
+    q = object_pose.orientation
+    axis = rotate_xyz_by_quat(0.0, 0.0, 1.0, q.x, q.y, q.z, q.w)
+    axis_norm = math.sqrt(sum(value * value for value in axis))
+    if axis_norm <= 1e-12:
+        return math.pi, axis
+    toward_base_minus_z = max(-1.0, min(1.0, -axis[2] / axis_norm))
+    return math.acos(toward_base_minus_z), axis
+
+
 def find_ungraspable_point_match(
     position: Sequence[float],
     ungraspable_points: Sequence[Sequence[float]],
@@ -2079,6 +2098,21 @@ def validate_reachable_grasp(
                 f"SJ.xyz=({point_position[0]:.4f}, {point_position[1]:.4f}, "
                 f"{point_position[2]:.4f}) 命中失败点 #{cache_index + 1}，"
                 f"距离={distance * 1000.0:.1f} mm，不再调用 IK/路径规划"
+            )
+            continue
+
+        tilt_result = grasp_point_tilt_from_base_minus_z(xyz_rpy)
+        if (
+            tilt_result is not None
+            and tilt_result[0] > math.radians(GRASP_MAX_GRASP_TILT_DEG) + 1e-12
+        ):
+            filtered_count += 1
+            if ungraspable_points is not None:
+                remember_ungraspable_point(xyz_rpy, ungraspable_points)
+            log.warning(
+                f"[reach] 点 {point_index + 1} 姿态夹角 "
+                f"{math.degrees(tilt_result[0]):.2f}° > "
+                f"{GRASP_MAX_GRASP_TILT_DEG:g}°，直接标为不可抓，不执行 IK/路径规划"
             )
             continue
 
@@ -9144,6 +9178,10 @@ class G01Demo(Node):
         execute_started = time.monotonic()
         try:
             ok = self._execute_traj(to_pre_traj)
+        except UpperGraspMotionFailure as exc:
+            self.last_pick_failure_reason = "q_pre"
+            log.error(f"[pick] 到预抓位途中机械臂运动失败，进入报警恢复：{exc}")
+            return False
         except ForceRangeAbort:
             if not self._recover_input4_force_stop():
                 self._abort_on_force_range()
@@ -9785,13 +9823,14 @@ def _run_main(
     def prioritize_upright_grasp_points(
         first_return_modes: Sequence[int],
         all_xyz_rpy: Sequence[dict],
-        ungraspable_points: Sequence[Sequence[float]],
+        ungraspable_points: list[tuple[float, float, float]],
     ) -> tuple[list[int], list[dict]]:
         """只排序未缓存点：先按物体局部 +Z 的偏离角分组。
 
         物体平放时局部 +Z 向下，与 moveit_base_link -Z 的偏离角
         为 0°。偏离角小于 30° 的点优先，然后是大于等于
         30° 的点；每组都按 moveit_base_link 中的 z 从高到低排序。
+        夹角大于 50° 的点直接记为不可抓，移到末尾且不执行规划。
         命中不可抓缓存的点不参与排序，按它们在本次视觉结果中的
         原始相对顺序放到可抓候选之后。
         """
@@ -9850,24 +9889,38 @@ def _run_main(
                 )
                 continue
 
+            tilt_rad, (axis_x, axis_y, axis_z) = grasp_point_tilt_from_base_minus_z(xyz_rpy)
+            if tilt_rad > math.radians(GRASP_MAX_GRASP_TILT_DEG) + 1e-12:
+                position, added = remember_ungraspable_point(xyz_rpy, ungraspable_points)
+                cached_match = (
+                    find_ungraspable_point_match(position, ungraspable_points)
+                    if position is not None else None
+                )
+                ranked_points.append(
+                    (
+                        3,
+                        float(original_index),
+                        original_index,
+                        first_return_mode,
+                        xyz_rpy,
+                        (axis_x, axis_y, axis_z),
+                        tilt_rad,
+                        float(pose_values[2]),
+                        cached_match,
+                    )
+                )
+                log.warning(
+                    f"[pick-order] 原顺序 {original_index}: 姿态夹角 "
+                    f"{math.degrees(tilt_rad):.2f}° > {GRASP_MAX_GRASP_TILT_DEG:g}°，"
+                    "直接标为不可抓，"
+                    + (
+                        "缺少有效 SJ.xyz，无法缓存"
+                        if position is None else
+                        ("已加入失败点缓存" if added else "已在失败点缓存")
+                    )
+                )
+                continue
             object_pose = xyz_rpy_to_pose(pose_values)
-            q = object_pose.orientation
-            axis_x, axis_y, axis_z = rotate_xyz_by_quat(
-                0.0,
-                0.0,
-                1.0,
-                q.x,
-                q.y,
-                q.z,
-                q.w,
-            )
-            axis_norm = math.sqrt(axis_x * axis_x + axis_y * axis_y + axis_z * axis_z)
-            if axis_norm <= 1e-12:
-                tilt_rad = math.pi
-            else:
-                # 与基坐标系 -Z 的单位向量 (0, 0, -1) 点积。
-                toward_base_minus_z = max(-1.0, min(1.0, -axis_z / axis_norm))
-                tilt_rad = math.acos(toward_base_minus_z)
             base_z = float(object_pose.position.z)
             # 给 30° 边界留极小数值容差，避免 acos/四元数舍入把恰好
             # 30° 的姿态误分到“<30°”组。
@@ -9913,6 +9966,13 @@ def _run_main(
                     f"距离={distance * 1000.0:.1f} mm，不参与姿态排序"
                 )
                 continue
+            if candidate_rank == 3:
+                log.warning(
+                    f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index} "
+                    f"姿态夹角 {math.degrees(tilt_rad):.2f}° 超过 "
+                    f"{GRASP_MAX_GRASP_TILT_DEG:g}°，但缺少有效 SJ.xyz，无法缓存"
+                )
+                continue
             if candidate_rank not in (0, 1) or local_plus_z_axis is None:
                 log.warning(
                     f"[pick-order] 排名 {sorted_index}: 原顺序 {original_index} "
@@ -9938,6 +9998,7 @@ def _run_main(
             f"偏离 moveit_base_link -Z <{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}°/"
             f"≥{GRASP_UPRIGHT_TILT_THRESHOLD_DEG:g}° 分组，每组再按 "
             "moveit_base_link z 从高到低；"
+            f">{GRASP_MAX_GRASP_TILT_DEG:g}° 的点直接不可抓；"
             f"{cached_count} 个缓存不可抓点未参与姿态排序并放在末尾"
         )
         return sorted_modes, sorted_xyz_rpy
@@ -9970,7 +10031,12 @@ def _run_main(
                 if point_position is not None
                 else None
             )
-            if cached_match is not None:
+            tilt_result = grasp_point_tilt_from_base_minus_z(xyz_rpy)
+            too_tilted = (
+                tilt_result is not None
+                and tilt_result[0] > math.radians(GRASP_MAX_GRASP_TILT_DEG) + 1e-12
+            )
+            if cached_match is not None or too_tilted:
                 cylinder_color = UNGRASPABLE_CYLINDER_COLOR
                 z_axis_color = UNGRASPABLE_Z_AXIS_COLOR
                 color_label = "black"
@@ -10004,7 +10070,7 @@ def _run_main(
             f"[pick-display] IK 验证前已显示 {shown_count}/{len(all_xyz_rpy)} "
             "个视觉物体的圆柱和 +Z 方向；"
             "可抓候选交替使用橙/蓝色，"
-            f"缓存不可抓点={cached_count} 个（黑色）"
+            f"不可抓点={cached_count} 个（黑色）"
         )
 
     def prompt_exit(message: str) -> bool:
@@ -10440,6 +10506,8 @@ def _run_main(
         frame_recognition_agv_pose = None
         return True
 
+    next_grasp_cache: dict[str, object] = {"future": None}
+
     def run_one_grasp(
         ungraspable_points: list[tuple[float, float, float]],
     ) -> bool | None:
@@ -10460,6 +10528,7 @@ def _run_main(
             node.last_pick_failure_reason = "no_place"
             log.info("[pick] SW1~SW4 均无空位，结束连续抓取，不执行视觉识别")
             return False
+        pipeline_enabled = len(empty_place_slots) > 1
         # --- 2. 初始识别 + 按最高 SJ Z 选择升降/腰部 + 可达性验证 ---
         targets = JOINT_TARGETS["dual_arm_body"]
         joint_names = list(targets.keys())
@@ -10469,6 +10538,32 @@ def _run_main(
         first_return_modes: list[int] = []
         all_xyz_rpy: list[dict] = []
         q1_for_waist = list(GRASP_Q1)
+        initial_vision_pose = None
+        initial_body_pose = None
+        cached_validation_failed = False
+
+        cached_future = next_grasp_cache.pop("future", None)
+        if isinstance(cached_future, Future):
+            log.info("[pipeline] 已回到识别位置，等待下一物体后台解算结果")
+            try:
+                cached_result = cached_future.result()
+            except Exception as exc:
+                report_runtime_exception(exc, "run_one_grasp")
+                log.error(f"[pipeline] 下一物体后台解算异常: {exc}")
+                cached_result = None
+            if cached_result is not None:
+                initial_vision_pose = (cached_result["modes"], cached_result["poses"])
+                initial_body_pose = (cached_result["lift_height"], cached_result["waist_deg"])
+                q1_for_waist[GRASP_Q1_LIFT_JOINT_INDEX] = initial_body_pose[0]
+                q1_for_waist[GRASP_Q1_WAIST_JOINT_INDEX] = math.radians(initial_body_pose[1])
+                reachable = cached_result["reachable"]
+                if reachable is not None:
+                    first_return_modes, all_xyz_rpy = initial_vision_pose
+                    selected_lift_height, selected_waist_deg = initial_body_pose
+                    log.info("[pipeline] 下一物体后台解算有解，直接使用该识别结果和抓取轨迹")
+                else:
+                    cached_validation_failed = True
+                    log.info("[pipeline] 下一物体后台解算无可抓点，按最高 SJ Z 切换识别构型")
 
         def recognize_at_body_pose(lift_height: float, waist_deg: float):
             nonlocal q1_for_waist
@@ -10501,22 +10596,21 @@ def _run_main(
             return vision_pose
 
         if reachable is None:
-            initial_vision_pose = None
-            initial_body_pose = None
-            for search_index, (lift_height, waist_deg) in enumerate(GRASP_VISION_BODY_POSES, start=1):
-                log.info(
-                    f"[pick-waist] 初始识别第 {search_index}/{len(GRASP_VISION_BODY_POSES)} 组："
-                    f"升降 {lift_height:.3f}m / 腰部 {waist_deg}°"
-                )
-                vision_pose = recognize_at_body_pose(lift_height, waist_deg)
-                if vision_pose is None:
-                    return False
-                if vision_pose[1]:
-                    initial_vision_pose = vision_pose
-                    initial_body_pose = (lift_height, waist_deg)
-                    break
-                cleanup_grasp_display()
-                log.warning(f"[pick-waist] 升降 {lift_height:.3f}m / 腰部 {waist_deg}° 未识别到物体")
+            if initial_vision_pose is None:
+                for search_index, (lift_height, waist_deg) in enumerate(GRASP_VISION_BODY_POSES, start=1):
+                    log.info(
+                        f"[pick-waist] 初始识别第 {search_index}/{len(GRASP_VISION_BODY_POSES)} 组："
+                        f"升降 {lift_height:.3f}m / 腰部 {waist_deg}°"
+                    )
+                    vision_pose = recognize_at_body_pose(lift_height, waist_deg)
+                    if vision_pose is None:
+                        return False
+                    if vision_pose[1]:
+                        initial_vision_pose = vision_pose
+                        initial_body_pose = (lift_height, waist_deg)
+                        break
+                    cleanup_grasp_display()
+                    log.warning(f"[pick-waist] 升降 {lift_height:.3f}m / 腰部 {waist_deg}° 未识别到物体")
 
             if initial_vision_pose is None:
                 node.publish_error(8, "全部初始识别构型均未识别到物体")
@@ -10544,6 +10638,10 @@ def _run_main(
                 if initial_body_pose == (lift_height, waist_deg):
                     vision_pose = initial_vision_pose
                     log.info(f"[pick-waist] 复用升降 {lift_height:.3f}m / 腰部 {waist_deg}° 的初始识别结果")
+                    if cached_validation_failed:
+                        cleanup_grasp_display()
+                        log.warning("[pipeline] 当前构型的后台可达性验证已失败，切换到下一识别构型")
+                        continue
                 else:
                     log.info(
                         f"[pick-waist] 选定高度第 {waist_attempt + 1}/{len(candidate_body_poses)} 组："
@@ -10652,6 +10750,38 @@ def _run_main(
         if prompt_exit("按回车继续，输入 q 回车退出并移除深框 …"):
             return None
 
+        def start_next_grasp_plan() -> None:
+            if sum(node._place_slot_is_empty(name) for name in PLACE_SLOT_MASKS) <= 1:
+                log.info("[pipeline] 当前放置后将无剩余空位，不预解算下一物体")
+                return
+            vision_pose = read_vision_object_pose(
+                node, log, sim_mode=sim_mode, sort_by_sj_z=False,
+            )
+            if vision_pose is None or not vision_pose[1]:
+                log.warning("[pipeline] 下一物体未识别到有效点，下一轮按初始构型重新识别")
+                return
+            modes, poses = prioritize_upright_grasp_points(
+                vision_pose[0], vision_pose[1], ungraspable_points,
+            )
+            waist_deg = selected_waist_deg
+            lift_height = selected_lift_height
+            start_state = dict(zip(joint_names, q1_for_waist))
+
+            def solve_next() -> dict:
+                result = validate_reachable_grasp(
+                    planner_node, poses, speed_scale=0.4,
+                    cutoff_joint_names=joint_names,
+                    ungraspable_points=list(ungraspable_points),
+                    planning_start_joints=start_state,
+                )
+                return {
+                    "reachable": result, "modes": modes, "poses": poses,
+                    "waist_deg": waist_deg, "lift_height": lift_height,
+                }
+
+            next_grasp_cache["future"] = planner_pool.submit(solve_next)
+            log.info("[pipeline] 已提交下一物体后台 IK/Cartesian/OMPL 解算")
+
         log.info(f"开始尝试{pick_label}抓取")
         if not node.pick_and_return(
             target_pose=pick_target_pose,
@@ -10672,11 +10802,25 @@ def _run_main(
             ),
             background_planner=planner_node,
             planner_pool=planner_pool,
-            recognition_state=None,
-            start_next_grasp_plan=None,
+            recognition_state=(
+                dict(zip(joint_names, q1_for_waist)) if pipeline_enabled else None
+            ),
+            start_next_grasp_plan=start_next_grasp_plan if pipeline_enabled else None,
         ):
             failure_reason = node.last_pick_failure_reason
-            if failure_reason == "q_pre" and not node._upper_grasp_active:
+            if failure_reason == "q_pre" and node._upper_grasp_active:
+                log.warning(
+                    "[pick][q-pre-recovery] 上位机模式到预抓位失败，"
+                    f"末端持料状态={node._tool_load_state}；"
+                    "仅在双末端已确认空载时清错并复位"
+                )
+                if node.reset_empty_arms_for_upper_grasp(clear_alarms=True):
+                    node.last_pick_failure_reason = "q_pre_alarm_recovered"
+                    log.warning("[pick][q-pre-recovery] 已清错并从实测位置复位到 GRASP_Q1，继续下一次抓取")
+                else:
+                    node.last_pick_failure_reason = "q_pre_recovery_failed"
+                    log.error("[pick][q-pre-recovery] 上位机模式报警恢复失败，保持停止")
+            elif failure_reason == "q_pre":
                 recovery_side = tool_side_for_link(pick_link)
                 recovery_q1 = list(GRASP_Q1)
                 recovery_q1[GRASP_Q1_LIFT_JOINT_INDEX] = selected_lift_height
@@ -10801,15 +10945,20 @@ def _run_main(
             try:
                 grasp_result = run_one_grasp(ungraspable_points)
             finally:
+                pending_next = next_grasp_cache.get("future")
                 cleanup_grasp_display(
                     remove_scene_objects=(
                         node.last_pick_failure_reason
                         not in {"no_place", "no_place_signal"}
+                        and not (
+                            isinstance(pending_next, Future)
+                            and not pending_next.done()
+                        )
                     )
                 )
 
             if node._upper_grasp_active and not grasp_result and node.last_pick_failure_reason not in (
-                "no_place", "q_pre_force_recovered", "suction_failed",
+                "no_place", "q_pre_alarm_recovered", "q_pre_force_recovered", "suction_failed",
             ):
                 log.error("[upper-grasp] 抓取失败，交由命令流程判断持料状态并处理退回")
                 return False
@@ -10892,6 +11041,15 @@ def _run_main(
         try:
             return _run_grasps_until_no_empty_slot(ungraspable_points)
         finally:
+            stale_future = next_grasp_cache.pop("future", None)
+            if isinstance(stale_future, Future):
+                stale_future.cancel()
+                if not stale_future.cancelled():
+                    try:
+                        stale_future.result()
+                    except Exception as exc:
+                        report_runtime_exception(exc, "run_grasps_until_no_empty_slot")
+                        log.warning(f"[pipeline] 清理后台规划任务时收到异常: {exc}")
             cached_count = len(ungraspable_points)
             ungraspable_points.clear()
             log.info(
@@ -12711,7 +12869,9 @@ def _run_main(
                         if stage == 2:
                             log.error("[upper-grasp] 深框识别失败，直接回复失败并继续等待命令")
                         else:
-                            keep_running = failed(motion_error=False)
+                            keep_running = failed(
+                                motion_error=(node.last_pick_failure_reason == "q_pre_recovery_failed")
+                            )
                         break
                     log.info(f"[upper-grasp] 步骤 {stage} 完成")
                     if stage == 5:
