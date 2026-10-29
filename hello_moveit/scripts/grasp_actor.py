@@ -60,7 +60,7 @@ G01 MoveIt 演示脚本
     接触后启用XY/Rz及10s局部XY螺旋期望力，幅值30→90N、频率0.5Hz；
     接触超时或到配置的放置停止高度时停止该臂。
     双臂都完成后下电，从实测位置重新规划同步直线退回预备位；
-    保留原始 Fz 下降超过210N及传感器量程保护。
+    原始 Fz 下降超过210N及传感器量程超限时红色打印错误，继续执行。
     优先 SW1+SW3，目标固定为 (1,3)；SW2+SW4
     目标固定为 (2,4)，不记录已经放过的位置。循环正常结束后，
     dual_arm_body 复位到 MOVE_TO_GRASP_RESET_Q。
@@ -85,7 +85,7 @@ G01 MoveIt 演示脚本
 
 控制方式：
   默认：等待上位机话题命令。
-  --noforces：禁用力传感器读取、自检、吸附检测及力保护，输入4/7使用原直线放置。
+  --noforces：禁用力传感器读取、自检、吸附检测及超限提示，输入4/7使用原直线放置。
   --keyboard：不等待上位机命令，每轮通过数字菜单选择要执行的流程。
   --interactive：运动流程中的人工确认点也等待按回车；可与 --keyboard 同时使用。
 
@@ -185,7 +185,7 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 # 输入4/7放置共用导纳：与 insert.py 独立实现，参数在这里集中修改。
 INPUT4_ADMITTANCE = {
     "period": 0.03, "feedback_timeout": 0.2, "startup_timeout": 5.0,
-    "approach_force": 100.0, "contact_force": 100.0, "force_threshold": 30.0,
+    "approach_force": 80.0, "contact_force": 60.0, "force_threshold": 30.0,
     "down_direction": 1.0, "reaction_sign": -1.0,
     "contact_duration": 15.0, "approach_timeout": 30.0,
     "M": [20.0, 20.0, 20.0], "B": [5000.0, 5000.0, 5000.0], "K": [0.0, 0.0, 0.0],
@@ -257,6 +257,7 @@ TRAJECTORY_CACHE_VERSION = 2  # 固定坐标系和完整预计状态规划；旧
 # 用户可调参数（改这里即可，无需动下面逻辑）
 # =============================================================================
 GREEN = '\033[32m'
+RED = '\033[31m'
 RESET = '\033[0m'
 # 第一步：关节空间规划使用哪个 SRDF 组
 
@@ -3826,6 +3827,7 @@ class G01Demo(Node):
         # 后台节点只做规划；保护和硬件停臂由前台节点统一执行。
         self._force_range_enabled = upper_communication and use_force_sensors
         self._force_range_fault: str | None = None
+        self._force_range_warning_active: set[str] = set()
         self._force_range_samples: dict[str, tuple[float, Sequence[float]]] = {}
         self._force_task_active = False
         self._force_stop_requests: dict[str, int] = {}
@@ -4496,18 +4498,14 @@ class G01Demo(Node):
             violation = ft_range_violation(
                 msg.data, ignore_limits=getattr(self, "_input4_retreat_ignore_limits", False),
             )
-            if violation is not None and self._force_range_fault is None:
-                self._force_range_fault = f"{side} 臂力传感器保护：{violation}"
-                self.get_logger().error(self._force_range_fault)
-                self._motor_command_pub.publish(UInt8(data=1))
-                self._force_stop_requests = {
-                    arm: self._send_servoj_control(arm, "stop")
-                    for arm in ("left", "right")
-                }
-                for handle in list(self._force_action_goals):
-                    handle.cancel_goal_async()
-            if self._force_task_active:
-                self._abort_on_force_range()
+            if not hasattr(self, "_force_range_warning_active"):
+                self._force_range_warning_active = set()
+            if violation is not None:
+                if side not in self._force_range_warning_active:
+                    print(f"{RED}[ERROR] {side} 臂力传感器超限：{violation}；仅记录，不停止运动{RESET}")
+                    self._force_range_warning_active.add(side)
+            else:
+                self._force_range_warning_active.discard(side)
         if len(msg.data) < 3:
             self.get_logger().error(
                 f"{side} 力传感器消息长度不足：{len(msg.data)} < 3"
@@ -4524,7 +4522,6 @@ class G01Demo(Node):
         if (
             guard is None
             or not guard["monitoring"]
-            or guard["contact"]
             or side not in guard["sides"]
         ):
             return
@@ -4542,32 +4539,25 @@ class G01Demo(Node):
             and in_first_zone
             and force_drop > guard["near_force_drop_threshold"]
         )
+        warned_sides = guard.setdefault("threshold_warning_sides", set())
         if not whole_path_contact and not first_zone_contact:
+            warned_sides.discard(side)
             return
-
-        guard["contact"] = True
-        guard["force_z"] = force_z
-        guard["force_drop"] = force_drop
-        guard["travelled"] = travelled
-        guard["trigger"] = "all" if whole_path_contact else "first_zone"
-        self._motor_command_pub.publish(UInt8(data=1))
-        guard["contact_side"] = side
-        guard["stop_request_ids"] = {
-            stop_side: self._send_servoj_control(stop_side, "stop")
-            for stop_side in guard["sides"]
-        }
+        if side in warned_sides:
+            return
+        warned_sides.add(side)
         threshold = (
             APPROACH_FORCE_Z_DROP_ALL_THRESHOLD
             if whole_path_contact
             else guard["near_force_drop_threshold"]
         )
-        self.get_logger().error(
-            f"[pick][force-guard] {side} 臂{guard['stage_label']}中检测到障碍物："
+        print(f"{RED}[ERROR] " + (
+            f"[pick][force-guard] {side} 臂{guard['stage_label']}中 Fz 下降超阈值："
             f"已行进约 {travelled * 100.0:.2f} cm，"
             f"{guard['baseline_label']} Fz={baseline_force_z:.6f} N，"
             f"当前 Fz={force_z:.6f} N，减小={force_drop:.6f} N > "
-            f"{threshold:.3f} N；已发布 {MOTOR_COMMAND_TOPIC}=1 并立即请求 ServoJ 停止"
-        )
+            f"{threshold:.3f} N；仅记录，不停止运动"
+        ) + f"{RESET}")
 
     def _on_servoj_control_state(self, msg: String) -> None:
         """缓存 servoj_30ms.py 对停止/恢复命令的确认。"""
@@ -8052,6 +8042,7 @@ class G01Demo(Node):
                 log.info(f"[place][admittance] {side} 初始 Fx/Fy/Fz/Mz={controller.baseline.tolist()}；开始100N Z导纳")
             next_tick = time.monotonic()+c["period"]
             contact_logged = set()
+            force_drop_warned = set()
             while rclpy.ok():
                 now = time.monotonic()
                 self._executor.spin_once(timeout_sec=min(0.01, max(0., next_tick-now)))
@@ -8066,14 +8057,19 @@ class G01Demo(Node):
                             or now-self._input4_wrench_time[side] > c["feedback_timeout"]
                             or now-self._input4_joint_time[side] > c["feedback_timeout"]):
                         raise ValueError(f"{side} 导纳力或关节反馈超时/无效")
-                    # 保留输入7原有整段 Fz 下降210N保护，使用原始FTSensor通道。
+                    # 输入7使用原始 FTSensor 通道监测整段 Fz 下降。
                     if force_baselines is not None:
                         raw_z = self._ft_sensor_z[side]
                         if raw_z is None or not math.isfinite(raw_z):
                             raise ValueError(f"{side} 原始Fz反馈无效")
                         if force_baselines[side]-raw_z > APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:
-                            self._motor_command_pub.publish(UInt8(data=1))
-                            raise ValueError(f"{side} 放置Fz下降超过210N，停止双臂导纳")
+                            if side not in force_drop_warned:
+                                print(f"{RED}[ERROR] {side} 放置Fz下降超过"
+                                      f"{APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:g}N；"
+                                      f"仅记录，继续导纳{RESET}")
+                                force_drop_warned.add(side)
+                        else:
+                            force_drop_warned.discard(side)
                     model = controller.model
                     q = np.array([self._joints[name] for name in model.joint_names])
                     if not controller.finished:
@@ -9745,7 +9741,7 @@ def _run_main(
     planner_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grasp-plan")
     log = node.get_logger()
     if not use_force_sensors:
-        log.info("[forces] 已禁用力传感器：不读取力数据，不执行力自检、吸附检测和力保护")
+        log.info("[forces] 已禁用力传感器：不读取力数据，不执行力自检、吸附检测和超限提示")
     if sim_mode:
         log.info(
             "[sim] 仿真模式：跳过工具电源服务，视觉使用固定 viewer pose，"
@@ -11566,7 +11562,7 @@ def _run_main(
                 log.info(
                     f"[unload] 放置下降前 Fz：左臂={left_force_z:.6f} N，"
                     f"右臂={right_force_z:.6f} N；任一侧全程下降超过 "
-                    f"{APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:.3f} N 判定碰撞"
+                    f"{APPROACH_FORCE_Z_DROP_ALL_THRESHOLD:.3f} N 只打印错误，不停止"
                 )
                 # 记录到位后的实际工具位姿；导纳会调整末端，返回不能反放下降缓存。
                 actual_yubei = node._get_joints(dual_body_joint_names, wait_new=True)
@@ -12637,7 +12633,9 @@ def _run_main(
         if step == 6:
             return prepare_unload_scene(body_only=True)
         if step == 7:
-            return run_unload_cycle()
+            if not run_unload_cycle():
+                return False
+            return execute_step(15, source, payload)
         if step == 8:
             # 碰撞模型清理是尽力而为；失败既不阻止导航，也不令步骤失败。
             remove_cached_unload_scene()

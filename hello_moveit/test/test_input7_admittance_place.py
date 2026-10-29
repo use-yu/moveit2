@@ -91,12 +91,12 @@ class DualAdmittanceTests(unittest.TestCase):
                     if case == 'force_limit' and clock.spins > 5:
                         node._ft_sensor_z['right'] = -250.
                 node._executor = NS(spin_once=spin_once)
-                with patch.object(g, 'INPUT4_ADMITTANCE', config), \
+                with patch('builtins.print'), patch.object(g, 'INPUT4_ADMITTANCE', config), \
                      patch.object(g.time, 'monotonic', lambda: clock.value), \
                      patch.object(g.rclpy, 'ok', return_value=True):
                     result = g.G01Demo._execute_input4_admittance(node, 'dual_arm',
                         height_stop=height_stops, force_baselines={'left': 0., 'right': 0.})
-                self.assertEqual(result, case == 'success')
+                self.assertEqual(result, case != 'stale')
                 self.assertIsNone(node._input4_active_side)
                 self.assertTrue(messages)
                 for msg in messages:
@@ -104,13 +104,13 @@ class DualAdmittanceTests(unittest.TestCase):
                     np.testing.assert_allclose(msg.position[:6], initial)
                     np.testing.assert_array_equal(msg.velocity[:6], np.zeros(6))
                 np.testing.assert_array_equal(messages[-1].velocity, np.zeros(12))
-                if case == 'success':
+                if case != 'stale':
                     self.assertGreater(len(messages), 3)
                     self.assertTrue(any(np.linalg.norm(msg.velocity[6:]) > 0 for msg in messages))
                     self.assertEqual(stops, [])
                 else:
                     self.assertEqual(stops, [('left', 'stop'), ('right', 'stop')])
-                self.assertEqual(motor, [1] if case == 'force_limit' else [])
+                self.assertEqual(motor, [])
 
     def test_height_targets_use_validated_descent_endpoint_and_actual_bases(self):
         names = g.joint_names_for_group('dual_arm')

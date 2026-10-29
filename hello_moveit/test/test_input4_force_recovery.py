@@ -6,6 +6,52 @@ from test_input4_admittance_place import g, logger
 
 
 class Input4ForceRecoveryTests(unittest.TestCase):
+    def test_force_limit_logs_without_stopping_or_canceling_motion(self):
+        errors = []
+        node = SimpleNamespace(
+            use_force_sensors=True, _ft_sensor_z={'left': None},
+            _ft_sensor_count={'left': 0}, _force_range_enabled=True,
+            _force_range_fault=None, _force_task_active=True,
+            _force_range_warning_active=set(), _force_range_samples={},
+            _active_approach_guard=None,
+            get_logger=lambda: SimpleNamespace(error=errors.append),
+            _send_servoj_control=lambda *args: self.fail('unexpected stop command'),
+            _motor_command_pub=SimpleNamespace(publish=lambda *args: self.fail('unexpected motor command')),
+            _force_action_goals=[SimpleNamespace(cancel_goal_async=lambda: self.fail('unexpected cancellation'))],
+        )
+        overloaded = SimpleNamespace(data=[0., 0., -185.6, 0., 0., 0.])
+        with patch('builtins.print', side_effect=lambda message: errors.append(message)):
+            g.G01Demo._on_ft_sensor(node, overloaded, 'left')
+            g.G01Demo._on_ft_sensor(node, overloaded, 'left')
+            g.G01Demo._on_ft_sensor(node, SimpleNamespace(data=[0.]*6), 'left')
+            g.G01Demo._on_ft_sensor(node, overloaded, 'left')
+        self.assertEqual(len(errors), 2)
+        self.assertIsNone(node._force_range_fault)
+        self.assertTrue(all(message.startswith(g.RED) and message.endswith(g.RESET) for message in errors))
+        self.assertEqual(node._ft_sensor_count['left'], 4)
+
+    def test_approach_force_drop_only_prints_without_stopping(self):
+        errors = []
+        guard = {
+            'monitoring': True, 'sides': ('left',), 'baseline_force_z_by_side': {'left': 0.},
+            'progress_fraction': 0., 'total_distance': .1,
+            'near_force_drop_threshold': 60., 'stage_label': '直线抓取',
+            'baseline_label': 'q_pre', 'contact': False,
+        }
+        node = SimpleNamespace(
+            use_force_sensors=True, _ft_sensor_z={'left': None},
+            _ft_sensor_count={'left': 0}, _force_range_enabled=False,
+            _active_approach_guard=guard,
+            _send_servoj_control=lambda *args: self.fail('unexpected stop command'),
+            _motor_command_pub=SimpleNamespace(publish=lambda *args: self.fail('unexpected motor command')),
+        )
+        with patch('builtins.print', side_effect=lambda message: errors.append(message)):
+            for force_z in (-70., -70., 0., -220.):
+                g.G01Demo._on_ft_sensor(node, SimpleNamespace(data=[0., 0., force_z]), 'left')
+        self.assertEqual(len(errors), 2)
+        self.assertFalse(guard['contact'])
+        self.assertTrue(all(message.startswith(g.RED) and message.endswith(g.RESET) for message in errors))
+
     def test_force_and_torque_limits(self):
         for axis in range(6):
             limit = 180. if axis < 3 else 10.
