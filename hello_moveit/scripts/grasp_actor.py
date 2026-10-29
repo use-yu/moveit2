@@ -1079,6 +1079,7 @@ PLACE_JOINTS = {
 
 # 抓取流程默认参数力传感器抓取失败判断参数
 PRE_GRASP_OFFSET = -0.1  # 预备抓取点沿末端坐标系 z 轴外移的距离 [m]
+GRASP_REVERSE_APPROACH_MAX_START_ERROR = 0.02  # 反放 approach 前允许的末端位置误差 [m]
 GRASP_FORCE_Z_INCREASE_THRESHOLD = 20.0  # q_pre 吸附后相对吸附前 Fz 增量阈值 [N]
 # 步骤 4 内不可抓点按 SJ 坐标系 xyz 去重；容差用于吸收多次视觉的小幅抖动。
 # 缓存在步骤 4 每次执行结束后清空，不影响下一批次。
@@ -4779,6 +4780,30 @@ class G01Demo(Node):
     def _has_any_empty_place_slot(self) -> bool:
         return any(self._place_slot_is_empty(name) for name in PLACE_SLOT_MASKS)
 
+    def confirm_all_place_slots_full(self) -> tuple[bool, set[str]] | None:
+        """用连续两帧新 SW 信号确认四个放置位均有料。"""
+        filled_slots: set[str] = set()
+        for frame_index in (1, 2):
+            if not self._wait_for_driver_signal(require_new=True):
+                self.get_logger().error(
+                    f"[pick][place-confirm] 第 {frame_index}/2 帧 SW 信号未更新，"
+                    "不能判定抓满"
+                )
+                return None
+            filled_slots = {
+                name for name in PLACE_SLOT_MASKS
+                if self._place_slot_has_material(name)
+            }
+            if len(filled_slots) != len(PLACE_SLOT_MASKS):
+                empty_slots = [name.upper() for name in PLACE_SLOT_MASKS if name not in filled_slots]
+                self.get_logger().warning(
+                    f"[pick][place-confirm] 第 {frame_index}/2 帧仍有空位："
+                    f"{', '.join(empty_slots)}，继续抓取"
+                )
+                return False, filled_slots
+        self.get_logger().info("[pick][place-confirm] 连续两帧新 SW 信号确认 SW1~SW4 均有料")
+        return True, filled_slots
+
     def _on_upper_command(self, msg: String, command_topic: str) -> None:
         """解析并排队上位机命令；return_init_pose 允许空字符串。"""
         log = self.get_logger()
@@ -5046,8 +5071,8 @@ class G01Demo(Node):
         target_pose: Pose,
         plan_frame: str,
         joint_names: Sequence[str],
-    ) -> None:
-        """用实际 joint_states 做 FK，并打印实际末端与目标位姿的误差。"""
+    ) -> float | None:
+        """用实际 joint_states 做 FK，打印并返回末端位置误差（m）。"""
         log = self.get_logger()
         joints = self._get_joints(list(joint_names), wait_new=True, timeout=3.0)
         if joints is None:
@@ -5082,6 +5107,7 @@ class G01Demo(Node):
             f"|pos|={pos_err * 1000.0:.2f} mm, "
             f"orientation={math.degrees(ori_err):.3f} deg{RESET}"
         )
+        return pos_err
 
     def _pose_in_frame(
         self,
@@ -7227,6 +7253,48 @@ class G01Demo(Node):
         finally:
             self._input4_retreat_ignore_limits = False
 
+    def recover_input4_approach_alarm(
+        self,
+        *,
+        side: str,
+        group: str,
+        link: str,
+        pre_pose: Pose,
+        joint_names: Sequence[str],
+        plan_frame: str,
+        speed_scale: float,
+    ) -> bool:
+        """直线接近报警后保持工具上电，清错并从实测位置直退 q_pre。"""
+        log = self.get_logger()
+        self._upper_grasp_recovering = True
+        try:
+            if not self.stop_upper_grasp_motion():
+                log.error("[pick][approach-recovery] 无法确认旧轨迹和 ServoJ 已停止，禁止退回")
+                return False
+            for attempt in range(1, 4):
+                if self.clear_arm_alarms_for_recovery((side,), "抓取直线接近报警"):
+                    break
+                if attempt == 3:
+                    log.error("[pick][approach-recovery] 三次清错均失败，保持工具上电及停止")
+                    return False
+                time.sleep(0.5)
+            for resume_side in (side, "left" if side == "right" else "right"):
+                request_id = self._send_servoj_control(resume_side, "resume")
+                if not self._wait_for_servoj_control_state(resume_side, "resume", request_id):
+                    log.error(
+                        f"[pick][approach-recovery] {resume_side} ServoJ 恢复失败，禁止退回"
+                    )
+                    return False
+            if not self._return_to_pre_after_approach_contact(
+                group, link, pre_pose, joint_names, plan_frame, speed_scale,
+            ):
+                log.error("[pick][approach-recovery] 从实测位置直退 q_pre 失败，保持工具上电")
+                return False
+            log.warning("[pick][approach-recovery] 已清错并直退 q_pre，保持工具上电，继续检查吸附")
+            return True
+        finally:
+            self._upper_grasp_recovering = False
+
     def _return_to_pre_after_approach_contact(
         self,
         group: str,
@@ -9248,7 +9316,8 @@ class G01Demo(Node):
         self.wait_for_operator()
 
         approach_distance = _pose_distance(pre_pose, target_pose)
-        force_range_retreated = False
+        already_retreated_to_pre = False
+        approach_alarm_retreated = False
         try:
             approach_result = self._execute_approach_with_force_guard(
                 approach_traj,
@@ -9256,6 +9325,22 @@ class G01Demo(Node):
                 force_z_before,
                 approach_distance,
             )
+        except UpperGraspMotionFailure as exc:
+            log.error(f"[pick] 直线接近时机械臂报警，开始清错并从实测位置直退 q_pre：{exc}")
+            if not self.recover_input4_approach_alarm(
+                side=tool_side,
+                group=group,
+                link=link,
+                pre_pose=pre_pose,
+                joint_names=joint_names,
+                plan_frame=plan_frame,
+                speed_scale=speed_scale,
+            ):
+                self.last_pick_failure_reason = "approach_alarm_recovery_failed"
+                return False
+            already_retreated_to_pre = True
+            approach_alarm_retreated = True
+            approach_result = "success"
         except ForceRangeAbort:
             if not self._continue_input4_retreat_after_force_stop(
                 group, link, pre_pose, joint_names, plan_frame, speed_scale,
@@ -9263,7 +9348,7 @@ class G01Demo(Node):
                 self.last_pick_failure_reason = "approach_force_guard_failed"
                 self._abort_on_force_range()
                 return False
-            force_range_retreated = True
+            already_retreated_to_pre = True
             approach_result = "success"
             log.warning("[pick] 直线抓取力保护后已从实测位置直退 q_pre，保持上电并检查吸附")
         if approach_result == "contact":
@@ -9292,39 +9377,96 @@ class G01Demo(Node):
             )
             return False
 
-        if approach_result == "safety_failed":
-            log.error(
-                "[pick] 障碍物接触后的停止/轨迹终止/恢复确认失败；"
-                "不执行自动退回，停止本批次"
-            )
-            self.last_pick_failure_reason = "approach_force_guard_failed"
-            if not self.set_tool_do(tool_side, 0):
-                log.error(f"[pick] 安全停止失败后{tool_label}工具下电失败")
-            return False
-
         if approach_result != "success":
-            log.error("[pick] 直线接近执行失败")
-            if not self.set_tool_do(tool_side, 0):
-                log.error(f"[pick] 直线接近失败后{tool_label}工具下电失败")
-            return False
+            log.error(
+                f"[pick] 直线接近返回 {approach_result}，先确认停止并清错，"
+                "保持工具上电从实测位置直退 q_pre"
+            )
+            if not self.recover_input4_approach_alarm(
+                side=tool_side,
+                group=group,
+                link=link,
+                pre_pose=pre_pose,
+                joint_names=joint_names,
+                plan_frame=plan_frame,
+                speed_scale=speed_scale,
+            ):
+                self.last_pick_failure_reason = "approach_alarm_recovery_failed"
+                return False
+            already_retreated_to_pre = True
+            approach_alarm_retreated = True
 
-        if not force_range_retreated:
-            self._log_actual_fk_error(
+        if not already_retreated_to_pre:
+            target_position_error = self._log_actual_fk_error(
                 "[pick] 3/9",
                 link=link,
                 target_pose=target_pose,
                 plan_frame=plan_frame,
                 joint_names=joint_names,
             )
-            self.wait_for_operator("[pick] 3/9  到达抓取位置，工具已上电，按回车继续 …")
+            if (
+                target_position_error is None
+                or target_position_error > GRASP_REVERSE_APPROACH_MAX_START_ERROR
+            ):
+                log.warning(
+                    "[pick] 接近轨迹结束位置与实测末端不一致"
+                    + (
+                        "（无法读取实际 FK）" if target_position_error is None else
+                        f"（位置误差 {target_position_error * 1000.0:.2f} mm > "
+                        f"{GRASP_REVERSE_APPROACH_MAX_START_ERROR * 1000.0:.0f} mm）"
+                    )
+                    + "，不反放原轨迹；先确认停止、清错，再从实测位置直退 q_pre"
+                )
+                if not self.recover_input4_approach_alarm(
+                    side=tool_side,
+                    group=group,
+                    link=link,
+                    pre_pose=pre_pose,
+                    joint_names=joint_names,
+                    plan_frame=plan_frame,
+                    speed_scale=speed_scale,
+                ):
+                    self.last_pick_failure_reason = "approach_alarm_recovery_failed"
+                    return False
+                already_retreated_to_pre = True
+                approach_alarm_retreated = True
+            else:
+                self.wait_for_operator("[pick] 3/9  到达抓取位置，工具已上电，按回车继续 …")
 
-        log.info("[pick] 4/9  反向播放 approach，直线复位回 q_pre")
-        retreat_approach = self._reverse_trajectory(approach_traj)
-        if not force_range_retreated:
+        if already_retreated_to_pre:
+            log.info("[pick] 4/9  已从实测位置直退 q_pre，跳过 approach 反向轨迹")
+        else:
+            log.info("[pick] 4/9  反向播放 approach，直线复位回 q_pre")
+            retreat_approach = self._reverse_trajectory(approach_traj)
             try:
                 if not self._execute_traj(retreat_approach):
-                    log.error("[pick] 反向播放 approach 失败")
+                    log.error("[pick] 反向播放 approach 返回失败，从实测位置重新直退 q_pre")
+                    if not self.recover_input4_approach_alarm(
+                        side=tool_side,
+                        group=group,
+                        link=link,
+                        pre_pose=pre_pose,
+                        joint_names=joint_names,
+                        plan_frame=plan_frame,
+                        speed_scale=speed_scale,
+                    ):
+                        self.last_pick_failure_reason = "approach_alarm_recovery_failed"
+                        return False
+                    approach_alarm_retreated = True
+            except UpperGraspMotionFailure as exc:
+                log.error(f"[pick] 反向播放 approach 时机械臂报警，从实测位置继续直退 q_pre：{exc}")
+                if not self.recover_input4_approach_alarm(
+                    side=tool_side,
+                    group=group,
+                    link=link,
+                    pre_pose=pre_pose,
+                    joint_names=joint_names,
+                    plan_frame=plan_frame,
+                    speed_scale=speed_scale,
+                ):
+                    self.last_pick_failure_reason = "approach_alarm_recovery_failed"
                     return False
+                approach_alarm_retreated = True
             except ForceRangeAbort:
                 if not self._continue_input4_retreat_after_force_stop(
                     group, link, pre_pose, joint_names, plan_frame, speed_scale,
@@ -9332,6 +9474,11 @@ class G01Demo(Node):
                     self.last_pick_failure_reason = "approach_force_guard_failed"
                     self._abort_on_force_range()
                     return False
+
+        if approach_alarm_retreated and not self.use_force_sensors:
+            self.last_pick_failure_reason = "approach_alarm_suction_unknown"
+            log.error("[pick] 直线接近恢复后已退回，但力传感器未启用，无法确认吸附；保持工具上电并停止")
+            return False
 
         if self.use_force_sensors:
             force_z_after = self.wait_for_ft_sensor_z(tool_side)
@@ -10934,7 +11081,24 @@ def _run_main(
         if not prepare_force_sensors_for_grasp_batch():
             return False
 
-        success_count = 0
+        def confirm_batch_full() -> bool | None:
+            confirmation = node.confirm_all_place_slots_full()
+            if confirmation is None:
+                node.last_pick_failure_reason = "place_confirm_signal_failed"
+                return None
+            all_full, filled_slots = confirmation
+            if node._upper_grasp_active:
+                before = set(node._upper_grasp_placed_slots)
+                node._upper_grasp_placed_slots.intersection_update(filled_slots)
+                dropped_slots = before - node._upper_grasp_placed_slots
+                if dropped_slots:
+                    log.warning(
+                        "[upper-grasp] 以下放置位未被 SW 确认有料，"
+                        f"不计入成功数量：{', '.join(sorted(dropped_slots))}"
+                    )
+            return all_full
+
+        completed_place_flows = 0
         grasp_index = 0
         while rclpy.ok():
             grasp_index += 1
@@ -10962,23 +11126,32 @@ def _run_main(
             ):
                 log.error("[upper-grasp] 抓取失败，交由命令流程判断持料状态并处理退回")
                 return False
-            if node._upper_grasp_active and len(node._upper_grasp_placed_slots) >= 4:
-                log.info("[upper-grasp] 本次已成功放置 4 个，结束步骤 4")
-                return True
             if grasp_result is None:
                 return None
             if (
                 not grasp_result
                 and node.last_pick_failure_reason == "no_place"
             ):
-                log.info(
-                    f"[frame-batch] SW1~SW4 已无空位，连续抓取正常结束；"
-                    f"本批次成功 {success_count} 次"
-                )
-                return True
+                all_full = confirm_batch_full()
+                if all_full is None:
+                    return False
+                if all_full:
+                    log.info(
+                        "[frame-batch] SW1~SW4 连续新信号确认已满，"
+                        f"连续抓取正常结束；本批次完成放置流程 {completed_place_flows} 次"
+                    )
+                    return True
+                log.warning("[frame-batch] 复查发现仍有空位，继续下一次抓取")
+                continue
 
             if grasp_result:
-                success_count += 1
+                completed_place_flows += 1
+                all_full = confirm_batch_full()
+                if all_full is None:
+                    return False
+                if all_full:
+                    log.info("[frame-batch] 四个放置位均由新 SW 信号确认有料，结束步骤 4")
+                    return True
             if (
                 not grasp_result
                 and node.last_pick_failure_reason in (
@@ -11024,7 +11197,7 @@ def _run_main(
 
             log.info(
                 f"[frame-batch] 第 {grasp_index} 次抓取完成；"
-                f"累计成功 {success_count} 次"
+                f"累计完成放置流程 {completed_place_flows} 次，实际占位以 SW 信号为准"
             )
 
         return None
