@@ -1110,6 +1110,7 @@ def ft_range_violation(values: Sequence[float], *, ignore_limits: bool = False) 
         if not math.isfinite(value) or (not ignore_limits and abs(value) >= limit):
             return f"{name}={value:.6f} {unit}，保护阈值 ±{limit:g} {unit}"
     return None
+INPUT4_APPROACH_FORCE_DELTA_THRESHOLD = 70.0  # |当前 Fz - q_pre Fz| > 此值停止并退回 [N]
 APPROACH_FORCE_GUARD_DISTANCE = 0.07  # 从 q_pre 起前 9 cm 使用小阈值 [m]
 APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD = 60.0  # 前 9 cm 的 Fz 减小阈值 [N]
 APPROACH_FORCE_Z_DROP_ALL_THRESHOLD = 210.0  # 整段接近的 Fz 减小阈值 [N]
@@ -4577,6 +4578,27 @@ class G01Demo(Node):
 
         baseline_force_z = guard["baseline_force_z_by_side"][side]
         force_drop = baseline_force_z - force_z
+        absolute_threshold = guard.get("absolute_force_delta_threshold")
+        if absolute_threshold is not None:
+            # 输入4抓取接近专用：整段监测正负两个方向，触发后只停止一次。
+            if abs(force_drop) <= absolute_threshold or guard["contact"]:
+                return
+            guard.update(
+                contact=True, monitoring=False, force_z=force_z,
+                force_drop=force_drop, contact_side=side,
+                trigger="absolute_force_delta",
+            )
+            self._motor_command_pub.publish(UInt8(data=1))
+            guard["stop_request_ids"] = {
+                stop_side: self._send_servoj_control(stop_side, "stop")
+                for stop_side in guard["stop_sides"]
+            }
+            self.get_logger().warning(
+                f"[pick][force-guard] {side} 臂 |Fz - q_pre Fz|="
+                f"{abs(force_drop):.3f} N > {absolute_threshold:.3f} N；"
+                "已发送电机停止命令和双臂 ServoJ stop，取消接近后保持吸附直退 q_pre"
+            )
+            return
         travelled = guard["progress_fraction"] * guard["total_distance"]
         in_first_zone = travelled <= min(
             APPROACH_FORCE_GUARD_DISTANCE,
@@ -7057,6 +7079,7 @@ class G01Demo(Node):
         near_force_drop_threshold: float | None = APPROACH_FORCE_Z_DROP_NEAR_THRESHOLD,
         stage_label: str = "直线接近",
         baseline_label: str = "q_pre",
+        absolute_force_delta_threshold: float | None = None,
     ) -> str:
         """执行接近轨迹并实时监测 Fz。
 
@@ -7082,6 +7105,8 @@ class G01Demo(Node):
             "sides": sides,
             "baseline_force_z_by_side": baseline_force_z_by_side,
             "near_force_drop_threshold": near_force_drop_threshold,
+            "absolute_force_delta_threshold": absolute_force_delta_threshold,
+            "stop_sides": ("left", "right") if absolute_force_delta_threshold is not None else sides,
             "stage_label": stage_label,
             "baseline_label": baseline_label,
             "total_distance": max(0.0, float(total_distance)),
@@ -7140,7 +7165,7 @@ class G01Demo(Node):
                             "stop",
                             guard["stop_request_ids"].get(stop_side),
                         )
-                        for stop_side in sides
+                        for stop_side in guard["stop_sides"]
                     }
                     stop_confirmed = all(stop_results.values())
                     trajectory_ended = self._spin_until(
@@ -7173,7 +7198,7 @@ class G01Demo(Node):
                             "resume",
                             self._send_servoj_control(resume_side, "resume"),
                         )
-                        for resume_side in sides
+                        for resume_side in guard["stop_sides"]
                     }
                     resume_confirmed = all(resume_results.values())
                     if not resume_confirmed:
@@ -7196,8 +7221,8 @@ class G01Demo(Node):
                     ):
                         if not guard["completion_force_checked"]:
                             # action 结果和力话题来自不同通道。成功终态后再处理一帧
-                            # 新力数据，确保末端最后时刻仍受整段 200 N 阈值保护；
-                            # 此时进度置 100%，不会误用“前 9 cm”的 20 N 阈值。
+                            # 新力数据，确保末端最后时刻仍受配置的力阈值保护。
+                            # 此时进度置 100%，不再使用接近前段阈值。
                             guard["completion_force_checked"] = True
                             guard["progress_fraction"] = 1.0
                             force_counts = {
@@ -9327,6 +9352,7 @@ class G01Demo(Node):
                 tool_side,
                 force_z_before,
                 approach_distance,
+                absolute_force_delta_threshold=INPUT4_APPROACH_FORCE_DELTA_THRESHOLD,
             )
         except UpperGraspMotionFailure as exc:
             log.error(f"[pick] 直线接近时机械臂报警，开始清错并从实测位置直退 q_pre：{exc}")
@@ -9356,29 +9382,16 @@ class G01Demo(Node):
             log.warning("[pick] 直线抓取力保护后已从实测位置直退 q_pre，保持上电并检查吸附")
         if approach_result == "contact":
             log.warning(
-                "[pick] 直线接近中途接触障碍物；接近轨迹和 ServoJ 状态均已确认，"
-                f"先将{tool_label}工具下电，再从当前位置直线退回 q_pre"
+                "[pick] 抓取接近力差超过阈值，已停止接近；保持吸附，"
+                "从实测位置直线退回 q_pre 后判断抓取是否成功"
             )
-            if not self.set_tool_do(tool_side, 0):
-                log.error(f"[pick] 障碍物接触后{tool_label}工具下电失败")
-                self.last_pick_failure_reason = "tool_power_off_failed"
-                return False
             if not self._return_to_pre_after_approach_contact(
-                group,
-                link,
-                pre_pose,
-                joint_names,
-                plan_frame,
-                speed_scale,
+                group, link, pre_pose, joint_names, plan_frame, speed_scale,
             ):
-                self.last_pick_failure_reason = "approach_obstacle_recovery_failed"
+                self.last_pick_failure_reason = "approach_force_retreat_failed"
                 return False
-            self.last_pick_failure_reason = "approach_obstacle"
-            log.warning(
-                "[pick] 障碍物接触恢复完成；工具已下电，"
-                "开始下一次 Q1 复位、视觉识别和抓取"
-            )
-            return False
+            already_retreated_to_pre = True
+            approach_result = "success"
 
         if approach_result != "success":
             log.error(

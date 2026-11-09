@@ -52,6 +52,126 @@ class Input4ForceRecoveryTests(unittest.TestCase):
         self.assertFalse(guard['contact'])
         self.assertTrue(all(message.startswith(g.RED) and message.endswith(g.RESET) for message in errors))
 
+    def test_input4_absolute_delta_stops_both_directions_once(self):
+        for side in ('left', 'right'):
+            for delta in (-70.001, -70., 70., 70.001):
+                with self.subTest(side=side, delta=delta):
+                    events = []
+                    guard = {
+                        'monitoring': True, 'sides': (side,),
+                        'baseline_force_z_by_side': {side: 25.},
+                        'absolute_force_delta_threshold': 70.,
+                        'stop_sides': ('left', 'right'), 'contact': False,
+                    }
+                    node = SimpleNamespace(
+                        use_force_sensors=True, _ft_sensor_z={side: None},
+                        _ft_sensor_count={side: 0}, _force_range_enabled=False,
+                        _active_approach_guard=guard, get_logger=logger,
+                        _motor_command_pub=SimpleNamespace(
+                            publish=lambda msg: events.append(('motor', msg.data))),
+                        _send_servoj_control=lambda side, cmd: events.append((side, cmd)) or 1,
+                    )
+                    msg = SimpleNamespace(data=[0., 0., 25.+delta])
+                    for _ in range(2):
+                        g.G01Demo._on_ft_sensor(node, msg, side)
+                    triggered = abs(delta) > 70.
+                    self.assertEqual(guard['contact'], triggered)
+                    self.assertEqual(events, [('motor', 1), ('left', 'stop'), ('right', 'stop')]
+                                     if triggered else [])
+
+    def test_contact_cancels_action_and_requires_stop_confirmation_before_resume(self):
+        from concurrent.futures import Future
+        for stop_ok in (True, False):
+            events = []
+            result = Future()
+            def cancel():
+                events.append('cancel')
+                result.set_result(SimpleNamespace(status=5, result=None))
+                future = Future()
+                future.set_result(SimpleNamespace(goals_canceling=[1]))
+                return future
+            handle = SimpleNamespace(accepted=True, get_result_async=lambda: result,
+                                     cancel_goal_async=cancel)
+            accepted = Future()
+            accepted.set_result(handle)
+            def confirm(side, command, request):
+                events.append(('confirm', side, command))
+                return stop_ok if command == 'stop' else True
+            node = SimpleNamespace(
+                use_force_sensors=True, sim_mode=False, get_logger=logger,
+                _ft_sensor_z={'right': 0.}, _ft_sensor_count={'right': 0},
+                _force_range_enabled=False,
+                _exec_cli=SimpleNamespace(wait_for_server=lambda **kwargs: True),
+                _send_force_guarded_goal=lambda *args: accepted,
+                _spin_until=lambda future, timeout: future.done(),
+                _motor_command_pub=SimpleNamespace(publish=lambda msg: events.append(('motor', msg.data))),
+                _send_servoj_control=lambda side, command: events.append((side, command)) or 1,
+                _wait_for_servoj_control_state=confirm,
+            )
+            node._executor = SimpleNamespace(spin_once=lambda **kwargs:
+                g.G01Demo._on_ft_sensor(node, SimpleNamespace(data=[0., 0., 71.]), 'right'))
+            with patch.object(g.rclpy, 'ok', return_value=True):
+                outcome = g.G01Demo._execute_approach_with_force_guard_impl(
+                    node, g.RobotTrajectory(), 'right', 0., .1,
+                    absolute_force_delta_threshold=70.,
+                )
+            self.assertEqual(outcome, 'contact' if stop_ok else 'safety_failed')
+            self.assertEqual(events[:4], [('motor', 1), ('left', 'stop'), ('right', 'stop'), 'cancel'])
+            if stop_ok:
+                self.assertGreater(events.index(('left', 'resume')), events.index(('confirm', 'right', 'stop')))
+                self.assertIn(('right', 'resume'), events)
+            else:
+                self.assertNotIn(('left', 'resume'), events)
+                self.assertNotIn(('right', 'resume'), events)
+            self.assertIsNone(node._active_approach_guard)
+
+    def test_force_contact_retreats_with_suction_then_checks_and_continues(self):
+        for suction_ok, retreat_ok in ((True, True), (False, True), (True, False)):
+            with self.subTest(suction_ok=suction_ok, retreat_ok=retreat_ok):
+                names = list(g.JOINT_TARGETS['right_arm'])
+                traj = g.RobotTrajectory()
+                traj.joint_trajectory.joint_names = names
+                traj.joint_trajectory.points.append(g.JointTrajectoryPoint(positions=[0.]*len(names)))
+                q_pre = dict.fromkeys(names, 0.)
+                events = []
+                readings = iter((0., 30. if suction_ok else 0.))
+                def read_force(*args):
+                    events.append('force')
+                    return next(readings)
+                def approach(*args, **kwargs):
+                    self.assertEqual(kwargs['absolute_force_delta_threshold'], 70.)
+                    events.append('contact')
+                    return 'contact'
+                node = SimpleNamespace(
+                    get_logger=logger, last_pick_failure_reason=None,
+                    _wait_for_driver_signal=lambda: True,
+                    _select_available_place_target=lambda *args: (True, 'sw1'),
+                    set_tool_do=lambda side, state: events.append(('power', state)) or True,
+                    _get_joints=lambda requested, **kwargs: dict.fromkeys(requested, 0.),
+                    _make_grasp_transfer_obstacles=lambda *args: [],
+                    _execute_traj=lambda *args: events.append('execute') or True,
+                    wait_for_operator=lambda *args: None,
+                    wait_for_ft_sensor_z=read_force,
+                    _execute_approach_with_force_guard=approach,
+                    _return_to_pre_after_approach_contact=lambda *args: events.append('retreat') or retreat_ok,
+                    use_force_sensors=True, sim_mode=False, _tool_load_state={},
+                    remove_all_pose_markers=lambda: None,
+                    _place_and_return=lambda *args, **kwargs: events.append('place') or True,
+                )
+                with patch.object(g.time, 'sleep', lambda *args: None):
+                    result = g.G01Demo.pick_and_return(
+                        node, target_pose=g.make_pose(0., 0., 0., 0., 0., 0.),
+                        speed_scale=.4, group='right_arm', link='r_tool',
+                        plan_frame=g.SCENE_FRAME, joint_names=names, first_return_mode=2,
+                        prevalidated_pair=(q_pre, q_pre, traj, traj),
+                    )
+                self.assertEqual(result, suction_ok and retreat_ok)
+                after_contact = events[events.index('contact')+1:]
+                self.assertEqual(after_contact, ['retreat'] if not retreat_ok else
+                                 ['retreat', 'force', 'place'] if suction_ok else
+                                 ['retreat', 'force', ('power', 0)])
+                self.assertEqual(events.count('execute'), 1)  # 不反放原接近轨迹
+
     def test_force_and_torque_limits(self):
         for axis in range(6):
             limit = 180. if axis < 3 else 10.
@@ -223,7 +343,7 @@ class Input4ForceRecoveryTests(unittest.TestCase):
             _reverse_trajectory=lambda trajectory: trajectory,
             wait_for_operator=lambda *args: None,
             wait_for_ft_sensor_z=lambda *args: 0.0,
-            _execute_approach_with_force_guard=lambda *args: (_ for _ in ()).throw(
+            _execute_approach_with_force_guard=lambda *args, **kwargs: (_ for _ in ()).throw(
                 g.UpperGraspMotionFailure('arm alarm')
             ),
             recover_input4_approach_alarm=lambda **kwargs: events.append('recover') or True,
@@ -274,7 +394,7 @@ class Input4ForceRecoveryTests(unittest.TestCase):
             _reverse_trajectory=lambda trajectory: trajectory,
             wait_for_operator=lambda *args: None,
             wait_for_ft_sensor_z=lambda *args: 0.0,
-            _execute_approach_with_force_guard=lambda *args: 'success',
+            _execute_approach_with_force_guard=lambda *args, **kwargs: 'success',
             recover_input4_approach_alarm=lambda **kwargs: events.append('recover') or True,
             _log_actual_fk_error=lambda *args, **kwargs: 0.0,
             use_force_sensors=True,
@@ -329,7 +449,7 @@ class Input4ForceRecoveryTests(unittest.TestCase):
                     _reverse_trajectory=lambda trajectory: trajectory,
                     wait_for_operator=lambda *args: None,
                     wait_for_ft_sensor_z=lambda *args: 0.0,
-                    _execute_approach_with_force_guard=lambda *args: 'success',
+                    _execute_approach_with_force_guard=lambda *args, **kwargs: 'success',
                     _log_actual_fk_error=lambda *args, **kwargs: (
                         0.0665 if case == 'fk_mismatch' else 0.0
                     ),
