@@ -1193,8 +1193,9 @@ VISION_LEFT_TRANSFORM_XYZ_WXYZ = [
 # 右臂抓
 SIM_VISION_RESULT = (
     1,
-    [-25.0305, 43.2781, 789.8122, -0.481, 0.0739, -0.1165, -0.8658],
+    [-25.0305, 43.2781, 989.8122, -0.481, 0.0739, -0.1165, -0.8658],
 )
+
 # 物料台 p,8 仿真视觉数据：
 # 原始协议为 header,x,y,z,qw,qx,qy,qz,mode；header 不使用。
 SIM_UNLOAD_VISION_RESULT = (
@@ -9063,6 +9064,7 @@ class G01Demo(Node):
         planner_pool: ThreadPoolExecutor | None = None,
         recognition_state: Mapping[str, float] | None = None,
         start_next_grasp_plan: Callable[[], None] | None = None,
+        exchange_zero_body: bool = False,
     ) -> bool:
         """抓取流程（IK 多解 + approach 预检 + 放置 + 原路返回）。
 
@@ -9205,6 +9207,7 @@ class G01Demo(Node):
                 selected_slot_name=selected_place_slot,
                 place_joint_config=place_joint_config,
                 speed=place_speed_scale,
+                exchange_zero_body=exchange_zero_body,
                 transfer_obstacles=copy.deepcopy(transfer_obstacles),
             )
             log.info("[pipeline] 抓取运动开始前已提交当前物体交换/放置后台规划")
@@ -9573,6 +9576,7 @@ class G01Demo(Node):
                 dual_speed=place_speed_scale,
                 cartesian_speed=speed_scale,
                 preplanned=post_grasp_plan.exchange if post_grasp_plan else None,
+                exchange_zero_body=exchange_zero_body,
                 transfer_obstacles=transfer_obstacles,
             ):
                 return False
@@ -9635,6 +9639,7 @@ class G01Demo(Node):
         z_down_distance: float | None,
         start_joints: Mapping[str, float] | None = None,
         transfer_obstacles: Sequence[CollisionObject] | None = None,
+        exchange_zero_body: bool = False,
     ) -> ExchangeTrajectoryPlan | None:
         """纯规划交换 Q2 和交接直线，不执行运动或工具命令。"""
         # 统一减慢交换运动，覆盖后台预规划和现场重规划；退回复用反向直线轨迹。
@@ -9668,6 +9673,12 @@ class G01Demo(Node):
         if len(q2_source) != 14:
             self.get_logger().error(f"[exchange] EXCHANGE_Q2[{source_side!r}] 长度错误")
             return None
+        if exchange_zero_body:
+            # 高物体交换必须同时规划升降和腰部，避免被抓取组裁掉。
+            exchange_group = "dual_arm_body"
+            exchange_joint_names = ["body_joint1", "body_joint2", *arm_dual_joint_names]
+            q2_slice_text = "全部14个，升降/腰部归零"
+            q2_source[:2] = [0.0, 0 * math.pi / 180]
         q2 = q2_source[-len(exchange_joint_names):]
         start = dict(start_joints) if start_joints is not None else self._get_joints(joint_names_for_group("dual_arm_body"))
         if start is None:
@@ -9748,6 +9759,7 @@ class G01Demo(Node):
         place_joint_config: dict[str, object],
         speed: float,
         transfer_obstacles: Sequence[CollisionObject] | None = None,
+        exchange_zero_body: bool = False,
     ) -> PostGraspTrajectoryPlan | None:
         """从识别位置纯规划当前物体的交换/放置全部轨迹。"""
         exchange = None
@@ -9759,6 +9771,7 @@ class G01Demo(Node):
                 EXCHANGE_Q2, source_link=pick_link, pick_group=pick_group,
                 dual_speed=speed, cartesian_speed=speed,
                 z_down_distance=None, start_joints=recognition_state,
+                exchange_zero_body=exchange_zero_body,
                 transfer_obstacles=transfer_obstacles,
             )
             if exchange is None:
@@ -9811,6 +9824,7 @@ class G01Demo(Node):
         cartesian_speed: float = 0.2,
         z_down_distance: float | None = None,
         preplanned: ExchangeTrajectoryPlan | None = None,
+        exchange_zero_body: bool = False,
         transfer_obstacles: Sequence[CollisionObject] | None = None,
     ) -> bool:
         """顺序调用交换纯规划和只执行阶段。"""
@@ -9837,6 +9851,7 @@ class G01Demo(Node):
             q2_by_side, source_link=source_link, pick_group=pick_group,
             dual_speed=dual_speed, cartesian_speed=cartesian_speed,
             z_down_distance=z_down_distance,
+            exchange_zero_body=exchange_zero_body,
             transfer_obstacles=transfer_obstacles,
         )
         if plan is None:
@@ -10929,6 +10944,15 @@ def _run_main(
             next_grasp_cache["future"] = planner_pool.submit(solve_next)
             log.info("[pipeline] 已提交下一物体后台 IK/Cartesian/OMPL 解算")
 
+        # 姿态排序后的首点不一定最高，使用本轮全部物体的 SJ 最大 z。
+        max_sj_z = max(pose["sj"][2] for pose in all_xyz_rpy)
+        exchange_zero_body = max_sj_z > 0.32
+        if first_return_mode == 1:
+            log.info(
+                f"[exchange] 本轮最大 SJ.z={max_sj_z:.6f}，"
+                + ("交换升降/腰部设为 0" if exchange_zero_body else "保持原交换配置")
+            )
+
         log.info(f"开始尝试{pick_label}抓取")
         if not node.pick_and_return(
             target_pose=pick_target_pose,
@@ -10953,6 +10977,7 @@ def _run_main(
                 dict(zip(joint_names, q1_for_waist)) if pipeline_enabled else None
             ),
             start_next_grasp_plan=start_next_grasp_plan if pipeline_enabled else None,
+            exchange_zero_body=exchange_zero_body,
         ):
             failure_reason = node.last_pick_failure_reason
             if failure_reason == "q_pre" and node._upper_grasp_active:
