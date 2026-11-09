@@ -99,6 +99,7 @@ class Input4ForceRecoveryTests(unittest.TestCase):
                 return stop_ok if command == 'stop' else True
             node = SimpleNamespace(
                 use_force_sensors=True, sim_mode=False, get_logger=logger,
+                _raise_arm_motion_fault=lambda: None,
                 _ft_sensor_z={'right': 0.}, _ft_sensor_count={'right': 0},
                 _force_range_enabled=False,
                 _exec_cli=SimpleNamespace(wait_for_server=lambda **kwargs: True),

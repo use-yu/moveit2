@@ -12,7 +12,7 @@ class ArmMotionStatusTests(unittest.TestCase):
         clock = [10.]
         errors = []
         node = NS(sim_mode=sim, _arm_robot_status=dict(old or {}),
-                  _abort_on_force_range=lambda: None,
+                  _abort_on_force_range=lambda: None, _poll_arm_motion_status=lambda: None,
                   get_logger=lambda: NS(error=errors.append))
         def spin(**kwargs):
             clock[0] += .1
@@ -58,6 +58,8 @@ class ArmMotionStatusTests(unittest.TestCase):
                 _input4_description='test', _force_action_goals=[],
                 _abort_on_force_range=lambda: None,
                 _check_arm_motion_ready=lambda names: checked.append(names) or False,
+                _trip_arm_motion=lambda reason: None,
+                _recover_arm_motion_interactively=lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
                 _input4_command_pub=NS(publish=lambda msg: self.fail('must not send any motion')),
             )
             def spin(**kwargs):
@@ -68,8 +70,9 @@ class ArmMotionStatusTests(unittest.TestCase):
             node._executor = NS(spin_once=spin)
             with patch.object(g.time, 'monotonic', return_value=10.), \
                  patch.object(g.rclpy, 'ok', return_value=True):
-                self.assertFalse(g.G01Demo._execute_input4_admittance(node, group))
-            self.assertEqual(checked, [g.joint_names_for_group(group)])
+                with self.assertRaises(KeyboardInterrupt):
+                    g.G01Demo._execute_input4_admittance(node, group)
+            self.assertEqual(checked, [g.joint_names_for_group('dual_arm')])
             self.assertIsNone(node._input4_active_side)
 
     def test_goal_send_blocks_execution_but_allows_plan_only(self):
@@ -78,7 +81,9 @@ class ArmMotionStatusTests(unittest.TestCase):
                 events = []
                 future = Future()
                 node = NS(_abort_on_force_range=lambda: None, _force_action_goals=[],
-                          _force_range_fault=None,
+                          _force_range_fault=None, _arm_motion_fault=None, _arm_motion_pending_goals=[],
+                          _raise_arm_motion_fault=lambda: None,
+                          _trip_arm_motion=lambda reason: None,
                           _check_arm_motion_ready=lambda names: events.append(('check', list(names))) or ready)
                 client = NS(send_goal_async=lambda goal: events.append('send') or future)
                 if kind == 'trajectory':
@@ -88,8 +93,13 @@ class ArmMotionStatusTests(unittest.TestCase):
                     goal = g.MoveGroup.Goal()
                     goal.request.group_name = 'right_arm'
                     goal.planning_options.plan_only = kind == 'plan_only'
-                result = g.G01Demo._send_force_guarded_goal(node, client, goal)
                 allowed = ready or kind == 'plan_only'
+                if allowed:
+                    result = g.G01Demo._send_force_guarded_goal(node, client, goal)
+                else:
+                    with self.assertRaises(g.ArmMotionStatusFault):
+                        g.G01Demo._send_force_guarded_goal(node, client, goal)
+                    result = None
                 self.assertEqual('send' in events, allowed)
                 self.assertIs(result, future if allowed else None)
                 if kind == 'plan_only':

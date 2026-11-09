@@ -230,6 +230,10 @@ class UpperGraspMotionFailure(BaseException):
     """上位机抓取运动失败，跳过旧流程的下电/无限恢复分支。"""
 
 
+class ArmMotionStatusFault(BaseException):
+    """当前运动臂状态异常，必须由本阶段暂停、回车清错并恢复。"""
+
+
 class ForceRangeAbort(BaseException):
     """量程保护直接退出任务，不允许被普通 Exception 恢复/重试分支吞掉。"""
 
@@ -3307,6 +3311,17 @@ class Input4PlacementControl:
         self.finished = False
         self.finish_reason = None
 
+    def resume_after_pause(self, q, paused_at, now):
+        """冻结阶段/螺旋时钟，从实测关节继续；保留接触、基准和螺旋配置。"""
+        paused_duration = max(0., now-paused_at)
+        self.started += paused_duration
+        if self.contact_time is not None:
+            self.contact_time += paused_duration
+        self.previous_time = now
+        self.command = np.asarray(q, dtype=float).copy()
+        self.xyz.velocity[:] = 0.
+        self.rz.velocity[:] = 0.
+
     def tool_height(self, transform):
         """由实测关节计算工具原点在公共基坐标系中的高度。"""
         point = transform @ np.append(self.tool_offset, 1.)
@@ -3881,6 +3896,11 @@ class G01Demo(Node):
         self.sim_mode = bool(sim_mode)
         self.use_force_sensors = use_force_sensors
         self._arm_robot_status: dict[str, tuple[int, float, int]] = {}
+        self._arm_motion_names: tuple[str, ...] = ()
+        self._arm_motion_fault: str | None = None
+        self._arm_motion_recovering = False
+        self._arm_motion_pending_goals: list = []
+        self.create_timer(0.05, self._poll_arm_motion_status)
         for side, topic in ARM_ROBOT_STATUS_TOPICS.items():
             self.create_subscription(
                 Int32, topic,
@@ -4530,6 +4550,100 @@ class G01Demo(Node):
         previous = self._arm_robot_status.get(side)
         sequence = previous[2] + 1 if previous is not None else 1
         self._arm_robot_status[side] = (int(msg.data), time.monotonic(), sequence)
+        self._poll_arm_motion_status()
+
+    def _trip_arm_motion(self, reason: str) -> None:
+        if self._arm_motion_fault is not None:
+            return
+        self._arm_motion_fault = reason
+        self.get_logger().error(f"[arm-status] {reason}；停止当前阶段，等待回车恢复")
+        self._motor_command_pub.publish(UInt8(data=1))
+        for side in ("left", "right"):
+            self._send_servoj_control(side, "stop")
+        for handle in list(self._force_action_goals):
+            handle.cancel_goal_async()
+
+    def _poll_arm_motion_status(self) -> None:
+        if (getattr(self, "sim_mode", False) or not getattr(self, "_arm_motion_names", ())
+                or getattr(self, "_arm_motion_recovering", False)):
+            return
+        now = time.monotonic()
+        for side in ("left", "right"):
+            sample = self._arm_robot_status.get(side)
+            if sample is None or now-sample[1] > ARM_ROBOT_STATUS_MAX_AGE_SEC:
+                self._trip_arm_motion(f"{side} 臂状态反馈超时")
+                return
+            if sample[0] != 1:
+                self._trip_arm_motion(f"{side} 臂状态={sample[0]}，不是正常使能状态1")
+                return
+
+    def _raise_arm_motion_fault(self) -> None:
+        self._poll_arm_motion_status()
+        if (getattr(self, "_arm_motion_fault", None) is not None
+                and not getattr(self, "_arm_motion_recovering", False)):
+            raise ArmMotionStatusFault(self._arm_motion_fault)
+
+    def _recover_arm_motion_interactively(self) -> None:
+        """停止并等旧目标结束；无论是否 --interactive 都必须回车才清错。"""
+        self._arm_motion_recovering = True
+        self._arm_motion_names = ()
+        try:
+            while rclpy.ok():
+                self._motor_command_pub.publish(UInt8(data=1))
+                # 包含异常发生时尚未收到接受回复的 action，禁止旧轨迹晚到后启动。
+                pending_done = all([
+                    self._spin_until(future, 5.0)
+                    for future in list(self._arm_motion_pending_goals)
+                ])
+                stopped = self.stop_upper_grasp_motion()
+                # 旧 action 的 CSP 预下发可能晚于第一次停止；确认结束后再次停止电机。
+                self._motor_command_pub.publish(UInt8(data=1))
+                if not pending_done or not stopped:
+                    self.get_logger().error("[arm-status] 尚未确认旧运动结束，保持停止")
+                try:
+                    input("[arm-status] 排除异常后按回车清错并恢复当前阶段 …")
+                except EOFError:
+                    raise KeyboardInterrupt("没有可用的回车输入，保持停止并退出")
+                if not pending_done or not stopped:
+                    continue
+                if not self.clear_arm_alarms_for_recovery(("left", "right"), "运动状态异常恢复"):
+                    continue
+                if not self._check_arm_motion_ready(joint_names_for_group("dual_arm")):
+                    continue
+                resumed = [
+                    self._wait_for_servoj_control_state(
+                        side, "resume", self._send_servoj_control(side, "resume"),
+                    ) for side in ("left", "right")
+                ]
+                if not all(resumed):
+                    continue
+                self._arm_motion_fault = None
+                self.get_logger().info("[arm-status] 清错并确认双臂状态1，恢复当前阶段")
+                return
+            raise KeyboardInterrupt("ROS已退出，保持停止")
+        finally:
+            self._arm_motion_recovering = False
+
+    def _replan_interrupted_trajectory(self, trajectory: RobotTrajectory) -> RobotTrajectory | None:
+        """舍弃旧起点，从全身实测状态重新规划到原轨迹终点。"""
+        names = list(trajectory.joint_trajectory.joint_names)
+        points = trajectory.joint_trajectory.points
+        if not points:
+            return None
+        candidates = [group for group, targets in JOINT_TARGETS.items()
+                      if set(names) == set(targets)]
+        if not candidates:
+            self.get_logger().error(f"[arm-status] 找不到轨迹关节对应的规划组: {names}")
+            return None
+        current = self._get_joints(list(JOINT_TARGETS["robot"]), wait_new=True)
+        if current is None:
+            return None
+        ok, _, replanned = self.plan_joint_motion(
+            candidates[0], dict(zip(names, points[-1].positions)), joint_names=names,
+            start_joints=current, speed_scale=0.2, execute=False,
+            num_attempts=30, planning_time_sec=10.0,
+        )
+        return replanned if ok else None
 
     def _check_arm_motion_ready(self, joint_names: Sequence[str]) -> bool:
         """真机每次运动前等参与臂的新状态；只有1（无报警且已使能）放行。"""
@@ -4578,11 +4692,19 @@ class G01Demo(Node):
             names = list(goal.trajectory.joint_trajectory.joint_names)
         else:
             raise TypeError(f"不支持的运动目标类型: {type(goal).__name__}")
-        if names and not self._check_arm_motion_ready(names):
-            return None
+        if names:
+            if not self._check_arm_motion_ready(joint_names_for_group("dual_arm")):
+                self._trip_arm_motion("运动前机械臂未处于正常使能状态")
+                raise ArmMotionStatusFault(self._arm_motion_fault)
+            self._arm_motion_names = tuple(names)
+            self._raise_arm_motion_fault()
         future = client.send_goal_async(goal)
+        if names:
+            self._arm_motion_pending_goals.append(future)
 
         def on_accepted(done):
+            if done in self._arm_motion_pending_goals:
+                self._arm_motion_pending_goals.remove(done)
             handle = done.result()
             if handle is None or not handle.accepted:
                 return
@@ -4594,7 +4716,7 @@ class G01Demo(Node):
                     self._force_action_goals.remove(handle)
 
             result.add_done_callback(on_finished)
-            if self._force_range_fault is not None:
+            if self._force_range_fault is not None or self._arm_motion_fault is not None:
                 handle.cancel_goal_async()
 
         future.add_done_callback(on_accepted)
@@ -5083,7 +5205,11 @@ class G01Demo(Node):
 
     def _spin_until(self, future, timeout: float) -> bool:
         """阻塞直到 future 完成或超时。"""
-        self._executor.spin_until_future_complete(future, timeout_sec=timeout)
+        deadline = time.monotonic() + timeout
+        while rclpy.ok() and not future.done() and time.monotonic() < deadline:
+            self._executor.spin_once(timeout_sec=min(0.01, max(0., deadline-time.monotonic())))
+            self._raise_arm_motion_fault()
+        self._raise_arm_motion_fault()
         return future.done() and future.result() is not None
 
     def _get_joints(self, names: list[str], wait_new=False, timeout=10.0) -> dict[str, float] | None:
@@ -6315,7 +6441,31 @@ class G01Demo(Node):
             )
         return True
 
-    def _move_once(
+    def _move_once(self, group, goal_constraints, start, plan_only, speed_scale,
+                   avoid_collisions=True, num_attempts=None, planning_time_sec=None,
+                   planning_obstacles=None):
+        while True:
+            try:
+                result = self._move_once_impl(
+                    group, goal_constraints, start, plan_only, speed_scale,
+                    avoid_collisions, num_attempts, planning_time_sec, planning_obstacles,
+                )
+                self._raise_arm_motion_fault()
+                if (not plan_only and not result[0] and self._arm_motion_names
+                        and not self._check_arm_motion_ready(joint_names_for_group("dual_arm"))):
+                    self._trip_arm_motion("运动执行失败后检测到机械臂状态异常")
+                    raise ArmMotionStatusFault(self._arm_motion_fault)
+                return result
+            except ArmMotionStatusFault:
+                self._recover_arm_motion_interactively()
+                start = self._get_joints(list(JOINT_TARGETS["robot"]), wait_new=True)
+                if start is None:
+                    return False, 0., None, MoveItErrorCodes.ROBOT_STATE_STALE
+            finally:
+                if not plan_only:
+                    self._arm_motion_names = ()
+
+    def _move_once_impl(
         self,
         group: str,
         goal_constraints: list[Constraints],
@@ -7089,11 +7239,27 @@ class G01Demo(Node):
         )
         return True
 
-    def _execute_traj(self, *args, **kwargs):
-        result = self._execute_traj_impl(*args, **kwargs)
-        if (self._upper_grasp_active or self._upper_place_active) and not self._upper_grasp_recovering and not result:
-            raise UpperGraspMotionFailure("_execute_traj 失败")
-        return result
+    def _execute_traj(self, traj, timeout: float = 60.0):
+        original = traj
+        while True:
+            try:
+                result = self._execute_traj_impl(traj, timeout=timeout)
+                self._raise_arm_motion_fault()
+                if (not result and self._arm_motion_names
+                        and not self._check_arm_motion_ready(joint_names_for_group("dual_arm"))):
+                    self._trip_arm_motion("轨迹执行失败后检测到机械臂状态异常")
+                    raise ArmMotionStatusFault(self._arm_motion_fault)
+                if (self._upper_grasp_active or self._upper_place_active) and not self._upper_grasp_recovering and not result:
+                    raise UpperGraspMotionFailure("_execute_traj 失败")
+                return result
+            except ArmMotionStatusFault:
+                self._recover_arm_motion_interactively()
+                traj = self._replan_interrupted_trajectory(original)
+                if traj is None:
+                    self.get_logger().error("[arm-status] 恢复后无法规划到原目标，停止当前流程")
+                    return False
+            finally:
+                self._arm_motion_names = ()
 
     def _execute_traj_impl(self, traj, timeout: float = 60.0) -> bool:
         """直接把一条 RobotTrajectory 发给 execute_trajectory action。
@@ -7128,13 +7294,32 @@ class G01Demo(Node):
             return False
         return True
 
-    def _execute_approach_with_force_guard(self, *args, **kwargs):
-        result = self._execute_approach_with_force_guard_impl(*args, **kwargs)
-        if self._upper_place_active and result == "contact":
-            raise UpperGraspMotionFailure("放置下降力碰撞，保持工具电源并交由上位机流程处理")
-        if (self._upper_grasp_active or self._upper_place_active) and not self._upper_grasp_recovering and result in ("failed", "safety_failed"):
-            raise UpperGraspMotionFailure("_execute_approach_with_force_guard 失败")
-        return result
+    def _execute_approach_with_force_guard(self, traj, *args, **kwargs):
+        original = traj
+        while True:
+            try:
+                result = self._execute_approach_with_force_guard_impl(traj, *args, **kwargs)
+                self._raise_arm_motion_fault()
+                if (result in ("failed", "safety_failed") and self._arm_motion_names
+                        and not self._check_arm_motion_ready(joint_names_for_group("dual_arm"))):
+                    self._trip_arm_motion("直线执行失败后检测到机械臂状态异常")
+                    raise ArmMotionStatusFault(self._arm_motion_fault)
+                if self._upper_place_active and result == "contact":
+                    raise UpperGraspMotionFailure("放置下降力碰撞，保持工具电源并交由上位机流程处理")
+                if (self._upper_grasp_active or self._upper_place_active) and not self._upper_grasp_recovering and result in ("failed", "safety_failed"):
+                    raise UpperGraspMotionFailure("_execute_approach_with_force_guard 失败")
+                return result
+            except ArmMotionStatusFault:
+                self._recover_arm_motion_interactively()
+                if kwargs.get("absolute_force_delta_threshold") is not None:
+                    # 输入4的抓取接近：复用contact分支，保持吸附、直退、检测吸附。
+                    self.get_logger().warning("[arm-status] 抓取接近异常已清除，不再接近，直接退回判断吸附")
+                    return "contact"
+                traj = self._replan_interrupted_trajectory(original)
+                if traj is None:
+                    return "failed"
+            finally:
+                self._arm_motion_names = ()
 
     def _execute_approach_with_force_guard_impl(
         self,
@@ -7210,6 +7395,7 @@ class G01Demo(Node):
                 self._executor.spin_once(
                     timeout_sec=min(0.01, max(0.0, deadline - time.monotonic())),
                 )
+                self._raise_arm_motion_fault()
                 if guard["contact"]:
                     guard["monitoring"] = False
                     # ServoJ 的 stop 已由力回调先发出；紧接着取消 MoveIt action，
@@ -8241,8 +8427,10 @@ class G01Demo(Node):
                 log.error("仍有未结束的运动action，禁止开始导纳")
                 return False
             # 导纳绕过 MoveIt action，首次发送直接关节指令前也检查参与臂。
-            if not self._check_arm_motion_ready(joint_names_for_group(arm_group)):
-                return False
+            while not self._check_arm_motion_ready(joint_names_for_group("dual_arm")):
+                self._trip_arm_motion("导纳开始前机械臂状态异常")
+                self._recover_arm_motion_interactively()
+            self._arm_motion_names = tuple(joint_names_for_group(arm_group))
             started = time.monotonic()
             for side in sides:
                 if side not in self._input4_models:
@@ -8260,6 +8448,24 @@ class G01Demo(Node):
                 now = time.monotonic()
                 self._executor.spin_once(timeout_sec=min(0.01, max(0., next_tick-now)))
                 self._abort_on_force_range()
+                try:
+                    self._raise_arm_motion_fault()
+                except ArmMotionStatusFault:
+                    paused_at = {side: controller.previous_time for side, controller in controllers.items()}
+                    self._recover_arm_motion_interactively()
+                    names = joint_names_for_group(arm_group)
+                    current = self._get_joints(names, wait_new=True)
+                    if current is None:
+                        return False
+                    resumed_at = time.monotonic()
+                    for side, controller in controllers.items():
+                        q = np.array([current[name] for name in controller.model.joint_names])
+                        controller.resume_after_pause(q, paused_at[side], resumed_at)
+                        if controller.finished:
+                            held_positions[side] = q.copy()
+                    self._arm_motion_names = tuple(names)
+                    next_tick = resumed_at+c["period"]
+                    continue
                 now = time.monotonic()
                 if now < next_tick:
                     continue
@@ -8315,22 +8521,30 @@ class G01Demo(Node):
         except (ValueError, KeyError, TypeError, ET.ParseError, np.linalg.LinAlgError) as exc:
             log.error(f"[pick][admittance] 放置导纳失败，保持工具上电：{exc}")
         finally:
-            self._input4_active_side = None
-            if controllers and self._force_range_fault is None:
-                # 停止继续积分；用实测位置消除尚未跟上的目标积累。
-                hold = JointState()
-                hold.header.stamp = self.get_clock().now().to_msg()
-                hold.name = [name for controller in controllers.values() for name in controller.model.joint_names]
-                hold.position = [float(self._joints[name]) for name in hold.name]
-                hold.velocity = [0.]*len(hold.name)
-                self._input4_command_pub.publish(hold)
-                deadline = time.monotonic()+2*c["period"]
-                while rclpy.ok() and time.monotonic() < deadline:
-                    self._executor.spin_once(timeout_sec=0.01)
-            if controllers and not success and self._force_range_fault is None:
-                requests = {side: self._send_servoj_control(side, "stop") for side in sides}
-                for side, request in requests.items():
-                    self._wait_for_servoj_control_state(side, "stop", request)
+            try:
+                self._input4_active_side = None
+                if controllers and self._force_range_fault is None and self._arm_motion_fault is None:
+                    # 停止继续积分；用实测位置消除尚未跟上的目标积累。
+                    hold = JointState()
+                    hold.header.stamp = self.get_clock().now().to_msg()
+                    hold.name = [name for controller in controllers.values() for name in controller.model.joint_names]
+                    hold.position = [float(self._joints[name]) for name in hold.name]
+                    hold.velocity = [0.]*len(hold.name)
+                    self._input4_command_pub.publish(hold)
+                    deadline = time.monotonic()+2*c["period"]
+                    while rclpy.ok() and time.monotonic() < deadline:
+                        self._executor.spin_once(timeout_sec=0.01)
+                        try:
+                            self._raise_arm_motion_fault()
+                        except ArmMotionStatusFault:
+                            self._recover_arm_motion_interactively()
+                            break  # 导纳已经结束，只需清错后进入后续阶段。
+                if controllers and not success and self._force_range_fault is None:
+                    requests = {side: self._send_servoj_control(side, "stop") for side in sides}
+                    for side, request in requests.items():
+                        self._wait_for_servoj_control_state(side, "stop", request)
+            finally:
+                self._arm_motion_names = ()
         return success
 
     def _execute_dual_place_admittance(self, descent: RobotTrajectory, *, force_baselines) -> bool:
