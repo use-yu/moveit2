@@ -681,6 +681,12 @@ RIGHT_CLEAR_ERROR_SERVICE = "/g01/right/clear_error"
 SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
 SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
 MOTOR_COMMAND_TOPIC = "/g01/motor_commands"
+ARM_ROBOT_STATUS_TOPICS = {
+    "left": "/g01/left_arm/robot_status",
+    "right": "/g01/right_arm/robot_status",
+}
+ARM_ROBOT_STATUS_WAIT_SEC = 1.0
+ARM_ROBOT_STATUS_MAX_AGE_SEC = 0.5
 MOVE_TO_GRASP_POSE_CMD_TOPIC = "/move_to_grasp_pose_cmd"
 GRASP_CMD_TOPIC = "/grasp_cmd"
 GRASP_CMD_RESULT_TOPIC = "/grasp_cmd_result"
@@ -3874,6 +3880,12 @@ class G01Demo(Node):
         self._startup_error_codes: list[int] = []
         self.sim_mode = bool(sim_mode)
         self.use_force_sensors = use_force_sensors
+        self._arm_robot_status: dict[str, tuple[int, float, int]] = {}
+        for side, topic in ARM_ROBOT_STATUS_TOPICS.items():
+            self.create_subscription(
+                Int32, topic,
+                lambda msg, side=side: self._on_arm_robot_status(msg, side), 1,
+            )
         # 后台节点只做规划；保护和硬件停臂由前台节点统一执行。
         self._force_range_enabled = upper_communication and use_force_sensors
         self._force_range_fault: str | None = None
@@ -4514,9 +4526,60 @@ class G01Demo(Node):
             self._input4_retreat_ignore_limits = previous_ignore_limits
             self._force_task_active = active
 
+    def _on_arm_robot_status(self, msg: Int32, side: str) -> None:
+        previous = self._arm_robot_status.get(side)
+        sequence = previous[2] + 1 if previous is not None else 1
+        self._arm_robot_status[side] = (int(msg.data), time.monotonic(), sequence)
+
+    def _check_arm_motion_ready(self, joint_names: Sequence[str]) -> bool:
+        """真机每次运动前等参与臂的新状态；只有1（无报警且已使能）放行。"""
+        if self.sim_mode:
+            return True
+        sides = tuple(
+            side for side, prefix in (("left", "l_arm_joint"), ("right", "r_arm_joint"))
+            if any(name.startswith(prefix) for name in joint_names)
+        )
+        if not sides:
+            return True
+        initial_sequences = {
+            side: self._arm_robot_status.get(side, (0, 0., 0))[2] for side in sides
+        }
+        deadline = time.monotonic() + ARM_ROBOT_STATUS_WAIT_SEC
+        reason = "未收到新状态"
+        while rclpy.ok() and time.monotonic() < deadline:
+            self._executor.spin_once(timeout_sec=min(0.05, max(0., deadline-time.monotonic())))
+            self._abort_on_force_range()
+            now = time.monotonic()
+            ready = True
+            for side in sides:
+                sample = self._arm_robot_status.get(side)
+                if (sample is None or sample[2] <= initial_sequences[side]
+                        or now-sample[1] > ARM_ROBOT_STATUS_MAX_AGE_SEC):
+                    ready = False
+                    reason = f"{side} 臂状态未更新或已超时：{ARM_ROBOT_STATUS_TOPICS[side]}"
+                    continue
+                if sample[0] != 1:
+                    status_text = {0: "未使能或反馈离线", 2: "报警"}.get(sample[0], "未知状态")
+                    self.get_logger().error(
+                        f"[arm-status] {side} 臂{status_text}（{sample[0]}），禁止开始运动"
+                    )
+                    return False
+            if ready:
+                return True
+        self.get_logger().error(f"[arm-status] {reason}，禁止开始运动")
+        return False
+
     def _send_force_guarded_goal(self, client, goal):
         """登记运动目标，包括保护触发时尚未返回接受结果的目标。"""
         self._abort_on_force_range()
+        if isinstance(goal, MoveGroup.Goal):
+            names = [] if goal.planning_options.plan_only else joint_names_for_group(goal.request.group_name)
+        elif isinstance(goal, ExecuteTrajectory.Goal):
+            names = list(goal.trajectory.joint_trajectory.joint_names)
+        else:
+            raise TypeError(f"不支持的运动目标类型: {type(goal).__name__}")
+        if names and not self._check_arm_motion_ready(names):
+            return None
         future = client.send_goal_async(goal)
 
         def on_accepted(done):
@@ -6333,6 +6396,8 @@ class G01Demo(Node):
             )
 
         send_fut = self._send_force_guarded_goal(self._move_cli, g)
+        if send_fut is None:
+            return False, elapsed_ms(), None, MoveItErrorCodes.CONTROL_FAILED
         if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
             log.error("move_action 目标被拒绝或超时")
             return False, elapsed_ms(), None, None
@@ -7043,6 +7108,8 @@ class G01Demo(Node):
 
         goal = ExecuteTrajectory.Goal(trajectory=traj)
         send_fut = self._send_force_guarded_goal(self._exec_cli, goal)
+        if send_fut is None:
+            return False
         if not self._spin_until(send_fut, 15.0) or not send_fut.result().accepted:
             log.error("execute_trajectory 目标被拒绝或超时")
             return False
@@ -7126,6 +7193,8 @@ class G01Demo(Node):
         try:
             goal = ExecuteTrajectory.Goal(trajectory=traj)
             send_fut = self._send_force_guarded_goal(self._exec_cli, goal)
+            if send_fut is None:
+                return "failed"
             if not self._spin_until(send_fut, 15.0):
                 log.error("execute_trajectory 目标发送超时")
                 return "failed"
@@ -8170,6 +8239,9 @@ class G01Demo(Node):
             if any(handle.status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING,
                                       GoalStatus.STATUS_CANCELING) for handle in self._force_action_goals):
                 log.error("仍有未结束的运动action，禁止开始导纳")
+                return False
+            # 导纳绕过 MoveIt action，首次发送直接关节指令前也检查参与臂。
+            if not self._check_arm_motion_ready(joint_names_for_group(arm_group)):
                 return False
             started = time.monotonic()
             for side in sides:

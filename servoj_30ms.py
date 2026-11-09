@@ -43,7 +43,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32MultiArray, String
+from std_msgs.msg import Float32MultiArray, Int32, String
 from dobot_msgs_v4.srv import (
     ClearError,
     DisableRobot,
@@ -144,6 +144,13 @@ RIGHT_JOINTS = JOINT_ORDER[10:16]
 ARM_COMMAND_SIZE = 6
 SERVOJ_SEND_PERIOD_SEC = 0.03
 COMMAND_TOPIC = "/g01/joint_commands"
+LEFT_ROBOT_STATUS_TOPIC = "/g01/left_arm/robot_status"
+RIGHT_ROBOT_STATUS_TOPIC = "/g01/right_arm/robot_status"
+ROBOT_STATUS_PUBLISH_PERIOD_SEC = 0.1
+ROBOT_STATUS_TIMEOUT_SEC = 0.5
+# Int32 状态码：0=未使能/反馈离线/未收到，1=无报警且已使能，2=报警。
+# 有效反馈中先判断 error_status 或报警/碰撞模式，再判断 enable_status。
+# 反馈离线仅依据通信新鲜度，不等同于机械臂已停止。
 SERVOJ_CONTROL_TOPIC = "/g01/servoj_control"
 SERVOJ_CONTROL_STATE_TOPIC = "/g01/servoj_control_state"
 SERVOJ_RESUME_GUARD_SEC = 0.1
@@ -237,7 +244,11 @@ class fankuis():
             ft_sensor = feedback['six_force_value'].copy()
             ft_sensor_online = int(feedback['six_force_online'])
             actual_tcp_force = feedback['actual_TCP_force'].copy()
-            return [tool_v, tool_j, tool_i, tcp_force, ft_sensor, ft_sensor_online, actual_tcp_force]
+            robot_mode = int(feedback['robot_mode'])
+            error_status = int(feedback['error_status'])
+            enable_status = int(feedback['enable_status'])
+            return [tool_v, tool_j, tool_i, tcp_force, ft_sensor, ft_sensor_online,
+                    actual_tcp_force, robot_mode, error_status, enable_status]
         except (OSError, ConnectionError, ValueError) as error:
             self._log_feedback_error(error)
             return ["NG"]
@@ -246,6 +257,13 @@ class ArmRosBridge(Node):
     def __init__(self, clients):
         super().__init__("dobot_arm_ros_bridge")
         self.arm_clients = clients
+        self._robot_status_lock = threading.Lock()
+        self._robot_status_samples = {"left": None, "right": None}
+        self._robot_status_pubs = {
+            "left": self.create_publisher(Int32, LEFT_ROBOT_STATUS_TOPIC, 10),
+            "right": self.create_publisher(Int32, RIGHT_ROBOT_STATUS_TOPIC, 10),
+        }
+        self.create_timer(ROBOT_STATUS_PUBLISH_PERIOD_SEC, self._publish_robot_status)
         self.left_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/state", 10)
         self.right_pub = self.create_publisher(Float32MultiArray, "/g01/right_arm/state", 10)
         self.left_i_pub = self.create_publisher(Float32MultiArray, "/g01/left_arm/i_actual", 10)
@@ -318,6 +336,28 @@ class ArmRosBridge(Node):
             DUAL_ARM_DISABLE_ROBOT_SERVICE,
             self._on_dual_arm_disable_robot,
         )
+
+    def update_robot_status(self, side, robot_mode, error_status, enable_status):
+        """由对应臂反馈线程更新；时间戳只在有效反馈帧到达后刷新。"""
+        with self._robot_status_lock:
+            self._robot_status_samples[side] = (
+                time.monotonic(), int(robot_mode), int(error_status), int(enable_status),
+            )
+
+    def _publish_robot_status(self):
+        now = time.monotonic()
+        with self._robot_status_lock:
+            samples = dict(self._robot_status_samples)
+        for side, sample in samples.items():
+            status = 0
+            # Dashboard 断线会令 stop=False 并终止两侧反馈线程，立即报离线。
+            if stop and sample is not None and now - sample[0] <= ROBOT_STATUS_TIMEOUT_SEC:
+                _, mode, error, enabled = sample
+                if error != 0 or mode in (9, 11):
+                    status = 2
+                elif enabled == 1:
+                    status = 1
+            self._robot_status_pubs[side].publish(Int32(data=status))
 
     def publish_arm_state(self, side, q):
         msg = Float32MultiArray()
@@ -676,6 +716,7 @@ def joint(feed_v, side, state_node):
             time.sleep(0.01)
             continue
 
+        state_node.update_robot_status(side, actual[7], actual[8], actual[9])
         q_actual[side] = [round(num, 6) for num in actual[1]]
         i_actual[side] = [round(num, 6) for num in actual[2]]
         TCP_force[side] = [float(num) for num in actual[3]]
