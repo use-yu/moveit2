@@ -39,7 +39,7 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
+#include <cstdint>
 #include <thread>
 
 using namespace std::placeholders;
@@ -49,7 +49,8 @@ namespace moveit_simple_controller_manager
 namespace
 {
 constexpr char G01_HARDWARE_PLUGIN[] = "g01_topic_hardware/G01TopicSystem";
-constexpr char MOTOR_COMMAND_TOPIC[] = "/g01/motor_commands";
+constexpr char WAIST_MOTOR_COMMAND_TOPIC[] = "/waist_motor_control/motor_commands";
+constexpr char LIFT_MOTOR_COMMAND_TOPIC[] = "/lift_motor_control/motor_commands";
 constexpr char WAIST_CSP_PATH_TOPIC[] = "/waist_motor_control/csp_path";
 constexpr char LIFT_CSP_PATH_TOPIC[] = "/lift_motor_control/csp_path";
 constexpr char EXECUTION_SCHEDULE_TOPIC[] = "/g01/trajectory_execution_schedule";
@@ -57,10 +58,12 @@ constexpr char WAIST_JOINT[] = "body_joint2";
 constexpr char LIFT_JOINT[] = "body_joint1";
 constexpr double WAIST_POSITION_SCALE = 1.0;    // rad -> rad
 constexpr double LIFT_POSITION_SCALE = 1000.0;  // m -> mm
-constexpr double CSP_PATH_FREQUENCY_HZ = 200.0;
-constexpr double CSP_PATH_PERIOD_SEC = 1.0 / CSP_PATH_FREQUENCY_HZ;
-constexpr double SYNCHRONIZED_START_DELAY_SEC = 0.1;
-constexpr auto CSP_PRELOAD_DELAY = std::chrono::milliseconds(100);
+constexpr int64_t CSP_PATH_FREQUENCY_HZ = 100;
+constexpr int64_t CSP_PATH_PERIOD_NS = 1'000'000'000 / CSP_PATH_FREQUENCY_HZ;
+constexpr uint8_t CSP_CLEAR_PATH_COMMAND = 0x02;
+constexpr uint8_t CSP_START_COMMAND = 0x01;
+constexpr auto CSP_CLEAR_PATH_DELAY = std::chrono::milliseconds(100);
+constexpr auto CSP_PATH_LOAD_DELAY = std::chrono::milliseconds(100);
 }  // namespace
 
 FollowJointTrajectoryControllerHandle::FollowJointTrajectoryControllerHandle(const rclcpp::Node::SharedPtr& node,
@@ -78,14 +81,15 @@ FollowJointTrajectoryControllerHandle::FollowJointTrajectoryControllerHandle(con
   }
 
   // 真机和仿真的 body_controller 共用 interpolation_method=none。两者都要先把
-  // 躯干轨迹离散为 5 ms 点；只有真机会把同一份点数组预发给 CSP。
+  // 躯干轨迹离散为 10 ms 点；只有真机会把同一份点数组预发给 CSP。
   g01_body_trajectory_sync_enabled_ = robot_description.find(WAIST_JOINT) != std::string::npos &&
                                       robot_description.find(LIFT_JOINT) != std::string::npos;
   if (!g01_body_trajectory_sync_enabled_ || robot_description.find(G01_HARDWARE_PLUGIN) == std::string::npos)
     return;
 
   g01_csp_preload_enabled_ = true;
-  motor_command_pub_ = node->create_publisher<std_msgs::msg::UInt8>(MOTOR_COMMAND_TOPIC, rclcpp::QoS(5));
+  waist_motor_command_pub_ = node->create_publisher<std_msgs::msg::UInt8>(WAIST_MOTOR_COMMAND_TOPIC, rclcpp::QoS(5));
+  lift_motor_command_pub_ = node->create_publisher<std_msgs::msg::UInt8>(LIFT_MOTOR_COMMAND_TOPIC, rclcpp::QoS(5));
   waist_csp_path_pub_ = node->create_publisher<std_msgs::msg::Float32MultiArray>(WAIST_CSP_PATH_TOPIC, rclcpp::QoS(5));
   lift_csp_path_pub_ = node->create_publisher<std_msgs::msg::Float32MultiArray>(LIFT_CSP_PATH_TOPIC, rclcpp::QoS(5));
   execution_schedule_pub_ =
@@ -106,7 +110,7 @@ bool FollowJointTrajectoryControllerHandle::synchronizeG01BodyTrajectory(
     return true;
 
   const std::size_t joint_count = trajectory.joint_names.size();
-  std::vector<double> point_times;
+  std::vector<int64_t> point_times;
   point_times.reserve(trajectory.points.size());
   for (std::size_t i = 0; i < trajectory.points.size(); ++i)
   {
@@ -119,7 +123,7 @@ bool FollowJointTrajectoryControllerHandle::synchronizeG01BodyTrajectory(
       return false;
     }
 
-    const double point_time = rclcpp::Duration(point.time_from_start).seconds();
+    const int64_t point_time = rclcpp::Duration(point.time_from_start).nanoseconds();
     if (i > 0 && point_time <= point_times.back())
     {
       RCLCPP_ERROR_STREAM(LOGGER, "Cannot synchronize G01 body trajectory: time_from_start is not strictly "
@@ -131,20 +135,19 @@ bool FollowJointTrajectoryControllerHandle::synchronizeG01BodyTrajectory(
   }
 
   const auto source_points = trajectory.points;
-  const double start_time = point_times.front();
-  const double end_time = point_times.back();
-  const double duration = end_time - start_time;
-  const std::size_t sample_intervals =
-      source_points.size() == 1 ? 0 : static_cast<std::size_t>(std::ceil(duration / CSP_PATH_PERIOD_SEC));
+  const int64_t start_time = point_times.front();
+  const int64_t end_time = point_times.back();
+  const int64_t duration = end_time - start_time;
+  const int64_t sample_intervals = (duration + CSP_PATH_PERIOD_NS - 1) / CSP_PATH_PERIOD_NS;
 
   std::vector<trajectory_msgs::msg::JointTrajectoryPoint> synchronized_points;
   synchronized_points.reserve(sample_intervals + 1);
   std::size_t segment = 0;
-  for (std::size_t sample = 0; sample <= sample_intervals; ++sample)
+  for (int64_t sample = 0; sample <= sample_intervals; ++sample)
   {
-    // 末点时间向上对齐到 5 ms，保证控制器的最后一个 200 Hz 周期也能取到终点。
-    const double synchronized_time = start_time + sample * CSP_PATH_PERIOD_SEC;
-    const double source_time = std::min(synchronized_time, end_time);
+    // 末点时间向上对齐到 CSP 的 10 ms 采样周期。
+    const int64_t synchronized_time = start_time + sample * CSP_PATH_PERIOD_NS;
+    const int64_t source_time = std::min(synchronized_time, end_time);
     while (segment + 1 < point_times.size() - 1 && source_time > point_times[segment + 1])
       ++segment;
 
@@ -156,8 +159,8 @@ bool FollowJointTrajectoryControllerHandle::synchronizeG01BodyTrajectory(
     }
     else
     {
-      const double segment_duration = point_times[segment + 1] - point_times[segment];
-      const double ratio = (source_time - point_times[segment]) / segment_duration;
+      const int64_t segment_duration = point_times[segment + 1] - point_times[segment];
+      const double ratio = static_cast<double>(source_time - point_times[segment]) / segment_duration;
       for (std::size_t joint = 0; joint < joint_count; ++joint)
       {
         point.positions[joint] =
@@ -180,7 +183,7 @@ bool FollowJointTrajectoryControllerHandle::synchronizeG01BodyTrajectory(
       point.positions[lift_index] = static_cast<double>(lift_mm) / LIFT_POSITION_SCALE;
     }
 
-    point.time_from_start = rclcpp::Duration::from_seconds(synchronized_time);
+    point.time_from_start = rclcpp::Duration::from_nanoseconds(synchronized_time);
     synchronized_points.push_back(std::move(point));
   }
 
@@ -210,11 +213,6 @@ bool FollowJointTrajectoryControllerHandle::prepareTrajectoryExecution(
     const std::vector<moveit_msgs::msg::RobotTrajectory>& trajectories)
 {
   return publishG01CspPaths(trajectories);
-}
-
-rclcpp::Duration FollowJointTrajectoryControllerHandle::getTrajectoryStartDelay() const
-{
-  return rclcpp::Duration::from_seconds(g01_csp_preload_enabled_ ? SYNCHRONIZED_START_DELAY_SEC : 0.0);
 }
 
 bool FollowJointTrajectoryControllerHandle::publishTrajectoryExecutionSchedule(
@@ -289,27 +287,33 @@ bool FollowJointTrajectoryControllerHandle::publishG01CspPaths(
   const std::size_t waist_sample_count = waist_path.data.size();
   const std::size_t lift_sample_count = lift_path.data.size();
 
-  // 发布顺序是协议的一部分：先给电机控制节点发 1，再发送完整 CSP 轨迹，
-  // 最后才把 FollowJointTrajectory goal 交给控制器。真机硬件插件只有在 goal
-  // 进入 EXECUTING 后才会开始发布 /g01/joint_commands。
+  // 分别清空参与轨迹的电机路径，给驱动留出处理清空命令的时间。
   std_msgs::msg::UInt8 motor_command;
-  motor_command.data = 1;
-  motor_command_pub_->publish(motor_command);
-
-  // 先让电机控制节点处理停止/切换命令，再发送新的 CSP 完整轨迹。
-  std::this_thread::sleep_for(CSP_PRELOAD_DELAY);
+  motor_command.data = CSP_CLEAR_PATH_COMMAND;
+  if (has_waist)
+    waist_motor_command_pub_->publish(motor_command);
+  if (has_lift)
+    lift_motor_command_pub_->publish(motor_command);
+  std::this_thread::sleep_for(CSP_CLEAR_PATH_DELAY);
 
   if (has_waist)
     waist_csp_path_pub_->publish(std::move(waist_path));
   if (has_lift)
     lift_csp_path_pub_->publish(std::move(lift_path));
 
-  // 给电机控制节点留出 0.1 秒接收和处理完整 CSP 数组，然后才发送 action goal。
-  std::this_thread::sleep_for(CSP_PRELOAD_DELAY);
+  // 等待驱动接收完整路径后再发送启动命令。
+  std::this_thread::sleep_for(CSP_PATH_LOAD_DELAY);
 
-  RCLCPP_INFO_STREAM(LOGGER, "Preloaded G01 CSP trajectory with two "
-                                 << CSP_PRELOAD_DELAY.count() << " ms delays before " << name_
-                                 << " execution: " << (has_waist ? "waist " : "") << (has_lift ? "lift " : "")
+  // 发出 CSP 启动命令后立即进入 action 流程，硬件桥在控制器进入 EXECUTING 后发布 joint_commands。
+  motor_command.data = CSP_START_COMMAND;
+  if (has_waist)
+    waist_motor_command_pub_->publish(motor_command);
+  if (has_lift)
+    lift_motor_command_pub_->publish(motor_command);
+
+  RCLCPP_INFO_STREAM(LOGGER, "Published G01 CSP paths and start commands before "
+                                 << name_ << " execution: " << (has_waist ? "waist " : "")
+                                 << (has_lift ? "lift " : "")
                                  << "(waist " << waist_sample_count << "/lift " << lift_sample_count
                                  << " CSP samples at " << CSP_PATH_FREQUENCY_HZ << " Hz)");
   return true;

@@ -1,7 +1,7 @@
 # This config file is used by ros2_control
 controller_manager:
   ros__parameters:
-    update_rate: 200  # Hz；执行期间 /g01/joint_commands 目标周期为 5 ms
+    update_rate: 100  # Hz，执行期间 /g01/joint_commands 目标周期为 10 ms
 
     left_arm_controller:
       type: joint_trajectory_controller/JointTrajectoryController
@@ -68,7 +68,7 @@ lift_controller:
   ros__parameters:
     joints:
       - body_joint1
-    # 躯干 action goal 已预先离散为 5 ms 点，禁止控制器再次样条插值。
+    # 躯干 action goal 使用 CSP 的 10 ms 轨迹点。
     interpolation_method: none
     command_interfaces:
       - position
@@ -79,8 +79,7 @@ waist_controller:
   ros__parameters:
     joints:
       - body_joint2
-    # 躯干 action goal 已预先离散为 5 ms 点，禁止控制器再次样条插值，
-    # 保证 /g01/joint_commands 和预下发 CSP 使用同一组点。
+    # 躯干 action goal 使用 CSP 的 10 ms 轨迹点。
     interpolation_method: none
     command_interfaces:
       - position

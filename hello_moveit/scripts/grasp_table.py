@@ -101,9 +101,9 @@ IK_MAX_SOLUTIONS_PER_ARM = 8
 IK_SEED_PERTURB = 2.5
 MAX_IK_PAIR_PLANS = 24
 
-# 合并轨迹的公共采样周期；控制器更新频率为 200 Hz，因此使用 5 ms。
-SYNC_SAMPLE_PERIOD = 0.005
-# 合并轨迹碰撞检查无需每 5 ms 调一次服务，按此周期抽样并始终检查终点。
+# 合并轨迹按控制器的 100 Hz 更新频率设置采样周期。
+SYNC_SAMPLE_PERIOD = 0.01
+# 按此周期抽样检查合并轨迹的碰撞，并始终检查终点。
 VALIDITY_SAMPLE_PERIOD = 0.02
 
 TABLE_MARKER_TOPIC = "table_coordinate_system"

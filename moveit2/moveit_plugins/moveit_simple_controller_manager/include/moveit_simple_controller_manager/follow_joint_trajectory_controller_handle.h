@@ -61,7 +61,6 @@ public:
   bool prepareTrajectory(moveit_msgs::msg::RobotTrajectory& trajectory) override;
   bool coordinatesTrajectoryExecution() const override;
   bool prepareTrajectoryExecution(const std::vector<moveit_msgs::msg::RobotTrajectory>& trajectories) override;
-  rclcpp::Duration getTrajectoryStartDelay() const override;
   bool publishTrajectoryExecutionSchedule(const rclcpp::Time& start_time,
                                           const std::vector<std::string>& joint_names) override;
   bool sendTrajectory(const moveit_msgs::msg::RobotTrajectory& trajectory) override;
@@ -87,7 +86,8 @@ private:
 
   bool g01_body_trajectory_sync_enabled_{ false };
   bool g01_csp_preload_enabled_{ false };
-  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr motor_command_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr waist_motor_command_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr lift_motor_command_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr waist_csp_path_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr lift_csp_path_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr execution_schedule_pub_;
