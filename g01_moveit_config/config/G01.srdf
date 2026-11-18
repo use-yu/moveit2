@@ -266,4 +266,6 @@
     <!-- <disable_collisions link1="SJ" link2="base_sj" reason="Adjacent"/> -->
     <!-- <disable_collisions link1="base_sj" link2="moveit_base_link" reason="Adjacent"/> -->
     <disable_collisions link1="YB" link2="head" reason="Adjacent"/>
+    <disable_collisions link1="r_JZ" link2="R6" reason="Adjacent"/>
+    <disable_collisions link1="l_JZ" link2="L6" reason="Adjacent"/>
 </robot>
