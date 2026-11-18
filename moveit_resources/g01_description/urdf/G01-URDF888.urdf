@@ -43,57 +43,6 @@
     <axis xyz="1 0 0" />
     <limit lower="-1.0" upper="1.0" effort="100.0" velocity="1.0" />
   </joint>
-
-  <link
-    name="moveit_base_link">
-    <inertial>
-      <origin
-        xyz="0.0691524291822167 0.259496930651884 -0.00130659890827987"
-        rpy="0 0 0" />
-      <mass
-        value="41.5277464083994" />
-      <inertia
-        ixx="0.570004732373126"
-        ixy="-0.00703781706041236"
-        ixz="0.00835110193260417"
-        iyy="0.691781343855571"
-        iyz="-0.000804977195232927"
-        izz="0.285311555623509" />
-    </inertial>
-    <visual>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 3.1415926" />
-      <geometry>
-        <mesh
-          filename="package://moveit_resources_g01_description/meshes/base_link.STL" />
-      </geometry>
-      <material
-        name="">
-        <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
-      </material>
-    </visual>
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 3.1415926" />
-      <geometry>
-        <mesh
-          filename="package://moveit_resources_g01_description/meshes/base_link.STL" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin
-        xyz="-0.217 0 0.6495"
-        rpy="0 0 0" />
-      <geometry>
-        <box
-          size="0.34 0.34 0.03" />
-      </geometry>
-    </collision>
-  </link>
-
   <joint name="base_joint2" type="revolute">
       <parent link="base_x_link" />
       <child link="moveit_base_link"/>
@@ -101,22 +50,21 @@
       <axis xyz="0 0 1" />
       <limit lower="-3.14" upper="3.14" effort="100.0" velocity="1.0" />      
   </joint>
-
   <link
-    name="base_sj">
+    name="moveit_base_link">
     <inertial>
       <origin
-        xyz="0.133450982977141 -1.41729194895084E-05 0.367160017405196"
+        xyz="-0.0355139875453498 -0.0031750736263505 0.320549311908938"
         rpy="0 0 0" />
       <mass
-        value="19.9697634207302" />
+        value="36.7545604805791" />
       <inertia
-        ixx="0.323000550121407"
-        ixy="-1.38857870649621E-06"
-        ixz="6.56605523551475E-05"
-        iyy="0.328467888870501"
-        iyz="1.09388604275496E-07"
-        izz="0.125203078713168" />
+        ixx="0.547388395364205"
+        ixy="-0.000771481575918922"
+        ixz="0.000973693814550719"
+        iyy="0.527990672579326"
+        iyz="0.000136531966976998"
+        izz="0.525428805870154" />
     </inertial>
     <visual>
       <origin
@@ -124,12 +72,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/1.STL" />
+          filename="package://moveit_resources_g01_description/meshes/base_link.STL" />
       </geometry>
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="1 1 1 1" />
       </material>
     </visual>
     <collision>
@@ -138,36 +86,25 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/1.STL" />
+          filename="package://moveit_resources_g01_description/meshes/base_link.STL" />
       </geometry>
     </collision>
   </link>
-  <joint
-    name="base_sj_joint"
-    type="fixed">
-    <origin
-      xyz="0 0 0"
-      rpy="0 0 0" />
-    <parent
-      link="moveit_base_link" />
-    <child
-      link="base_sj" />
-  </joint>
   <link
     name="SJ">
     <inertial>
       <origin
-        xyz="-0.00395805470520541 8.04674475233509E-05 0.371900051124025"
+        xyz="0.00190026205788245 -0.00108505553972454 0.31206860555596"
         rpy="0 0 0" />
       <mass
-        value="17.6002532483208" />
+        value="16.6778347486063" />
       <inertia
-        ixx="0.318245215724161"
-        ixy="3.13835558262271E-05"
-        ixz="-0.000168188402116862"
-        iyy="0.317843038906483"
-        iyz="-0.000283196972292768"
-        izz="0.085449301954894" />
+        ixx="0.30844236098004"
+        ixy="6.85506859356414E-08"
+        ixz="-2.78554644051061E-06"
+        iyy="0.311553486331149"
+        iyz="0.000473896023521609"
+        izz="0.0779405448884047" />
     </inertial>
     <visual>
       <origin
@@ -175,12 +112,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/2.STL" />
+          filename="package://moveit_resources_g01_description/meshes/Empty_Link-lift.STL" />
       </geometry>
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="1 1 1 1" />
       </material>
     </visual>
     <collision>
@@ -189,7 +126,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/2.STL" />
+          filename="package://moveit_resources_g01_description/meshes/Empty_Link-lift.STL" />
       </geometry>
     </collision>
   </link>
@@ -197,17 +134,17 @@
     name="body_joint1"
     type="prismatic">
     <origin
-      xyz="0.127 0 0.1355"
+      xyz="-0.096 0 0.254"
       rpy="0 0 0" />
     <parent
-      link="base_sj" />
+      link="moveit_base_link" />
     <child
       link="SJ" />
     <axis
       xyz="0 0 1" />
     <limit
       lower="0"
-      upper="0.19"
+      upper="0.213"
       effort="0"
       velocity="0" />
   </joint>
@@ -215,17 +152,17 @@
     name="YB">
     <inertial>
       <origin
-        xyz="-0.00496671797700096 0.250265690930262 -0.110261468853256"
+        xyz="0.00155174368940539 0.24177933447235 0.120044638922435"
         rpy="0 0 0" />
       <mass
-        value="6.37285826562377" />
+        value="4.14473268670768" />
       <inertia
-        ixx="0.104057625489572"
-        ixy="0.000356602912657763"
-        ixz="2.0257963908081E-05"
-        iyy="0.0540784200777737"
-        iyz="-0.000135803148206808"
-        izz="0.0689819139928815" />
+        ixx="0.0168144222692434"
+        ixy="-4.59499340728062E-05"
+        ixz="-1.17258590870701E-06"
+        iyy="0.0165264800124468"
+        iyz="-4.73413675985381E-06"
+        izz="0.0125140578583211" />
     </inertial>
     <visual>
       <origin
@@ -233,12 +170,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/3.STL" />
+          filename="package://moveit_resources_g01_description/meshes/Empty_Link-y.STL" />
       </geometry>
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="1 1 1 1" />
       </material>
     </visual>
     <collision>
@@ -247,7 +184,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/3.STL" />
+          filename="package://moveit_resources_g01_description/meshes/Empty_Link-y.STL" />
       </geometry>
     </collision>
   </link>
@@ -255,7 +192,7 @@
     name="body_joint2"
     type="revolute">
     <origin
-      xyz="0 0.1175 0.697"
+      xyz="0 -0.1173 0.64"
       rpy="1.5708 0 -3.1416" />
     <parent
       link="SJ" />
@@ -265,26 +202,25 @@
       xyz="0 0 1" />
     <limit
       lower="0"
-      upper="1.0"
-      effort="100"
-      velocity="100" />
+      upper="0.7854"
+      effort="0"
+      velocity="0" />
   </joint>
-
   <link
     name="head">
     <inertial>
       <origin
-        xyz="-0.00403705357872861 0.115732858597124 -0.0491268553659784"
+        xyz="-0.0191789255830817 -0.103745615519259 0.0487269429643096"
         rpy="0 0 0" />
       <mass
-        value="0.83283062923428" />
+        value="0.480448725344528" />
       <inertia
-        ixx="0.00142817479719766"
-        ixy="-5.17934423555129E-05"
-        ixz="-2.22025767502253E-06"
-        iyy="0.0014159733101056"
-        iyz="4.09940583982823E-06"
-        izz="0.000753501633654325" />
+        ixx="0.000854405612000462"
+        ixy="5.08778661270695E-05"
+        ixz="1.62078943694278E-06"
+        iyy="0.000716838233338799"
+        iyz="3.70070125511527E-06"
+        izz="0.000490976522678425" />
     </inertial>
     <visual>
       <origin
@@ -292,12 +228,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/6.STL" />
+          filename="package://moveit_resources_g01_description/meshes/Empty_Link-t.STL" />
       </geometry>
       <material
         name="">
         <color
-          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+          rgba="1 1 1 1" />
       </material>
     </visual>
     <collision>
@@ -306,16 +242,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/6.STL" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin
-        xyz="0.02 0.1 -0.05"
-        rpy="0 0 0" />
-      <geometry>
-        <box
-          size="0.26 0.2 0.2" />
+          filename="package://moveit_resources_g01_description/meshes/Empty_Link-t.STL" />
       </geometry>
     </collision>
   </link>
@@ -323,30 +250,30 @@
     name="head_joint"
     type="revolute">
     <origin
-      xyz="-0.047 0.5115 -0.1664"
-      rpy="3.1416 0 3.1416" />
+      xyz="-0.047 0.5115 0.0684"
+      rpy="0 0 -3.1416" />
     <parent
       link="YB" />
     <child
       link="head" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="0"
       upper="1.0472"
-      effort="100"
-      velocity="100" />
+      effort="0"
+      velocity="0" />
   </joint>
 
-
+  
 
   <xacro:cr7_robot
     prefix="l_"
     link_prefix="L"
     joint_prefix="l_arm_joint"
     parent="YB"
-    xyz="0.000 0.418 0.059"
-    rpy="0 0 -3.1415926"
+    xyz="0 0.418 0.2938"
+    rpy="0 0 3.1416"
     dh_id="'1077'" />
 
   <xacro:cr7_robot
@@ -354,8 +281,8 @@
     link_prefix="R"
     joint_prefix="r_arm_joint"
     parent="YB"
-    xyz="-0.000 0.418 -0.294"
-    rpy="-3.1415926 0 0"
+    xyz="0 0.418 -0.0592"
+    rpy="3.1416 0 0"
     dh_id="'1079'" />
 
 </robot>

@@ -23,7 +23,6 @@
         <joint name="world_to_base_footprint"/>
         <joint name="base_joint1"/>
         <joint name="base_joint2"/>
-        <joint name="base_sj_joint"/>
         <joint name="body_joint1"/>
         <joint name="body_joint2"/>
         <joint name="l_arm_joint1"/>
@@ -42,7 +41,6 @@
     <group name="dual_arm_body">
         <joint name="body_joint1"/>
         <joint name="body_joint2"/>
-        <joint name="base_sj_joint"/>
         <joint name="l_arm_joint1"/>
         <joint name="l_arm_joint2"/>
         <joint name="l_arm_joint3"/>
@@ -91,7 +89,6 @@
         <joint name="world_to_base_footprint"/>
         <joint name="base_joint1"/>
         <joint name="base_joint2"/>
-        <joint name="base_sj_joint"/>
         <joint name="body_joint1"/>
         <joint name="body_joint2"/>
         <joint name="l_arm_joint1"/>
@@ -133,7 +130,6 @@
         <joint name="world_to_base_footprint"/>
         <joint name="base_joint1"/>
         <joint name="base_joint2"/>
-        <joint name="base_sj_joint"/>
         <joint name="body_joint1"/>
         <joint name="body_joint2"/>
         <joint name="r_arm_joint1"/>
@@ -267,7 +263,7 @@
     <disable_collisions link1="SJ" link2="YB" reason="Adjacent"/>
     <disable_collisions link1="SJ" link2="moveit_base_link" reason="Adjacent"/>
     <disable_collisions link1="YB" link2="moveit_base_link" reason="Never"/>
-    <disable_collisions link1="SJ" link2="base_sj" reason="Adjacent"/>
-    <disable_collisions link1="base_sj" link2="moveit_base_link" reason="Adjacent"/>
+    <!-- <disable_collisions link1="SJ" link2="base_sj" reason="Adjacent"/> -->
+    <!-- <disable_collisions link1="base_sj" link2="moveit_base_link" reason="Adjacent"/> -->
     <disable_collisions link1="YB" link2="head" reason="Adjacent"/>
 </robot>
