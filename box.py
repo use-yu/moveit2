@@ -47,7 +47,7 @@ from scipy.interpolate import CubicHermiteSpline, PchipInterpolator
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float32, Float64MultiArray
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectoryPoint
 
@@ -66,7 +66,7 @@ BOX_SIZE_M = (0.593, 0.312, 0.395)
 LEFT_GRASP_X_OUTSIDE_M = 0.062
 RIGHT_GRASP_X_OUTSIDE_M = 0.022
 LEFT_GRASP_Y_OUTSIDE_M = 0.05
-RIGHT_GRASP_Y_OUTSIDE_M = 0.07
+RIGHT_GRASP_Y_OUTSIDE_M = 0.065
 # 抓取点相对箱体局部 Z 中心的偏移。
 LEFT_GRASP_Z_OFFSET_M = -0.00
 RIGHT_GRASP_Z_OFFSET_M = -0.007
@@ -99,7 +99,7 @@ PLAN_TIME_SEC = 10.0
 IK_TIMEOUT_SEC = 0.2
 SVC_COMPUTE_IK = "compute_ik"
 SVC_CARTESIAN_PATH = "compute_cartesian_path"
-UNLOAD_PLACE_JOINT_SPEED = 0.15
+UNLOAD_PLACE_JOINT_SPEED = 0.3
 UNLOAD_PLACE_POSITION_TOLERANCE = 0.001
 UNLOAD_PLACE_ORIENTATION_TOLERANCE = math.radians(0.1)
 UNLOAD_PLACE_ARM_IK_ATTEMPTS = 200
@@ -132,10 +132,18 @@ CART_PRISMATIC_JUMP_THRESHOLD = 0.02
 JOINT_STATES_TOPIC = "/g01/joint_states"
 PREGRASP_OUTSIDE_M = 0.10
 LIFT_M = 0.15
+CLAW_TOPIC = "/driver_control/claw"
+CLAW_OPEN = -45.0
+CLAW_CLOSED = 0.0
+CLAW_SETTLE_SEC = 1.0
+TRANSFER_REFERENCE_TAG_XZ_M = (0.5407, 0.7426)
+REFERENCE_RETRACT_M = 0.43
+REFERENCE_LOWER_M = 0.342
+SPREAD_M = 0.10
 CARTESIAN_STEP_M = CART_EEF_STEP
 COLLISION_CHECK_STEP_RAD = 0.025
 COLLISION_CHECK_STEP_M = 0.005
-LIFT_SYNC_TOLERANCE_M = 0.01
+SYNC_TRANSLATION_TOLERANCE_M = 0.01
 MOVEIT_START_TOLERANCE = 0.01
 FOLLOWER_JOINT_STEP_RAD = 0.12
 CONTROLLER_PERIOD_SEC = 0.01
@@ -434,6 +442,7 @@ class BoxNode(Node):
         self.validity_client = self.create_client(GetStateValidity, "check_state_validity")
         self.fk_client = self.create_client(GetPositionFK, "compute_fk")
         self.execution_client = ActionClient(self, ExecuteTrajectory, "execute_trajectory")
+        self.claw_publisher = self.create_publisher(Float32, CLAW_TOPIC, 10)
 
     def read_marker(self):
         """Read one valid detection after the command."""
@@ -1110,20 +1119,20 @@ class BoxNode(Node):
                 positions.append([state[name] for name in output_names])
         return time_shared_body_path(times, positions)
 
-    def cartesian_candidates(self, start, starts, targets, lift=False, cache=None):
+    def cartesian_candidates(self, start, starts, targets, synchronized=False, cache=None):
         path = self.plan_cartesian(start, targets, cache)
-        if path is not None and self.validate_path(path, start, (starts, targets), lift=lift):
+        if path is not None and self.validate_path(path, start, (starts, targets), synchronized):
             yield path
         for lead, follow in (ARMS, ARMS[::-1]):
             path = self.plan_shared_body_line(start, starts, targets, lead, follow)
-            if path is not None and self.validate_path(path, start, (starts, targets), lift=lift):
+            if path is not None and self.validate_path(path, start, (starts, targets), synchronized):
                 yield path
 
-    def check_cartesian_pair(self, state, starts, targets, lift, endpoint):
+    def check_cartesian_pair(self, state, starts, targets, synchronized, endpoint):
         poses = self.forward_poses(state, [link for _, link, _, _ in ARMS])
         if poses is None:
             return False
-        differences = []
+        distances = []
         for _, link, frame, _ in ARMS:
             actual = poses[link]
             start = position_xyz(starts[frame])
@@ -1136,10 +1145,10 @@ class BoxNode(Node):
             if (np.linalg.norm(position_xyz(actual) - nearest) > CARTESIAN_STEP_M
                     or (pose_rotation(actual).inv() * pose_rotation(targets[frame])).magnitude() > 0.03):
                 return False
-            differences.append(position_xyz(actual) - start)
-        return not lift or np.linalg.norm(differences[0] - differences[1]) <= LIFT_SYNC_TOLERANCE_M
+            distances.append((position_xyz(actual) - start) @ line / np.linalg.norm(line))
+        return not synchronized or abs(distances[0] - distances[1]) <= SYNC_TRANSLATION_TOLERANCE_M
 
-    def validate_path(self, trajectory, start, cartesian=None, lift=False):
+    def validate_path(self, trajectory, start, cartesian=None, synchronized=False):
         joints = trajectory.joint_trajectory
         names = joints.joint_names
         points = joints.points
@@ -1163,8 +1172,8 @@ class BoxNode(Node):
                 return False
             if cartesian is not None:
                 endpoint = 0.0 if index == 0 else 1.0 if index == len(samples) - 1 else None
-                if not self.check_cartesian_pair(state, *cartesian, lift, endpoint):
-                    self.get_logger().error(f"双臂笛卡尔状态 {index} 偏离直线或抬升不同步")
+                if not self.check_cartesian_pair(state, *cartesian, synchronized, endpoint):
+                    self.get_logger().error(f"双臂笛卡尔状态 {index} 偏离直线或双臂不同步")
                     return False
         return True
 
@@ -1261,23 +1270,58 @@ class BoxNode(Node):
                 return False
         return True
 
+    def box_transfer_moves(self, tag_pose):
+        tag = tag_pose.position
+        reference_x, reference_z = TRANSFER_REFERENCE_TAG_XZ_M
+        retract = REFERENCE_RETRACT_M + (tag.x - reference_x)
+        lower = REFERENCE_LOWER_M + (tag.z - reference_z)
+        if not all(isfinite(value) and value > 0 for value in (retract, lower)):
+            self.get_logger().error("根据标签位置计算的后退或下降距离无效")
+            return None
+        self.get_logger().info(
+            f"标签 X={tag.x:.4f} m、Z={tag.z:.4f} m，抱箱后退 {retract:.3f} m、下降 {lower:.3f} m"
+        )
+        return (
+            ("双臂抬升 15 cm", ((0.0, 0.0, LIFT_M),) * len(ARMS)),
+            (f"双臂后退 {retract * 100:.1f} cm", ((-retract, 0.0, 0.0),) * len(ARMS)),
+            (f"双臂下降 {lower * 100:.1f} cm", ((0.0, 0.0, -lower),) * len(ARMS)),
+            ("双臂张开 10 cm", ((0.0, SPREAD_M, 0.0), (0.0, -SPREAD_M, 0.0))),
+        )
+
+    def plan_box_transfers(self, start, starts, moves):
+        if not moves:
+            return []
+        label, offsets = moves[0]
+        targets = {
+            frame: shifted_pose(starts[frame], offset)
+            for (_, _, frame, _), offset in zip(ARMS, offsets)
+        }
+        for trajectory in self.cartesian_candidates(start, starts, targets, synchronized=True):
+            endpoint = trajectory_state(start, trajectory, -1)
+            rest = self.plan_box_transfers(endpoint, targets, moves[1:])
+            if rest is not None:
+                return [(label, trajectory, start, (starts, targets)), *rest]
+        return None
+
     def plan_box_pick(self, current, collision):
         log = self.get_logger()
+        moves = self.box_transfer_moves(self.frame_poses[self.tag_frame])
+        if moves is None:
+            return None
         grasp = {frame: self.frame_poses[frame] for _, _, frame, _ in ARMS}
         rotation = pose_rotation(self.box_pose)
         pregrasp = {
             frame: shifted_pose(grasp[frame], rotation.apply((side * PREGRASP_OUTSIDE_M, 0.0, 0.0)))
             for _, _, frame, side in ARMS
         }
-        raised = {frame: shifted_pose(pose, (0.0, 0.0, LIFT_M)) for frame, pose in grasp.items()}
         cache = {}
         for group, names, target, label in self.pregrasp_candidates(current, pregrasp):
             candidate = {**current, **target}
-            lines = self.plan_box_lines(candidate, collision, pregrasp, grasp, raised, cache)
+            lines = self.plan_box_lines(candidate, collision, pregrasp, grasp, moves, cache)
             if self.box_collision is None:
                 return None
             if lines is None:
-                log.info(f"[unload] {label}：双臂接近或抬升直线不可行，换下一构型")
+                log.info(f"[unload] {label}：至少一段双臂直线不可行，换下一构型")
                 continue
             log.info(f"[unload] {label}：左右直线和同步碰撞检查均通过，已缓存同步轨迹")
             started = monotonic()
@@ -1292,29 +1336,22 @@ class BoxNode(Node):
             if endpoint_delta > 1e-4:
                 log.info(f"[unload] {label}：OMPL 末点与 IK 目标最大偏差 "
                          f"{endpoint_delta:.6f}，按实际末点更新直线缓存")
-                lines = self.plan_box_lines(endpoint, collision, pregrasp, grasp, raised, cache)
+                lines = self.plan_box_lines(endpoint, collision, pregrasp, grasp, moves, cache)
                 if self.box_collision is None:
                     return None
                 if lines is None:
                     continue
             if not self.check_pregrasp_endpoint(endpoint, pregrasp, label):
                 continue
-            approach, lift = lines
-            at_grasp = trajectory_state(endpoint, approach, -1)
-            approach_body = all(name in approach.joint_trajectory.joint_names for name in TORSO_JOINTS)
-            lift_body = all(name in lift.joint_trajectory.joint_names for name in TORSO_JOINTS)
-            log.info(f"[unload] {label}：IK、左右 Cartesian、OMPL 均通过，已缓存三段抱箱轨迹")
-            return (
+            log.info(f"[unload] {label}：IK、左右 Cartesian、OMPL 均通过，已缓存六段抱箱轨迹")
+            return [
                 ("移动到预备位", preparation, current, None),
-                ("双臂直线接近" + ("（含腰部和升降）" if approach_body else ""),
-                 approach, endpoint, (pregrasp, grasp)),
-                ("双臂抬升 15 cm" + ("（含腰部和升降）" if lift_body else ""),
-                 lift, at_grasp, (grasp, raised)),
-            )
+                *lines,
+            ]
         log.error("[unload] 左点1/右点2 的纯臂及 dual_arm_body 多构型全部失败")
         return None
 
-    def plan_box_lines(self, start, collision, pregrasp, grasp, raised, cache):
+    def plan_box_lines(self, start, collision, pregrasp, grasp, moves, cache):
         lines = None
         # Cartesian services read the live scene. Restore the box before any execution.
         try:
@@ -1322,9 +1359,9 @@ class BoxNode(Node):
                 return None
             for approach in self.cartesian_candidates(start, pregrasp, grasp, cache=cache):
                 at_grasp = trajectory_state(start, approach, -1)
-                lift = next(self.cartesian_candidates(at_grasp, grasp, raised, lift=True), None)
-                if lift is not None:
-                    lines = (approach, lift)
+                transfers = self.plan_box_transfers(at_grasp, grasp, moves)
+                if transfers is not None:
+                    lines = [("双臂直线接近", approach, start, (pregrasp, grasp)), *transfers]
                     break
         finally:
             restored = self.restore_box_collision(collision)
@@ -1364,7 +1401,10 @@ class BoxNode(Node):
             return False
         return True
 
-    def prepare_lift_for_execution(self, trajectory, actual, expected, cartesian):
+    def prepare_transfer_for_execution(self, stages, actual):
+        label, trajectory, start, cartesian = stages[0]
+        expected = trajectory_state(start, trajectory, 0)
+
         def start_error(path, measured):
             joints = path.joint_trajectory
             return max(
@@ -1374,39 +1414,43 @@ class BoxNode(Node):
 
         error, joint = start_error(trajectory, actual)
         if error <= MOVEIT_START_TOLERANCE:
-            if not self.validate_path(trajectory, actual, cartesian, lift=True):
+            if not self.validate_path(trajectory, actual, cartesian, synchronized=True):
                 return None
             actual = self.read_joints()
             if actual is None:
                 return None
             error, joint = start_error(trajectory, actual)
             if error <= MOVEIT_START_TOLERANCE:
-                return trajectory
+                return stages
         if any(abs(actual[name] - value) > (0.005 if name in LINEAR_JOINTS else 0.02)
                for name, value in expected.items()):
-            self.get_logger().error("抬升前实测关节状态已明显偏离抓取构型，停止执行")
+            self.get_logger().error(f"{label}前实测关节状态已偏离规划起点，停止执行")
             return None
 
         self.get_logger().info(
-            f"抬升起点关节 {joint} 偏差 {error:.5f} 超过 MoveIt 容差 "
-            f"{MOVEIT_START_TOLERANCE:.3f}，从当前实测姿态重新规划抬升"
+            f"{label}起点关节 {joint} 偏差 {error:.5f} 超过 MoveIt 容差 "
+            f"{MOVEIT_START_TOLERANCE:.3f}，从当前实测姿态重新规划剩余直线"
         )
         poses = self.forward_poses(actual, [link for _, link, _, _ in ARMS])
         if poses is None:
-            self.get_logger().error("无法计算抬升起点实测末端位姿")
+            self.get_logger().error(f"无法计算{label}起点实测末端位姿")
             return None
         starts = {frame: poses[link] for _, link, frame, _ in ARMS}
-        targets = {frame: shifted_pose(pose, (0.0, 0.0, LIFT_M)) for frame, pose in starts.items()}
-        refreshed = next(self.cartesian_candidates(actual, starts, targets, lift=True), None)
+        moves = [
+            (step_label, tuple(position_xyz(to_poses[frame]) - position_xyz(from_poses[frame])
+                               for _, _, frame, _ in ARMS))
+            for step_label, _, _, (from_poses, to_poses) in stages
+        ]
+        refreshed = self.plan_box_transfers(actual, starts, moves)
         if refreshed is None:
-            self.get_logger().error("从实测姿态重新规划抬升失败")
+            self.get_logger().error("从实测姿态重新规划剩余直线失败")
             return None
         latest = self.read_joints()
         if latest is None:
             return None
-        error, joint = start_error(refreshed, latest)
+        error, joint = start_error(refreshed[0][1], latest)
         if error > MOVEIT_START_TOLERANCE:
-            self.get_logger().error(f"抬升重规划后关节 {joint} 起点仍偏差 {error:.5f}，停止执行")
+            self.get_logger().error(f"重规划后关节 {joint} 起点仍偏差 {error:.5f}，停止执行")
             return None
         return refreshed
 
@@ -1441,34 +1485,45 @@ class BoxNode(Node):
             if not self.validate_path(trajectory, actual) or not self.execute_trajectory(trajectory):
                 return False
 
-        deadline = monotonic() + BOX_RECOGNITION_SETTLE_SEC
-        while rclpy.ok() and (remaining := deadline - monotonic()) > 0:
-            rclpy.spin_once(self, timeout_sec=min(TF_PUBLISH_PERIOD_SEC, remaining))
-        if not rclpy.ok():
+        if not self.spin_for(BOX_RECOGNITION_SETTLE_SEC):
             return False
         if not torso_at_target(self.read_joints()):
             self.get_logger().error("实测升降或腰部未到达箱体识别位")
             return False
         return True
 
+    def spin_for(self, seconds):
+        deadline = monotonic() + seconds
+        while rclpy.ok() and (remaining := deadline - monotonic()) > 0:
+            rclpy.spin_once(self, timeout_sec=min(TF_PUBLISH_PERIOD_SEC, remaining))
+        return rclpy.ok()
+
+    def command_claw(self, value):
+        self.claw_publisher.publish(Float32(data=value))
+        self.get_logger().info(f"已向 {CLAW_TOPIC} 发布夹爪指令 {value:g}")
+
     def pick_box(self, confirm=None):
         collision = self.box_collision
         if collision is None:
             self.get_logger().error("请先输入 1 识别并添加箱体")
             return
+        self.command_claw(CLAW_OPEN)
         current = self.read_joints()
         if current is None:
             return
         stages = self.plan_box_pick(current, collision)
         if stages is None:
-            self.get_logger().error("抱箱三段路径未全部通过规划检查")
+            self.get_logger().error("抱箱和放箱六段路径未全部通过规划检查")
             return
-        print(f"{GREEN}预备、接近、抬升三段路径均已通过规划检查{RESET}")
+        print(f"{GREEN}预备、接近、抬升、后退、下降、张开六段路径均已通过规划检查{RESET}")
         if not self.execution_client.wait_for_server(timeout_sec=TIMEOUT_SEC):
             self.get_logger().error("execute_trajectory 动作服务不可用")
             return
 
-        for index, (label, trajectory, start, cartesian) in enumerate(stages):
+        for index in range(len(stages)):
+            label, trajectory, start, cartesian = stages[index]
+            if cartesian is not None and all(name in trajectory.joint_trajectory.joint_names for name in TORSO_JOINTS):
+                label += "（含腰部和升降）"
             if confirm is not None and not confirm(f"按回车{label}，输入 q 退出："):
                 return
             actual = self.read_joints()
@@ -1483,9 +1538,18 @@ class BoxNode(Node):
                 self.restore_box_collision(collision)
                 return
             if index == 2:
-                trajectory = self.prepare_lift_for_execution(trajectory, actual, expected, cartesian)
-                if trajectory is None:
+                self.command_claw(CLAW_CLOSED)
+                if not self.spin_for(CLAW_SETTLE_SEC):
                     return
+                actual = self.read_joints()
+                if actual is None:
+                    return
+            if index >= 2:
+                remaining_stages = self.prepare_transfer_for_execution(stages[index:], actual)
+                if remaining_stages is None:
+                    return
+                stages[index:] = remaining_stages
+                trajectory = stages[index][1]
             elif not self.validate_path(trajectory, actual, cartesian):
                 if index == 1:
                     self.restore_box_collision(collision)
@@ -1497,6 +1561,8 @@ class BoxNode(Node):
             if index == 2:
                 # Stop publishing the original grasp locations as the box starts moving.
                 self.frame_poses.clear()
+            if index == len(stages) - 1:
+                self.command_claw(CLAW_OPEN)
             if not self.execute_trajectory(trajectory):
                 return
             print(f"{GREEN}已完成{label}{RESET}")
