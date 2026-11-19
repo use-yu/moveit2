@@ -1,3 +1,6 @@
+# 测试箱子姿态：
+# ros2 run tf2_ros tf2_echo moveit_base_link aruco_33
+
 #!/usr/bin/env python3
 """Manage the ArUco-tagged box in MoveIt and publish the tag TF."""
 
@@ -24,12 +27,13 @@ SCENE_FRAME = "moveit_base_link"
 TARGET_FRAMES = (SCENE_FRAME, "SJ", "YB")
 BOX_ID = "aruco_box"
 TF_PUBLISH_PERIOD_SEC = 0.1
-BOX_SIZE_M = (0.610, 0.169, 0.412)
-#加的尺寸
+#箱子尺寸
+BOX_SIZE_M = (0.593, 0.312, 0.395)
+#加的保护尺寸
 PADDING_PER_SIDE_M = 0.02
-BOX_RPY_DEG = (-7.7, 0.0, 0.0)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
-# Tag +Y points toward the top edge; tag +Z points out of the front face.
-MARKER_TO_CENTER_M = (0.0, 0.03 - BOX_SIZE_M[1] / 2, -BOX_SIZE_M[2] / 2)
+BOX_RPY_DEG = (-6.292, 0.0, -2.3)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
+# 二维码位于 X 中线，距箱体 +Y 边缘 26 cm、+Z 边缘 1.6 cm。
+MARKER_TO_CENTER_M = (0.0, 0.260 - BOX_SIZE_M[1] / 2, 0.016 - BOX_SIZE_M[2] / 2)
 TIMEOUT_SEC = 3.0
 GREEN = "\033[32m"
 RESET = "\033[0m"
