@@ -2,7 +2,7 @@
 # ros2 run tf2_ros tf2_echo moveit_base_link aruco_33
 
 #!/usr/bin/env python3
-"""Manage the ArUco-tagged box in MoveIt and publish the tag TF."""
+"""Add the ArUco-tagged box to MoveIt and publish tag and grasp TFs."""
 
 from math import isfinite
 from queue import Empty, SimpleQueue
@@ -29,9 +29,18 @@ BOX_ID = "aruco_box"
 TF_PUBLISH_PERIOD_SEC = 0.1
 #箱子尺寸
 BOX_SIZE_M = (0.593, 0.312, 0.395)
+# 抓取点位于箱体局部 +Y 边缘之外。
+GRASP_Y_OUTSIDE_M = 0.095 #0.099
+GRASP_X_OUTSIDE_M = 0.025 #0.02
+# 标定时箱体和左右工具在 moveit_base_link 中的四元数（xyzw）。
+REFERENCE_BOX_XYZW = (-0.4911, 0.5049, 0.5147, -0.4888)
+GRASP_REFERENCES = (
+    ("l_box_grasp", -1, (0.634, -0.308, 0.661, -0.257)),
+    ("r_box_grasp", 1, (0.672, 0.243, 0.645, 0.270)),
+)
 #加的保护尺寸
 PADDING_PER_SIDE_M = 0.02
-BOX_RPY_DEG = (-6.292, 0.0, -2.3)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
+BOX_RPY_DEG = (-3, 0.0, -1.0)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
 # 二维码位于 X 中线，距箱体 +Y 边缘 26 cm、+Z 边缘 1.6 cm。
 MARKER_TO_CENTER_M = (0.0, 0.260 - BOX_SIZE_M[1] / 2, 0.016 - BOX_SIZE_M[2] / 2)
 TIMEOUT_SEC = 3.0
@@ -53,14 +62,25 @@ class BoxNode(Node):
         self.tf_buffer = Buffer(node=self)
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
-        self.tag_pose = None
+        self.frame_poses = {}
         self.box_rotation_in_tag = Rotation.from_euler("XYZ", BOX_RPY_DEG, degrees=True)
         self.box_center_in_tag = self.box_rotation_in_tag.apply(MARKER_TO_CENTER_M)
-        self.tf_timer = self.create_timer(TF_PUBLISH_PERIOD_SEC, self.publish_tag_tf)
+        # 将标定工具姿态从基座坐标系转换到箱体坐标系。
+        reference_to_box = Rotation.from_quat(REFERENCE_BOX_XYZW).inv()
+        grasp_x = BOX_SIZE_M[0] / 2 + GRASP_X_OUTSIDE_M
+        grasp_y = BOX_SIZE_M[1] / 2 + GRASP_Y_OUTSIDE_M
+        self.grasps_in_box = {
+            frame: (
+                (side * grasp_x, grasp_y, 0.0),
+                reference_to_box * Rotation.from_quat(tool_xyzw),
+            )
+            for frame, side, tool_xyzw in GRASP_REFERENCES
+        }
+        self.tf_timer = self.create_timer(TF_PUBLISH_PERIOD_SEC, self.publish_tfs)
         self.scene_client = self.create_client(ApplyPlanningScene, "apply_planning_scene")
 
     def read_marker(self):
-        """Wait for a fresh detection after the command, then record its receive time."""
+        """Read one valid detection after the command."""
         detection = None
 
         def on_poses(msg):
@@ -144,31 +164,46 @@ class BoxNode(Node):
                 f"箱体四元数 xyzw ({q.x:.4f}, {q.y:.4f}, {q.z:.4f}, {q.w:.4f}){RESET}"
             )
 
-        dimensions = [round(size + 2 * PADDING_PER_SIDE_M, 3) for size in BOX_SIZE_M]
-        marker_pose, _ = poses[SCENE_FRAME]
+        if self.apply_box(*poses[SCENE_FRAME]):
+            print(f"{GREEN}已更新箱体 {BOX_ID}，发布 TF {SCENE_FRAME} → "
+                  f"{', '.join(self.frame_poses)}{RESET}")
+
+    def apply_box(self, marker_pose, box_pose):
         collision = CollisionObject(id=BOX_ID, operation=CollisionObject.ADD)
         collision.header.frame_id = SCENE_FRAME
         collision.pose = marker_pose
+        dimensions = [round(size + 2 * PADDING_PER_SIDE_M, 3) for size in BOX_SIZE_M]
         collision.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=dimensions)]
         collision.primitive_poses = [make_pose(self.box_center_in_tag, self.box_rotation_in_tag)]
 
-        if self.apply_scene(collision):
-            self.tag_pose = marker_pose
-            self.publish_tag_tf()
-            print(f"{GREEN}已更新箱体 {BOX_ID} 和 TF {SCENE_FRAME} → {self.tag_frame}，"
-                  f"箱体尺寸 (m) {dimensions}{RESET}")
+        if not self.apply_scene(collision):
+            return False
+        p = box_pose.position
+        q = box_pose.orientation
+        center = (p.x, p.y, p.z)
+        box_rotation = Rotation.from_quat([q.x, q.y, q.z, q.w])
+        self.frame_poses = {self.tag_frame: marker_pose}
+        for frame, (position, rotation) in self.grasps_in_box.items():
+            self.frame_poses[frame] = make_pose(
+                center + box_rotation.apply(position), box_rotation * rotation
+            )
+        self.publish_tfs()
+        return True
 
-    def publish_tag_tf(self):
-        if self.tag_pose is None:
+    def publish_tfs(self):
+        if not self.frame_poses:
             return
-
-        position = self.tag_pose.position
-        transform = TransformStamped(child_frame_id=self.tag_frame)
-        transform.header.frame_id = SCENE_FRAME
-        transform.header.stamp = self.get_clock().now().to_msg()
-        transform.transform.translation = Vector3(x=position.x, y=position.y, z=position.z)
-        transform.transform.rotation = self.tag_pose.orientation
-        self.tf_broadcaster.sendTransform(transform)
+        stamp = self.get_clock().now().to_msg()
+        transforms = []
+        for frame, pose in self.frame_poses.items():
+            position = pose.position
+            transform = TransformStamped(child_frame_id=frame)
+            transform.header.frame_id = SCENE_FRAME
+            transform.header.stamp = stamp
+            transform.transform.translation = Vector3(x=position.x, y=position.y, z=position.z)
+            transform.transform.rotation = pose.orientation
+            transforms.append(transform)
+        self.tf_broadcaster.sendTransform(transforms)
 
     def clear_scene(self):
         if not self.scene_client.wait_for_service(timeout_sec=TIMEOUT_SEC):
@@ -177,8 +212,9 @@ class BoxNode(Node):
 
         # MoveIt interprets REMOVE with an empty ID as clearing all world collision objects.
         if self.apply_scene(CollisionObject(operation=CollisionObject.REMOVE)):
-            self.tag_pose = None
-            print(f"{GREEN}已清除世界碰撞物体，停止发布 TF {self.tag_frame}{RESET}")
+            frames = ", ".join(self.frame_poses)
+            self.frame_poses.clear()
+            print(f"{GREEN}已清除世界碰撞物体，停止发布箱体相关 TF {frames}{RESET}")
 
     def apply_scene(self, collision):
         scene = PlanningScene(is_diff=True)
@@ -210,7 +246,7 @@ def main():
     Thread(target=read_commands, daemon=True).start()
     try:
         while rclpy.ok():
-            print("输入 1 添加箱体和二维码 TF，0 清除，q 退出：", end="", flush=True)
+            print("输入 1 单次识别并添加箱体、发布二维码和抓取 TF，0 清除，q 退出：", end="", flush=True)
             while rclpy.ok():
                 try:
                     command = commands.get_nowait()

@@ -223,7 +223,7 @@ Visualization Manager:
         Goal State Color: 250; 128; 0
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
-        Planning Group: right_arm
+        Planning Group: body
         Query Goal State: true
         Query Start State: false
         Show Workspace: false
@@ -576,6 +576,8 @@ Visualization Manager:
           Value: true
         l_base_link:
           Value: true
+        l_box_grasp:
+          Value: true
         l_tool:
           Value: true
         moveit_base_link:
@@ -583,6 +585,8 @@ Visualization Manager:
         r_JZ:
           Value: true
         r_base_link:
+          Value: true
+        r_box_grasp:
           Value: true
         r_tool:
           Value: true
@@ -626,6 +630,10 @@ Visualization Manager:
                                   r_tool:
                                     {}
                 aruco_33:
+                  {}
+                l_box_grasp:
+                  {}
+                r_box_grasp:
                   {}
       Update Interval: 0
       Value: true
@@ -672,25 +680,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 3.982426881790161
+      Distance: 3.4577016830444336
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.6161834001541138
-        Y: -0.20258508622646332
-        Z: 0.8338715434074402
+        X: 0.8386731147766113
+        Y: -0.133979931473732
+        Z: 0.7100589871406555
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.42479634284973145
+      Pitch: 0.13479657471179962
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 4.9286274909973145
+      Yaw: 4.178619384765625
     Saved: ~
 Window Geometry:
   Displays:
@@ -708,5 +716,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1387
-  X: 269
-  Y: 159
+  X: 382
+  Y: 203

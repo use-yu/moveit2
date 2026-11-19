@@ -5,7 +5,7 @@
 <robot
   xmlns:xacro="http://www.ros.org/wiki/xacro"
   name="cr7_robot">
-  <xacro:macro name="cr7_robot" params="prefix link_prefix joint_prefix parent xyz rpy dh_id">
+  <xacro:macro name="cr7_robot" params="prefix link_prefix joint_prefix parent xyz rpy dh_id jz_mesh:=Empty_Link--L-JZ.STL jz_rpy:='0 -1.5708 0.7854'">
   <xacro:property name="cr7_transforms" value="${xacro.load_yaml('m_dh_transforms.json')[dh_id]}" />
   <xacro:property name="cr7_frame_01" value="${cr7_transforms['frame_0_to_frame_1']}" />
   <xacro:property name="cr7_frame_12" value="${cr7_transforms['frame_1_to_frame_2']}" />
@@ -459,7 +459,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/Empty_Link--L-JZ.STL" />
+          filename="package://moveit_resources_g01_description/meshes/${jz_mesh}" />
       </geometry>
       <material
         name="">
@@ -473,7 +473,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://moveit_resources_g01_description/meshes/Empty_Link--L-JZ.STL" />
+          filename="package://moveit_resources_g01_description/meshes/${jz_mesh}" />
       </geometry>
     </collision>
   </link>
@@ -482,7 +482,7 @@
     type="fixed">
     <origin
       xyz="0 0 0"
-      rpy="0 -1.5708 0.7854" />
+      rpy="${jz_rpy}" />
     <parent
       link="${link_prefix}6" />
     <child
