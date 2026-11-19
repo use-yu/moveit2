@@ -1,3 +1,29 @@
+root@ubuntu:/home/ws_moveit/src# python3 box.py --interactive
+输入 1 定位并识别箱体，2 规划抱箱，3 添加后墙，0 清除，q 退出：1
+按回车移动到箱体识别位（升降 0 m、腰部 10°），输入 q 退出：
+[moveit_base_link] 标签 33 xyz (m) (0.5397, -0.0025, 0.7278)，箱中心 xyz (m) (0.7208, 0.0063, 0.7375)，箱体四元数 xyzw (-0.5173, 0.4981, 0.4773, -0.5064)
+[SJ] 标签 33 xyz (m) (0.6357, -0.0025, 0.4738)，箱中心 xyz (m) (0.8168, 0.0063, 0.4835)，箱体四元数 xyzw (-0.5173, 0.4981, 0.4773, -0.5064)
+[YB] 标签 33 xyz (m) (-0.6549, -0.0533, 0.1148)，箱中心 xyz (m) (-0.8315, -0.0123, 0.1236)，箱体四元数 xyzw (-0.0777, -0.7198, 0.0678, -0.6864)
+已更新箱体 aruco_box，发布 TF moveit_base_link → aruco_33, l_box_grasp, r_box_grasp
+输入 1 定位并识别箱体，2 规划抱箱，3 添加后墙，0 清除，q 退出：2
+[INFO] [1795093266.236991859] [aruco_box_obstacle]: 已向 /driver_control/claw 发布夹爪指令 -45
+[INFO] [1795093266.254443730] [aruco_box_obstacle]: 标签 X=0.5397 m、Z=0.7278 m，抱箱后退 0.429 m、下降 0.327 m
+[INFO] [1795093266.255608942] [aruco_box_obstacle]: [unload] 左右纯臂 IK 使用 moveit_base_link 目标和完整预计关节状态
+[INFO] [1795093266.370168920] [aruco_box_obstacle]: [unload-ik] group=left_arm, frame=moveit_base_link, solutions=20/200, avoid_collisions=True, failures=NO_IK_SOLUTION:3
+[INFO] [1795093266.490937569] [aruco_box_obstacle]: [unload-ik] group=right_arm, frame=moveit_base_link, solutions=20/200, avoid_collisions=True, failures=NO_IK_SOLUTION:2
+[INFO] [1795093266.491521166] [aruco_box_obstacle]: [unload] 纯臂多构型：左点1=20 解，右点2=20 解
+[INFO] [1795093266.493622221] [aruco_box_obstacle]: [unload] 纯臂共生成 400 个左右组合，按关节距离全范围分布验证 200 组
+[ERROR] [1795093269.587593576] [aruco_box_obstacle]: 双臂笛卡尔状态 236 偏离直线或双臂不同步
+[INFO] [1795093283.520592812] [aruco_box_obstacle]: [unload] dual_arm 纯臂构型 1/200：左右直线和同步碰撞检查均通过，已缓存同步轨迹
+[INFO] [1795093286.267886554] [aruco_box_obstacle]: [unload] dual_arm 纯臂构型 1/200: 2746.0 ms (planned)
+[INFO] [1795093286.358291927] [aruco_box_obstacle]: [unload] dual_arm 纯臂构型 1/200 左臂规划终点 FK 误差：位置=0.008 mm，姿态=0.0009°
+[INFO] [1795093286.359447827] [aruco_box_obstacle]: [unload] dual_arm 纯臂构型 1/200 右臂规划终点 FK 误差：位置=0.009 mm，姿态=0.0004°
+[INFO] [1795093286.360377366] [aruco_box_obstacle]: [unload] dual_arm 纯臂构型 1/200：IK、左右 Cartesian、OMPL 均通过，已缓存六段抱箱轨迹
+预备、接近、抬升、后退、下降、张开六段路径均已通过规划检查
+
+
+
+
 # moveit2
 第一个位置后退一点
 抓取：55cm
