@@ -265,7 +265,12 @@
       velocity="0" />
   </joint>
 
-  
+  <link name="camera_link" />
+  <joint name="head_to_camera" type="fixed">
+    <parent link="head" />
+    <child link="camera_link" />
+    <origin xyz="0.05745 -0.12733 0.08115" rpy="0 1.5707963267948966 0" />
+  </joint>
 
   <xacro:cr7_robot
     prefix="l_"
