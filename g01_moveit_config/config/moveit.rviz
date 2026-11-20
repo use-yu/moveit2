@@ -14,7 +14,7 @@ Panels:
         - /MarkerArray1
         - /MarkerArray1/Topic1
       Splitter Ratio: 0.5
-    Tree Height: 343
+    Tree Height: 1231
   - Class: rviz_common/Help
     Name: Help
   - Class: rviz_common/Views
@@ -45,7 +45,7 @@ Visualization Manager:
       Value: true
     - Acceleration_Scaling_Factor: 0.1
       Class: moveit_rviz_plugin/MotionPlanning
-      Enabled: true
+      Enabled: false
       Move Group Namespace: ""
       MoveIt_Allow_Approximate_IK: false
       MoveIt_Allow_External_Program: false
@@ -73,133 +73,7 @@ Visualization Manager:
           Expand Joint Details: false
           Expand Link Details: false
           Expand Tree: false
-          L1:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L2:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L3:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L4:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L5:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L6:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
           Link Tree Style: Links in Alphabetic Order
-          R1:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R2:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R3:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R4:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R5:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R6:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          SJ:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          YB:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          base_footprint:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          base_x_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          camera_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          head:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          l_JZ:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          l_base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          l_tool:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          moveit_base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          r_JZ:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          r_base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          r_tool:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          world:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
         Loop Animation: false
         Robot Alpha: 0.5
         Robot Color: 150; 50; 150
@@ -245,137 +119,11 @@ Visualization Manager:
           Expand Joint Details: false
           Expand Link Details: false
           Expand Tree: false
-          L1:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L2:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L3:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L4:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L5:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          L6:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
           Link Tree Style: Links in Alphabetic Order
-          R1:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R2:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R3:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R4:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R5:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          R6:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          SJ:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          YB:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          base_footprint:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          base_x_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          camera_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          head:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          l_JZ:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          l_base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          l_tool:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          moveit_base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          r_JZ:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          r_base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          r_tool:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          world:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
         Robot Alpha: 0.5
         Show Robot Collision: false
         Show Robot Visual: false
-      Value: true
+      Value: false
       Velocity_Scaling_Factor: 0.1
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
@@ -535,63 +283,57 @@ Visualization Manager:
       Frames:
         All Enabled: false
         L1:
-          Value: true
+          Value: false
         L2:
-          Value: true
+          Value: false
         L3:
-          Value: true
+          Value: false
         L4:
-          Value: true
+          Value: false
         L5:
-          Value: true
+          Value: false
         L6:
           Value: true
         R1:
-          Value: true
+          Value: false
         R2:
-          Value: true
+          Value: false
         R3:
-          Value: true
+          Value: false
         R4:
-          Value: true
+          Value: false
         R5:
-          Value: true
+          Value: false
         R6:
-          Value: true
+          Value: false
         SJ:
-          Value: true
+          Value: false
         YB:
-          Value: true
-        aruco_33:
-          Value: true
+          Value: false
         base_footprint:
-          Value: true
+          Value: false
         base_x_link:
-          Value: true
+          Value: false
         camera_link:
-          Value: true
+          Value: false
         head:
-          Value: true
+          Value: false
         l_JZ:
           Value: true
         l_base_link:
-          Value: true
-        l_box_grasp:
-          Value: true
+          Value: false
         l_tool:
-          Value: true
+          Value: false
         moveit_base_link:
-          Value: true
+          Value: false
         r_JZ:
-          Value: true
+          Value: false
         r_base_link:
-          Value: true
-        r_box_grasp:
-          Value: true
+          Value: false
         r_tool:
-          Value: true
+          Value: false
         world:
-          Value: true
+          Value: false
       Marker Scale: 1
       Name: TF
       Show Arrows: true
@@ -674,30 +416,30 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.977397084236145
+      Distance: 6.1773505210876465
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.38688358664512634
-        Y: 0.05190286785364151
-        Z: 0.9074363708496094
+        X: -0.36488211154937744
+        Y: -0.04356252774596214
+        Z: 0.9893692135810852
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.22979696094989777
+      Pitch: 0.14979760348796844
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 0.4204367399215698
+      Yaw: 0.010446302592754364
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1016
+  Height: 1376
   Help:
     collapsed: false
   Hide Left Dock: false
@@ -706,9 +448,9 @@ Window Geometry:
     collapsed: false
   MotionPlanning - Trajectory Slider:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000002b4000003a2fc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb000000100044006900730070006c006100790073010000003b00000192000000c700fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e006701000001d30000020a0000016a00fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000043c00000109000000a000ffffff00000480000003a200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000002b40000050afc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb000000100044006900730070006c006100790073010000003b0000050a000000c700fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e00670000000270000002d50000016900fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000043c00000109000000a000ffffff000006fe0000050a00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 1850
-  X: 70
+  Width: 2488
+  X: 72
   Y: 27

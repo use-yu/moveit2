@@ -279,7 +279,7 @@
     parent="YB"
     xyz="0 0.418 0.2938"
     rpy="0 0 3.1416"
-    jz_rpy="0 -1.5708 -0.95"
+    jz_rpy="0 0.0 0.0"
     dh_id="'1077'" />
 
   <xacro:cr7_robot
@@ -289,8 +289,8 @@
     parent="YB"
     xyz="0 0.418 -0.0592"
     rpy="3.1416 0 0"
-    jz_mesh="Empty_Link--R-JZ.STL"
-    jz_rpy="0 -1.5708 0.13"
+    jz_mesh="Empty_Link-R-JZ.STL"
+    jz_rpy="0 0.0 0.0"
     dh_id="'1079'" />
 
 </robot>
