@@ -5,7 +5,7 @@
 # [moveit_base_link] 标签 33 xyz (m) (0.5158, -0.0323, 0.6835)，箱中心 xyz (m) (0.6939, -0.0314, 0.6486)，箱体四元数 xyzw (-0.4437, 0.4428, 0.5487, -0.5532)
 # [SJ] 标签 33 xyz (m) (0.6118, -0.0323, 0.4295)，箱中心 xyz (m) (0.7899, -0.0314, 0.3946)，箱体四元数 xyzw (-0.4437, 0.4428, 0.5487, -0.5532)
 # [YB] 标签 33 xyz (m) (-0.6436, -0.0658, 0.0850)，箱中心 xyz (m) (-0.8251, -0.0593, 0.0859)，箱体四元数 xyzw (-0.0063, -0.7089, 0.0034, -0.7053)
-# head 0.8
+# head 0.75
 
 #!/usr/bin/env python3
 """Detect a box, publish grasp TFs, and plan a staged dual-arm pick with MoveIt."""
@@ -14,8 +14,10 @@ import argparse
 import bisect
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+import json
 import math
 from math import ceil, isfinite
+from pathlib import Path
 from queue import Empty, SimpleQueue
 import random
 import re
@@ -48,11 +50,13 @@ from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Float32, Float64MultiArray
-from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
+from tf2_ros import TransformBroadcaster
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 
-SOURCE_FRAME = "head"
+CAMERA_FRAME = "camera_color_optical_frame"
+HEAD_LINK = "head"
+HEAD_JOINT = "head_joint"
 SCENE_FRAME = "moveit_base_link"
 TARGET_FRAMES = (SCENE_FRAME, "SJ", "YB")
 # --sim：固定视觉结果，坐标均位于 moveit_base_link。
@@ -67,29 +71,29 @@ TF_PUBLISH_PERIOD_SEC = 0.1
 #箱子尺寸
 BOX_SIZE_M = (0.593, 0.312, 0.395)
 # 抓取点相对箱体局部 ±X 和 +Y 边缘的外偏移。
-LEFT_GRASP_X_OUTSIDE_M = 0.062
-RIGHT_GRASP_X_OUTSIDE_M = 0.022
-LEFT_GRASP_Y_OUTSIDE_M = 0.05
-RIGHT_GRASP_Y_OUTSIDE_M = 0.065
+LEFT_GRASP_X_OUTSIDE_M = 0.03
+RIGHT_GRASP_X_OUTSIDE_M = 0.04
+LEFT_GRASP_Y_OUTSIDE_M = 0.075
+RIGHT_GRASP_Y_OUTSIDE_M = 0.075
 # 抓取点相对箱体局部 Z 中心的偏移。
-LEFT_GRASP_Z_OFFSET_M = -0.00
-RIGHT_GRASP_Z_OFFSET_M = -0.007
-# 标定时箱体和左右工具在 moveit_base_link 中的四元数（xyzw）。
-REFERENCE_BOX_XYZW = (-0.4911, 0.5049, 0.5147, -0.4888)
-GRASP_REFERENCES = (
+LEFT_GRASP_Z_OFFSET_M = -0.01
+RIGHT_GRASP_Z_OFFSET_M = -0.006
+# 抓取姿态从箱体姿态出发，先绕局部 Y 轴转 180°，再绕旋转后的局部 Z 轴转指定角度。
+GRASP_OFFSETS = (
     (
         "l_box_grasp", -1, LEFT_GRASP_X_OUTSIDE_M, LEFT_GRASP_Y_OUTSIDE_M,
-        LEFT_GRASP_Z_OFFSET_M, (0.634, -0.308, 0.661, -0.257),
+        LEFT_GRASP_Z_OFFSET_M, 225.0,
     ),
     (
         "r_box_grasp", 1, RIGHT_GRASP_X_OUTSIDE_M, RIGHT_GRASP_Y_OUTSIDE_M,
-        RIGHT_GRASP_Z_OFFSET_M, (0.672, 0.243, 0.645, 0.270),
+        RIGHT_GRASP_Z_OFFSET_M, 135.0,
     ),
 )
 ARMS = (
     ("left_arm", "l_tool", "l_box_grasp", -1),
     ("right_arm", "r_tool", "r_box_grasp", 1),
 )
+GRASP_BASE_FRAMES = {frame: f"{link[0]}_base_link" for _, link, frame, _ in ARMS}
 ARM_JOINTS = tuple(f"{side}_arm_joint{i}" for side in "lr" for i in range(1, 7))
 TORSO_JOINTS = ("body_joint1", "body_joint2")
 BOX_RECOGNITION_TORSO_TARGET = {"body_joint1": 0.0, "body_joint2": math.radians(10.0)}
@@ -135,16 +139,17 @@ CART_JUMP_THRESHOLD = 2.0
 CART_REVOLUTE_JUMP_THRESHOLD = 0.2
 CART_PRISMATIC_JUMP_THRESHOLD = 0.02
 JOINT_STATES_TOPIC = "/g01/joint_states"
-PREGRASP_OUTSIDE_M = 0.10
+PREGRASP_OUTSIDE_M = 0.15
 LIFT_M = 0.15
 CLAW_TOPIC = "/driver_control/claw"
 CLAW_OPEN = -45.0
-CLAW_CLOSED = 0.0
+CLAW_CLOSED = 5.0
 CLAW_SETTLE_SEC = 1.0
 TRANSFER_REFERENCE_TAG_XZ_M = (0.5407, 0.7426)
 # REFERENCE_RETRACT_M = 0.43
 REFERENCE_RETRACT_M = 0.43
 REFERENCE_LOWER_M = 0.342
+POST_RELEASE_LOWER_M = 0.03
 SPREAD_M = 0.10
 CARTESIAN_STEP_M = CART_EEF_STEP
 COLLISION_CHECK_STEP_RAD = 0.025
@@ -161,7 +166,7 @@ TORSO_PATH_LIMITS = {
 }
 # 箱体局部 X、Y、Z 的单侧保护量。
 PADDING_PER_SIDE_M = (0.02, 0.08, 0.02)
-BOX_RPY_DEG = (-3, 0.0, -1.0)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
+BOX_RPY_DEG = (-5, 0.0, -0.0)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
 # 二维码位于 X 中线，距箱体 +Y 边缘 26 cm、+Z 边缘 1.6 cm。
 MARKER_TO_CENTER_M = (0.0, 0.160 - BOX_SIZE_M[1] / 2, 0.016 - BOX_SIZE_M[2] / 2)
 TIMEOUT_SEC = 3.0
@@ -183,6 +188,34 @@ def position_xyz(pose):
 def pose_rotation(pose):
     q = pose.orientation
     return Rotation.from_quat((q.x, q.y, q.z, q.w))
+
+
+def pose_matrix(pose):
+    matrix = np.eye(4)
+    matrix[:3, :3] = pose_rotation(pose).as_matrix()
+    matrix[:3, 3] = position_xyz(pose)
+    return matrix
+
+
+def load_extrinsics(arm, base_frame):
+    path = Path(__file__).with_name(f"g01_handeye_{arm}.json")
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+        transform = np.asarray(result["calibration"]["best"]["T_base_camera"], dtype=float)
+        head_angle = float(result["head_joint_rad"])
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"无法从 {path} 读取完整的手眼标定结果：{error}") from error
+
+    if (result.get("arm") != arm or result.get("base_frame") != base_frame
+            or result.get("camera_frame") != CAMERA_FRAME):
+        raise RuntimeError(f"{path} 的坐标系应为 {CAMERA_FRAME} → {base_frame}。")
+    if (transform.shape != (4, 4) or not np.isfinite(transform).all()
+            or not np.allclose(transform[3], [0, 0, 0, 1]) or not isfinite(head_angle)):
+        raise RuntimeError(f"{path} 的外参矩阵或头部关节角度无效。")
+    rotation = transform[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6) or not np.isclose(np.linalg.det(rotation), 1):
+        raise RuntimeError(f"{path} 的外参旋转矩阵无效。")
+    return transform, head_angle
 
 
 def shifted_pose(pose, offset):
@@ -425,24 +458,20 @@ class BoxNode(Node):
             self.marker_id = 33
             self.get_logger().info("--sim：使用标签 33 的固定视觉数据，跳过识别定位；运动仍由 MoveIt 执行")
         self.tag_frame = f"aruco_{self.marker_id}"
-        self.tf_buffer = Buffer(node=self)
-        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.frame_poses = {}
         self.box_collision = None
-        self.box_pose = None
+        self.grasp_boxes = {}
         self.box_rotation_in_tag = Rotation.from_euler("XYZ", BOX_RPY_DEG, degrees=True)
         self.box_center_in_tag = self.box_rotation_in_tag.apply(MARKER_TO_CENTER_M)
-        # 将标定工具姿态从基座坐标系转换到箱体坐标系。
-        reference_to_box = Rotation.from_quat(REFERENCE_BOX_XYZW).inv()
         edge_x = BOX_SIZE_M[0] / 2
         edge_y = BOX_SIZE_M[1] / 2
         self.grasps_in_box = {
             frame: (
                 (side * (edge_x + x_outside), edge_y + y_outside, z_offset),
-                reference_to_box * Rotation.from_quat(tool_xyzw),
+                Rotation.from_euler("YZ", (180.0, z_rotation_deg), degrees=True),
             )
-            for frame, side, x_outside, y_outside, z_offset, tool_xyzw in GRASP_REFERENCES
+            for frame, side, x_outside, y_outside, z_offset, z_rotation_deg in GRASP_OFFSETS
         }
         self.tf_timer = self.create_timer(TF_PUBLISH_PERIOD_SEC, self.publish_tfs)
         self.scene_client = self.create_client(ApplyPlanningScene, "apply_planning_scene")
@@ -457,10 +486,15 @@ class BoxNode(Node):
     def read_marker(self):
         """Read one valid detection after the command."""
         detection = None
+        mismatched_frame = None
 
         def on_poses(msg):
-            nonlocal detection
+            nonlocal detection, mismatched_frame
             if len(msg.data) % 8:
+                return
+            source_frame = msg.layout.dim[0].label if msg.layout.dim else ""
+            if source_frame != CAMERA_FRAME:
+                mismatched_frame = source_frame or "未标记"
                 return
             # /aruco_poses packs [x, y, z, qx, qy, qz, qw, id] for each tag.
             for start in range(0, len(msg.data), 8):
@@ -471,7 +505,7 @@ class BoxNode(Node):
                     rotation = Rotation.from_quat(pose[3:])
                 except ValueError:
                     continue
-                detection = (self.get_clock().now(), pose[:3], rotation)
+                detection = make_pose(pose[:3], rotation)
                 break
 
         subscription = self.create_subscription(Float64MultiArray, "/aruco_poses", on_poses, 1)
@@ -482,38 +516,65 @@ class BoxNode(Node):
                 if remaining <= 0:
                     break
                 rclpy.spin_once(self, timeout_sec=remaining)
+            if detection is None and mismatched_frame is not None:
+                self.get_logger().error(f"/aruco_poses 的坐标系为 {mismatched_frame}，要求 {CAMERA_FRAME}。")
             return detection
         finally:
             self.destroy_subscription(subscription)
 
-    def box_poses(self, stamp, marker_xyz, marker_rotation):
-        poses = {}
-        deadline = monotonic() + TIMEOUT_SEC
-        for frame in TARGET_FRAMES:
-            while rclpy.ok():
-                try:
-                    transform = self.tf_buffer.lookup_transform(frame, SOURCE_FRAME, stamp).transform
-                    break
-                except TransformException as exc:
-                    remaining = deadline - monotonic()
-                    if remaining <= 0:
-                        self.get_logger().error(f"无法获取检测时刻的 TF {frame} ← {SOURCE_FRAME}：{exc}")
-                        return None
-                    rclpy.spin_once(self, timeout_sec=remaining)
-            else:
+    def marker_and_box(self, transform):
+        tag_xyz = transform[:3, 3]
+        tag_rotation = Rotation.from_matrix(transform[:3, :3])
+        center = tag_xyz + tag_rotation.apply(self.box_center_in_tag)
+        return make_pose(tag_xyz, tag_rotation), make_pose(center, tag_rotation * self.box_rotation_in_tag)
+
+    def box_poses(self, camera_marker, joints):
+        log = self.get_logger()
+        links = [HEAD_LINK, *GRASP_BASE_FRAMES.values(), *TARGET_FRAMES[1:]]
+        current = self.forward_poses(joints, links)
+        if current is None:
+            log.error("无法使用实测关节状态计算头部和双臂基座的 FK。")
+            return None
+
+        scene_from_head = pose_matrix(current[HEAD_LINK])
+        camera_from_marker = pose_matrix(camera_marker)
+        arm_poses = {}
+        scene_from_markers = {}
+        grasp_boxes = {}
+        for grasp_frame, base_frame in GRASP_BASE_FRAMES.items():
+            arm = "left" if base_frame == "l_base_link" else "right"
+            try:
+                calibrated_base_from_camera, calibrated_angle = load_extrinsics(arm, base_frame)
+            except RuntimeError as error:
+                log.error(str(error))
+                return None
+            calibrated = self.forward_poses({**joints, HEAD_JOINT: calibrated_angle}, [HEAD_LINK, base_frame])
+            if calibrated is None:
+                log.error(f"无法计算 {base_frame} 在标定头部角度 {calibrated_angle:.6f} rad 时的 FK。")
                 return None
 
-            q = transform.rotation
-            t = transform.translation
-            rotation = Rotation.from_quat([q.x, q.y, q.z, q.w])
-            tag_xyz = rotation.apply(marker_xyz) + (t.x, t.y, t.z)
-            tag_rotation = rotation * marker_rotation
-            center = tag_xyz + tag_rotation.apply(self.box_center_in_tag)
-            poses[frame] = (
-                make_pose(tag_xyz, tag_rotation),
-                make_pose(center, tag_rotation * self.box_rotation_in_tag),
-            )
-        return poses
+            scene_from_base = pose_matrix(current[base_frame])
+            base_from_head = np.linalg.solve(scene_from_base, scene_from_head)
+            calibrated_base_from_head = np.linalg.solve(pose_matrix(calibrated[base_frame]),
+                                                        pose_matrix(calibrated[HEAD_LINK]))
+            head_delta = Rotation.from_matrix(calibrated_base_from_head[:3, :3].T @ base_from_head[:3, :3]).magnitude()
+            if abs(head_delta - abs(joints[HEAD_JOINT] - calibrated_angle)) > 1e-3:
+                log.error(f"{base_frame} 的 FK 头部转角与实测关节角不一致，请检查 MoveIt 的 head_joint 模型。")
+                return None
+
+            head_from_camera = np.linalg.solve(calibrated_base_from_head, calibrated_base_from_camera)
+            base_from_marker = base_from_head @ head_from_camera @ camera_from_marker
+            arm_poses[base_frame] = self.marker_and_box(base_from_marker)
+            scene_from_markers[base_frame] = scene_from_base @ base_from_marker
+            grasp_boxes[grasp_frame] = self.marker_and_box(scene_from_markers[base_frame])[1]
+            log.info(f"{base_frame} 使用头部标定角 {calibrated_angle:.6f} rad，实测角 {joints[HEAD_JOINT]:.6f} rad。")
+
+        # 保留单个场景碰撞箱和标签 TF，采用右臂标定结果。规划目标使用各臂自己的结果。
+        scene_from_marker = scene_from_markers["r_base_link"]
+        poses = {SCENE_FRAME: self.marker_and_box(scene_from_marker), **arm_poses}
+        for frame in TARGET_FRAMES[1:]:
+            poses[frame] = self.marker_and_box(np.linalg.solve(pose_matrix(current[frame]), scene_from_marker))
+        return poses, grasp_boxes
 
     def simulated_box_poses(self):
         box_rotation = Rotation.from_quat(SIM_BOX_XYZW)
@@ -531,14 +592,19 @@ class BoxNode(Node):
 
         if self.sim:
             poses = self.simulated_box_poses()
+            grasp_boxes = {frame: poses[SCENE_FRAME][1] for frame in GRASP_BASE_FRAMES}
         else:
             detection = self.read_marker()
             if detection is None:
                 self.get_logger().error(f"未收到 /aruco_poses 中的新标签 {self.marker_id} 位姿")
                 return
-            poses = self.box_poses(*detection)
-        if poses is None:
-            return
+            joints = self.read_joints()
+            if joints is None:
+                return
+            result = self.box_poses(detection, joints)
+            if result is None:
+                return
+            poses, grasp_boxes = result
         for frame, (marker_pose, pose) in poses.items():
             tag = marker_pose.position
             p = pose.position
@@ -550,11 +616,11 @@ class BoxNode(Node):
                 f"箱体四元数 xyzw ({q.x:.4f}, {q.y:.4f}, {q.z:.4f}, {q.w:.4f}){RESET}"
             )
 
-        if self.apply_box(*poses[SCENE_FRAME]):
+        if self.apply_box(*poses[SCENE_FRAME], grasp_boxes):
             print(f"{GREEN}已更新箱体 {BOX_ID}，发布 TF {SCENE_FRAME} → "
                   f"{', '.join(self.frame_poses)}{RESET}")
 
-    def apply_box(self, marker_pose, box_pose):
+    def apply_box(self, marker_pose, box_pose, grasp_boxes):
         collision = CollisionObject(id=BOX_ID, operation=CollisionObject.ADD)
         collision.header.frame_id = SCENE_FRAME
         collision.pose = box_pose
@@ -567,11 +633,11 @@ class BoxNode(Node):
         if not self.apply_scene(collision):
             return False
         self.box_collision = collision
-        self.box_pose = box_pose
-        center = position_xyz(box_pose)
-        box_rotation = pose_rotation(box_pose)
+        self.grasp_boxes = grasp_boxes
         self.frame_poses = {self.tag_frame: marker_pose}
         for frame, (position, rotation) in self.grasps_in_box.items():
+            center = position_xyz(grasp_boxes[frame])
+            box_rotation = pose_rotation(grasp_boxes[frame])
             self.frame_poses[frame] = make_pose(
                 center + box_rotation.apply(position), box_rotation * rotation
             )
@@ -1306,6 +1372,8 @@ class BoxNode(Node):
             ("双臂抬升 15 cm", ((0.0, 0.0, LIFT_M),) * len(ARMS)),
             (f"双臂后退 {retract * 100:.1f} cm", ((-retract, 0.0, 0.0),) * len(ARMS)),
             (f"双臂下降 {lower * 100:.1f} cm", ((0.0, 0.0, -lower),) * len(ARMS)),
+            (f"双臂再下降 {POST_RELEASE_LOWER_M * 100:g} cm",
+             ((0.0, 0.0, -POST_RELEASE_LOWER_M),) * len(ARMS)),
             ("双臂张开 10 cm", ((0.0, SPREAD_M, 0.0), (0.0, -SPREAD_M, 0.0))),
         )
 
@@ -1330,9 +1398,9 @@ class BoxNode(Node):
         if moves is None:
             return None
         grasp = {frame: self.frame_poses[frame] for _, _, frame, _ in ARMS}
-        rotation = pose_rotation(self.box_pose)
         pregrasp = {
-            frame: shifted_pose(grasp[frame], rotation.apply((side * PREGRASP_OUTSIDE_M, 0.0, 0.0)))
+            frame: shifted_pose(grasp[frame], pose_rotation(self.grasp_boxes[frame]).apply(
+                (side * PREGRASP_OUTSIDE_M, 0.0, 0.0)))
             for _, _, frame, side in ARMS
         }
         cache = {}
@@ -1364,7 +1432,7 @@ class BoxNode(Node):
                     continue
             if not self.check_pregrasp_endpoint(endpoint, pregrasp, label):
                 continue
-            log.info(f"[unload] {label}：IK、左右 Cartesian、OMPL 均通过，已缓存六段抱箱轨迹")
+            log.info(f"[unload] {label}：IK、左右 Cartesian、OMPL 均通过，已缓存 {len(lines) + 1} 段抱箱轨迹")
             return [
                 ("移动到预备位", preparation, current, None),
                 *lines,
@@ -1530,9 +1598,9 @@ class BoxNode(Node):
             return
         stages = self.plan_box_pick(current, collision)
         if stages is None:
-            self.get_logger().error("抱箱和放箱六段路径未全部通过规划检查")
+            self.get_logger().error("抱箱和放箱路径未全部通过规划检查")
             return
-        print(f"{GREEN}预备、接近、抬升、后退、下降、张开六段路径均已通过规划检查{RESET}")
+        print(f"{GREEN}预备、接近、抬升、后退、下降、再下降、张开共 {len(stages)} 段路径均已通过规划检查{RESET}")
         if not self.execution_client.wait_for_server(timeout_sec=TIMEOUT_SEC):
             self.get_logger().error("execute_trajectory 动作服务不可用")
             return
@@ -1554,13 +1622,6 @@ class BoxNode(Node):
             if index == 1 and not self.apply_scene(CollisionObject(id=BOX_ID, operation=CollisionObject.REMOVE)):
                 self.restore_box_collision(collision)
                 return
-            if index == 2:
-                self.command_claw(CLAW_CLOSED)
-                if not self.spin_for(CLAW_SETTLE_SEC):
-                    return
-                actual = self.read_joints()
-                if actual is None:
-                    return
             if index >= 2:
                 remaining_stages = self.prepare_transfer_for_execution(stages[index:], actual)
                 if remaining_stages is None:
@@ -1570,15 +1631,21 @@ class BoxNode(Node):
             if index == 1:
                 # The box is out of the scene after contact; require a fresh detection for a new pick.
                 self.box_collision = None
-                self.box_pose = None
+                self.grasp_boxes.clear()
             if index == 2:
                 # Stop publishing the original grasp locations as the box starts moving.
                 self.frame_poses.clear()
-            if index == len(stages) - 1:
-                self.command_claw(CLAW_OPEN)
             if not self.execute_trajectory(trajectory):
                 return
             print(f"{GREEN}已完成{label}{RESET}")
+            if index == 2:
+                # 抬升成功后合爪，再后退。
+                self.command_claw(CLAW_CLOSED)
+            elif index == 4:
+                # 到达放箱高度后松爪，再下降并张开双臂。
+                self.command_claw(CLAW_OPEN)
+            if index in (2, 4) and not self.spin_for(CLAW_SETTLE_SEC):
+                return
 
     def add_rear_wall(self):
         if not self.scene_client.wait_for_service(timeout_sec=TIMEOUT_SEC):
@@ -1607,7 +1674,7 @@ class BoxNode(Node):
             frames = ", ".join(self.frame_poses)
             self.frame_poses.clear()
             self.box_collision = None
-            self.box_pose = None
+            self.grasp_boxes.clear()
             print(f"{GREEN}已清除世界碰撞物体，停止发布箱体相关 TF {frames}{RESET}")
 
     def apply_scene(self, collision):

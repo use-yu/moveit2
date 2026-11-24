@@ -8,42 +8,20 @@
 #   3) optional EMA for translation + SLERP for rotation
 #   4) outlier rejection with auto-reacquire (prevents "stuck no output" when marker moves)
 # -----------------------------
+import argparse
+
 import cv2
 import numpy as np
 import pyrealsense2 as rs
 
 import rclpy
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, MultiArrayDimension
 from scipy.spatial.transform import Rotation as R
 
-# -----------------------------
-# 1) Camera intrinsics & distortion 相机内参和畸变
-# -----------------------------
-K = np.array([[597.00150665,   0.0,         328.05591866],
-              [  0.0,         598.22467831, 251.49384323],
-              [  0.0,           0.0,           1.0]], dtype=np.float64)
-
-dist = np.array([[0.02952984, 0.47996238, 0.00040253, 0.000753, -1.89223474]],
-                dtype=np.float64)
+CAMERA_FRAME = "camera_color_optical_frame"
 
 # -----------------------------
-# 2) Extrinsics: camera -> world
-#    X_world = R_wc * X_cam + t_wc
-# -----------------------------
-R_wc = np.array([
-    [0.0, 0.0,  1.0],
-    [0.0, 1.0, 0.0],
-    [ -1.0, 0.0, 0.0]
-], dtype=np.float64)
-
-t_wc = np.array([
-    [0.05745],
-    [-0.12733],
-    [0.08115]
-], dtype=np.float64)
-
-# -----------------------------
-# 3) ArUco settings (OpenCV 4.11.0)
+# ArUco settings (OpenCV 4.11.0)
 # -----------------------------
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 # aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
@@ -63,7 +41,7 @@ obj_points = np.array([
 ], dtype=np.float32)
 
 # -----------------------------
-# 4) Stabilization parameters
+# Stabilization parameters
 # -----------------------------
 ENABLE_FILTER = True
 ENABLE_OUTLIER_REJECT = True
@@ -182,7 +160,17 @@ def run_camera(pub):
                       [0.0, intr.fy, intr.ppy],
                       [0.0, 0.0, 1.0]], dtype=np.float64)
 
-        dist = np.array(intr.coeffs, dtype=np.float64).reshape(1, -1)
+        dist = np.asarray(intr.coeffs, dtype=np.float64)
+        if (not np.isfinite(K).all() or intr.fx <= 0 or intr.fy <= 0
+                or dist.shape != (5,) or not np.isfinite(dist).all()):
+            raise RuntimeError("当前彩色流返回了无效的相机内参。")
+        if intr.model == rs.distortion.none:
+            dist = np.zeros(5)
+        elif intr.model != rs.distortion.brown_conrady and not (
+            intr.model in (rs.distortion.inverse_brown_conrady, rs.distortion.modified_brown_conrady)
+            and not np.any(dist)
+        ):
+            raise RuntimeError(f"当前彩色流的畸变模型 {intr.model} 无法用于 OpenCV 位姿解算。")
 
         print("Using intrinsics:", intr.width, intr.height)
         print("K=\n", K)
@@ -223,20 +211,15 @@ def run_camera(pub):
 
                     cv2.drawFrameAxes(frame, K, dist, rvec_cm, t_cm, marker_length * 0.5)
 
-                    # -------- position in world --------
-                    P_world = R_wc @ t_cm + t_wc  # 3x1
-
-                    # -------- orientation in world --------
-                    R_cm, _ = cv2.Rodrigues(rvec_cm)   # marker -> camera
-                    R_wm = R_wc @ R_cm                 # marker -> world
-                    q = R.from_matrix(R_wm).as_quat().astype(np.float64)  # xyzw
+                    position = t_cm
+                    q = R.from_rotvec(rvec_cm.ravel()).as_quat()
 
                     # ---- quaternion continuity ----
                     q = quat_continuity(mid, q)
 
                     # ---- outlier rejection + auto reacquire ----
                     if ENABLE_OUTLIER_REJECT and (mid in last_pos) and (mid in last_quat):
-                        pos_jump = float(np.linalg.norm(P_world - last_pos[mid]))
+                        pos_jump = float(np.linalg.norm(position - last_pos[mid]))
                         ang_jump = quat_angle_deg(last_quat[mid], q)
 
                         if (pos_jump > MAX_POS_JUMP_M) or (ang_jump > MAX_ANG_JUMP_DEG):
@@ -252,19 +235,19 @@ def run_camera(pub):
                     # ---- filtering (optional) ----
                     if ENABLE_FILTER:
                         if mid in last_pos:
-                            P_world = ALPHA_POS * P_world + (1.0 - ALPHA_POS) * last_pos[mid]
+                            position = ALPHA_POS * position + (1.0 - ALPHA_POS) * last_pos[mid]
                         if mid in last_quat:
                             q = slerp_quat(last_quat[mid], q, ALPHA_ROT)
 
                     # update caches (and clear drop counter)
                     drop_count[mid] = 0
-                    last_pos[mid] = P_world
+                    last_pos[mid] = position
                     last_quat[mid] = q
 
                     data.extend([
-                        float(P_world[0, 0]),
-                        float(P_world[1, 0]),
-                        float(P_world[2, 0]),
+                        float(position[0, 0]),
+                        float(position[1, 0]),
+                        float(position[2, 0]),
                         float(q[0]),
                         float(q[1]),
                         float(q[2]),
@@ -279,6 +262,9 @@ def run_camera(pub):
                 print("*" * 40)
 
             if msg.data and rclpy.ok():
+                # Float64MultiArray 没有 Header，在第一维标签中传递位姿坐标系。
+                msg.layout.dim = [MultiArrayDimension(label=CAMERA_FRAME, size=len(data) // 8, stride=len(data)),
+                                  MultiArrayDimension(label="pose", size=8, stride=8)]
                 pub.publish(msg)
 
             cv2.imshow("RealSense D435 ArUco", frame)
@@ -293,14 +279,24 @@ def run_camera(pub):
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    parser = argparse.ArgumentParser(description="在 RealSense 彩色光学坐标系中发布 ArUco 标签位姿")
+    _, ros_args = parser.parse_known_args(args)
+    if ros_args and ros_args[0] != "--ros-args":
+        parser.error(f"未知参数 {' '.join(ros_args)}")
+
+    rclpy.init(args=ros_args)
     node = None
     try:
         node = rclpy.create_node("realsense_aruco_pose_pub")
+        node.get_logger().info(f"输出位姿坐标系 {CAMERA_FRAME}。")
         pub = node.create_publisher(Float64MultiArray, "/aruco_poses", 10)
         run_camera(pub)
+        return 0
     except KeyboardInterrupt:
-        pass
+        return 130
+    except RuntimeError as error:
+        print(f"ArUco 识别停止：{error}", flush=True)
+        return 1
     finally:
         if node is not None:
             node.destroy_node()
@@ -308,4 +304,4 @@ def main(args=None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

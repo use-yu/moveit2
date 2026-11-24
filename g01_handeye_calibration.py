@@ -4,7 +4,7 @@ ros2 topic echo /driver_report/camera_motor_info pkg_msg_define/msg/MotorRuntime
 功能position: 0.749996542930603标定位置
   1. 从当前末端位姿出发，生成多轴平移、转动及组合采样位姿。
   2. MoveIt 先做带碰撞检查的 IK，再从上一段的实际规划终点规划下一段。
-     跳过无解或规划失败的点。全部规划完毕后逐段执行，每段末尾停车。
+     跳过无解、规划失败或关节轨迹绕行过大的点。全部规划完毕后逐段执行，每段末尾停车。
   3. 实机用 D435i 彩色图像及其 CameraInfo。12×9 格、边长 0.02 m 的
      棋盘有 11×8 个内角点。每次停车后配对图像和关节状态，通过 MoveIt FK
      和 solvePnP 得到一对位姿，保存到 JSON。相机、头部和躯干须固定，
@@ -460,11 +460,28 @@ class Calibration(Node):
             raise RuntimeError(f"MoveIt 规划请求失败，错误码 {code}。")
         trajectory = action.result.planned_trajectory
         jt = trajectory.joint_trajectory
-        if (not jt.points or set(jt.joint_names) != set(self.arm)
+        if (not jt.points or len(jt.joint_names) != len(self.arm)
+                or set(jt.joint_names) != set(self.arm)
                 or trajectory.multi_dof_joint_trajectory.points):
             raise RuntimeError("MoveIt 返回的轨迹没有覆盖且仅覆盖所选六轴。")
+        positions = np.asarray([point.positions for point in jt.points], dtype=float)
+        if positions.shape != (len(jt.points), len(self.arm)) or not np.isfinite(positions).all():
+            raise RuntimeError("MoveIt 返回的轨迹包含无效的关节位置。")
         start = dict(zip(jt.joint_names, jt.points[0].positions))
         self.require_close(start, seed, self.arm, 0.02, "规划轨迹起点与种子不一致")
+
+        steps = np.diff(positions, axis=0)
+        joint_travel = np.degrees(np.abs(steps).sum(axis=0))
+        longest_joint = int(np.argmax(joint_travel))
+        if joint_travel[longest_joint] > self.args.max_joint_travel_deg:
+            return None, (f"关节 {jt.joint_names[longest_joint]} 累计转动 {joint_travel[longest_joint]:.1f}°，"
+                          f"超过 {self.args.max_joint_travel_deg:g}° 上限")
+        path_length = np.linalg.norm(steps, axis=1).sum()
+        direct_length = np.linalg.norm(positions[-1] - positions[0])
+        detour = math.degrees(path_length - direct_length)
+        if detour > self.args.max_detour_deg:
+            return None, (f"关节空间轨迹比起终点直线多走 {detour:.1f}°，"
+                          f"超过 {self.args.max_detour_deg:g}° 上限")
         return trajectory, code
 
     def collect(self, index, reference, expected):
@@ -638,7 +655,8 @@ class Calibration(Node):
             ).as_matrix()
             trajectory, code = self.plan(seed, target_pose("world", target), index)
             if trajectory is None:
-                self.get_logger().warning(f"跳过候选点 {index}，IK 或规划返回 {code}。")
+                reason = code if isinstance(code, str) else f"IK 或规划返回错误码 {code}"
+                self.get_logger().warning(f"跳过候选点 {index}，{reason}。")
                 continue
             segments.append((index, trajectory))
             jt = trajectory.joint_trajectory
@@ -701,6 +719,10 @@ def main():
     parser.add_argument("--info-topic", default="/camera/camera/color/camera_info")
     parser.add_argument("--translation-m", type=float, default=0.035)
     parser.add_argument("--rotation-deg", type=float, default=18.0)
+    parser.add_argument("--max-joint-travel-deg", type=float, default=90.0,
+                        help="每段轨迹中单个关节累计转动角度上限（度）")
+    parser.add_argument("--max-detour-deg", type=float, default=30.0,
+                        help="每段轨迹在关节空间中比起终点直线多走的长度上限（度）")
     parser.add_argument("--speed", type=float, default=0.10)
     parser.add_argument("--settle", type=float, default=0.6)
     parser.add_argument("--capture-timeout", type=float, default=5.0)
@@ -715,7 +737,7 @@ def main():
         parser.error("--start-camera 仅用于 --mode real")
     if args.preview and args.mode != "real":
         parser.error("--preview 仅用于 --mode real")
-    for name in ("translation_m", "rotation_deg", "speed", "settle",
+    for name in ("translation_m", "rotation_deg", "max_joint_travel_deg", "max_detour_deg", "speed", "settle",
                  "capture_timeout", "max_skew", "max_reprojection"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} 必须为正数")
