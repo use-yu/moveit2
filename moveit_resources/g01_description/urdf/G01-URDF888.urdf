@@ -280,7 +280,7 @@
     xyz="0 0.418 0.2938"
     rpy="0 0 3.1416"
     jz_rpy="0 0.0 -0.785"
-    dh_id="'1077'" />
+    dh_id="'1084'" />
 
   <xacro:cr7_robot
     prefix="r_"
@@ -291,6 +291,6 @@
     rpy="3.1416 0 0"
     jz_mesh="Empty_Link-R-JZ.STL"
     jz_rpy="0 0.0 0.785"
-    dh_id="'1079'" />
+    dh_id="'1078'" />
 
 </robot>
