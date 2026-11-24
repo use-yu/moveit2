@@ -1,6 +1,8 @@
 # 测试箱子姿态：
 # ros2 run tf2_ros tf2_echo moveit_base_link aruco_33
-
+# [moveit_base_link] 标签 33 xyz (m) (0.6488, 0.0067, 0.7318)，
+# 箱中心 xyz (m) (0.8303, 0.0077, 0.7340)，
+# 箱体四元数 xyzw (-0.4970, 0.4978, 0.4997, -0.5054)
 
 # [moveit_base_link] 标签 33 xyz (m) (0.5158, -0.0323, 0.6835)，箱中心 xyz (m) (0.6939, -0.0314, 0.6486)，箱体四元数 xyzw (-0.4437, 0.4428, 0.5487, -0.5532)
 # [SJ] 标签 33 xyz (m) (0.6118, -0.0323, 0.4295)，箱中心 xyz (m) (0.7899, -0.0314, 0.3946)，箱体四元数 xyzw (-0.4437, 0.4428, 0.5487, -0.5532)
@@ -73,11 +75,11 @@ BOX_SIZE_M = (0.593, 0.312, 0.395)
 # 抓取点相对箱体局部 ±X 和 +Y 边缘的外偏移。
 LEFT_GRASP_X_OUTSIDE_M = 0.03
 RIGHT_GRASP_X_OUTSIDE_M = 0.04
-LEFT_GRASP_Y_OUTSIDE_M = 0.075
-RIGHT_GRASP_Y_OUTSIDE_M = 0.075
+LEFT_GRASP_Y_OUTSIDE_M = 0.07
+RIGHT_GRASP_Y_OUTSIDE_M = 0.07
 # 抓取点相对箱体局部 Z 中心的偏移。
 LEFT_GRASP_Z_OFFSET_M = -0.01
-RIGHT_GRASP_Z_OFFSET_M = -0.006
+RIGHT_GRASP_Z_OFFSET_M = -0.013
 # 抓取姿态从箱体姿态出发，先绕局部 Y 轴转 180°，再绕旋转后的局部 Z 轴转指定角度。
 GRASP_OFFSETS = (
     (
@@ -143,7 +145,7 @@ PREGRASP_OUTSIDE_M = 0.15
 LIFT_M = 0.15
 CLAW_TOPIC = "/driver_control/claw"
 CLAW_OPEN = -45.0
-CLAW_CLOSED = 5.0
+CLAW_CLOSED = 25.0
 CLAW_SETTLE_SEC = 1.0
 TRANSFER_REFERENCE_TAG_XZ_M = (0.5407, 0.7426)
 # REFERENCE_RETRACT_M = 0.43
