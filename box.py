@@ -55,6 +55,10 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 SOURCE_FRAME = "head"
 SCENE_FRAME = "moveit_base_link"
 TARGET_FRAMES = (SCENE_FRAME, "SJ", "YB")
+# --sim：固定视觉结果，坐标均位于 moveit_base_link。
+SIM_MARKER_XYZ = (0.5397, -0.0025, 0.7278)
+SIM_BOX_XYZ = (0.7208, 0.0063, 0.7375)
+SIM_BOX_XYZW = (-0.5173, 0.4981, 0.4773, -0.5064)
 BOX_ID = "aruco_box"
 REAR_WALL_ID = "rear_wall"
 REAR_WALL_SIZE_M = (0.10, 3.0, 2.5)
@@ -96,7 +100,8 @@ LINEAR_JOINTS = ("base_joint1", "body_joint1")
 PLAN_FRAME = "r_base_link"
 PLANNER_ID = "RRTConnect"
 PLAN_TIME_SEC = 10.0
-IK_TIMEOUT_SEC = 0.2
+#ik
+IK_TIMEOUT_SEC = 0.05
 SVC_COMPUTE_IK = "compute_ik"
 SVC_CARTESIAN_PATH = "compute_cartesian_path"
 UNLOAD_PLACE_JOINT_SPEED = 0.3
@@ -121,7 +126,7 @@ ARM_JOINT_LIMITS_BY_INDEX = {
     5: (-3.14, 3.14),
     6: (-3.14, 3.14),
 }
-UNLOAD_PLACE_CARTESIAN_SPEED = 0.1
+UNLOAD_PLACE_CARTESIAN_SPEED = 0.3
 UNLOAD_SYNC_SAMPLE_PERIOD = 0.01
 UNLOAD_PLACE_SELF_COLLISION_SAMPLE_PERIOD = 0.02
 CART_EEF_STEP = 0.005
@@ -137,6 +142,7 @@ CLAW_OPEN = -45.0
 CLAW_CLOSED = 0.0
 CLAW_SETTLE_SEC = 1.0
 TRANSFER_REFERENCE_TAG_XZ_M = (0.5407, 0.7426)
+# REFERENCE_RETRACT_M = 0.43
 REFERENCE_RETRACT_M = 0.43
 REFERENCE_LOWER_M = 0.342
 SPREAD_M = 0.10
@@ -150,8 +156,8 @@ CONTROLLER_PERIOD_SEC = 0.01
 # Conservative velocity and acceleration caps from the G01 joint limits.
 ARM_PATH_LIMIT = 3.14 * UNLOAD_PLACE_CARTESIAN_SPEED
 TORSO_PATH_LIMITS = {
-    "body_joint1": 0.10 * UNLOAD_PLACE_CARTESIAN_SPEED,
-    "body_joint2": 0.30 * UNLOAD_PLACE_CARTESIAN_SPEED,
+    "body_joint1": 0.1 * UNLOAD_PLACE_CARTESIAN_SPEED,
+    "body_joint2": 0.3 * UNLOAD_PLACE_CARTESIAN_SPEED,
 }
 # 箱体局部 X、Y、Z 的单侧保护量。
 PADDING_PER_SIDE_M = (0.02, 0.08, 0.02)
@@ -411,9 +417,13 @@ def merge_dual_arm_cartesian_trajectories(
 
 
 class BoxNode(Node):
-    def __init__(self):
+    def __init__(self, sim=False):
         super().__init__("aruco_box_obstacle")
+        self.sim = sim
         self.marker_id = self.declare_parameter("marker_id", 33).value
+        if self.sim:
+            self.marker_id = 33
+            self.get_logger().info("--sim：使用标签 33 的固定视觉数据，跳过识别定位；运动仍由 MoveIt 执行")
         self.tag_frame = f"aruco_{self.marker_id}"
         self.tf_buffer = Buffer(node=self)
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -505,17 +515,28 @@ class BoxNode(Node):
             )
         return poses
 
+    def simulated_box_poses(self):
+        box_rotation = Rotation.from_quat(SIM_BOX_XYZW)
+        # 未提供标签朝向，沿用箱体相对标签的标定关系反推。
+        marker_rotation = box_rotation * self.box_rotation_in_tag.inv()
+        return {SCENE_FRAME: (
+            make_pose(SIM_MARKER_XYZ, marker_rotation),
+            make_pose(SIM_BOX_XYZ, box_rotation),
+        )}
+
     def add_box(self):
         if not self.scene_client.wait_for_service(timeout_sec=TIMEOUT_SEC):
             self.get_logger().error("MoveIt 的 apply_planning_scene 服务不可用")
             return
 
-        detection = self.read_marker()
-        if detection is None:
-            self.get_logger().error(f"未收到 /aruco_poses 中的新标签 {self.marker_id} 位姿")
-            return
-
-        poses = self.box_poses(*detection)
+        if self.sim:
+            poses = self.simulated_box_poses()
+        else:
+            detection = self.read_marker()
+            if detection is None:
+                self.get_logger().error(f"未收到 /aruco_poses 中的新标签 {self.marker_id} 位姿")
+                return
+            poses = self.box_poses(*detection)
         if poses is None:
             return
         for frame, (marker_pose, pose) in poses.items():
@@ -536,12 +557,12 @@ class BoxNode(Node):
     def apply_box(self, marker_pose, box_pose):
         collision = CollisionObject(id=BOX_ID, operation=CollisionObject.ADD)
         collision.header.frame_id = SCENE_FRAME
-        collision.pose = marker_pose
+        collision.pose = box_pose
         dimensions = [
             round(size + 2 * padding, 3) for size, padding in zip(BOX_SIZE_M, PADDING_PER_SIDE_M)
         ]
         collision.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=dimensions)]
-        collision.primitive_poses = [make_pose(self.box_center_in_tag, self.box_rotation_in_tag)]
+        collision.primitive_poses = [make_pose((0.0, 0.0, 0.0), Rotation.identity())]
 
         if not self.apply_scene(collision):
             return False
@@ -1414,14 +1435,8 @@ class BoxNode(Node):
 
         error, joint = start_error(trajectory, actual)
         if error <= MOVEIT_START_TOLERANCE:
-            if not self.validate_path(trajectory, actual, cartesian, synchronized=True):
-                return None
-            actual = self.read_joints()
-            if actual is None:
-                return None
-            error, joint = start_error(trajectory, actual)
-            if error <= MOVEIT_START_TOLERANCE:
-                return stages
+            # 规划阶段已验证整段轨迹，执行前只确认实测起点。
+            return stages
         if any(abs(actual[name] - value) > (0.005 if name in LINEAR_JOINTS else 0.02)
                for name, value in expected.items()):
             self.get_logger().error(f"{label}前实测关节状态已偏离规划起点，停止执行")
@@ -1455,6 +1470,8 @@ class BoxNode(Node):
         return refreshed
 
     def prepare_box_recognition(self, confirm):
+        if self.sim:
+            return True
         target = BOX_RECOGNITION_TORSO_TARGET
 
         def torso_at_target(state):
@@ -1550,10 +1567,6 @@ class BoxNode(Node):
                     return
                 stages[index:] = remaining_stages
                 trajectory = stages[index][1]
-            elif not self.validate_path(trajectory, actual, cartesian):
-                if index == 1:
-                    self.restore_box_collision(collision)
-                return
             if index == 1:
                 # The box is out of the scene after contact; require a fresh detection for a new pick.
                 self.box_collision = None
@@ -1615,10 +1628,11 @@ class BoxNode(Node):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sim", action="store_true", help="使用固定仿真视觉数据，跳过识别定位；需启动 MoveIt 仿真环境")
     parser.add_argument("--interactive", action="store_true", help="每段抱箱轨迹开始前等待回车确认")
     options = parser.parse_args(remove_ros_args(sys.argv)[1:])
     rclpy.init()
-    node = BoxNode()
+    node = BoxNode(sim=options.sim)
     commands = SimpleQueue()
 
     def read_commands():

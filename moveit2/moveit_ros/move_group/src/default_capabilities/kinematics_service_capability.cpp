@@ -39,6 +39,7 @@
 #include <moveit/robot_state/conversions.h>
 #include <moveit/utils/message_checks.h>
 #include <tf2_eigen/tf2_eigen.hpp>
+#include <rclcpp/duration.hpp>
 #include <moveit/move_group/capability_names.h>
 
 namespace move_group
@@ -93,6 +94,7 @@ void MoveGroupKinematicsService::computeIK(moveit_msgs::msg::PositionIKRequest& 
       moveit::core::robotStateMsgToRobotState(req.robot_state, rs);
     }
     const std::string& default_frame = context_->planning_scene_monitor_->getRobotModel()->getModelFrame();
+    const double timeout = rclcpp::Duration(req.timeout).seconds();
 
     if (req.pose_stamped_vector.empty() || req.pose_stamped_vector.size() == 1)
     {
@@ -106,9 +108,9 @@ void MoveGroupKinematicsService::computeIK(moveit_msgs::msg::PositionIKRequest& 
       {
         bool result_ik = false;
         if (ik_link.empty())
-          result_ik = rs.setFromIK(jmg, req_pose.pose, req.timeout.sec, constraint);
+          result_ik = rs.setFromIK(jmg, req_pose.pose, timeout, constraint);
         else
-          result_ik = rs.setFromIK(jmg, req_pose.pose, ik_link, req.timeout.sec, constraint);
+          result_ik = rs.setFromIK(jmg, req_pose.pose, ik_link, timeout, constraint);
 
         if (result_ik)
         {
@@ -143,7 +145,7 @@ void MoveGroupKinematicsService::computeIK(moveit_msgs::msg::PositionIKRequest& 
         }
         if (ok)
         {
-          if (rs.setFromIK(jmg, req_poses, req.ik_link_names, req.timeout.sec, constraint))
+          if (rs.setFromIK(jmg, req_poses, req.ik_link_names, timeout, constraint))
           {
             moveit::core::robotStateToRobotStateMsg(rs, solution, false);
             error_code.val = moveit_msgs::msg::MoveItErrorCodes::SUCCESS;

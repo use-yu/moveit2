@@ -1,6 +1,6 @@
 <?xml version="1.0" ?>
 <!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
-     Commit Version: 1.6.0-1-g15f4949  Build Version: 1.6.7594.29634
+       Build Version: 1.6.7594.29634
      For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
 <robot
   xmlns:xacro="http://www.ros.org/wiki/xacro"
@@ -113,8 +113,8 @@
     <axis
       xyz="0 0 1" />
     <limit
-      lower="-6.0"
-      upper="6.0"
+      lower="-3.1416"
+      upper="3.1416"
       effort="0"
       velocity="0" />
   </joint>
@@ -171,8 +171,8 @@
     <axis
       xyz="0 0 1" />
     <limit
-      lower="-6.0"
-      upper="6.0"
+      lower="-3.1416"
+      upper="3.1416"
       effort="0"
       velocity="0" />
   </joint>
@@ -287,8 +287,8 @@
     <axis
       xyz="0 0 1" />
     <limit
-      lower="-6.0"
-      upper="6.0"
+      lower="-3.1416"
+      upper="3.1416"
       effort="0"
       velocity="0" />
   </joint>
@@ -345,8 +345,8 @@
     <axis
       xyz="0 0 1" />
     <limit
-      lower="-6.0"
-      upper="6.0"
+      lower="-3.1416"
+      upper="3.1416"
       effort="0"
       velocity="0" />
   </joint>
@@ -431,8 +431,8 @@
     <axis
       xyz="0 0 1" />
     <limit
-      lower="-6.0"
-      upper="6.0"
+      lower="-3.1416"
+      upper="3.1416"
       effort="0"
       velocity="0" />
   </joint>

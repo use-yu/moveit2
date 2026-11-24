@@ -43,7 +43,7 @@ Visualization Manager:
       Plane Cell Count: 10
       Reference Frame: <Fixed Frame>
       Value: true
-    - Acceleration_Scaling_Factor: 0.30000000000000004
+    - Acceleration_Scaling_Factor: 0.3
       Class: moveit_rviz_plugin/MotionPlanning
       Enabled: true
       Move Group Namespace: ""
@@ -223,7 +223,7 @@ Visualization Manager:
         Goal State Color: 250; 128; 0
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
-        Planning Group: right_arm
+        Planning Group: dual_arm
         Query Goal State: true
         Query Start State: false
         Show Workspace: false
@@ -376,7 +376,7 @@ Visualization Manager:
         Show Robot Collision: false
         Show Robot Visual: false
       Value: true
-      Velocity_Scaling_Factor: 0.30000000000000004
+      Velocity_Scaling_Factor: 0.3
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: true
@@ -562,6 +562,8 @@ Visualization Manager:
           Value: false
         YB:
           Value: false
+        aruco_33:
+          Value: true
         base_footprint:
           Value: false
         base_x_link:
@@ -571,9 +573,11 @@ Visualization Manager:
         head:
           Value: false
         l_JZ:
-          Value: true
+          Value: false
         l_base_link:
           Value: false
+        l_box_grasp:
+          Value: true
         l_tool:
           Value: false
         moveit_base_link:
@@ -582,6 +586,8 @@ Visualization Manager:
           Value: false
         r_base_link:
           Value: false
+        r_box_grasp:
+          Value: true
         r_tool:
           Value: false
         world:
@@ -623,6 +629,12 @@ Visualization Manager:
                                     {}
                                   r_tool:
                                     {}
+                aruco_33:
+                  {}
+                l_box_grasp:
+                  {}
+                r_box_grasp:
+                  {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Marker
@@ -668,25 +680,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 4.068247318267822
+      Distance: 4.697068691253662
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -0.0701381117105484
-        Y: 0.3946203291416168
-        Z: 0.9903485178947449
+        X: 0.4087643623352051
+        Y: 0.4303603768348694
+        Z: 0.9954018592834473
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.26979827880859375
+      Pitch: 0.0997958555817604
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 0.09044836461544037
+      Yaw: 4.713644504547119
     Saved: ~
 Window Geometry:
   Displays:
@@ -704,5 +716,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1640
-  X: -27
-  Y: 118
+  X: 555
+  Y: 195
