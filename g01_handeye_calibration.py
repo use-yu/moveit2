@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """G01 固定头部相机的眼在手外标定，支持 left/right 两条六轴臂。
-
-功能
+ros2 topic echo /driver_report/camera_motor_info pkg_msg_define/msg/MotorRuntimeInfo
+功能position: 0.749996542930603标定位置
   1. 从当前末端位姿出发，生成多轴平移、转动及组合采样位姿。
   2. MoveIt 先做带碰撞检查的 IK，再从上一段的实际规划终点规划下一段。
      跳过无解或规划失败的点。全部规划完毕后逐段执行，每段末尾停车。
-  3. 实机用 D435i 彩色图像及其 CameraInfo。12×9 格、边长 0.015 m 的
+  3. 实机用 D435i 彩色图像及其 CameraInfo。12×9 格、边长 0.02 m 的
      棋盘有 11×8 个内角点。每次停车后配对图像和关节状态，通过 MoveIt FK
      和 solvePnP 得到一对位姿，保存到 JSON。相机、头部和躯干须固定，
      棋盘必须刚性安装。实机前在 MoveIt 规划场景中配置板、支架和障碍物。
@@ -25,18 +25,20 @@
   ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=false
   python3 g01_handeye_calibration.py --arm left --mode sim
 
-  实机先启动 G01 驱动、RealSense ROS 驱动和彩色流，然后启动：
+  实机先启动 G01 驱动，然后启动：
   ros2 launch g01_moveit_config demo.launch.py use_real_hardware:=true
-  将棋盘移入画面，再执行：
-  python3 g01_handeye_calibration.py --arm right --mode real
-  默认订阅 /camera/camera/color/{image_raw,camera_info}，可用 --image-topic、
-  --info-topic 覆盖。建议使用原始彩色图像以及对应的 CameraInfo。
+  将棋盘摆到相机视野内，通过 pyrealsense2 直接打开 USB 相机：
+  python3 g01_handeye_calibration.py --arm right --mode real --start-camera
+  加 --preview 可在开始标定前预览彩色图像，窗口内按回车继续，按 Esc 退出。
+  使用已有 RealSense ROS 驱动时，去掉 --start-camera。脚本默认订阅
+  /camera/camera/color/{image_raw,camera_info}，可用 --image-topic、--info-topic 覆盖。
 """
 
 import argparse
-from collections import deque
+from collections import Counter, deque
 import json
 import math
+import os
 from pathlib import Path
 import time
 
@@ -58,7 +60,7 @@ from sensor_msgs.msg import CameraInfo, Image, JointState
 
 
 PATTERN = (11, 8)
-SQUARE_M = 0.015
+SQUARE_M = 0.02
 # 偏移量乘以用户指定的平移/旋转幅度。先试纯旋转，再覆盖位置及组合。
 OFFSETS = (
     ((0, 0, 0), (1, 0, 0)), ((0, 0, 0), (-1, 0, 0)),
@@ -163,10 +165,70 @@ class ChessboardCamera:
         self.cv = cv2
         self.info = None
         self.images = deque(maxlen=6)
+        self.pipeline = None
         self.points = np.zeros((PATTERN[0] * PATTERN[1], 3), np.float32)
         self.points[:, :2] = np.mgrid[:PATTERN[0], :PATTERN[1]].T.reshape(-1, 2) * SQUARE_M
-        node.create_subscription(CameraInfo, args.info_topic, self.on_info, qos_profile_sensor_data)
-        node.create_subscription(Image, args.image_topic, self.on_image, qos_profile_sensor_data)
+        if not args.start_camera:
+            node.create_subscription(CameraInfo, args.info_topic, self.on_info, qos_profile_sensor_data)
+            node.create_subscription(Image, args.image_topic, self.on_image, qos_profile_sensor_data)
+
+    def open_usb(self):
+        try:
+            import pyrealsense2 as rs
+        except ImportError as error:
+            raise RuntimeError("--start-camera 需要安装 pyrealsense2。") from error
+
+        try:
+            pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            profile = pipeline.start(config)
+        except RuntimeError as error:
+            raise RuntimeError(f"无法打开 RealSense 彩色流，请检查 USB 连接及相机是否被占用：{error}") from error
+        self.pipeline = pipeline
+        self.system_timestamp_domains = (rs.timestamp_domain.global_time, rs.timestamp_domain.system_time)
+        sensor = profile.get_device().first_color_sensor()
+        if sensor.supports(rs.option.global_time_enabled):
+            sensor.set_option(rs.option.global_time_enabled, 1)
+
+        intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        coeffs = list(intr.coeffs)
+        if intr.model == rs.distortion.none:
+            coeffs = [0.0] * 5
+        elif intr.model != rs.distortion.brown_conrady and not (
+            intr.model in (rs.distortion.inverse_brown_conrady, rs.distortion.modified_brown_conrady)
+            and not any(coeffs)
+        ):
+            raise RuntimeError(f"USB 彩色流的畸变模型 {intr.model} 无法用于当前棋盘解算。")
+        self.info = CameraInfo(
+            width=intr.width, height=intr.height, distortion_model="plumb_bob",
+            k=[intr.fx, 0.0, intr.ppx, 0.0, intr.fy, intr.ppy, 0.0, 0.0, 1.0], d=coeffs,
+        )
+        self.info.header.frame_id = "camera_color_optical_frame"
+
+    def poll_usb(self):
+        if self.pipeline is None:
+            return None
+        frames = self.pipeline.poll_for_frames()
+        if not frames:
+            return None
+        color = frames.get_color_frame()
+        # 全局时间或系统时间才能与使用系统时钟的 ROS 关节反馈配对。
+        if not color or color.get_frame_timestamp_domain() not in self.system_timestamp_domains:
+            return None
+        seconds, milliseconds = divmod(color.get_timestamp(), 1_000)
+        timestamp_ns = int(seconds) * 1_000_000_000 + round(milliseconds * 1e6)
+        width, height = color.get_width(), color.get_height()
+        image = Image(width=width, height=height, encoding="bgr8", step=width * 3,
+                      data=np.asanyarray(color.get_data()).tobytes())
+        image.header.frame_id = self.info.header.frame_id
+        image.header.stamp.sec, image.header.stamp.nanosec = divmod(timestamp_ns, 1_000_000_000)
+        self.on_image(image)
+        return image
+
+    def close(self):
+        if self.pipeline is not None:
+            self.pipeline.stop()
 
     def on_info(self, msg):
         self.info = msg
@@ -174,7 +236,15 @@ class ChessboardCamera:
     def on_image(self, msg):
         self.images.append(msg)
 
-    def detect(self, image, info):
+    def pixels(self, image):
+        channels = {"mono8": 1, "rgb8": 3, "bgr8": 3}.get(image.encoding)
+        if channels is None:
+            raise RuntimeError(f"不支持图像编码 {image.encoding}。")
+        rows = np.frombuffer(bytes(image.data), dtype=np.uint8).reshape(image.height, image.step)
+        pixels = rows[:, :image.width * channels]
+        return pixels if channels == 1 else pixels.reshape(image.height, image.width, channels)
+
+    def detect(self, image, info, rejected):
         cv = self.cv
         if ((image.width, image.height) != (info.width, info.height)
                 or not image.header.frame_id or image.header.frame_id != info.header.frame_id
@@ -185,17 +255,14 @@ class ChessboardCamera:
                 or info.roi.width not in (0, info.width)
                 or info.roi.height not in (0, info.height)):
             raise RuntimeError("彩色图像和 CameraInfo 不匹配，或相机内参/畸变模型不支持。")
-        channels = {"mono8": 1, "rgb8": 3, "bgr8": 3}.get(image.encoding)
-        if channels is None:
-            raise RuntimeError(f"不支持图像编码 {image.encoding}。")
-        rows = np.frombuffer(bytes(image.data), dtype=np.uint8).reshape(image.height, image.step)
-        pixels = rows[:, :image.width * channels]
-        gray = pixels if channels == 1 else cv.cvtColor(
-            pixels.reshape(image.height, image.width, channels),
+        pixels = self.pixels(image)
+        gray = pixels if image.encoding == "mono8" else cv.cvtColor(
+            pixels,
             cv.COLOR_RGB2GRAY if image.encoding == "rgb8" else cv.COLOR_BGR2GRAY,
         )
         found, corners = cv.findChessboardCornersSB(gray, PATTERN, cv.CALIB_CB_NORMALIZE_IMAGE)
         if not found:
+            rejected["未找到 11×8 内角点"] += 1
             return None
         grid = corners.reshape(PATTERN[1], PATTERN[0], 2)
         # 对角内格是反色（11×8 内角点）。固定棋盘的第一个内格为黑色，
@@ -205,15 +272,18 @@ class ChessboardCamera:
         a, b = (float(cv.getRectSubPix(gray, (3, 3), tuple(point)).mean())
                 for point in (first, last))
         if abs(a - b) < 20:
+            rejected["棋盘黑白格对比度不足"] += 1
             return None
         if a > b:
             corners = np.ascontiguousarray(corners[::-1])
         k, d = np.asarray(info.k).reshape(3, 3), np.asarray(info.d)
         ok, rvec, tvec = cv.solvePnP(self.points, corners, k, d)
         if not ok or not np.isfinite(rvec).all() or not np.isfinite(tvec).all():
+            rejected["PnP 位姿解算失败"] += 1
             return None
         rotation = cv.Rodrigues(rvec)[0]
         if np.min((self.points @ rotation.T + tvec.ravel())[:, 2]) <= 0:
+            rejected["PnP 解算的棋盘位于相机后方"] += 1
             return None
         projected = cv.projectPoints(self.points, rvec, tvec, k, d)[0]
         rmse = float(np.sqrt(np.mean(np.sum((projected - corners)**2, axis=-1))))
@@ -394,19 +464,24 @@ class Calibration(Node):
                 or trajectory.multi_dof_joint_trajectory.points):
             raise RuntimeError("MoveIt 返回的轨迹没有覆盖且仅覆盖所选六轴。")
         start = dict(zip(jt.joint_names, jt.points[0].positions))
-        self.require_close(start, seed, self.arm, 0.015, "规划轨迹起点与种子不一致")
+        self.require_close(start, seed, self.arm, 0.02, "规划轨迹起点与种子不一致")
         return trajectory, code
 
     def collect(self, index, reference, expected):
         after = self.get_clock().now().nanoseconds + int(self.args.settle * 1e9)
+        max_skew = int(self.args.max_skew * 1e9)
         seen = 0
         best_rmse = None
+        best_skew = None
+        paired = 0
+        rejected = Counter()
 
         def synchronized_frame():
+            nonlocal best_skew
+            self.camera.poll_usb()
             info = self.camera.info
             if info is None or not self.history:
                 return None
-            skew = int(self.args.max_skew * 1e9)
             for image in reversed(self.camera.images):
                 stamp = stamp_ns(image.header.stamp)
                 if stamp <= max(seen, after) or stamp > self.history[-1][1]:
@@ -415,7 +490,9 @@ class Calibration(Node):
                                if after <= item[1] <= stamp), None)
                 later = next((item for item in self.history if item[1] >= stamp), None)
                 if before is not None and later is not None:
-                    if max(stamp - before[1], later[1] - stamp) <= skew:
+                    skew = max(stamp - before[1], later[1] - stamp)
+                    best_skew = skew if best_skew is None else min(best_skew, skew)
+                    if skew <= max_skew:
                         return image, info, before, later
             return None
 
@@ -424,15 +501,17 @@ class Calibration(Node):
             pair = self.wait_until(synchronized_frame, deadline - time.monotonic())
             if pair is None:
                 break
+            paired += 1
             image, info, before, later = pair
             seen = stamp_ns(image.header.stamp)
             for frame in (before, later):
                 self.require_close(frame[2], reference, self.fixed, 0.005, "头部、躯干或另一条臂发生移动")
             if max(abs(before[2][name] - later[2][name]) for name in self.arm) > 0.002:
+                rejected["采样时机械臂仍在移动"] += 1
                 continue
             nearest = min((before, later), key=lambda item: abs(item[1] - seen))
             self.require_close(nearest[2], expected, self.arm, 0.025, "末端未到达轨迹终点")
-            detection = self.camera.detect(image, info)
+            detection = self.camera.detect(image, info, rejected)
             if detection is None:
                 continue
             matrix, rmse = detection
@@ -444,8 +523,32 @@ class Calibration(Node):
                     "T_base_ee": self.fk(nearest[2], self.base).tolist(),
                     "T_camera_board": matrix.tolist(), "reprojection_rmse_px": rmse,
                 }
-        if best_rmse is not None:
-            self.get_logger().warning(f"点 {index} 的最佳重投影误差 {best_rmse:.2f} px。")
+            rejected["重投影误差超限"] += 1
+
+        if paired:
+            detail = "，".join(f"{reason} {count} 帧" for reason, count in rejected.items())
+            if best_rmse is not None:
+                detail += f"，最佳重投影误差 {best_rmse:.2f} px（上限 {self.args.max_reprojection:g} px）"
+            summary = f"已配对 {paired} 帧，{detail}"
+        elif self.camera.info is None or not self.camera.images or not self.history:
+            missing = []
+            if self.camera.info is None:
+                missing.append("相机内参")
+            if not self.camera.images:
+                missing.append("彩色图像")
+            if not self.history:
+                missing.append("完整的关节反馈")
+            summary = f"没有可配对的数据，缺少{'、'.join(missing)}"
+        else:
+            now = self.get_clock().now().nanoseconds
+            image_stamp = stamp_ns(self.camera.images[-1].header.stamp)
+            joint_stamp = self.history[-1][1]
+            summary = (f"图像与关节反馈未配对（每侧上限 {self.args.max_skew * 1e3:g} ms）。"
+                       f"最新图像时间减节点时间 {(image_stamp - now) / 1e6:.1f} ms，"
+                       f"最新关节时间减节点时间 {(joint_stamp - now) / 1e6:.1f} ms")
+            if best_skew is not None:
+                summary += f"，最接近的前后关节反馈最大时间差 {best_skew / 1e6:.1f} ms"
+        self.get_logger().warning(f"点 {index} 采样失败。{summary}。")
         return None
 
     def save(self, data):
@@ -455,7 +558,61 @@ class Calibration(Node):
         temporary.replace(output)
         return output
 
+    def preview_camera(self):
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            raise RuntimeError("--preview 需要桌面图形会话，请在有图形显示的终端中运行。")
+
+        def latest_image():
+            self.camera.poll_usb()
+            return self.camera.images[-1] if self.camera.images else None
+
+        if self.wait_until(latest_image, self.args.capture_timeout) is None:
+            raise RuntimeError("预览超时，未收到相机彩色图像。")
+
+        cv = self.camera.cv
+        window = "G01 Camera Preview"
+        try:
+            cv.namedWindow(window, cv.WINDOW_NORMAL)
+        except cv.error as error:
+            raise RuntimeError(f"无法打开 OpenCV 预览窗口：{error}") from error
+
+        try:
+            self.get_logger().info("请让完整棋盘入镜。点击预览窗口后按回车开始标定，按 Esc 退出。")
+            displayed = None
+            while rclpy.ok():
+                image = latest_image()
+                if image is not displayed:
+                    pixels = self.camera.pixels(image)
+                    if image.encoding == "rgb8":
+                        pixels = cv.cvtColor(pixels, cv.COLOR_RGB2BGR)
+                    cv.imshow(window, pixels)
+                    displayed = image
+                key = cv.waitKey(1) & 0xff
+                if key == 27:
+                    break
+                try:
+                    visible = cv.getWindowProperty(window, cv.WND_PROP_VISIBLE)
+                except cv.error:
+                    visible = 1  # 部分 HighGUI 后端不支持查询窗口状态。
+                if visible < 1:
+                    break
+                if key in (10, 13):
+                    return
+                rclpy.spin_once(self, timeout_sec=0.02)
+            raise KeyboardInterrupt
+        finally:
+            cv.destroyAllWindows()
+
     def run(self):
+        if self.args.start_camera:
+            if self.get_parameter("use_sim_time").value:
+                raise RuntimeError("USB 相机的时间戳需要 ROS 使用系统时钟，请关闭 use_sim_time。")
+            self.camera.open_usb()
+            if self.wait_until(self.camera.poll_usb, self.args.capture_timeout) is None:
+                raise RuntimeError("RealSense 未收到带系统时间戳的彩色图像。请检查 USB 连接和相机时钟。")
+            self.get_logger().info("RealSense USB 彩色流已就绪（640×480，30 FPS）。")
+        if self.args.preview:
+            self.preview_camera()
         self.connect()
         reference = self.current()
         initial = self.fk(reference, "world")
@@ -463,7 +620,7 @@ class Calibration(Node):
         if self.camera is not None:
             first = self.collect(0, reference, reference)
             if first is None:
-                raise RuntimeError("起始位姿没有合格的棋盘观测。检查棋盘可见性、内参和图像/关节时钟。")
+                raise RuntimeError("起始位姿没有合格的棋盘观测。请查看上方的点 0 采样日志。")
             data = {"arm": self.args.arm, "base_frame": self.base, "end_effector_frame": self.tip,
                     "camera_frame": first["camera_frame"], "head_joint_rad": reference["head_joint"],
                     "pattern_inner_corners": list(PATTERN), "square_size_m": SQUARE_M,
@@ -536,6 +693,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--arm", choices=("left", "right"), required=True)
     parser.add_argument("--mode", choices=("sim", "real"), default="sim")
+    parser.add_argument("--start-camera", action="store_true",
+                        help="实机模式下用 pyrealsense2 直接打开 USB 相机")
+    parser.add_argument("--preview", action="store_true", help="标定前显示相机预览，按回车继续")
     parser.add_argument("--joint-topic", default="/g01/joint_states")
     parser.add_argument("--image-topic", default="/camera/camera/color/image_raw")
     parser.add_argument("--info-topic", default="/camera/camera/color/camera_info")
@@ -551,6 +711,10 @@ def main():
     args, ros_args = parser.parse_known_args()
     if ros_args and ros_args[0] != "--ros-args":
         parser.error(f"未知参数 {' '.join(ros_args)}")
+    if args.start_camera and args.mode != "real":
+        parser.error("--start-camera 仅用于 --mode real")
+    if args.preview and args.mode != "real":
+        parser.error("--preview 仅用于 --mode real")
     for name in ("translation_m", "rotation_deg", "speed", "settle",
                  "capture_timeout", "max_skew", "max_reprojection"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
@@ -572,9 +736,13 @@ def main():
         print(f"标定流程停止：{error}", flush=True)
         return 1
     finally:
-        if node is not None:
-            node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if node is not None and node.camera is not None:
+                node.camera.close()
+        finally:
+            if node is not None:
+                node.destroy_node()
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
