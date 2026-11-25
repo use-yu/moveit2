@@ -32,7 +32,7 @@ import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion, TransformStamped, Vector3
+from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion, TransformStamped, Twist, Vector3
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     CollisionObject, Constraints, JointConstraint, MoveItErrorCodes, PlanningScene,
@@ -149,12 +149,17 @@ CLAW_TOPIC = "/driver_control/claw"
 CLAW_OPEN = -45.0
 CLAW_CLOSED = 12.0
 CLAW_SETTLE_SEC = 1.0
+MOBILE_SPEED_TOPIC = "/mobile_set_speed"
+MOBILE_SPEED_Y_MPS = 0.05
+MOBILE_SPEED_DURATION_SEC = 6
+MOBILE_SPEED_RATE_HZ = 10
 TRANSFER_REFERENCE_TAG_XZ_M = (0.5407, 0.7426)
 # REFERENCE_RETRACT_M = 0.43
 REFERENCE_RETRACT_M = 0.43
 REFERENCE_LOWER_M = 0.342
 POST_RELEASE_LOWER_M = 0.03
 SPREAD_M = 0.10
+RETREAT_TRAJECTORY_SPEED_SCALE = 2.0
 CARTESIAN_STEP_M = CART_EEF_STEP
 COLLISION_CHECK_STEP_RAD = 0.025
 COLLISION_CHECK_STEP_M = 0.005
@@ -246,6 +251,15 @@ def point_time_ns(point):
 def trajectory_state(start, trajectory, point_index):
     joints = trajectory.joint_trajectory
     return {**start, **dict(zip(joints.joint_names, joints.points[point_index].positions))}
+
+
+def scale_joint_trajectory_speed(trajectory, speed_scale):
+    for point in trajectory.joint_trajectory.points:
+        elapsed_ns = round(point_time_ns(point) / speed_scale)
+        sec, nanosec = divmod(elapsed_ns, 1_000_000_000)
+        point.time_from_start = Duration(sec=sec, nanosec=nanosec)
+        point.velocities = [value * speed_scale for value in point.velocities]
+        point.accelerations = [value * speed_scale ** 2 for value in point.accelerations]
 
 
 def reverse_joint_trajectory(trajectory):
@@ -501,6 +515,7 @@ class BoxNode(Node):
         self.fk_client = self.create_client(GetPositionFK, "compute_fk")
         self.execution_client = ActionClient(self, ExecuteTrajectory, "execute_trajectory")
         self.claw_publisher = self.create_publisher(Float32, CLAW_TOPIC, 10)
+        self.mobile_speed_publisher = self.create_publisher(Twist, MOBILE_SPEED_TOPIC, 10)
 
     def read_marker(self):
         """Aggregate fresh detections of the target marker."""
@@ -1122,22 +1137,7 @@ class BoxNode(Node):
 
         scale = _clamp01(speed_scale)
         if scale > 0.0 and abs(scale - 1.0) > 1e-6:
-            for point in trajectory.joint_trajectory.points:
-                total_seconds = (
-                    point.time_from_start.sec
-                    + point.time_from_start.nanosec * 1e-9
-                )
-                scaled_ns = int(
-                    round(total_seconds * 1_000_000_000 / scale)
-                )
-                (
-                    point.time_from_start.sec,
-                    point.time_from_start.nanosec,
-                ) = divmod(scaled_ns, 1_000_000_000)
-                point.velocities = [value * scale for value in point.velocities]
-                point.accelerations = [
-                    value * scale * scale for value in point.accelerations
-                ]
+            scale_joint_trajectory_speed(trajectory, scale)
 
         return trajectory
 
@@ -1629,6 +1629,22 @@ class BoxNode(Node):
         self.claw_publisher.publish(Float32(data=value))
         self.get_logger().info(f"已向 {CLAW_TOPIC} 发布夹爪指令 {value:g}")
 
+    def move_mobile_after_placement(self):
+        speed = Twist(linear=Vector3(y=MOBILE_SPEED_Y_MPS))
+        period = 1.0 / MOBILE_SPEED_RATE_HZ
+        start = monotonic()
+        try:
+            for index in range(MOBILE_SPEED_DURATION_SEC * MOBILE_SPEED_RATE_HZ):
+                send_at = start + index * period
+                if not self.spin_for(send_at - monotonic()):
+                    return False
+                if monotonic() < send_at + period:
+                    self.mobile_speed_publisher.publish(speed)
+            return self.spin_for(start + MOBILE_SPEED_DURATION_SEC - monotonic())
+        finally:
+            if rclpy.ok():
+                self.mobile_speed_publisher.publish(Twist())
+
     def return_box(self, stages, confirm):
         # 倒放实际执行的六段直线，最后停在取箱预备位。
         return_steps = (
@@ -1711,6 +1727,10 @@ class BoxNode(Node):
             if index == 2:
                 # Stop publishing the original grasp locations as the box starts moving.
                 self.frame_poses.clear()
+            if index == 3:
+                # 只加速抱箱后退，保留原始缓存给返程倒放。
+                trajectory = deepcopy(trajectory)
+                scale_joint_trajectory_speed(trajectory, RETREAT_TRAJECTORY_SPEED_SCALE)
             if not self.execute_trajectory(trajectory):
                 return
             print(f"{GREEN}已完成{label}{RESET}")
@@ -1723,7 +1743,10 @@ class BoxNode(Node):
             if index in (2, 4) and not self.spin_for(CLAW_SETTLE_SEC):
                 return
 
-        self.return_box(stages, confirm)
+        if confirm is not None and not confirm(f"按回车移动底盘 {MOBILE_SPEED_DURATION_SEC:g} 秒，输入 q 退出："):
+            return
+        if self.move_mobile_after_placement():
+            self.return_box(stages, confirm)
 
     def add_rear_wall(self):
         if not self.scene_client.wait_for_service(timeout_sec=TIMEOUT_SEC):
@@ -1774,7 +1797,7 @@ class BoxNode(Node):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sim", action="store_true", help="使用固定仿真视觉数据，跳过识别定位；需启动 MoveIt 仿真环境")
-    parser.add_argument("--interactive", action="store_true", help="每段抱箱和返程动作开始前等待回车确认")
+    parser.add_argument("--interactive", action="store_true", help="抱箱、底盘移动和返程动作开始前等待回车确认")
     options = parser.parse_args(remove_ros_args(sys.argv)[1:])
     rclpy.init()
     node = BoxNode(sim=options.sim)
