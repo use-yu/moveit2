@@ -172,6 +172,7 @@ BOX_RPY_DEG = (-5, 0.0, -0.0)  # 箱体相对识别到的二维码，绕局部 X
 # 二维码位于 X 中线，距箱体 +Y 边缘 26 cm、+Z 边缘 1.6 cm。
 MARKER_TO_CENTER_M = (0.0, 0.160 - BOX_SIZE_M[1] / 2, 0.016 - BOX_SIZE_M[2] / 2)
 TIMEOUT_SEC = 3.0
+MARKER_SAMPLE_COUNT = 10
 GREEN = "\033[32m"
 RESET = "\033[0m"
 
@@ -486,12 +487,12 @@ class BoxNode(Node):
         self.claw_publisher = self.create_publisher(Float32, CLAW_TOPIC, 10)
 
     def read_marker(self):
-        """Read one valid detection after the command."""
-        detection = None
+        """Aggregate fresh detections of the target marker."""
+        samples = []
         mismatched_frame = None
 
         def on_poses(msg):
-            nonlocal detection, mismatched_frame
+            nonlocal mismatched_frame
             if len(msg.data) % 8:
                 return
             source_frame = msg.layout.dim[0].label if msg.layout.dim else ""
@@ -507,22 +508,34 @@ class BoxNode(Node):
                     rotation = Rotation.from_quat(pose[3:])
                 except ValueError:
                     continue
-                detection = make_pose(pose[:3], rotation)
+                samples.append((pose[:3], rotation))
                 break
 
         subscription = self.create_subscription(Float64MultiArray, "/aruco_poses", on_poses, 1)
         try:
             deadline = monotonic() + TIMEOUT_SEC
-            while detection is None and rclpy.ok():
+            while len(samples) < MARKER_SAMPLE_COUNT and rclpy.ok():
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     break
                 rclpy.spin_once(self, timeout_sec=remaining)
-            if detection is None and mismatched_frame is not None:
-                self.get_logger().error(f"/aruco_poses 的坐标系为 {mismatched_frame}，要求 {CAMERA_FRAME}。")
-            return detection
         finally:
             self.destroy_subscription(subscription)
+
+        if len(samples) < MARKER_SAMPLE_COUNT:
+            if mismatched_frame is not None:
+                self.get_logger().error(f"/aruco_poses 的坐标系为 {mismatched_frame}，要求 {CAMERA_FRAME}。")
+            self.get_logger().error(
+                f"/aruco_poses 中标签 {self.marker_id} 的有效位姿只收到 "
+                f"{len(samples)}/{MARKER_SAMPLE_COUNT} 条"
+            )
+            return None
+
+        positions, rotations = zip(*samples)
+        position = np.median(positions, axis=0)
+        rotation = Rotation.concatenate(rotations).mean()
+        self.get_logger().info(f"已汇总标签 {self.marker_id} 的 {MARKER_SAMPLE_COUNT} 条有效位姿")
+        return make_pose(position, rotation)
 
     def marker_and_box(self, transform):
         tag_xyz = transform[:3, 3]
@@ -598,7 +611,6 @@ class BoxNode(Node):
         else:
             detection = self.read_marker()
             if detection is None:
-                self.get_logger().error(f"未收到 /aruco_poses 中的新标签 {self.marker_id} 位姿")
                 return
             joints = self.read_joints()
             if joints is None:

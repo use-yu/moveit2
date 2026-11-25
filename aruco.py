@@ -8,6 +8,18 @@
 #   3) optional EMA for translation + SLERP for rotation
 #   4) outlier rejection with auto-reacquire (prevents "stuck no output" when marker moves)
 # -----------------------------
+"""
+4X4_50 0.045单标签
+640×480 @ 30 FPS
+z 约 12.67 mm 峰峰
+姿态：约 2° 峰峰
+
+1920×1080 @ 15 FPS
+x:0.26 mm 峰峰
+y:0.88 mm 峰峰
+z:4.43 mm 峰峰
+姿态：约 0.4° 峰峰
+"""
 import argparse
 
 import cv2
@@ -26,6 +38,7 @@ CAMERA_FRAME = "camera_color_optical_frame"
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 # aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
 params = cv2.aruco.DetectorParameters()
+params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 detector = cv2.aruco.ArucoDetector(aruco_dict, params)
 
 target_ids = {23, 33}
@@ -148,8 +161,8 @@ def slerp_quat(q_prev, q_curr, alpha):
 def run_camera(pub):
     pipeline = rs.pipeline()
     config = rs.config()
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    # config.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 15)
+    # config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 15)
 
     profile = pipeline.start(config)
     try:
@@ -288,7 +301,11 @@ def main(args=None):
     node = None
     try:
         node = rclpy.create_node("realsense_aruco_pose_pub")
-        node.get_logger().info(f"输出位姿坐标系 {CAMERA_FRAME}。")
+        node.get_logger().info(
+            f"输出位姿坐标系 {CAMERA_FRAME}。"
+            "每个标签的数据顺序为 [x, y, z, qx, qy, qz, qw, id]，"
+            "位置单位为米，多个标签按此顺序逐组拼接。"
+        )
         pub = node.create_publisher(Float64MultiArray, "/aruco_poses", 10)
         run_camera(pub)
         return 0
