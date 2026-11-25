@@ -19,6 +19,13 @@ x:0.26 mm 峰峰
 y:0.88 mm 峰峰
 z:4.43 mm 峰峰
 姿态：约 0.4° 峰峰
+
+4X4_50 0.045单标签
+1920×1080 @ 15 FPS
+x:0.1 mm 峰峰
+y: 0.06 mm 峰峰
+z:1.15 mm 峰峰
+姿态：约 0.13° 峰峰
 """
 import argparse
 
@@ -43,7 +50,7 @@ detector = cv2.aruco.ArucoDetector(aruco_dict, params)
 
 target_ids = {23, 33}
 
-marker_length = 0.045  # meters (确认这个长度与角点定义一致)
+marker_length = 0.0545  # meters (确认这个长度与角点定义一致)
 
 half_len = marker_length / 2.0
 obj_points = np.array([
