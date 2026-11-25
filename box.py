@@ -66,20 +66,22 @@ SIM_MARKER_XYZ = (0.5397, -0.0025, 0.7278)
 SIM_BOX_XYZ = (0.7208, 0.0063, 0.7375)
 SIM_BOX_XYZW = (-0.5173, 0.4981, 0.4773, -0.5064)
 BOX_ID = "aruco_box"
+BOX_TABLE_ID = "aruco_box_table"
 REAR_WALL_ID = "rear_wall"
 REAR_WALL_SIZE_M = (0.10, 3.0, 2.5)
 REAR_WALL_CLEARANCE_M = 0.5
 TF_PUBLISH_PERIOD_SEC = 0.1
 #箱子尺寸
 BOX_SIZE_M = (0.593, 0.312, 0.395)
+BOX_TABLE_SIZE_M = (3 * BOX_SIZE_M[0], BOX_SIZE_M[1], BOX_SIZE_M[2])
 # 抓取点相对箱体局部 ±X 和 +Y 边缘的外偏移。
-LEFT_GRASP_X_OUTSIDE_M = 0.03
-RIGHT_GRASP_X_OUTSIDE_M = 0.04
+LEFT_GRASP_X_OUTSIDE_M = 0.035
+RIGHT_GRASP_X_OUTSIDE_M = 0.035
 LEFT_GRASP_Y_OUTSIDE_M = 0.035
 RIGHT_GRASP_Y_OUTSIDE_M = 0.055
 # 抓取点相对箱体局部 Z 中心的偏移。
-LEFT_GRASP_Z_OFFSET_M = -0.02
-RIGHT_GRASP_Z_OFFSET_M = -0.02
+LEFT_GRASP_Z_OFFSET_M = -0.026
+RIGHT_GRASP_Z_OFFSET_M = -0.025
 # 抓取姿态从箱体姿态出发，先绕局部 Y 轴转 180°，再绕旋转后的局部 Z 轴转指定角度。
 GRASP_OFFSETS = (
     (
@@ -98,7 +100,7 @@ ARMS = (
 GRASP_BASE_FRAMES = {frame: f"{link[0]}_base_link" for _, link, frame, _ in ARMS}
 ARM_JOINTS = tuple(f"{side}_arm_joint{i}" for side in "lr" for i in range(1, 7))
 TORSO_JOINTS = ("body_joint1", "body_joint2")
-BOX_RECOGNITION_TORSO_TARGET = {"body_joint1": 0.0, "body_joint2": math.radians(10.0)}
+BOX_RECOGNITION_TORSO_TARGET = {"body_joint1": 0.0, "body_joint2": math.radians(0.0)}
 BOX_RECOGNITION_SETTLE_SEC = 1.0
 BODY_JOINTS = ("base_joint1", "base_joint2", "body_joint1", "body_joint2", "head_joint")
 LINEAR_JOINTS = ("base_joint1", "body_joint1")
@@ -107,7 +109,7 @@ PLAN_FRAME = "r_base_link"
 PLANNER_ID = "RRTConnect"
 PLAN_TIME_SEC = 10.0
 #ik
-IK_TIMEOUT_SEC = 0.05
+IK_TIMEOUT_SEC = 0.005
 SVC_COMPUTE_IK = "compute_ik"
 SVC_CARTESIAN_PATH = "compute_cartesian_path"
 UNLOAD_PLACE_JOINT_SPEED = 0.3
@@ -145,7 +147,7 @@ PREGRASP_OUTSIDE_M = 0.15
 LIFT_M = 0.15
 CLAW_TOPIC = "/driver_control/claw"
 CLAW_OPEN = -45.0
-CLAW_CLOSED = 10.0
+CLAW_CLOSED = 12.0
 CLAW_SETTLE_SEC = 1.0
 TRANSFER_REFERENCE_TAG_XZ_M = (0.5407, 0.7426)
 # REFERENCE_RETRACT_M = 0.43
@@ -168,9 +170,11 @@ TORSO_PATH_LIMITS = {
 }
 # 箱体局部 X、Y、Z 的单侧保护量。
 PADDING_PER_SIDE_M = (0.02, 0.08, 0.02)
-BOX_RPY_DEG = (-2.0, 0.6, -0.35)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
-# 二维码位于 X 中线，距箱体 +Y 边缘 18.7 cm、+Z 边缘 1.6 cm。
-MARKER_TO_CENTER_M = (0.0, 0.187 - BOX_SIZE_M[1] / 2, 0.016 - BOX_SIZE_M[2] / 2)
+BOX_RPY_DEG = (-1.6, -0.5, -2.0)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
+# 二维码位于 X 中线，距箱体 +Y 边缘 6.15 cm、+Z 边缘 0 cm。
+MARKER_TO_CENTER_M = (0.0, 0.0615 - BOX_SIZE_M[1] / 2, -BOX_SIZE_M[2] / 2)
+# 搬运距离基准按旧贴标位置标定，距 +Y 边缘 18.7 cm、+Z 边缘 1.6 cm。
+TRANSFER_REFERENCE_MARKER_TO_CENTER_M = (0.0, 0.187 - BOX_SIZE_M[1] / 2, 0.016 - BOX_SIZE_M[2] / 2)
 TIMEOUT_SEC = 3.0
 MARKER_SAMPLE_COUNT = 10
 GREEN = "\033[32m"
@@ -242,6 +246,18 @@ def point_time_ns(point):
 def trajectory_state(start, trajectory, point_index):
     joints = trajectory.joint_trajectory
     return {**start, **dict(zip(joints.joint_names, joints.points[point_index].positions))}
+
+
+def reverse_joint_trajectory(trajectory):
+    result = deepcopy(trajectory)
+    points = result.joint_trajectory.points
+    end_ns = point_time_ns(points[-1])
+    points.reverse()
+    for point in points:
+        sec, nanosec = divmod(end_ns - point_time_ns(point), 1_000_000_000)
+        point.time_from_start = Duration(sec=sec, nanosec=nanosec)
+        point.velocities = [-value for value in point.velocities]
+    return result
 
 
 def collision_step_sizes(names):
@@ -631,7 +647,7 @@ class BoxNode(Node):
             )
 
         if self.apply_box(*poses[SCENE_FRAME], grasp_boxes):
-            print(f"{GREEN}已更新箱体 {BOX_ID}，发布 TF {SCENE_FRAME} → "
+            print(f"{GREEN}已更新箱体 {BOX_ID} 和桌子 {BOX_TABLE_ID}，发布 TF {SCENE_FRAME} → "
                   f"{', '.join(self.frame_poses)}{RESET}")
 
     def apply_box(self, marker_pose, box_pose, grasp_boxes):
@@ -642,9 +658,18 @@ class BoxNode(Node):
             round(size + 2 * padding, 3) for size, padding in zip(BOX_SIZE_M, PADDING_PER_SIDE_M)
         ]
         collision.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=dimensions)]
-        collision.primitive_poses = [make_pose((0.0, 0.0, 0.0), Rotation.identity())]
+        primitive_pose = make_pose((0.0, 0.0, 0.0), Rotation.identity())
+        collision.primitive_poses = [primitive_pose]
 
-        if not self.apply_scene(collision):
+        table = CollisionObject(id=BOX_TABLE_ID, operation=CollisionObject.ADD)
+        table.header.frame_id = SCENE_FRAME
+        # 箱体局部 +Y 朝上，桌面与箱体不含保护量的底面贴合。
+        table_center_y = -(BOX_SIZE_M[1] + BOX_TABLE_SIZE_M[1]) / 2
+        table.pose = shifted_pose(box_pose, pose_rotation(box_pose).apply((0.0, table_center_y, 0.0)))
+        table.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=list(BOX_TABLE_SIZE_M))]
+        table.primitive_poses = [primitive_pose]
+
+        if not self.apply_scene(collision, table):
             return False
         self.box_collision = collision
         self.grasp_boxes = grasp_boxes
@@ -1371,16 +1396,19 @@ class BoxNode(Node):
                 return False
         return True
 
-    def box_transfer_moves(self, tag_pose):
-        tag = tag_pose.position
+    def box_transfer_moves(self, box_pose):
+        tag_x, _, tag_z = position_xyz(box_pose) - pose_rotation(box_pose).apply(
+            TRANSFER_REFERENCE_MARKER_TO_CENTER_M
+        )
         reference_x, reference_z = TRANSFER_REFERENCE_TAG_XZ_M
-        retract = REFERENCE_RETRACT_M + (tag.x - reference_x)
-        lower = REFERENCE_LOWER_M + (tag.z - reference_z)
+        retract = REFERENCE_RETRACT_M + (tag_x - reference_x)
+        lower = REFERENCE_LOWER_M + (tag_z - reference_z)
         if not all(isfinite(value) and value > 0 for value in (retract, lower)):
-            self.get_logger().error("根据标签位置计算的后退或下降距离无效")
+            self.get_logger().error("根据箱体位置计算的后退或下降距离无效")
             return None
         self.get_logger().info(
-            f"标签 X={tag.x:.4f} m、Z={tag.z:.4f} m，抱箱后退 {retract:.3f} m、下降 {lower:.3f} m"
+            f"旧贴标等效位置 X={tag_x:.4f} m、Z={tag_z:.4f} m，"
+            f"抱箱后退 {retract:.3f} m、下降 {lower:.3f} m"
         )
         return (
             ("双臂抬升 15 cm", ((0.0, 0.0, LIFT_M),) * len(ARMS)),
@@ -1408,7 +1436,7 @@ class BoxNode(Node):
 
     def plan_box_pick(self, current, collision):
         log = self.get_logger()
-        moves = self.box_transfer_moves(self.frame_poses[self.tag_frame])
+        moves = self.box_transfer_moves(collision.pose)
         if moves is None:
             return None
         grasp = {frame: self.frame_poses[frame] for _, _, frame, _ in ARMS}
@@ -1601,6 +1629,40 @@ class BoxNode(Node):
         self.claw_publisher.publish(Float32(data=value))
         self.get_logger().info(f"已向 {CLAW_TOPIC} 发布夹爪指令 {value:g}")
 
+    def return_box(self, stages, confirm):
+        # 倒放实际执行的六段直线，最后停在取箱预备位。
+        return_steps = (
+            ("双臂合拢", None),
+            (f"双臂向上抬 {POST_RELEASE_LOWER_M * 100:g} cm", ("闭合夹爪", CLAW_CLOSED)),
+            ("双臂向上抬至搬运高度", None),
+            ("双臂向前", ("松开夹爪", CLAW_OPEN)),
+            (f"双臂向下 {LIFT_M * 100:g} cm", None),
+            ("双臂张开至取箱预备位", None),
+        )
+        for (_, forward, start, _), (label, claw_step) in zip(reversed(stages[1:]), return_steps, strict=True):
+            if all(name in forward.joint_trajectory.joint_names for name in TORSO_JOINTS):
+                label += "（含腰部和升降）"
+            if confirm is not None and not confirm(f"按回车{label}，输入 q 退出："):
+                return
+            actual = self.read_joints()
+            expected = trajectory_state(start, forward, -1)
+            if actual is None or any(
+                abs(actual[name] - value) > (0.005 if name in LINEAR_JOINTS else MOVEIT_START_TOLERANCE)
+                for name, value in expected.items()
+            ):
+                self.get_logger().error(f"{label}的实际关节状态与缓存轨迹起点不一致，停止返程")
+                return
+            if not self.execute_trajectory(reverse_joint_trajectory(forward)):
+                return
+            print(f"{GREEN}已完成{label}{RESET}")
+            if claw_step is not None:
+                claw_label, value = claw_step
+                if confirm is not None and not confirm(f"按回车{claw_label}，输入 q 退出："):
+                    return
+                self.command_claw(value)
+                if not self.spin_for(CLAW_SETTLE_SEC):
+                    return
+
     def pick_box(self, confirm=None):
         collision = self.box_collision
         if collision is None:
@@ -1661,6 +1723,8 @@ class BoxNode(Node):
             if index in (2, 4) and not self.spin_for(CLAW_SETTLE_SEC):
                 return
 
+        self.return_box(stages, confirm)
+
     def add_rear_wall(self):
         if not self.scene_client.wait_for_service(timeout_sec=TIMEOUT_SEC):
             self.get_logger().error("MoveIt 的 apply_planning_scene 服务不可用")
@@ -1691,10 +1755,10 @@ class BoxNode(Node):
             self.grasp_boxes.clear()
             print(f"{GREEN}已清除世界碰撞物体，停止发布箱体相关 TF {frames}{RESET}")
 
-    def apply_scene(self, collision):
+    def apply_scene(self, *collisions):
         scene = PlanningScene(is_diff=True)
         scene.robot_state.is_diff = True
-        scene.world.collision_objects = [collision]
+        scene.world.collision_objects = list(collisions)
         future = self.scene_client.call_async(ApplyPlanningScene.Request(scene=scene))
         rclpy.spin_until_future_complete(self, future, timeout_sec=TIMEOUT_SEC)
         if not future.done():
@@ -1710,7 +1774,7 @@ class BoxNode(Node):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sim", action="store_true", help="使用固定仿真视觉数据，跳过识别定位；需启动 MoveIt 仿真环境")
-    parser.add_argument("--interactive", action="store_true", help="每段抱箱轨迹开始前等待回车确认")
+    parser.add_argument("--interactive", action="store_true", help="每段抱箱和返程动作开始前等待回车确认")
     options = parser.parse_args(remove_ros_args(sys.argv)[1:])
     rclpy.init()
     node = BoxNode(sim=options.sim)
