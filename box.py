@@ -75,11 +75,11 @@ BOX_SIZE_M = (0.593, 0.312, 0.395)
 # 抓取点相对箱体局部 ±X 和 +Y 边缘的外偏移。
 LEFT_GRASP_X_OUTSIDE_M = 0.03
 RIGHT_GRASP_X_OUTSIDE_M = 0.04
-LEFT_GRASP_Y_OUTSIDE_M = 0.06
-RIGHT_GRASP_Y_OUTSIDE_M = 0.065
+LEFT_GRASP_Y_OUTSIDE_M = 0.035
+RIGHT_GRASP_Y_OUTSIDE_M = 0.055
 # 抓取点相对箱体局部 Z 中心的偏移。
-LEFT_GRASP_Z_OFFSET_M = -0.012
-RIGHT_GRASP_Z_OFFSET_M = -0.017
+LEFT_GRASP_Z_OFFSET_M = -0.02
+RIGHT_GRASP_Z_OFFSET_M = -0.02
 # 抓取姿态从箱体姿态出发，先绕局部 Y 轴转 180°，再绕旋转后的局部 Z 轴转指定角度。
 GRASP_OFFSETS = (
     (
@@ -168,9 +168,9 @@ TORSO_PATH_LIMITS = {
 }
 # 箱体局部 X、Y、Z 的单侧保护量。
 PADDING_PER_SIDE_M = (0.02, 0.08, 0.02)
-BOX_RPY_DEG = (1.0, 0.0, -0.0)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
-# 二维码位于 X 中线，距箱体 +Y 边缘 16 cm、+Z 边缘 1.6 cm。
-MARKER_TO_CENTER_M = (0.0, 0.160 - BOX_SIZE_M[1] / 2, 0.016 - BOX_SIZE_M[2] / 2)
+BOX_RPY_DEG = (-2.0, 0.6, -0.35)  # 箱体相对识别到的二维码，绕局部 X、Y、Z 轴旋转（度）
+# 二维码位于 X 中线，距箱体 +Y 边缘 18.7 cm、+Z 边缘 1.6 cm。
+MARKER_TO_CENTER_M = (0.0, 0.187 - BOX_SIZE_M[1] / 2, 0.016 - BOX_SIZE_M[2] / 2)
 TIMEOUT_SEC = 3.0
 MARKER_SAMPLE_COUNT = 10
 GREEN = "\033[32m"
