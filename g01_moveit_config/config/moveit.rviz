@@ -14,7 +14,7 @@ Panels:
         - /MarkerArray1
         - /MarkerArray1/Topic1
       Splitter Ratio: 0.5
-    Tree Height: 456
+    Tree Height: 657
   - Class: rviz_common/Help
     Name: Help
   - Class: rviz_common/Views
@@ -43,7 +43,7 @@ Visualization Manager:
       Plane Cell Count: 10
       Reference Frame: <Fixed Frame>
       Value: true
-    - Acceleration_Scaling_Factor: 0.1
+    - Acceleration_Scaling_Factor: 0.5
       Class: moveit_rviz_plugin/MotionPlanning
       Enabled: true
       Move Group Namespace: ""
@@ -173,6 +173,10 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          l_box:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           l_tool:
             Alpha: 1
             Show Axes: false
@@ -192,6 +196,10 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          r_box:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           r_tool:
             Alpha: 1
             Show Axes: false
@@ -223,7 +231,7 @@ Visualization Manager:
         Goal State Color: 250; 128; 0
         Interactive Marker Size: 0.30000001192092896
         Joint Violation Color: 255; 0; 255
-        Planning Group: left_arm
+        Planning Group: right_arm
         Query Goal State: false
         Query Start State: false
         Show Workspace: false
@@ -345,6 +353,10 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          l_box:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           l_tool:
             Alpha: 1
             Show Axes: false
@@ -364,6 +376,10 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          r_box:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           r_tool:
             Alpha: 1
             Show Axes: false
@@ -376,7 +392,7 @@ Visualization Manager:
         Show Robot Collision: false
         Show Robot Visual: false
       Value: true
-      Velocity_Scaling_Factor: 0.1
+      Velocity_Scaling_Factor: 0.5
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: true
@@ -494,6 +510,10 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
+        l_box:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
         l_tool:
           Alpha: 1
           Show Axes: false
@@ -513,6 +533,10 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
+        r_box:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
         r_tool:
           Alpha: 1
           Show Axes: false
@@ -545,7 +569,7 @@ Visualization Manager:
         L5:
           Value: false
         L6:
-          Value: true
+          Value: false
         R1:
           Value: false
         R2:
@@ -562,8 +586,6 @@ Visualization Manager:
           Value: false
         YB:
           Value: false
-        aruco_33:
-          Value: true
         base_footprint:
           Value: false
         base_x_link:
@@ -573,20 +595,20 @@ Visualization Manager:
         head:
           Value: false
         l_JZ:
-          Value: false
-        l_base_link:
           Value: true
-        l_box_grasp:
+        l_base_link:
+          Value: false
+        l_box:
           Value: true
         l_tool:
           Value: false
         moveit_base_link:
           Value: true
         r_JZ:
-          Value: false
+          Value: true
         r_base_link:
           Value: false
-        r_box_grasp:
+        r_box:
           Value: true
         r_tool:
           Value: false
@@ -615,7 +637,8 @@ Visualization Manager:
                               L5:
                                 L6:
                                   l_JZ:
-                                    {}
+                                    l_box:
+                                      {}
                                   l_tool:
                                     {}
                     r_base_link:
@@ -626,15 +649,10 @@ Visualization Manager:
                               R5:
                                 R6:
                                   r_JZ:
-                                    {}
+                                    r_box:
+                                      {}
                                   r_tool:
                                     {}
-                aruco_33:
-                  {}
-                l_box_grasp:
-                  {}
-                r_box_grasp:
-                  {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Marker
@@ -680,30 +698,30 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 3.481234312057495
+      Distance: 3.453923463821411
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.8789269924163818
-        Y: 0.0015295518096536398
-        Z: 0.579483687877655
+        X: -0.07206732779741287
+        Y: 0.2677558660507202
+        Z: 1.2123546600341797
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.04479699581861496
+      Pitch: -0.10520245879888535
       Target Frame: world
       Value: Orbit (rviz_default_plugins)
-      Yaw: 4.685473918914795
+      Yaw: 5.8204827308654785
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1016
+  Height: 1376
   Help:
     collapsed: false
   Hide Left Dock: false
@@ -712,9 +730,9 @@ Window Geometry:
     collapsed: false
   MotionPlanning - Trajectory Slider:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000002b4000003a2fc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb000000100044006900730070006c006100790073010000003b00000203000000c700fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e00670100000244000001990000016900fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000043c00000109000000a000ffffff00000480000003a200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000002b40000050afc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb000000100044006900730070006c006100790073010000003b000002cc000000c700fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e0067010000030d000002380000016900fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000043c00000109000000a000ffffff000006fe0000050a00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 1850
-  X: 70
+  Width: 2488
+  X: 72
   Y: 27
