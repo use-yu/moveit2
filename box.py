@@ -10,7 +10,10 @@
 # head 0.75
 
 #!/usr/bin/env python3
-"""Detect a box, publish grasp TFs, and plan a staged dual-arm pick with MoveIt."""
+"""
+ros2 run pkg_driver_control_v2 chest_board_node
+
+Detect a box, publish grasp TFs, and plan a staged dual-arm pick with MoveIt."""
 
 import argparse
 import bisect
@@ -80,8 +83,8 @@ RIGHT_GRASP_X_OUTSIDE_M = 0.035
 LEFT_GRASP_Y_OUTSIDE_M = 0.033
 RIGHT_GRASP_Y_OUTSIDE_M = 0.043
 # 抓取点相对箱体局部 Z 中心的偏移。
-LEFT_GRASP_Z_OFFSET_M = -0.023
-RIGHT_GRASP_Z_OFFSET_M = -0.027
+LEFT_GRASP_Z_OFFSET_M = -0.025
+RIGHT_GRASP_Z_OFFSET_M = -0.029
 # 抓取姿态从箱体姿态出发，先绕局部 Y 轴转 180°，再绕旋转后的局部 Z 轴转指定角度。
 GRASP_OFFSETS = (
     (
@@ -159,7 +162,13 @@ REFERENCE_RETRACT_M = 0.43
 REFERENCE_LOWER_M = 0.342
 POST_RELEASE_LOWER_M = 0.03
 SPREAD_M = 0.10
-RETREAT_TRAJECTORY_SPEED_SCALE = 4.0
+RETREAT_CARTESIAN_SPEED = 0.6
+RETREAT_LABEL = "双臂后退"
+LOWER_LABEL = "双臂下降"
+BOX_TRANSFER_CARTESIAN_SPEEDS = {
+    RETREAT_LABEL: RETREAT_CARTESIAN_SPEED,
+    LOWER_LABEL: 0.5,
+}
 CARTESIAN_STEP_M = CART_EEF_STEP
 COLLISION_CHECK_STEP_RAD = 0.025
 COLLISION_CHECK_STEP_M = 0.005
@@ -168,10 +177,10 @@ MOVEIT_START_TOLERANCE = 0.01
 FOLLOWER_JOINT_STEP_RAD = 0.12
 CONTROLLER_PERIOD_SEC = 0.01
 # Conservative velocity and acceleration caps from the G01 joint limits.
-ARM_PATH_LIMIT = 3.14 * UNLOAD_PLACE_CARTESIAN_SPEED
+ARM_PATH_LIMIT = 3.14
 TORSO_PATH_LIMITS = {
-    "body_joint1": 0.1 * UNLOAD_PLACE_CARTESIAN_SPEED,
-    "body_joint2": 0.3 * UNLOAD_PLACE_CARTESIAN_SPEED,
+    "body_joint1": 0.1,
+    "body_joint2": 0.3,
 }
 # 箱体局部 X、Y、Z 的单侧保护量。
 PADDING_PER_SIDE_M = (0.02, 0.08, 0.02)
@@ -281,7 +290,7 @@ def collision_step_sizes(names):
     ])
 
 
-def time_shared_body_path(times, positions):
+def time_shared_body_path(times, positions, speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED):
     """Fit a smooth joint path and time it for the G01 10 ms torso controllers."""
     names = TORSO_JOINTS + ARM_JOINTS
     times = np.asarray(times, dtype=float)
@@ -301,7 +310,7 @@ def time_shared_body_path(times, positions):
         np.abs((3 * a * extrema + 2 * b) * extrema + c),
     ])
     acceleration = np.maximum(np.abs(2 * b), np.abs(6 * a * span + 2 * b))
-    limits = np.array([TORSO_PATH_LIMITS.get(name, ARM_PATH_LIMIT) for name in names])
+    limits = speed_scale * np.array([TORSO_PATH_LIMITS.get(name, ARM_PATH_LIMIT) for name in names])
     scale = max(1.0, float(np.max(velocity / limits)), float(np.sqrt(np.max(acceleration / limits))))
     sample_count = ceil(times[-1] * scale / CONTROLLER_PERIOD_SEC)
     trajectory = RobotTrajectory()
@@ -1141,16 +1150,16 @@ class BoxNode(Node):
 
         return trajectory
 
-    def plan_cartesian(self, start, targets, cache=None):
+    def plan_cartesian(self, start, targets, cache=None, *, speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED):
         paths = []
         for group, link, frame, _ in ARMS:
             names = [name for name in ARM_JOINTS if name.startswith(link[0] + "_")]
-            key = (group, tuple(start[name] for name in (*names, *BODY_JOINTS)))
+            key = (group, speed_scale, tuple(start[name] for name in (*names, *BODY_JOINTS)))
             if cache is not None and key in cache:
                 path = cache[key]
             else:
                 path = self.plan_cartesian_line(
-                    group, link, targets[frame], speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED,
+                    group, link, targets[frame], speed_scale=speed_scale,
                     avoid_collisions=False, start_joints=start, plan_frame=SCENE_FRAME, verbose=False,
                 )
                 if path is not None and not self.valid_trajectory(path, names):
@@ -1180,13 +1189,13 @@ class BoxNode(Node):
         }
         return poses if all(link in poses for link in links) else None
 
-    def plan_shared_body_line(self, start, starts, targets, lead, follow):
+    def plan_shared_body_line(self, start, starts, targets, lead, follow, *, speed_scale):
         lead_group, lead_link, lead_frame, _ = lead
         follow_group, follow_link, follow_frame, _ = follow
         lead_group = f"{lead_group.removesuffix('_arm')}_body"
         lead_names = TORSO_JOINTS + tuple(name for name in ARM_JOINTS if name[0] == lead_link[0])
         path = self.plan_cartesian_line(
-            lead_group, lead_link, targets[lead_frame], speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED,
+            lead_group, lead_link, targets[lead_frame], speed_scale=speed_scale,
             start_joints=start, plan_frame=SCENE_FRAME, verbose=False,
         )
         if path is None or not self.valid_trajectory(path, lead_names):
@@ -1243,14 +1252,15 @@ class BoxNode(Node):
                 state.update({name: solution[name] for name in follow_names})
                 times.append((start_ns + delta_ns * fraction) * 1e-9)
                 positions.append([state[name] for name in output_names])
-        return time_shared_body_path(times, positions)
+        return time_shared_body_path(times, positions, speed_scale)
 
-    def cartesian_candidates(self, start, starts, targets, synchronized=False, cache=None):
-        path = self.plan_cartesian(start, targets, cache)
+    def cartesian_candidates(self, start, starts, targets, synchronized=False, cache=None,
+                             *, speed_scale=UNLOAD_PLACE_CARTESIAN_SPEED):
+        path = self.plan_cartesian(start, targets, cache, speed_scale=speed_scale)
         if path is not None and self.validate_path(path, start, (starts, targets), synchronized):
             yield path
         for lead, follow in (ARMS, ARMS[::-1]):
-            path = self.plan_shared_body_line(start, starts, targets, lead, follow)
+            path = self.plan_shared_body_line(start, starts, targets, lead, follow, speed_scale=speed_scale)
             if path is not None and self.validate_path(path, start, (starts, targets), synchronized):
                 yield path
 
@@ -1412,8 +1422,8 @@ class BoxNode(Node):
         )
         return (
             ("双臂抬升 15 cm", ((0.0, 0.0, LIFT_M),) * len(ARMS)),
-            (f"双臂后退 {retract * 100:.1f} cm", ((-retract, 0.0, 0.0),) * len(ARMS)),
-            (f"双臂下降 {lower * 100:.1f} cm", ((0.0, 0.0, -lower),) * len(ARMS)),
+            (f"{RETREAT_LABEL} {retract * 100:.1f} cm", ((-retract, 0.0, 0.0),) * len(ARMS)),
+            (f"{LOWER_LABEL} {lower * 100:.1f} cm", ((0.0, 0.0, -lower),) * len(ARMS)),
             (f"双臂再下降 {POST_RELEASE_LOWER_M * 100:g} cm",
              ((0.0, 0.0, -POST_RELEASE_LOWER_M),) * len(ARMS)),
             ("双臂张开 10 cm", ((0.0, SPREAD_M, 0.0), (0.0, -SPREAD_M, 0.0))),
@@ -1427,7 +1437,9 @@ class BoxNode(Node):
             frame: shifted_pose(starts[frame], offset)
             for (_, _, frame, _), offset in zip(ARMS, offsets)
         }
-        for trajectory in self.cartesian_candidates(start, starts, targets, synchronized=True):
+        stage_label = label.split(" ", 1)[0]
+        speed_scale = BOX_TRANSFER_CARTESIAN_SPEEDS.get(stage_label, UNLOAD_PLACE_CARTESIAN_SPEED)
+        for trajectory in self.cartesian_candidates(start, starts, targets, synchronized=True, speed_scale=speed_scale):
             endpoint = trajectory_state(start, trajectory, -1)
             rest = self.plan_box_transfers(endpoint, targets, moves[1:])
             if rest is not None:
@@ -1727,10 +1739,6 @@ class BoxNode(Node):
             if index == 2:
                 # Stop publishing the original grasp locations as the box starts moving.
                 self.frame_poses.clear()
-            if index == 3:
-                # 只加速抱箱后退，保留原始缓存给返程倒放。
-                trajectory = deepcopy(trajectory)
-                scale_joint_trajectory_speed(trajectory, RETREAT_TRAJECTORY_SPEED_SCALE)
             if not self.execute_trajectory(trajectory):
                 return
             print(f"{GREEN}已完成{label}{RESET}")
