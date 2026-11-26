@@ -503,7 +503,7 @@
   <joint name="${prefix}box_to_${link_prefix}6" type="fixed">
     <parent link="${prefix}JZ" />
     <child link="${prefix}box" />
-    <origin xyz="-0.1 ${-0.03 if prefix == 'r_' else 0.03} 0.064" rpy="3.1416 0 1.5708" />
+    <origin xyz="-0.0575 ${-0.0652 if prefix == 'r_' else 0.0652} 0.0875" rpy="3.1416 0 1.5708" />
   </joint>
 
   </xacro:macro>
