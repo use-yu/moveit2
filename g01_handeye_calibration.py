@@ -6,8 +6,8 @@ ros2 topic echo /driver_report/camera_motor_info pkg_msg_define/msg/MotorRuntime
   2. MoveIt 先做带碰撞检查的 IK，再从上一段的实际规划终点规划下一段。
      跳过无解、规划失败或关节轨迹绕行过大的点。全部规划完毕后逐段执行，每段末尾停车。
   3. 实机用 D435i 彩色图像及其 CameraInfo。12×9 格、边长 0.02 m 的
-     棋盘有 11×8 个内角点。每次停车后配对图像和关节状态，通过 MoveIt FK
-     和 solvePnP 得到一对位姿，保存到 JSON。相机、头部和躯干须固定，
+     棋盘有 11×8 个内角点。每次停车并等待后，检查连续配对的图像中棋盘是否稳定，
+     再通过 MoveIt FK 和 solvePnP 得到一对位姿，保存到 JSON。相机、头部和躯干须固定，
      棋盘必须刚性安装。实机前在 MoveIt 规划场景中配置板、支架和障碍物。
   4. --mode sim 只规划并执行轨迹，跳过相机、采样与求解。
 
@@ -61,6 +61,10 @@ from sensor_msgs.msg import CameraInfo, Image, JointState
 
 PATTERN = (11, 8)
 SQUARE_M = 0.02
+STABLE_FRAME_COUNT = 4
+STABLE_DURATION_NS = 100_000_000
+MAX_STABLE_FRAME_GAP_NS = 250_000_000
+MAX_CORNER_SHIFT_RMSE_PX = 0.5
 # 偏移量乘以用户指定的平移/旋转幅度。先试纯旋转，再覆盖位置及组合。
 OFFSETS = (
     ((0, 0, 0), (1, 0, 0)), ((0, 0, 0), (-1, 0, 0)),
@@ -289,7 +293,7 @@ class ChessboardCamera:
         rmse = float(np.sqrt(np.mean(np.sum((projected - corners)**2, axis=-1))))
         transform = np.eye(4)
         transform[:3, :3], transform[:3, 3] = rotation, tvec.ravel()
-        return transform, rmse
+        return transform, rmse, corners
 
 
 class RosResponseTimeout(RuntimeError):
@@ -492,6 +496,7 @@ class Calibration(Node):
         best_skew = None
         paired = 0
         rejected = Counter()
+        stable_frames = []
 
         def synchronized_frame():
             nonlocal best_skew
@@ -525,28 +530,45 @@ class Calibration(Node):
                 self.require_close(frame[2], reference, self.fixed, 0.005, "头部、躯干或另一条臂发生移动")
             if max(abs(before[2][name] - later[2][name]) for name in self.arm) > 0.002:
                 rejected["采样时机械臂仍在移动"] += 1
+                stable_frames.clear()
                 continue
             nearest = min((before, later), key=lambda item: abs(item[1] - seen))
             self.require_close(nearest[2], expected, self.arm, 0.025, "末端未到达轨迹终点")
             detection = self.camera.detect(image, info, rejected)
             if detection is None:
+                stable_frames.clear()
                 continue
-            matrix, rmse = detection
+            matrix, rmse, corners = detection
             best_rmse = rmse if best_rmse is None else min(best_rmse, rmse)
-            if rmse <= self.args.max_reprojection:
+            if not math.isfinite(rmse) or rmse > self.args.max_reprojection:
+                rejected["重投影误差超限"] += 1
+                stable_frames.clear()
+                continue
+
+            if stable_frames and seen - stable_frames[-1][0] > MAX_STABLE_FRAME_GAP_NS:
+                rejected["稳定检查帧间隔过长"] += 1
+                stable_frames.clear()
+            # 与整个窗口比较，避免棋盘缓慢漂移却逐帧通过检查。
+            if any(np.mean(np.sum((corners - previous)**2, axis=-1)) > MAX_CORNER_SHIFT_RMSE_PX**2
+                   for _, previous in stable_frames):
+                rejected["棋盘角点仍在移动"] += 1
+                stable_frames.clear()
+            stable_frames.append((seen, corners))
+            if time.monotonic() >= deadline:
+                break
+            if len(stable_frames) >= STABLE_FRAME_COUNT and seen - stable_frames[0][0] >= STABLE_DURATION_NS:
                 return {
                     "index": index, "image_stamp_ns": seen, "joint_stamp_ns": nearest[1],
                     "joint_positions_rad_or_m": nearest[2], "camera_frame": image.header.frame_id,
                     "T_base_ee": self.fk(nearest[2], self.base).tolist(),
                     "T_camera_board": matrix.tolist(), "reprojection_rmse_px": rmse,
                 }
-            rejected["重投影误差超限"] += 1
 
         if paired:
-            detail = "，".join(f"{reason} {count} 帧" for reason, count in rejected.items())
+            details = [f"已配对 {paired} 帧", *(f"{reason} {count} 帧" for reason, count in rejected.items())]
             if best_rmse is not None:
-                detail += f"，最佳重投影误差 {best_rmse:.2f} px（上限 {self.args.max_reprojection:g} px）"
-            summary = f"已配对 {paired} 帧，{detail}"
+                details.append(f"最佳重投影误差 {best_rmse:.2f} px（上限 {self.args.max_reprojection:g} px）")
+            summary = "，".join(details)
         elif self.camera.info is None or not self.camera.images or not self.history:
             missing = []
             if self.camera.info is None:
@@ -565,8 +587,9 @@ class Calibration(Node):
                        f"最新关节时间减节点时间 {(joint_stamp - now) / 1e6:.1f} ms")
             if best_skew is not None:
                 summary += f"，最接近的前后关节反馈最大时间差 {best_skew / 1e6:.1f} ms"
-        self.get_logger().warning(f"点 {index} 采样失败。{summary}。")
-        return None
+        raise RuntimeError(f"点 {index} 在 {self.args.capture_timeout:g} 秒内未获得稳定的相机数据。"
+                           f"需连续至少 {STABLE_FRAME_COUNT} 帧且覆盖 {STABLE_DURATION_NS / 1e6:g} ms，"
+                           f"帧间角点位移 RMSE 不超过 {MAX_CORNER_SHIFT_RMSE_PX:g} px。{summary}。")
 
     def save(self, data):
         output = self.args.output or Path(f"g01_handeye_{self.args.arm}.json")
@@ -636,8 +659,6 @@ class Calibration(Node):
         data = None
         if self.camera is not None:
             first = self.collect(0, reference, reference)
-            if first is None:
-                raise RuntimeError("起始位姿没有合格的棋盘观测。请查看上方的点 0 采样日志。")
             data = {"arm": self.args.arm, "base_frame": self.base, "end_effector_frame": self.tip,
                     "camera_frame": first["camera_frame"], "head_joint_rad": reference["head_joint"],
                     "pattern_inner_corners": list(PATTERN), "square_size_m": SQUARE_M,
@@ -685,9 +706,6 @@ class Calibration(Node):
                 self.require_close(self.current(), expected, self.arm, 0.025, "仿真未到达轨迹终点")
                 continue
             sample = self.collect(index, reference, expected)
-            if sample is None:
-                self.get_logger().warning(f"跳过点 {index} 的采样，未获得合格的同步棋盘观测。")
-                continue
             if sample["camera_frame"] != data["camera_frame"]:
                 raise RuntimeError("采样过程中相机光学坐标系发生变化。")
             data["samples"].append(sample)
@@ -724,8 +742,8 @@ def main():
     parser.add_argument("--max-detour-deg", type=float, default=30.0,
                         help="每段轨迹在关节空间中比起终点直线多走的长度上限（度）")
     parser.add_argument("--speed", type=float, default=0.10)
-    parser.add_argument("--settle", type=float, default=0.6)
-    parser.add_argument("--capture-timeout", type=float, default=5.0)
+    parser.add_argument("--settle", type=float, default=0.6, help="停车后开始检查相机稳定性前的等待时间（秒）")
+    parser.add_argument("--capture-timeout", type=float, default=5.0, help="单点采样总超时（秒，含停车后的等待）")
     parser.add_argument("--max-skew", type=float, default=0.12, help="图像与每侧关节反馈的最大时间差（秒）")
     parser.add_argument("--max-reprojection", type=float, default=1.0, help="最大重投影 RMSE（像素）")
     parser.add_argument("--min-samples", type=int, default=10)
