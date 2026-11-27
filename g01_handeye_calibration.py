@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """G01 固定头部相机的眼在手外标定，支持 left/right 两条六轴臂。
+python3 g01_handeye_calibration.py --arm right --mode real --preview --start-camera
 ros2 topic echo /driver_report/camera_motor_info pkg_msg_define/msg/MotorRuntimeInfo
 功能position: 0.749996542930603标定位置
   1. 从当前末端位姿出发，生成多轴平移、转动及组合采样位姿。
